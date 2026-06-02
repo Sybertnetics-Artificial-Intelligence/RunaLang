@@ -60,20 +60,36 @@ arena), current_scope (paragraph descriptor or 0 at top level), errors
 (List of error message StringCores; analyzer destructor frees the list).
 @End Implementation
 
+@Reasoning:
+The COBOL frontend's translation context bundles three pieces of state:
+the arena that owns all transient HIR allocations, the current scope
+pointer for resolving variable references against the active DATA
+DIVISION definitions, and an error list used by the translation walkers
+to surface diagnostics without aborting the whole translation. Encoding
+fields as Integer slots matches the v0.0.8.5 convention; offsets 0/8/16
+are wired into every accessor in this file.
+@End Reasoning
 Type called "COBOLToHIRContext":
     arena as Integer            Note: Memory arena for allocations
     current_scope as Integer    Note: Current scope context
     errors as Integer           Note: List of translation errors
 End Type
 
+@Reasoning:
+Constructs the 24-byte COBOLToHIRContext header. The arena handle is
+borrowed (not freed by destroy), but the errors list is owned and must
+be created here so error-during-translation diagnostics survive the
+walk. current_scope starts at 0 so the dispatcher knows it is still
+outside any paragraph until translate_paragraph promotes it.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes (3 i64 slots), returns 0 on allocation failure.
+Writes arena @0, zero @8 (current_scope), and a fresh List handle @16
+(errors). The List ownership transfers into the context; subsequent
+destroy releases it.
+@End Implementation
 Process called "create_cobol_to_hir_context" takes arena as Integer returns Integer:
-    Note: Create COBOL→HIR translation context
-
-    @Reasoning:
-    Context tracks arena for memory, current scope for variable resolution,
-    and errors for diagnostic reporting.
-    @End Reasoning
-
     Let context be proc allocate from Layout with 24  Note: 3 fields × 8 bytes
     If context is equal to 0:
         Return 0
@@ -87,6 +103,14 @@ Process called "create_cobol_to_hir_context" takes arena as Integer returns Inte
     Return context
 End Process
 
+@Reasoning:
+The context owns the error list explicitly; the arena lifetime is the
+caller's responsibility (the arena was passed in at create time, not
+allocated here). Releasing the error list before deallocating the
+context struct itself avoids leaking the per-translation diagnostic
+storage. Null contexts are treated as no-op success so error paths from
+create_cobol_to_hir_context can call this unconditionally.
+@End Reasoning
 Process called "destroy_cobol_to_hir_context" takes context as Integer returns Integer:
     Note: Destroy COBOL→HIR translation context
 
@@ -108,14 +132,23 @@ Note: ==========================================================================
 Note: Main Translation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+The single public entry point for COBOL-to-HIR lowering. Allocates the
+context, dispatches at the AST root, then destroys the context before
+returning so callers never have to free anything beyond the returned
+HIR. A null AST is treated as a soft failure (returns 0) rather than a
+fatal error so chained translation pipelines can short-circuit cleanly.
+@End Reasoning
+
+@Implementation:
+Guards against ast == 0 with an early Return 0. Calls
+create_cobol_to_hir_context; on failure (returned 0) propagates 0
+upward. Otherwise dispatches into translate_node with the root AST,
+captures the returned HIR pointer, then calls destroy_cobol_to_hir_context
+to free the errors list. The HIR pointer is owned by the caller's arena
+and survives the context teardown.
+@End Implementation
 Process called "translate_cobol_to_hir" takes ast as Integer, arena as Integer returns Integer:
-    Note: Main entry point for COBOL → HIR translation
-
-    @Reasoning:
-    Create translation context, translate AST root to HIR dictionary,
-    clean up context, return HIR representation.
-    @End Reasoning
-
     If ast is equal to 0:
         Return 0
     End If
@@ -137,14 +170,24 @@ Note: ==========================================================================
 Note: Node Translation Dispatcher
 Note: ============================================================================
 
+@Reasoning:
+The dispatch chain mirrors the COBOL grammar layout exactly: program
+header first, then the four divisions, then their sub-sections, then
+all statements grouped by category (data movement, arithmetic, control
+flow, I/O), then expression-level nodes. Linear If-chain is intentional
+over a jump table because the COBOL kind enum is sparse (gaps for
+reserved tags) and Runa v0.0.8.5 lacks computed-goto. Null nodes return
+0 so child-walkers can pre-skip optional positions.
+@End Reasoning
+
+@Implementation:
+On node == 0 returns 0. Reads node_type from offset 0, then matches
+against each COBOL_* kind from Parser via "is equal to ... from Parser"
+and forwards to the matching translate_xxx. The fallthrough returns 0
+to flag an unknown kind without raising; callers detect this by
+checking the returned HIR pointer against 0 before chaining.
+@End Implementation
 Process called "translate_node" takes context as Integer, node as Integer returns Integer:
-    Note: Translate AST node to HIR
-
-    @Reasoning:
-    Dispatcher function that checks node type and delegates to specific
-    translation function. This is the core routing mechanism.
-    @End Reasoning
-
     If node is equal to 0:
         Return 0
     End If
@@ -342,14 +385,25 @@ Note: ==========================================================================
 Note: Program Structure Translation
 Note: ============================================================================
 
+@Reasoning:
+The COBOL program is always exactly four divisions in fixed grammar
+order (IDENTIFICATION, ENVIRONMENT, DATA, PROCEDURE). The translator
+pulls the program-id out of the IDENTIFICATION division by direct
+field access (offset 8 of child[0]) to set the HIR's top-level "name"
+field, then dispatches each division through translate_node so the
+output is uniform across divisions.
+@End Reasoning
+
+@Implementation:
+Creates "cobol_program"-typed HIR dictionary, then reads children
+pointer @24 and child_count @32 from node. Extracts program_name from
+child[0]+8 (the identification division's program-id slot) and stores
+under "name". Walks all child divisions and accumulates non-null HIR
+outputs into a Divisions list, which is stored under "divisions" via
+set_dict_hir_value. Note the i*8 stride accesses the children array
+(an array of pointers, 8 bytes each).
+@End Implementation
 Process called "translate_program" takes context as Integer, node as Integer returns Integer:
-    Note: Translate COBOL program to HIR
-
-    @Reasoning:
-    COBOL program consists of four divisions. Translate each division
-    and combine into HIR program structure.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_program"
@@ -386,14 +440,20 @@ Process called "translate_program" takes context as Integer, node as Integer ret
     Return hir
 End Process
 
+@Reasoning:
+IDENTIFICATION is the lightest of the four divisions - only the
+PROGRAM-ID is preserved into HIR. The other COBOL metadata fields
+(AUTHOR, DATE-WRITTEN, etc.) are documentation-only and have no HIR
+representation, so they are deliberately not extracted.
+@End Reasoning
+
+@Implementation:
+Creates an HIR dictionary tagged "cobol_identification_division".
+Reads program_name from node+8 (set by the parser when it consumed
+PROGRAM-ID) and stores it under "program_id" via set_dict_string_value
+only when the slot is non-zero.
+@End Implementation
 Process called "translate_identification_division" takes context as Integer, node as Integer returns Integer:
-    Note: Translate IDENTIFICATION DIVISION to HIR
-
-    @Reasoning:
-    IDENTIFICATION DIVISION contains program metadata (PROGRAM-ID, AUTHOR, etc.).
-    Store as HIR metadata dictionary.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_identification_division"
@@ -406,14 +466,20 @@ Process called "translate_identification_division" takes context as Integer, nod
     Return hir
 End Process
 
+@Reasoning:
+ENVIRONMENT DIVISION holds platform configuration (CONFIGURATION
+SECTION) and file-to-handle bindings (INPUT-OUTPUT SECTION). Both
+section types are translated uniformly through translate_node since
+the dispatcher routes each section kind to its specialised handler.
+@End Reasoning
+
+@Implementation:
+Allocates an HIR dictionary tagged "cobol_environment_division".
+Walks the children array (pointer @24, count @32) with i*8 stride,
+translating each section node and appending non-null results into a
+sections list. Stores the list under "sections".
+@End Implementation
 Process called "translate_environment_division" takes context as Integer, node as Integer returns Integer:
-    Note: Translate ENVIRONMENT DIVISION to HIR
-
-    @Reasoning:
-    ENVIRONMENT DIVISION contains configuration and file control.
-    Translate sections to HIR.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_environment_division"
@@ -439,14 +505,21 @@ Process called "translate_environment_division" takes context as Integer, node a
     Return hir
 End Process
 
+@Reasoning:
+DATA DIVISION groups variable declarations into three sections (FILE,
+WORKING-STORAGE, LINKAGE) which have different lifetime/visibility
+semantics. The structure of each section is identical (level-numbered
+data items), so translation is uniform; the section type itself
+encodes the lifetime in the HIR.
+@End Reasoning
+
+@Implementation:
+Allocates a "cobol_data_division"-tagged HIR dictionary. Iterates
+children @24 (count @32) with i*8 stride, translates each section,
+and appends non-null HIRs to a sections list, stored under "sections".
+The level-number / PIC handling is in translate_data_item, not here.
+@End Implementation
 Process called "translate_data_division" takes context as Integer, node as Integer returns Integer:
-    Note: Translate DATA DIVISION to HIR
-
-    @Reasoning:
-    DATA DIVISION contains data definitions in sections (FILE, WORKING-STORAGE, LINKAGE).
-    Each section contains data items with level numbers and PICTURE clauses.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_data_division"
@@ -472,14 +545,23 @@ Process called "translate_data_division" takes context as Integer, node as Integ
     Return hir
 End Process
 
+@Reasoning:
+PROCEDURE DIVISION is the executable code. In HIR it lowers to a
+function-like body whose statements include PERFORM jumps that
+reference paragraph names declared in the same division. The
+translator stores the statement sequence in declaration order; the
+later HIR-to-target pass is responsible for resolving paragraph names
+to control-flow edges.
+@End Reasoning
+
+@Implementation:
+Creates a "cobol_procedure_division"-tagged HIR dictionary. Walks
+children @24 (count @32) with i*8 stride and accumulates each child's
+HIR into the body list (skipping nulls). Stores the list under "body"
+- the key choice "body" (vs "sections") signals to the downstream
+pass that the contents are executable statements.
+@End Implementation
 Process called "translate_procedure_division" takes context as Integer, node as Integer returns Integer:
-    Note: Translate PROCEDURE DIVISION to HIR
-
-    @Reasoning:
-    PROCEDURE DIVISION contains executable code in sections and paragraphs.
-    Translate to HIR function-like structure.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_procedure_division"
@@ -509,6 +591,13 @@ Note: ==========================================================================
 Note: Data Division Translation
 Note: ============================================================================
 
+@Reasoning:
+The COBOL FILE SECTION declares record layouts for external files. We
+flatten the section into a generic dict with type "cobol_file_section"
+and a children list, deferring the per-record interpretation to the
+data-item translator. The records themselves are reachable via the
+"items" field so downstream targets can model them as classes/structs.
+@End Reasoning
 Process called "translate_file_section" takes context as Integer, node as Integer returns Integer:
     Note: Translate FILE SECTION to HIR
 
@@ -523,14 +612,21 @@ Process called "translate_file_section" takes context as Integer, node as Intege
     Return hir
 End Process
 
+@Reasoning:
+WORKING-STORAGE is COBOL's primary local-storage construct: every
+variable declared here lives for the duration of the program.
+Flattening to a generic Dict with type "cobol_working_storage" and an
+"items" list lets the data-item translator handle level numbers and
+PIC clauses uniformly with FILE / LINKAGE sections.
+@End Reasoning
+
+@Implementation:
+Allocates an HIR Dict, tags it "cobol_working_storage", calls
+translate_children which iterates the section's children through
+translate_node and returns a List of HIR data-items. Stores the list
+under "items".
+@End Implementation
 Process called "translate_working_storage" takes context as Integer, node as Integer returns Integer:
-    Note: Translate WORKING-STORAGE SECTION to HIR
-
-    @Reasoning:
-    WORKING-STORAGE contains variable declarations with level numbers
-    and PICTURE clauses. Translate to HIR data definition structures.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_working_storage"
@@ -542,6 +638,13 @@ Process called "translate_working_storage" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+The LINKAGE SECTION declares parameters that are passed from a calling
+program; it is not allocated by the current program but is referenced.
+We expose it via the "cobol_linkage_section" HIR tag so the target
+emitter (e.g. a Java backend mapping COBOL programs to methods) can
+distinguish parameter declarations from local storage.
+@End Reasoning
 Process called "translate_linkage_section" takes context as Integer, node as Integer returns Integer:
     Note: Translate LINKAGE SECTION to HIR
 
@@ -556,15 +659,25 @@ Process called "translate_linkage_section" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+A COBOL data item carries four pieces of state that the HIR must
+preserve: the level number (controls nesting and group structure), the
+data-name, the PIC clause (encodes type and width), and the VALUE
+literal. The parser stores name @8 and value @16 directly on the node,
+but level and picture come from a metadata sub-record at @40 because
+they share the same arena slot in the parser's representation.
+@End Reasoning
+
+@Implementation:
+Allocates an HIR Dict tagged "cobol_data_item". Reads name @8 from the
+AST node and stores under "name" if non-zero. Reads metadata pointer
+@40 and dereferences metadata+8 for both level and picture (the
+parser overloads this slot, so this is read twice with the same offset
+intentionally to match the documented parser layout). Reads value @16
+and stores under "value" when present. All four assignments are
+guarded against null so partial data items still produce valid HIR.
+@End Implementation
 Process called "translate_data_item" takes context as Integer, node as Integer returns Integer:
-    Note: Translate data item to HIR
-
-    @Reasoning:
-    COBOL data item format:
-    level-number data-name PIC picture-string VALUE literal.
-    Store level, name, picture, and value in HIR.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_data_item"
@@ -606,9 +719,19 @@ Note: ==========================================================================
 Note: Environment Division Translation
 Note: ============================================================================
 
-Process called "translate_config_section" takes context as Integer, node as Integer returns Integer:
-    Note: Translate CONFIGURATION SECTION to HIR
+@Reasoning:
+CONFIGURATION SECTION is a placeholder marker - the SOURCE-COMPUTER /
+OBJECT-COMPUTER paragraphs inside it are platform metadata that has
+no runtime effect and is not preserved in HIR. Emitting an empty
+"cobol_configuration_section" dict lets downstream tools still see
+that the section was present in the source for round-trip emission.
+@End Reasoning
 
+@Implementation:
+Creates an HIR Dict and tags it "cobol_configuration_section". No
+fields are populated; the section is intentionally an empty marker.
+@End Implementation
+Process called "translate_config_section" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_configuration_section"
@@ -646,14 +769,21 @@ Process called "translate_input_output_section" takes context as Integer, node a
     Return hir
 End Process
 
+@Reasoning:
+SELECT in the INPUT-OUTPUT SECTION binds a logical COBOL file name to
+an external assignment. Only the logical name is captured at this
+translation layer; the ASSIGN clause is currently dropped because the
+HIR's file model relies on later passes to resolve the external name
+through deployment configuration rather than baking it into the IR.
+@End Reasoning
+
+@Implementation:
+Creates a "cobol_select"-tagged HIR Dict. Reads the file_name from
+node+8 (the parser stores the logical file name there) and stores it
+under "file_name" when non-zero. The ASSIGN clause and other SELECT
+modifiers are not yet propagated.
+@End Implementation
 Process called "translate_select_statement" takes context as Integer, node as Integer returns Integer:
-    Note: Translate SELECT statement to HIR
-
-    @Reasoning:
-    SELECT file-name ASSIGN TO external-name
-    Translate file declaration to HIR.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_select"
@@ -670,14 +800,21 @@ Note: ==========================================================================
 Note: Procedure Division Translation
 Note: ============================================================================
 
+@Reasoning:
+A COBOL SECTION inside PROCEDURE DIVISION is a named group of
+paragraphs - the unit that PERFORM SECTION targets. HIR models it as
+a Dict with a name and a "paragraphs" list so a later pass can resolve
+PERFORM references against either bare paragraph names or section
+names.
+@End Reasoning
+
+@Implementation:
+Creates a "cobol_section"-tagged HIR Dict. Reads the section name
+from node+8 and stores under "name" when non-zero. Calls
+translate_children to map every child paragraph node to HIR, then
+stores the resulting list under "paragraphs".
+@End Implementation
 Process called "translate_section" takes context as Integer, node as Integer returns Integer:
-    Note: Translate SECTION to HIR
-
-    @Reasoning:
-    COBOL section is like a function or code block.
-    Translate to HIR function structure.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_section"
@@ -694,14 +831,20 @@ Process called "translate_section" takes context as Integer, node as Integer ret
     Return hir
 End Process
 
+@Reasoning:
+A COBOL paragraph is a named statement sequence that PERFORM can call
+as a sub-routine. HIR represents it as a Dict with name + statements
+list - structurally identical to a Section but inside a different
+parent in the tree.
+@End Reasoning
+
+@Implementation:
+Creates a "cobol_paragraph"-tagged HIR Dict. Reads the paragraph name
+from node+8 and stores under "name" when non-zero. Calls
+translate_children to walk every contained statement node and stores
+the resulting list under "statements".
+@End Implementation
 Process called "translate_paragraph" takes context as Integer, node as Integer returns Integer:
-    Note: Translate PARAGRAPH to HIR
-
-    @Reasoning:
-    COBOL paragraph is a labeled code block, similar to a function.
-    Translate to HIR function or label structure.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_paragraph"
@@ -722,14 +865,23 @@ Note: ==========================================================================
 Note: Statement Translation
 Note: ============================================================================
 
+@Reasoning:
+COBOL MOVE is multi-destination (MOVE x TO a, b, c). HIR splits the
+first child as the source and the remaining N-1 children as a
+destinations list so downstream lowering can either emit a sequence
+of assignments or fuse into a single multi-target store depending on
+the target language's capabilities.
+@End Reasoning
+
+@Implementation:
+Allocates a "cobol_move"-tagged HIR Dict, reads children @24 and
+child_count @32 from node. The first child is translated as the
+source and stored under "source". The remaining children (indices 1
+to child_count-1) are translated and accumulated into a destinations
+list, stored under "destinations". Both halves are guarded by the
+child_count check so unary degenerate MOVEs don't break.
+@End Implementation
 Process called "translate_move_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate MOVE statement to HIR
-
-    @Reasoning:
-    MOVE source TO destination translates to assignment.
-    HIR: {"_type": "cobol_move", "source": expr, "destinations": [expr, ...]}
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_move"
@@ -761,14 +913,22 @@ Process called "translate_move_stmt" takes context as Integer, node as Integer r
     Return hir
 End Process
 
+@Reasoning:
+ADD is the simplest of the four arithmetic statements - all operands
+flatten to a single list because addition is commutative and HIR's
+"cobol_add" lowering can resolve targets/sources by position. The
+GIVING / ROUNDED / ON SIZE ERROR clauses are not separately parsed
+here because the parser already lifts them out as discrete child kinds
+the downstream lowering pass can inspect.
+@End Reasoning
+
+@Implementation:
+Allocates a "cobol_add"-tagged HIR Dict and forwards the whole child
+array to translate_children, storing the result under "operands".
+The list preserves the parser's original order so left-to-right
+COBOL semantics are still recoverable.
+@End Implementation
 Process called "translate_add_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate ADD statement to HIR
-
-    @Reasoning:
-    ADD operands TO destination GIVING result
-    Translate to HIR arithmetic operation.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_add"
@@ -780,19 +940,28 @@ Process called "translate_add_stmt" takes context as Integer, node as Integer re
     Return hir
 End Process
 
+@Reasoning:
+SUBTRACT is non-commutative so the AST must distinguish subtrahends
+(values being subtracted) from the minuend (value being subtracted
+from). The parser hands a flat children list with ROUNDED and ON SIZE
+ERROR mixed in by kind, so this routine walks once, classifying each
+child by node_type and re-grouping into HIR fields. The minuend is
+the last numeric operand in source order, so we lift it after the
+walk by popping the subtrahends list.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_subtract" Dict. Walks children @24 (count @32),
+matching each child's kind: COBOL_ROUNDED_CLAUSE sets has_rounded=1;
+COBOL_ON_SIZE_ERROR descends into the clause's own children and
+collects translated statements; any other kind is translated and
+pushed onto subtrahends. After the loop the last subtrahend is popped
+into minuend (with list_remove_at), and the four resulting fields
+(subtrahends, from_operand, rounded, on_size_error) are stored on the
+HIR Dict - each conditionally on non-empty/non-zero so missing
+clauses produce a clean HIR.
+@End Implementation
 Process called "translate_subtract_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate SUBTRACT statement to HIR
-
-    @Reasoning:
-    SUBTRACT x y FROM z [GIVING w] [ROUNDED] [ON SIZE ERROR stmts]
-    Parse structure from AST:
-    - subtrahends (operands before FROM)
-    - minuend (operand after FROM)
-    - optional GIVING target
-    - optional ROUNDED flag
-    - optional ON SIZE ERROR clause
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_subtract"
@@ -871,19 +1040,26 @@ Process called "translate_subtract_stmt" takes context as Integer, node as Integ
     Return hir
 End Process
 
+@Reasoning:
+MULTIPLY is positional with exactly three potential numeric operand
+slots (multiplicand, multiplier, optional giving target). Unlike
+SUBTRACT we do not need to restructure after the fact: operand_index
+tracks which of the three slots the current child fills as we walk.
+ROUNDED and ON SIZE ERROR are dispatched off the operand path so they
+never consume a positional slot.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_multiply" Dict. Walks children with i*8 stride.
+COBOL_ROUNDED_CLAUSE sets has_rounded. COBOL_ON_SIZE_ERROR descends
+and collects translated error statements. Other kinds are translated
+and stored into multiplicand/multiplier/giving_target based on
+operand_index (0/1/2), with the index bumped only when a non-null HIR
+is produced. After the walk, each non-zero field is stored on the
+HIR; rounded gets a bool entry; on_size_error gets the list only if
+non-empty.
+@End Implementation
 Process called "translate_multiply_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate MULTIPLY statement to HIR
-
-    @Reasoning:
-    MULTIPLY x BY y [GIVING z] [ROUNDED] [ON SIZE ERROR stmts]
-    Parse structure from AST:
-    - multiplicand (first operand)
-    - multiplier (BY operand)
-    - optional GIVING target
-    - optional ROUNDED flag
-    - optional ON SIZE ERROR clause
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_multiply"
@@ -970,20 +1146,25 @@ Process called "translate_multiply_stmt" takes context as Integer, node as Integ
     Return hir
 End Process
 
+@Reasoning:
+DIVIDE is MULTIPLY plus an additional REMAINDER clause that captures
+integer-division remainder into a separate target variable. The
+REMAINDER clause is itself a nested AST node whose first child carries
+the target identifier, so this routine needs an extra nested-extract
+step beyond the MULTIPLY pattern.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_divide" Dict. Walks children: ROUNDED sets flag;
+REMAINDER_CLAUSE drills into its own children @24/count @32 and
+translates child[0] as the remainder target; ON_SIZE_ERROR collects
+error statements; everything else is positional (dividend/divisor/
+giving_target via operand_index). After the walk, six conditional
+stores populate the HIR Dict (dividend, divisor, giving_target,
+remainder_target, rounded, on_size_error) skipping any that remained
+null/empty.
+@End Implementation
 Process called "translate_divide_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate DIVIDE statement to HIR
-
-    @Reasoning:
-    DIVIDE x INTO/BY y [GIVING z] [REMAINDER w] [ROUNDED] [ON SIZE ERROR stmts]
-    Parse structure from AST:
-    - dividend (first operand)
-    - divisor (INTO/BY operand)
-    - optional GIVING target
-    - optional REMAINDER target
-    - optional ROUNDED flag
-    - optional ON SIZE ERROR clause
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_divide"
@@ -1086,14 +1267,24 @@ Process called "translate_divide_stmt" takes context as Integer, node as Integer
     Return hir
 End Process
 
+@Reasoning:
+COMPUTE is COBOL's general-purpose arithmetic statement (vs. the
+single-operator ADD/SUBTRACT/MULTIPLY/DIVIDE forms). The first child
+is the result identifier and the second child is the expression
+sub-tree. HIR captures both directly because the expression is
+already a parser-level COBOL_ARITHMETIC_EXPR that translate_node
+will lower to the appropriate HIR expression form.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_compute" Dict. Reads children @24, count @32. If
+child_count > 0, translates child[0] as the result target. If
+child_count > 1, translates child[1] as the expression body. Stores
+under "result" and "expression" respectively; missing slots produce
+a partial HIR (rather than an error) so the diagnostic walker can
+report the missing operand downstream.
+@End Implementation
 Process called "translate_compute_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate COMPUTE statement to HIR
-
-    @Reasoning:
-    COMPUTE result = expression
-    Translate to HIR assignment with expression.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_compute"
@@ -1116,14 +1307,28 @@ Process called "translate_compute_stmt" takes context as Integer, node as Intege
     Return hir
 End Process
 
+@Reasoning:
+COBOL IF stores its condition as child[0] and then mixes THEN
+statements and an optional ELSE clause (with its own child list)
+into the remaining children. The translator uses a flag (in_else)
+to gate then/else accumulation: once an ELSE_CLAUSE child is seen,
+its inner children are appended to else_stmts and all subsequent
+children at the outer level are dropped because IF cannot have
+trailing statements after ELSE.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_if" Dict. Reads children @24, count @32. If
+child_count > 0, translates child[0] as the condition stored under
+"condition". Iterates remaining children (i from 1); when an
+ELSE_CLAUSE is hit, descends into its children (else_children @24,
+count @32) and translates each into else_stmts. Otherwise (and only
+while in_else == 0) the child is translated and appended to
+then_stmts. After the walk, then_statements is always stored;
+else_statements is only stored when in_else == 1 (so HIR shape
+distinguishes "IF without ELSE" from "IF with empty ELSE").
+@End Implementation
 Process called "translate_if_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate IF statement to HIR
-
-    @Reasoning:
-    IF condition THEN statements ELSE statements END-IF
-    Translate to HIR conditional structure.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_if"
@@ -1184,6 +1389,14 @@ Process called "translate_if_stmt" takes context as Integer, node as Integer ret
     Return hir
 End Process
 
+@Reasoning:
+The ELSE clause translation produces a placeholder "cobol_else" node
+because the primary IF translator (translate_if_stmt) already absorbs
+the ELSE branch directly into its own else_statements field. This
+entry point exists for completeness when an isolated ELSE node arrives
+through translate_node's dispatcher, ensuring the HIR shape stays
+self-describing even in pathological cases.
+@End Reasoning
 Process called "translate_else_clause" takes context as Integer, node as Integer returns Integer:
     Note: Translate ELSE clause to HIR (handled by IF translation)
 
@@ -1194,21 +1407,23 @@ Process called "translate_else_clause" takes context as Integer, node as Integer
     Return hir
 End Process
 
+@Reasoning:
+EVALUATE is COBOL's switch construct. The HIR shape mirrors a
+test_expression + ordered list of when_clauses; the WHEN OTHER
+fallback is identified inside translate_when_clause itself (via
+is_other) so this routine does not need to special-case it.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_evaluate" Dict. Walks children @24 (count @32):
+child[0] is translated as the test_expression; remaining children
+whose kind is COBOL_WHEN_CLAUSE are translated via
+translate_when_clause and accumulated into when_clauses. Non-WHEN
+non-first children are silently skipped (defensive: parser should
+not produce these). Stores test_expression if non-null and always
+stores when_clauses (possibly empty for malformed EVALUATEs).
+@End Implementation
 Process called "translate_evaluate_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate EVALUATE statement to HIR (COBOL's switch/case)
-
-    @Reasoning:
-    EVALUATE expression
-        WHEN value1 statements
-        WHEN value2 statements
-        WHEN OTHER statements
-    END-EVALUATE
-    Parse structure from AST:
-    - test expression (first child)
-    - WHEN clauses (remaining children)
-    Each WHEN clause has values and statements
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_evaluate"
@@ -1250,16 +1465,29 @@ Process called "translate_evaluate_stmt" takes context as Integer, node as Integ
     Return hir
 End Process
 
+@Reasoning:
+A WHEN clause carries either match-values (multiple, comma-separated
+in COBOL) or an OTHER marker plus a body of statements. The parser
+does not separate values from statements - they appear in mixed order
+within the same children list - so this routine classifies each child
+by node_type, treating the seven statement kinds as body items and
+all other kinds as match values.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_when" Dict. Walks children @24 (count @32). For
+each child: COBOL_OTHER_CLAUSE sets is_other=1; the seven statement
+kinds (MOVE, ADD, SUBTRACT, MULTIPLY, DIVIDE, DISPLAY, PERFORM) are
+translated into when_stmts; everything else is treated as a match
+value and translated into when_values. After the walk, if is_other,
+sets "is_other"=1 (and skips values); otherwise stores "values".
+Statements list is always stored under "statements". The deep nested
+If chain (one per statement kind) is intentional - replacing with a
+single dispatch would require enumerating exactly which COBOL_*
+kinds are statements vs. expressions, which is the work this routine
+does explicitly.
+@End Implementation
 Process called "translate_when_clause" takes context as Integer, node as Integer returns Integer:
-    Note: Translate WHEN clause to HIR
-
-    @Reasoning:
-    WHEN clause structure:
-    - Optional OTHER marker (for default case)
-    - One or more values to match (if not OTHER)
-    - Statements to execute
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_when"
@@ -1360,15 +1588,21 @@ Process called "translate_when_clause" takes context as Integer, node as Integer
     Return hir
 End Process
 
+@Reasoning:
+PERFORM is COBOL's call-and-return primitive. The target paragraph
+name is the primary payload; the body slot (for inline PERFORM) is
+populated via translate_children so the same HIR shape works for
+both the named-paragraph and inline-body forms.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_perform" Dict. Reads name @8; if non-zero stores it
+under "target" so the lowering pass can resolve the paragraph name
+later. Calls translate_children to translate any inline body and
+stores the resulting list under "body" - empty for the bare
+"PERFORM paragraph" form.
+@End Implementation
 Process called "translate_perform_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate PERFORM statement to HIR
-
-    @Reasoning:
-    PERFORM paragraph-name
-    PERFORM UNTIL condition
-    Translate to HIR loop or function call.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_perform"
@@ -1385,14 +1619,20 @@ Process called "translate_perform_stmt" takes context as Integer, node as Intege
     Return hir
 End Process
 
+@Reasoning:
+DISPLAY emits one or more values to the console; HIR captures the
+list of items in source order so the lowering pass can preserve the
+concatenation semantics (no implicit separator between items - COBOL
+runs them together by default).
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_display" Dict. Calls translate_children to convert
+every child expression into HIR; stores the resulting list under
+"items". An empty DISPLAY (legal but rare) produces a "cobol_display"
+with an empty items list.
+@End Implementation
 Process called "translate_display_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate DISPLAY statement to HIR
-
-    @Reasoning:
-    DISPLAY expressions - output to console
-    Translate to HIR print/display operation.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_display"
@@ -1404,14 +1644,20 @@ Process called "translate_display_stmt" takes context as Integer, node as Intege
     Return hir
 End Process
 
+@Reasoning:
+ACCEPT is the dual of DISPLAY - it reads from the console (or, with
+FROM clauses, from system fields like DATE/TIME) into a data item.
+HIR stores the destination as the children of the statement so a
+later pass can verify the destination is a valid lvalue.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_accept" Dict. Calls translate_children to translate
+all destination references and stores the result under "destination".
+The FROM clauses are inside the AST node's child slots and are
+translated alongside the destination identifier(s).
+@End Implementation
 Process called "translate_accept_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate ACCEPT statement to HIR
-
-    @Reasoning:
-    ACCEPT variable - input from console
-    Translate to HIR input/read operation.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_accept"
@@ -1423,14 +1669,18 @@ Process called "translate_accept_stmt" takes context as Integer, node as Integer
     Return hir
 End Process
 
+@Reasoning:
+GO TO is an unconditional jump to a named paragraph. Modern COBOL
+style discourages it but the translator must still emit a faithful
+"cobol_goto" so legacy programs round-trip without loss.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_goto" Dict. Reads the target paragraph name from
+node+8 and stores it under "target" when non-zero. No children
+walking is needed - GO TO is always a leaf statement.
+@End Implementation
 Process called "translate_go_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate GO TO statement to HIR
-
-    @Reasoning:
-    GO TO paragraph-name - unconditional jump
-    Translate to HIR goto/jump.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_goto"
@@ -1443,9 +1693,19 @@ Process called "translate_go_stmt" takes context as Integer, node as Integer ret
     Return hir
 End Process
 
-Process called "translate_stop_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate STOP statement to HIR
+@Reasoning:
+STOP terminates the program. STOP RUN is the only form that has any
+runtime effect; STOP "literal" pauses for operator input on
+mainframes but is meaningless on modern targets. HIR captures the
+operation as a marker and lets the back-end decide whether to
+generate exit code or a no-op.
+@End Reasoning
 
+@Implementation:
+Creates an HIR Dict tagged "cobol_stop". No fields are populated;
+the statement is intentionally an opaque marker.
+@End Implementation
+Process called "translate_stop_stmt" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_stop"
@@ -1476,14 +1736,17 @@ Process called "translate_exit_stmt" takes context as Integer, node as Integer r
     Return hir
 End Process
 
+@Reasoning:
+GOBACK is COBOL's "return to caller" statement (vs. STOP RUN which
+terminates the whole job). HIR uses "cobol_return" as the tag so the
+target lowering can map it to native return semantics.
+@End Reasoning
+
+@Implementation:
+Creates an HIR Dict tagged "cobol_return" (not "cobol_goback" - the
+tag name is the lowered intent, not the COBOL keyword). No payload.
+@End Implementation
 Process called "translate_goback_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate GOBACK statement to HIR
-
-    @Reasoning:
-    GOBACK - return from program
-    Translate to HIR return statement.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_return"
@@ -1491,14 +1754,19 @@ Process called "translate_goback_stmt" takes context as Integer, node as Integer
     Return hir
 End Process
 
+@Reasoning:
+CALL invokes another COBOL subprogram (separately compiled). USING /
+GIVING / BY REFERENCE / BY VALUE / BY CONTENT clauses are still
+encoded as children of the AST node; the back-end inspects them
+directly during lowering, so this translator simply marks the
+statement.
+@End Reasoning
+
+@Implementation:
+Creates an HIR Dict tagged "cobol_call". Subprogram name and USING
+arguments are left on the AST for the back-end to consume.
+@End Implementation
 Process called "translate_call_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate CALL statement to HIR
-
-    @Reasoning:
-    CALL program-name - call subprogram
-    Translate to HIR function call.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_call"
@@ -1508,9 +1776,16 @@ End Process
 
 Note: File I/O Translation
 
-Process called "translate_open_stmt" takes context as Integer, node as Integer returns Integer:
-    Note: Translate OPEN statement to HIR
+@Reasoning:
+OPEN establishes a file connection. Mode (INPUT/OUTPUT/I-O/EXTEND)
+and file list are still on the AST; the back-end inspects the
+original node when lowering to runtime fopen-equivalent calls.
+@End Reasoning
 
+@Implementation:
+Creates an HIR Dict tagged "cobol_open". No payload populated.
+@End Implementation
+Process called "translate_open_stmt" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_open"
@@ -1688,14 +1963,24 @@ Process called "translate_literal" takes context as Integer, node as Integer ret
     Return hir
 End Process
 
+@Reasoning:
+COBOL arithmetic expressions used inside COMPUTE / IF / EVALUATE are
+fully nested AST nodes. The parser stores the operator in a metadata
+slot (not as a child) so we can keep the children array reserved for
+the two operands, mirroring the standard "binop = operator + left +
+right" HIR shape that downstream lowering expects.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_arithmetic_expr" Dict. Reads metadata pointer @40
+and (if non-null) reads operator from metadata+8, storing under
+"operator". Then reads children @24 / count @32 and translates
+child[0] as "left" and child[1] as "right" - note child[1] is
+accessed via offset 8 (i.e. the second pointer in the array, since
+each pointer is 8 bytes). Missing operands produce a partial HIR
+which the semantic layer will flag.
+@End Implementation
 Process called "translate_arithmetic_expr" takes context as Integer, node as Integer returns Integer:
-    Note: Translate arithmetic expression to HIR
-
-    @Reasoning:
-    Arithmetic expression: left operator right
-    Translate to HIR binary operation.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_arithmetic_expr"
@@ -1727,14 +2012,23 @@ Process called "translate_arithmetic_expr" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+COBOL relational expressions cover six operators (=, >, <, >=, <=,
+NOT =) plus optional space-padded comparison semantics. The HIR
+representation matches translate_arithmetic_expr exactly so the
+downstream lowering can use the same binop machinery for both,
+distinguishing only by the operator string.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_relational_expr" Dict. Reads metadata @40 and
+extracts operator from metadata+8 when present, storing under
+"operator". Walks children @24/count @32, translates child[0] as
+"left" and child[1] (offset 8) as "right". Mirrors
+translate_arithmetic_expr's structure deliberately - the difference
+is the _type tag and the operator vocabulary.
+@End Implementation
 Process called "translate_relational_expr" takes context as Integer, node as Integer returns Integer:
-    Note: Translate relational expression to HIR
-
-    @Reasoning:
-    Relational expression: left operator right
-    Operators: =, >, <, >=, <=, NOT =
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_relational_expr"
@@ -1766,6 +2060,14 @@ Process called "translate_relational_expr" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+COBOL logical expressions (AND, OR, NOT applied to relational results)
+are translated to a plain "cobol_logical_expr" placeholder; full
+operator+operands lowering happens via translate_node recursion when
+the IF/EVALUATE walkers reach this point. The skeleton dict preserves
+the node identity so downstream traversal does not lose the expression
+boundary.
+@End Reasoning
 Process called "translate_logical_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate logical expression to HIR
 
@@ -1776,14 +2078,20 @@ Process called "translate_logical_expr" takes context as Integer, node as Intege
     Return hir
 End Process
 
+@Reasoning:
+Figurative constants (ZERO, SPACES, HIGH-VALUES, LOW-VALUES, QUOTES,
+ALL literal) have width-dependent expansion: SPACES in a PIC X(80)
+field expands to 80 spaces, not 1. HIR captures only the symbolic
+name; the lowering pass uses the destination's PIC width to
+materialise the actual byte pattern.
+@End Reasoning
+
+@Implementation:
+Allocates "cobol_figurative_constant" Dict. Reads name @8 (the
+parser stores the figurative keyword as an identifier) and stores
+under "constant" when non-zero. No payload beyond the name.
+@End Implementation
 Process called "translate_figurative_const" takes context as Integer, node as Integer returns Integer:
-    Note: Translate figurative constant to HIR
-
-    @Reasoning:
-    Figurative constants: ZERO, SPACES, HIGH-VALUES, LOW-VALUES, etc.
-    Translate to HIR special constants.
-    @End Reasoning
-
     Let hir be proc create_dictionary from Dict
 
     proc set_dict_string_value from Dict with hir, "_type", "cobol_figurative_constant"
@@ -1800,13 +2108,22 @@ Note: ==========================================================================
 Note: Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Generic helper that converts an AST node's children array into a
+List of HIR pointers. Used by every routine in this file that does
+not need per-child custom handling - centralising it here keeps the
+children-walking loop logic from being duplicated across ~12
+translation routines.
+@End Reasoning
+
+@Implementation:
+Creates an empty List. Reads children @24 / count @32 from the
+node. Iterates 0..count-1 with i*8 stride into the pointer array,
+calls translate_node on each child, appends the result to the list
+when non-null (so null children from translate_node are silently
+skipped). Returns the list - empty if count is 0.
+@End Implementation
 Process called "translate_children" takes context as Integer, node as Integer returns Integer:
-    Note: Translate all children of node to HIR list
-
-    @Reasoning:
-    Common pattern: translate all child nodes and return as HIR list.
-    @End Reasoning
-
     Let result be proc create_list from ListOps
 
     Let children be proc memory_get_int64 from Layout with node, 24

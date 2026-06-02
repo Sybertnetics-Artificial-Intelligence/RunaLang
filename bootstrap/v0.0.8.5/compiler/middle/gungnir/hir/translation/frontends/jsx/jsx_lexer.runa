@@ -98,6 +98,12 @@ Fields:
 - value (40): Optional numeric or additional value
 :End Note
 
+@Reasoning:
+The lexer is a 56-byte struct (seven 8-byte slots) holding source pointer, cursor position, total length, line/column tracking, and two reserved slots for state (JSX mode flag, last-emitted token). Bundling these makes peek/advance O(1) without dict lookups.
+@End Reasoning
+@Implementation:
+Field layout: 0=source, 8=position, 16=length, 24=line (1-based), 32=column (1-based), 40=reserved, 48=reserved. Line/column start at 1 because users expect 1-based diagnostics. Source is borrowed (caller owns the buffer for the lexer's lifetime).
+@End Implementation
 Process called "create_lexer" takes source as Integer, length as Integer returns Integer:
     Let lexer be proc allocate from Layout with 56
 
@@ -112,6 +118,12 @@ Process called "create_lexer" takes source as Integer, length as Integer returns
     Return lexer
 End Process
 
+@Reasoning:
+A token is a 48-byte record bundling type, text pointer (zero-copy view into source), text length, line/column, and one extensible value slot for numeric token values or interned identifier IDs. Six 8-byte slots accommodate the parser's typical access patterns without re-reading from source.
+@End Reasoning
+@Implementation:
+text is a pointer back into the original source buffer, so token text validity depends on the source outliving the token; the caller (parser) is responsible for that lifetime contract. The value slot is intentionally a single Integer so the same record shape serves numeric literals (encoded value), regex flags, template-literal indices, and identifier IDs.
+@End Implementation
 Process called "create_token" takes type as Integer, text as Integer, text_length as Integer, line as Integer, column as Integer, value as Integer returns Integer:
     Let token be proc allocate from Layout with 48
 
@@ -125,6 +137,9 @@ Process called "create_token" takes type as Integer, text as Integer, text_lengt
     Return token
 End Process
 
+@Reasoning:
+peek_char returns 0 at end-of-input rather than -1 or a sentinel so callers can branch on `is equal to 0` without special-casing. 0 is safe because legitimate JSX/JS source never contains a NUL byte mid-file (NUL would terminate the source string in any C-compatible representation).
+@End Reasoning
 Process called "peek_char" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let position be proc memory_get_int64 from Layout with lexer, 8
@@ -138,6 +153,9 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+JSX disambiguation requires multi-character lookahead: "<" alone vs "</" vs "<!--" all need 1-2 chars beyond the cursor before the lexer commits to a path. An explicit offset parameter (not just "peek next") lets callers look arbitrarily far without per-arity wrappers.
+@End Reasoning
 Process called "peek_ahead" takes lexer as Integer, offset as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let position be proc memory_get_int64 from Layout with lexer, 8
@@ -152,6 +170,9 @@ Process called "peek_ahead" takes lexer as Integer, offset as Integer returns In
     Return char
 End Process
 
+@Reasoning:
+advance_char both moves the cursor and maintains line/column state in one pass; doing both here means every other production sees correct location info "for free". Newline (ASCII 10) resets column to 1 and bumps line; carriage-return (13) is not handled specially because the spec defines line counts by LF, and CRLF input has the LF counted on the second byte.
+@End Reasoning
 Process called "advance_char" takes lexer as Integer returns Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 8
     Let length be proc memory_get_int64 from Layout with lexer, 16
@@ -182,6 +203,9 @@ Process called "advance_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+The JS/JSX whitespace set is space (32), tab (9), LF (10), and CR (13); the four explicit branches are faster than a table lookup for this small fixed set and mirror the ECMA-262 whitespace definition used in everyday JS source.
+@End Reasoning
 Process called "is_whitespace" takes char as Integer returns Integer:
     If char is equal to 32:
         Return 1
@@ -198,6 +222,9 @@ Process called "is_whitespace" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+JS identifiers may begin with [A-Za-z_$]; underscore (95) and dollar (36) are explicit because they're outside the contiguous letter ranges. Unicode identifier characters are not handled here — they would require a separate is_unicode_id_start predicate (deferred to the parser's identifier scanner if a non-ASCII start is detected).
+@End Reasoning
 Process called "is_alpha" takes char as Integer returns Integer:
     If char is greater than or equal to 65:
         If char is less than or equal to 90:
@@ -218,6 +245,9 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII digits 0-9 occupy code points 48-57; the range check is the canonical fast-path. JS BigInt literals (e.g., 42n) are handled at scan_number rather than here.
+@End Reasoning
 Process called "is_digit" takes char as Integer returns Integer:
     If char is greater than or equal to 48:
         If char is less than or equal to 57:
@@ -227,6 +257,9 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Hex digits cover 0-9, A-F, and a-f; we delegate the digit check to is_digit and add the two letter ranges. JS hex escapes (\\x.., \\u....) and hex numeric literals (0x...) share this predicate.
+@End Reasoning
 Process called "is_hex_digit" takes char as Integer returns Integer:
     Let is_digit_result be proc is_digit from char
     If is_digit_result is equal to 1:
@@ -245,6 +278,9 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+JS identifier continuation characters are letters + digits + _ + $; we reuse is_alpha (which already handles _ and $) and add is_digit. The order matters for hit-rate: most identifier-body characters are letters, so checking is_alpha first short-circuits faster on the common case.
+@End Reasoning
 Process called "is_identifier_char" takes char as Integer returns Integer:
     Let is_alpha_result be proc is_alpha from char
     If is_alpha_result is equal to 1:
@@ -257,6 +293,9 @@ Process called "is_identifier_char" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Whitespace skipping is a hot path so we loop in tight peek/advance pairs; the `Break` exit when a non-whitespace char appears (or end-of-source returns 0) keeps the inner loop predictable for branch prediction. Comments are NOT skipped here because they're tokenized as TOKEN_COMMENT for tooling that wants to preserve them (formatters, doc generators).
+@End Reasoning
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     While 1 is equal to 1:
         Let char be proc peek_char from lexer
@@ -272,6 +311,9 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+JS has two comment forms — // (single-line, ends at LF) and /* */ (multi-line) — both starting with /. We discriminate via the second character (47=/ or 42=*) and emit a single TOKEN_COMMENT spanning the entire comment text including the delimiters; this preserves the original source for formatters and IDEs. End-of-file inside a /* */ terminates the comment without error (lenient to truncated input).
+@End Reasoning
 Process called "scan_comment" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_position be proc memory_get_int64 from Layout with lexer, 8
@@ -349,6 +391,9 @@ Process called "scan_comment" takes lexer as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier scanning is the standard "consume while is_identifier_char" loop. After scanning, check_keyword reclassifies the text into TOKEN_KEYWORD if it matches a reserved word — this maximum-munch approach is correct because JS keywords and identifiers share the same lexical shape and only differ by exact text.
+@End Reasoning
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_position be proc memory_get_int64 from Layout with lexer, 8
@@ -375,6 +420,12 @@ Process called "scan_identifier" takes lexer as Integer returns Integer:
     Return proc create_token with token_type, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+Keyword recognition uses length-bucketed character comparison (length first, then per-position byte checks) rather than a string hash table because the JS reserved-word set is small and the per-bucket comparison is a few branches at most. The bucketing prevents wasted work — a 5-char input never touches the 6-char keyword cases.
+@End Reasoning
+@Performance_Hints:
+This is a hot path (called once per identifier); the length-then-byte structure outperforms hash-based lookup for small fixed sets because it avoids allocator/hash overhead and stays in registers.
+@End Performance_Hints
 Process called "check_keyword" takes text as Integer, length as Integer returns Integer:
     Note:
     Check for JavaScript/TypeScript keywords
@@ -856,6 +907,9 @@ Process called "check_keyword" takes text as Integer, length as Integer returns 
     Return TOKEN_IDENTIFIER
 End Process
 
+@Reasoning:
+JS numeric literals have three shapes: hex (0x...), decimal (digits[.digits][eExp]), and the spec-defined scientific suffix. Hex is detected by the 0x/0X prefix and consumes hex digits; decimal falls through to digit-or-dot consumption then optional scientific suffix. We accept both lowercase e (101) and uppercase E (69) for the exponent because the spec is case-insensitive there. The whole numeric text is captured as a single TOKEN_NUMBER with the value-conversion deferred to the parser.
+@End Reasoning
 Process called "scan_number" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_position be proc memory_get_int64 from Layout with lexer, 8
@@ -987,6 +1041,12 @@ Process called "scan_number" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_NUMBER, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+JS supports two string forms ('...' and "...") with identical escape rules; passing the quote character as a parameter lets one function handle both. Backslash escapes are consumed greedily (advance past the backslash AND the following char) so escape sequences containing the quote character don't terminate the string prematurely. EOF mid-string is tolerated (loop breaks on 0) rather than emitting a fatal error so partial source can still be tokenized for editor completion.
+@End Reasoning
+@Security_Scope:
+The token text points back into the source buffer with no copy; the parser owns string-content interpretation including escape decoding. This keeps the lexer side-effect-free with respect to string content and avoids unbounded memory growth on adversarial input with many escapes.
+@End Security_Scope
 Process called "scan_string" takes lexer as Integer, quote as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_position be proc memory_get_int64 from Layout with lexer, 8
@@ -1022,6 +1082,12 @@ Process called "scan_string" takes lexer as Integer, quote as Integer returns In
     Return proc create_token with TOKEN_STRING, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+Template literals (backtick strings) embed expressions via ${...}; we track brace depth so a closing backtick INSIDE an embedded expression doesn't prematurely terminate the literal. The brace depth also handles nested objects/arrays inside the embedded expression. Backslash escapes consume two characters to avoid escape-sequence interactions with the depth counter.
+@End Reasoning
+@Implementation:
+The whole template (including embedded expressions) is captured as a single TOKEN_TEMPLATE_LITERAL; the parser re-lexes the embedded expressions on demand. This keeps the lexer's state machine flat and avoids needing a sub-lexer for the expression portions.
+@End Implementation
 Process called "scan_template_literal" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_position be proc memory_get_int64 from Layout with lexer, 8
@@ -1078,6 +1144,9 @@ Process called "scan_template_literal" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_TEMPLATE_LITERAL, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+JS regex literals are delimited by / on both ends with optional [gimsuy] flag suffix; the body may contain escaped slashes (\\/) which must not terminate the literal. Caller (next_token) is responsible for the regex-vs-division disambiguation because that depends on the previous token's grammatical role — the lexer enters this path only when context proves "/" starts a regex.
+@End Reasoning
 Process called "scan_regex" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_position be proc memory_get_int64 from Layout with lexer, 8
@@ -1127,6 +1196,9 @@ Process called "scan_regex" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_REGEX, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+JSX text is the content between tags; it ends at the next "<" (start of next tag) or "{" (start of embedded expression). All other characters including whitespace and newlines are part of the text token so JSX whitespace semantics (collapsing rules) can be applied by the parser/translator rather than baked in here.
+@End Reasoning
 Process called "scan_jsx_text" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_position be proc memory_get_int64 from Layout with lexer, 8
@@ -1163,6 +1235,12 @@ Process called "scan_jsx_text" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_JSX_TEXT, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+The token dispatcher is mode-sensitive: JSX vs JS context affects what counts as a token start. jsx_depth tracks nested JSX element depth and brace_depth tracks embedded-expression depth; when jsx_depth > 0 and brace_depth = 0 we are inside an element body, so anything other than "<" or "{" starts JSX text. Otherwise we dispatch by lookahead on the first character to the appropriate scanner.
+@End Reasoning
+@Implementation:
+EOF returns a TOKEN_EOF with line/column captured so the parser can pin error messages to file-end positions. Whitespace is skipped before dispatch so every token's start position is meaningful.
+@End Implementation
 Process called "next_token" takes lexer as Integer returns Integer:
     proc skip_whitespace from lexer
 

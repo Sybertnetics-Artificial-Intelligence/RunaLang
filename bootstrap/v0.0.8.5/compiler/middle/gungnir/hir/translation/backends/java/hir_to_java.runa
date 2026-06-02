@@ -52,10 +52,32 @@ Note: ==========================================================================
 Note: Code Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Minimal codegen context for Java backend: an emitter pointer plus an
+indent cursor. No error channel because Java codegen is best-effort
+(unknown HIR nodes produce comments rather than aborting).
+@End Reasoning
+
+@Implementation:
+16-byte record (2 x i64): emitter at offset 0, indent_level at
+offset 8.
+@End Implementation
+
 Type called "JavaCodegenContext":
     emitter as Integer          Note: Java emitter instance
     indent_level as Integer     Note: Current indentation level
 End Type
+
+@Reasoning:
+Builds a context bound to a pre-existing emitter. The emitter is
+created by the caller (generate_java_code) and aliased into the
+context — context destruction does not free the emitter.
+@End Reasoning
+
+@Implementation:
+Allocates 16 bytes, OOM short-circuit. Stores emitter at offset 0 and
+zero-initialises indent_level at offset 8.
+@End Implementation
 
 Process called "create_codegen_context" takes emitter as Integer returns Integer:
     Note: Create code generation context
@@ -76,6 +98,20 @@ End Process
 Note: ============================================================================
 Note: HIR Dictionary Access Helpers
 Note: ============================================================================
+
+@Reasoning:
+Linear-scan accessor returning a HIR dictionary's value by key. The
+HIR dict layout differs from the SwiftUI backend's: here entry_count
+sits at offset 0 and the (key,value) pair array at offset 8, with
+each pair occupying 16 bytes (key at +0, value at +8).
+@End Reasoning
+
+@Implementation:
+Reads entry_count (offset 0) and entries (offset 8). Iterates entries
+computing each entry's offset as index*16, comparing key at
+entries[index*16] via strings_equal. On match returns value at
+entries[index*16 + 8]. Missing key returns 0.
+@End Implementation
 
 Process called "get_dict_string_value" takes dict as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary
@@ -102,6 +138,18 @@ Process called "get_dict_string_value" takes dict as Integer, key as Integer ret
     Return 0
 End Process
 
+@Reasoning:
+Identical lookup to get_dict_string_value but named to signal that
+the returned value is expected to be a HIR sub-node (dict or list)
+rather than a raw string. Provided as a named alias for readability
+at call sites.
+@End Reasoning
+
+@Implementation:
+Delegates to get_dict_string_value — the storage layout is uniform,
+so the implementation is the same.
+@End Implementation
+
 Process called "get_dict_hir_value" takes dict as Integer, key as Integer returns Integer:
     Note: Get HIR value (dict or list) from HIR dictionary
 
@@ -111,6 +159,20 @@ End Process
 Note: ============================================================================
 Note: Main Generation Entry Point
 Note: ============================================================================
+
+@Reasoning:
+Public entry point for HIR -> Java code generation. Creates emitter
++ context, runs the module-level generator, retrieves the assembled
+source string, then disposes the emitter. The caller receives the
+output string buffer which it owns (the emitter's destroy releases
+the emitter struct but not the buffer it produced).
+@End Reasoning
+
+@Implementation:
+create_java_emitter, create_codegen_context, generate_module on the
+HIR root, get_output to extract the final buffer, destroy_java_emitter.
+Returns the output pointer.
+@End Implementation
 
 Process called "generate_java_code" takes hir as Integer returns Integer:
     Note: Generate Java code from HIR module
@@ -129,6 +191,20 @@ End Process
 Note: ============================================================================
 Note: Module Generation
 Note: ============================================================================
+
+@Reasoning:
+Emits a complete Java compilation unit: package declaration, imports,
+and type declarations. The three sections appear in the strict order
+Java requires: package first, then imports, then types. Blank lines
+separate the sections.
+@End Reasoning
+
+@Implementation:
+Optionally emits `package name;` if the HIR has a "package" key.
+Iterates the "imports" sub-list emitting each via generate_import,
+followed by a blank-line separator. Iterates "types" sub-list emitting
+each via generate_type_declaration with newline separators.
+@End Implementation
 
 Process called "generate_module" takes context as Integer, hir as Integer returns Integer:
     Note: Generate Java compilation unit
@@ -181,6 +257,17 @@ Process called "generate_module" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+Emits a single import statement, handling both regular imports and
+static imports (`import static java.util.Arrays.asList;`). The
+is_static flag distinguishes the two forms.
+@End Reasoning
+
+@Implementation:
+Emits `import `, then optionally `static ` if is_static is non-zero,
+then the fully-qualified name, then `;` and newline.
+@End Implementation
+
 Process called "generate_import" takes context as Integer, hir as Integer returns Integer:
     Note: Generate import declaration
 
@@ -206,6 +293,20 @@ End Process
 Note: ============================================================================
 Note: Type Declaration Generation
 Note: ============================================================================
+
+@Reasoning:
+Dispatches a top-level type declaration to its kind-specific
+generator. Java has four top-level type-declaration forms: class,
+interface, enum, and annotation (@interface). Each has its own
+syntax requirements.
+@End Reasoning
+
+@Implementation:
+Reads node_type string. Four sequential strings_equal tests against
+the four declaration kinds; on match invokes the specialised
+generator (generate_class_declaration etc.). Unknown kinds return 0
+without emitting anything.
+@End Implementation
 
 Process called "generate_type_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate type declaration (class, interface, enum, annotation)
@@ -234,6 +335,22 @@ Process called "generate_type_declaration" takes context as Integer, hir as Inte
 
     Return 0
 End Process
+
+@Reasoning:
+Emits a full Java class: modifiers, the `class Name` header,
+generics, optional extends, optional implements, then the brace-
+enclosed member list. Modifiers (public, abstract, static, etc.)
+must precede `class` per Java syntax.
+@End Reasoning
+
+@Implementation:
+Reads modifiers, class_name, type_parameters, extends, implements,
+members from the HIR dict. Sequence: indent, modifiers; `class`,
+name, optional `<T, U>`, optional ` extends ParentType`, optional
+` implements I1, I2`, ` {`, newline. Increments indent for body,
+iterates members through generate_class_member, restores indent,
+closes `}`.
+@End Implementation
 
 Process called "generate_class_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate class declaration
@@ -302,6 +419,18 @@ Process called "generate_class_declaration" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Java interface: modifiers + `interface Name` + generics + optional
+extends (can extend MULTIPLE interfaces, unlike class extends) +
+member list. Interfaces have no implements clause.
+@End Reasoning
+
+@Implementation:
+Same structure as generate_class_declaration but uses `interface`
+keyword, allows multiple extends via generate_type_list (the HIR
+"extends" key carries a list of interface names), and omits implements.
+@End Implementation
+
 Process called "generate_interface_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate interface declaration
 
@@ -362,6 +491,19 @@ Process called "generate_interface_declaration" takes context as Integer, hir as
     Return 1
 End Process
 
+@Reasoning:
+Java enum: modifiers + `enum Name { CONSTANT, CONSTANT, CONSTANT }`.
+Constants are simple names separated by commas — full enum-constant
+syntax with arguments or method overrides isn't currently produced.
+@End Reasoning
+
+@Implementation:
+Emits modifiers + `enum Name {` + newline. Iterates constants list:
+indented constant name, comma if not last, newline. Closes with `}`.
+The constant_count comparison `index plus 1 < constant_count` is the
+last-element test for comma suppression.
+@End Implementation
+
 Process called "generate_enum_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate enum declaration
 
@@ -418,6 +560,19 @@ Process called "generate_enum_declaration" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Java annotation declaration: `@interface Name { }`. The `@interface`
+prefix is what distinguishes annotation types from regular interfaces.
+The implementation currently emits an empty body — annotation
+attribute declarations (members) are not yet generated.
+@End Reasoning
+
+@Implementation:
+Emits indent + `@interface ` + annotation name + ` {` + newline +
+indent + `}` + newline. No body iteration — known gap for a future
+extension covering annotation member declarations.
+@End Implementation
+
 Process called "generate_annotation_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate annotation type declaration
 
@@ -443,6 +598,21 @@ End Process
 Note: ============================================================================
 Note: Modifiers and Annotations Generation
 Note: ============================================================================
+
+@Reasoning:
+Emits a sequence of Java modifiers (public, private, abstract, static,
+final, etc.) and annotations (@Override, @Deprecated, etc.) on the
+same line. Annotations and modifiers can be intermixed in source but
+this routine emits each item with a trailing space.
+@End Reasoning
+
+@Implementation:
+Iterates the modifiers list. For each item, reads the type_info at
+offset 0 to determine annotation vs string modifier. HIR_ANNOTATION
+items route through generate_annotation; otherwise the item is
+treated as a raw string modifier and emit directly. Each item is
+followed by a space.
+@End Implementation
 
 Process called "generate_modifiers" takes context as Integer, modifiers as Integer returns Integer:
     Note: Generate modifiers and annotations
@@ -480,6 +650,19 @@ End Process
 Note: ============================================================================
 Note: Member Generation
 Note: ============================================================================
+
+@Reasoning:
+Dispatches a class member to the appropriate generator: field, method,
+constructor, or nested type. Nested types delegate to
+generate_type_declaration so inner classes/interfaces/enums share
+the top-level type-declaration code path.
+@End Reasoning
+
+@Implementation:
+Reads node_type and routes via strings_equal: "field_declaration",
+"method_declaration", "constructor_declaration", or fall through to
+generate_type_declaration for nested types.
+@End Implementation
 
 Process called "generate_class_member" takes context as Integer, hir as Integer returns Integer:
     Note: Generate class member (field, method, constructor, nested type)
@@ -519,6 +702,18 @@ Process called "generate_class_member" takes context as Integer, hir as Integer 
     Return 0
 End Process
 
+@Reasoning:
+Emits a class field: optional modifiers, type, name, optional
+initializer expression, semicolon. Java syntax requires exactly this
+order and the semicolon terminator.
+@End Reasoning
+
+@Implementation:
+Indent + modifiers (if any) + type_reference + space + name +
+optional ` = initializer` (parsed through generate_expression) + `;`
++ newline.
+@End Implementation
+
 Process called "generate_field_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate field declaration
 
@@ -556,6 +751,21 @@ Process called "generate_field_declaration" takes context as Integer, hir as Int
 
     Return 1
 End Process
+
+@Reasoning:
+Emits a Java method: modifiers + generics + return type + name +
+parameters + optional throws + optional body. Abstract methods
+terminate with `;` instead of a body block; the body absence is the
+abstract-method signal here.
+@End Reasoning
+
+@Implementation:
+Indent + modifiers + optional `<T>` type parameters + return type +
+space + method name + `(parameters)` + optional ` throws E1, E2` +
+body (if present) as `{ ... }` block via generate_block, or `;` if
+no body. Body iteration uses indent_level+1 and recurses on each
+statement via generate_statement.
+@End Implementation
 
 Process called "generate_method_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate method declaration
@@ -614,6 +824,18 @@ Process called "generate_method_declaration" takes context as Integer, hir as In
     Return 1
 End Process
 
+@Reasoning:
+Constructor: modifiers + class name (constructors use class name not
+"constructor" keyword) + parameters + optional throws + body. No
+return type — the syntactic absence of return type is what
+distinguishes constructors from methods.
+@End Reasoning
+
+@Implementation:
+Indent + modifiers + class_name + `(parameters)` + optional throws +
+body block. Like methods but with no return-type emission step.
+@End Implementation
+
 Process called "generate_constructor_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate constructor declaration
 
@@ -660,6 +882,17 @@ Process called "generate_constructor_declaration" takes context as Integer, hir 
     Return 1
 End Process
 
+@Reasoning:
+Emits a comma-separated parameter list (just the parameters; the
+enclosing parens are emitted by the caller). Used by methods and
+constructors.
+@End Reasoning
+
+@Implementation:
+Iterates parameters list. For each: emit comma if not first, then
+delegate to generate_parameter.
+@End Implementation
+
 Process called "generate_parameter_list" takes context as Integer, parameters as Integer returns Integer:
     Note: Generate parameter list
 
@@ -685,6 +918,18 @@ Process called "generate_parameter_list" takes context as Integer, parameters as
 
     Return 1
 End Process
+
+@Reasoning:
+Single parameter declaration: optional `final` modifier + type +
+optional `...` (varargs) + name. The varargs marker appears between
+type and name, not after the type as in some languages.
+@End Reasoning
+
+@Implementation:
+Optionally emits `final ` if the is_final flag is set on the parameter
+dict. Emits the type via generate_type_reference, space, optional
+`...` if is_varargs is set, then the parameter name.
+@End Implementation
 
 Process called "generate_parameter" takes context as Integer, hir as Integer returns Integer:
     Note: Generate parameter
@@ -715,6 +960,20 @@ Note: ==========================================================================
 Note: Type Reference Generation
 Note: ============================================================================
 
+@Reasoning:
+Routes a type reference to its specialised generator based on
+node_type. Java has three structured type-reference forms beyond
+simple named types: array (T[]), generic (List<T>), and wildcard
+(? extends T). Simple types emit the name directly.
+@End Reasoning
+
+@Implementation:
+Reads node_type. Tests "array_type" -> generate_array_type;
+"generic_type" -> generate_generic_type; "wildcard_type" ->
+generate_wildcard_type. Anything else (simple type) emits the
+"name" string directly.
+@End Implementation
+
 Process called "generate_type_reference" takes context as Integer, hir as Integer returns Integer:
     Note: Generate type reference
 
@@ -744,6 +1003,16 @@ Process called "generate_type_reference" takes context as Integer, hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Emits `ElementType[]`. The element type is itself a type reference
+that may be array, generic, or wildcard — recursive call into
+generate_type_reference handles all cases.
+@End Reasoning
+
+@Implementation:
+Recursively emits the element_type, then appends `[]`.
+@End Implementation
+
 Process called "generate_array_type" takes context as Integer, hir as Integer returns Integer:
     Note: Generate array type
 
@@ -759,6 +1028,17 @@ Process called "generate_array_type" takes context as Integer, hir as Integer re
 
     Return 1
 End Process
+
+@Reasoning:
+Emits `BaseName<T1, T2, T3>`. Comma-separated type arguments allow
+nested generics like `Map<String, List<Integer>>`. Each type argument
+is itself a type reference.
+@End Reasoning
+
+@Implementation:
+Emits base_name, then `<`, then comma-separated type arguments via
+generate_type_reference for each, then `>`.
+@End Implementation
 
 Process called "generate_generic_type" takes context as Integer, hir as Integer returns Integer:
     Note: Generate generic type with type arguments
@@ -797,6 +1077,18 @@ Process called "generate_generic_type" takes context as Integer, hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Emits `?`, `? extends UpperBound`, or `? super LowerBound`. Java
+wildcards have at most one bound and it's either upper (extends) or
+lower (super), not both.
+@End Reasoning
+
+@Implementation:
+Emits `?`. If bound_kind is "extends" emits ` extends ` and the
+upper bound type. If "super" emits ` super ` and the lower bound.
+Unbounded wildcards emit just `?`.
+@End Implementation
+
 Process called "generate_wildcard_type" takes context as Integer, hir as Integer returns Integer:
     Note: Generate wildcard type (? extends/super)
 
@@ -818,6 +1110,18 @@ Process called "generate_wildcard_type" takes context as Integer, hir as Integer
 
     Return 1
 End Process
+
+@Reasoning:
+Emits `<T1, T2 extends Bound, T3>` style generic-type-parameter
+declarations on a class or method. Each parameter has a name and an
+optional bound list (intersection types via & separator).
+@End Reasoning
+
+@Implementation:
+Emits `<`. Iterates type_params: parameter name, optional ` extends
+bound1 & bound2` via generate_type_bound_list, comma if not last.
+Closes `>`.
+@End Implementation
 
 Process called "generate_type_parameters" takes context as Integer, type_params as Integer returns Integer:
     Note: Generate generic type parameters
@@ -858,6 +1162,17 @@ Process called "generate_type_parameters" takes context as Integer, type_params 
     Return 1
 End Process
 
+@Reasoning:
+Emits `Bound1 & Bound2 & Bound3` — Java's intersection-type syntax
+used in generic type-parameter bounds (`<T extends A & B>`). The `&`
+separator is what distinguishes intersection from a comma list.
+@End Reasoning
+
+@Implementation:
+Iterates bounds list emitting each via generate_type_reference, joined
+by ` & ` (space-ampersand-space).
+@End Implementation
+
 Process called "generate_type_bound_list" takes context as Integer, bounds as Integer returns Integer:
     Note: Generate type bound list
 
@@ -882,6 +1197,17 @@ Process called "generate_type_bound_list" takes context as Integer, bounds as In
 
     Return 1
 End Process
+
+@Reasoning:
+Emits `T1, T2, T3` — comma-separated type references used in
+implements clauses, throws clauses, and similar positions. Distinct
+from generate_type_bound_list (which uses `&`).
+@End Reasoning
+
+@Implementation:
+Iterates types list, emit each via generate_type_reference with `, `
+separator between (no trailing comma on last).
+@End Implementation
 
 Process called "generate_type_list" takes context as Integer, types as Integer returns Integer:
     Note: Generate comma-separated type list
@@ -912,6 +1238,20 @@ End Process
 Note: ============================================================================
 Note: Statement Generation
 Note: ============================================================================
+
+@Reasoning:
+Statement dispatcher. Routes each HIR statement to its specialised
+generator based on node_type. Handles block, if, while, for, return,
+throw, try, variable declaration, and falls through to expression
+statement for the rest.
+@End Reasoning
+
+@Implementation:
+Sequential strings_equal tests on node_type. Each match returns the
+corresponding generator's result. Default fallthrough delegates to
+generate_expression_statement which treats the HIR as an expression
+plus a `;` terminator.
+@End Implementation
 
 Process called "generate_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate statement
@@ -966,6 +1306,19 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
     Return 0
 End Process
 
+@Reasoning:
+Emits `{ statements }` with proper indentation. The block opens its
+own brace level (incrementing indent for the body) and closes back
+at the caller's level.
+@End Reasoning
+
+@Implementation:
+Emits opening `{` at current indent + newline. Increases indent by 1.
+Delegates body emission to generate_block_statements which iterates
+the statements list. Restores indent and emits closing `}` at the
+original indent level.
+@End Implementation
+
 Process called "generate_block" takes context as Integer, hir as Integer returns Integer:
     Note: Generate block statement
 
@@ -986,6 +1339,18 @@ Process called "generate_block" takes context as Integer, hir as Integer returns
 
     Return 1
 End Process
+
+@Reasoning:
+Iterates a block's statements list emitting each in order via
+generate_statement. Skips quietly if the "statements" key is absent
+(empty block).
+@End Reasoning
+
+@Implementation:
+Reads statements list; null returns 1 (empty block ok). Iterates
+each list element calling generate_statement, which handles indent
+and semicolons per kind.
+@End Implementation
 
 Process called "generate_block_statements" takes context as Integer, hir as Integer returns Integer:
     Note: Generate statements within block
@@ -1008,6 +1373,21 @@ Process called "generate_block_statements" takes context as Integer, hir as Inte
 
     Return 1
 End Process
+
+@Reasoning:
+Emits `if (cond) { then } [else { else_branch }]`. Both branches
+always use brace blocks even for single statements — keeping all
+emitted output stylistically consistent at the cost of slightly
+more verbose output for one-liners.
+@End Reasoning
+
+@Implementation:
+Indent + `if (` + condition expression + `) {` + newline. Recurses
+into then-branch with incremented indent. Emits closing `}`.
+If else branch present, emits ` else {` + newline, recurses with
+incremented indent, closes `}`. Final newline terminates the
+statement.
+@End Implementation
 
 Process called "generate_if_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate if statement
@@ -1052,6 +1432,17 @@ Process called "generate_if_statement" takes context as Integer, hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Emits `while (cond) { body }`. Like if, always uses brace blocks
+regardless of body shape.
+@End Reasoning
+
+@Implementation:
+Indent + `while (` + condition + `) {` + newline. Recurses into
+body with incremented indent. Closes `}` + newline at original
+indent.
+@End Implementation
+
 Process called "generate_while_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate while statement
 
@@ -1080,6 +1471,19 @@ Process called "generate_while_statement" takes context as Integer, hir as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+Emits classic Java for-loop `for (init; cond; update) { body }`. All
+three header slots are optional (any missing slot emits as empty).
+Enhanced for-loops (for-each) would need a separate generator —
+this routine handles only the C-style three-part for.
+@End Reasoning
+
+@Implementation:
+Indent + `for (` + optional init statement + `;` + optional condition
+expression + `;` + optional update expression + `) {` + newline.
+Body recursion with incremented indent, then closing `}` + newline.
+@End Implementation
 
 Process called "generate_for_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate for statement
@@ -1128,6 +1532,17 @@ Process called "generate_for_statement" takes context as Integer, hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+Emits `return;` for void or `return value;` for value-returning
+methods. The presence of "value" in the HIR dict distinguishes the
+two forms.
+@End Reasoning
+
+@Implementation:
+Indent + `return`. If value present emits space + expression. Always
+ends with `;` + newline.
+@End Implementation
+
 Process called "generate_return_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate return statement
 
@@ -1149,6 +1564,16 @@ Process called "generate_return_statement" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emits `throw expression;` for raising an exception. The expression
+is typically `new ExceptionType(args)` but can be any value-yielding
+expression.
+@End Reasoning
+
+@Implementation:
+Indent + `throw ` + exception expression + `;` + newline.
+@End Implementation
+
 Process called "generate_throw_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate throw statement
 
@@ -1166,6 +1591,18 @@ Process called "generate_throw_statement" takes context as Integer, hir as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+Emits `try { ... }`. The current implementation only handles the
+try block — catch clauses and the optional finally block are known
+gaps and would need additional HIR fields plus emission code.
+@End Reasoning
+
+@Implementation:
+Indent + `try {` + newline. Body iteration via generate_block_statements
+at incremented indent. Closes `}` + newline. No catch or finally
+support yet.
+@End Implementation
 
 Process called "generate_try_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate try statement
@@ -1190,6 +1627,17 @@ Process called "generate_try_statement" takes context as Integer, hir as Integer
 
     Return 1
 End Process
+
+@Reasoning:
+Emits local variable declaration `Type name = initializer;`. The type
+is required; the initializer is optional (default values are
+zero-valued per Java rules). Used inside method bodies.
+@End Reasoning
+
+@Implementation:
+Indent + optional `Type ` + variable name + optional ` = expr` + `;`
++ newline.
+@End Implementation
 
 Process called "generate_variable_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate variable declaration
@@ -1220,6 +1668,16 @@ Process called "generate_variable_declaration" takes context as Integer, hir as 
     Return 1
 End Process
 
+@Reasoning:
+Emits an expression in statement position: `expression;`. Used for
+function calls, assignments, increments, and any side-effecting
+expression that doesn't fit another statement form.
+@End Reasoning
+
+@Implementation:
+Indent + expression (via generate_expression) + `;` + newline.
+@End Implementation
+
 Process called "generate_expression_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate expression statement
 
@@ -1240,6 +1698,20 @@ End Process
 Note: ============================================================================
 Note: Expression Generation
 Note: ============================================================================
+
+@Reasoning:
+Expression-form dispatcher covering Java's full expression grammar:
+binary/unary operators, calls, member access, array access, object
+creation (new), lambdas, method references, literals, identifiers,
+and ternary. Each routes to its specialised generator.
+@End Reasoning
+
+@Implementation:
+Reads node_type, runs eleven strings_equal tests in sequence, returns
+the matching generator's result on first hit. Null hir returns 0.
+Unknown node_type also returns 0 (silent — known gap, no error
+emission for unrecognised forms).
+@End Implementation
 
 Process called "generate_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate expression
@@ -1308,6 +1780,20 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
     Return 0
 End Process
 
+@Reasoning:
+Emits a binary expression `left op right` with spaces around the
+operator. The operator token (HIR-form like "PLUS") is mapped to its
+Java source form ("+") via an operator-name lookup table.
+@End Reasoning
+
+@Implementation:
+Recursively emits left operand, space, operator (looked up in op_map
+Dict that translates "PLUS"/"MINUS"/... to "+"/"-"/..., 19 entries
+covering arithmetic, comparison, logical, bitwise, and shift),
+space, recursively emits right operand. Unknown operators fall
+through to "+".
+@End Implementation
+
 Process called "generate_binary_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate binary expression
 
@@ -1355,6 +1841,19 @@ Process called "generate_binary_expression" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Emits a unary expression `op operand` where op is one of `!`, `-`, `+`,
+`~`. Uses the same operator-token-to-string mapping table as
+binary expressions (sharing the table is wasteful but matches the
+generation pattern).
+@End Reasoning
+
+@Implementation:
+Looks up operator in op_map (same table built each call — known
+inefficiency). Emits operator string then recursively the operand
+expression. Unknown operators default to `!`.
+@End Implementation
+
 Process called "generate_unary_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate unary expression
 
@@ -1395,6 +1894,17 @@ Process called "generate_unary_expression" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emits `callee(arg1, arg2, ...)`. The callee may be an identifier
+(function name) or a member-access expression (qualified call like
+`obj.method`). The argument list is comma-separated.
+@End Reasoning
+
+@Implementation:
+Recursively emits callee, opens `(`, delegates to generate_argument_list
+if arguments present, closes `)`.
+@End Implementation
+
 Process called "generate_call_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate call expression
 
@@ -1414,6 +1924,16 @@ Process called "generate_call_expression" takes context as Integer, hir as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+Emits comma-separated arguments inside a call's parens. Each argument
+is a full expression so generate_expression handles nesting.
+@End Reasoning
+
+@Implementation:
+Iterates arguments list. For each: emit `, ` if not first, then
+recursively emit the argument expression.
+@End Implementation
 
 Process called "generate_argument_list" takes context as Integer, arguments as Integer returns Integer:
     Note: Generate argument list
@@ -1441,6 +1961,18 @@ Process called "generate_argument_list" takes context as Integer, arguments as I
     Return 1
 End Process
 
+@Reasoning:
+Emits `object.member` syntax for field access or qualified method
+invocation. The object expression can itself be a member access
+(nested fields like `a.b.c.d`) which the recursive generate_expression
+handles correctly.
+@End Reasoning
+
+@Implementation:
+Recursively emits the object expression, then `.`, then the member
+name string.
+@End Implementation
+
 Process called "generate_member_access" takes context as Integer, hir as Integer returns Integer:
     Note: Generate member access
 
@@ -1456,6 +1988,17 @@ Process called "generate_member_access" takes context as Integer, hir as Integer
 
     Return 1
 End Process
+
+@Reasoning:
+Emits `array[index]` for array element access. Multi-dimensional
+arrays come through as nested array_access nodes producing
+`a[i][j]` naturally via recursion.
+@End Reasoning
+
+@Implementation:
+Recursively emits array expression, opens `[`, recursively emits
+index expression, closes `]`.
+@End Implementation
 
 Process called "generate_array_access" takes context as Integer, hir as Integer returns Integer:
     Note: Generate array access
@@ -1474,6 +2017,18 @@ Process called "generate_array_access" takes context as Integer, hir as Integer 
 
     Return 1
 End Process
+
+@Reasoning:
+Emits `new Type(args)` for constructor invocation. The type can be
+parameterized (`new ArrayList<String>()`) — that's handled by
+generate_type_reference. Anonymous classes (`new T() { ... }`) are
+not currently produced.
+@End Reasoning
+
+@Implementation:
+Emits `new `, recursively emits type, opens `(`, argument list via
+generate_argument_list, closes `)`.
+@End Implementation
 
 Process called "generate_object_creation" takes context as Integer, hir as Integer returns Integer:
     Note: Generate object creation (new)
@@ -1497,6 +2052,19 @@ Process called "generate_object_creation" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Emits a Java lambda `(params) -> body`. Single-param lambdas can
+omit parens (`x -> x + 1`) but this implementation always emits
+parens for consistency. The body may be either an expression or a
+block — block bodies use braces.
+@End Reasoning
+
+@Implementation:
+Emits `(parameters)` via generate_parameter_list, then ` -> `,
+then either an expression body (via generate_expression) or a block
+body (via generate_block) depending on body_kind.
+@End Implementation
+
 Process called "generate_lambda_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate lambda expression
 
@@ -1515,6 +2083,17 @@ Process called "generate_lambda_expression" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Emits `Target::method` syntax for method references. The target may
+be a class name (`String::length`), an instance (`instance::method`),
+or `super` for explicit super-class method references.
+@End Reasoning
+
+@Implementation:
+Recursively emits the target expression, then `::`, then the method
+name string.
+@End Implementation
+
 Process called "generate_method_reference" takes context as Integer, hir as Integer returns Integer:
     Note: Generate method reference (::)
 
@@ -1530,6 +2109,16 @@ Process called "generate_method_reference" takes context as Integer, hir as Inte
 
     Return 1
 End Process
+
+@Reasoning:
+Emits Java's ternary expression `condition ? then : else`. All three
+operands are full expressions. Precedence concerns are deferred to
+higher-level parenthesisation.
+@End Reasoning
+
+@Implementation:
+Recursively emits condition, ` ? `, then-branch, ` : `, else-branch.
+@End Implementation
 
 Process called "generate_ternary_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate ternary conditional expression
@@ -1552,6 +2141,18 @@ Process called "generate_ternary_expression" takes context as Integer, hir as In
     Return 1
 End Process
 
+@Reasoning:
+Emits a Java literal value. The literal's raw value lives in the HIR
+dict's "value" field; the literal_type field selects formatting
+(integer with no suffix, long with `L`, float with `f`, etc.).
+@End Reasoning
+
+@Implementation:
+Reads value string and emits directly. The current implementation
+emits the raw value without applying literal-type suffixes — a
+known limitation that matters only for ambiguous numeric literals.
+@End Implementation
+
 Process called "generate_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate literal value
 
@@ -1562,6 +2163,16 @@ Process called "generate_literal" takes context as Integer, hir as Integer retur
 
     Return 1
 End Process
+
+@Reasoning:
+Emits a bare identifier name. Used wherever an HIR identifier node
+appears in an expression context (variable references, method names
+in calls before the `(`, etc.).
+@End Reasoning
+
+@Implementation:
+Reads the "name" string from the HIR dict and emits it directly.
+@End Implementation
 
 Process called "generate_identifier" takes context as Integer, hir as Integer returns Integer:
     Note: Generate identifier

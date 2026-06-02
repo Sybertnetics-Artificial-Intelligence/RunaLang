@@ -58,6 +58,15 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+Minimal context state: just an error message and flag. Unlike the Rust
+translator which threads scope chains, C-to-HIR is structural enough
+that no global scope tracking is needed at this layer (variable
+resolution happens at HIR consumption time).
+@End Reasoning
+@Implementation:
+16-byte layout: error_message@0 (owned String pointer), has_error@8.
+@End Implementation
 Type called "CToHIRContext":
     error_message as Integer    Note: Error message (if any)
     has_error as Integer        Note: Boolean: 1 if error occurred
@@ -67,6 +76,12 @@ Note: ==========================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Factory; allocates and zeros the small context. Returns 0 on alloc failure.
+@End Reasoning
+@Implementation:
+Allocate 16 bytes; zero offsets 0 and 8.
+@End Implementation
 Process called "create_translation_context" returns Integer:
     Note: Create C to HIR translation context
 
@@ -83,6 +98,12 @@ Process called "create_translation_context" returns Integer:
     Return context
 End Process
 
+@Reasoning:
+Releases the owned error_message before freeing the context to prevent leaks.
+@End Reasoning
+@Implementation:
+Null check; deallocate error_message@0 if non-null; deallocate context.
+@End Implementation
 Process called "destroy_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context
 
@@ -105,6 +126,14 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Copies the message into owned context storage so the caller can free its
+own buffer immediately. Last-error-wins (overwrites any previous message).
+@End Reasoning
+@Implementation:
+Free old error_message; allocate length+1 bytes; memory_copy the bytes;
+null-terminate; store at offset 0 and set has_error to 1.
+@End Implementation
 Process called "set_translation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set translation error message
 
@@ -128,6 +157,13 @@ Process called "set_translation_error" takes context as Integer, message as Inte
     Return 1
 End Process
 
+@Reasoning:
+Fast boolean check used by translate_* to early-out on the error path
+without re-walking the message.
+@End Reasoning
+@Implementation:
+Return has_error@8.
+@End Implementation
 Process called "has_translation_error" takes context as Integer returns Integer:
     Note: Check if translation has error
 
@@ -136,6 +172,13 @@ Process called "has_translation_error" takes context as Integer returns Integer:
     Return has_error
 End Process
 
+@Reasoning:
+Returns the owned message pointer; caller must NOT free it (it's owned
+by the context).
+@End Reasoning
+@Implementation:
+Return error_message@0.
+@End Implementation
 Process called "get_error_message" takes context as Integer returns Integer:
     Note: Get translation error message
 
@@ -148,6 +191,19 @@ Note: ==========================================================================
 Note: Type Translation
 Note: ============================================================================
 
+@Reasoning:
+C type translation produces either a plain HIR string literal (simple
+types like `int`, `char*`, `void`) or a HIR dictionary (composite types
+like pointer/array with base type, struct/union with fields). Null
+type_node defaults to "void" which is the safe choice for missing
+return types in K&R-style code.
+@End Reasoning
+@Implementation:
+Null check returns HIR "void". Read tag@0 from type_node. Dispatch on
+C_TYPE_NODE (simple), C_POINTER_TYPE (pointer dict with base_type),
+C_ARRAY_TYPE (array dict with element_type and size). Fall through to
+"void" for unknown tags.
+@End Implementation
 Process called "translate_type_to_hir" takes context as Integer, type_node as Integer returns Integer:
     Note: Translate C type to HIR
 
@@ -216,6 +272,17 @@ Note: ==========================================================================
 Note: Expression Translation
 Note: ============================================================================
 
+@Reasoning:
+Central expression dispatch. C expressions cover ~12 kinds: literals,
+identifiers, binary, unary, calls, subscripts, member access (.,->),
+assignments, ternary, sizeof, casts. Each routes to a dedicated
+translate_<kind>_expr.
+@End Reasoning
+@Implementation:
+Null expr returns HIR null literal. Read tag@0; dispatch via if/Otherwise
+If chain on each C_*_EXPR tag. Unknown tags set translation error and
+return null HIR.
+@End Implementation
 Process called "translate_expression_to_hir" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate C expression to HIR
 
@@ -285,6 +352,14 @@ Process called "translate_expression_to_hir" takes context as Integer, expr_node
     Return proc create_hir_error_node from HIR with "UnknownExpression"
 End Process
 
+@Reasoning:
+C literals are integer, float, character, or string. The HIR carries the
+literal value pre-decoded.
+@End Reasoning
+@Implementation:
+Read literal kind and value from expr_node; create the appropriate HIR
+literal node (integer/float/string/char).
+@End Implementation
 Process called "translate_literal_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate literal expression to HIR
 
@@ -303,6 +378,13 @@ Process called "translate_literal_expr" takes context as Integer, expr_node as I
     Return hir_dict
 End Process
 
+@Reasoning:
+Identifier expression: a bare name. Variable resolution happens later
+in the HIR consumer; this layer just emits the identifier HIR node.
+@End Reasoning
+@Implementation:
+Read name string from expr_node; create HIR identifier with that name.
+@End Implementation
 Process called "translate_identifier_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate identifier expression to HIR
 
@@ -321,6 +403,15 @@ Process called "translate_identifier_expr" takes context as Integer, expr_node a
     Return hir_dict
 End Process
 
+@Reasoning:
+C binary operators include arithmetic (+, -, *, /, %), comparison (==,
+!=, <, >, <=, >=), logical (&&, ||), and bitwise (&, |, ^, <<, >>). The
+HIR carries the operator string and both operand HIR nodes.
+@End Reasoning
+@Implementation:
+Read operator string, left, right; recursively translate both operands;
+build HIR binary node with the operator and operand HIRs.
+@End Implementation
 Process called "translate_binary_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate binary expression to HIR
 
@@ -353,6 +444,15 @@ Process called "translate_binary_expr" takes context as Integer, expr_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+C unary operators: prefix ++/--, postfix ++/--, !, ~, -, +, *, &. The
+prefix vs postfix distinction is carried in a separate flag because
+they have different semantics (postfix returns the old value).
+@End Reasoning
+@Implementation:
+Read operator string, operand, and prefix flag; recursively translate
+operand; build HIR unary node with operator, operand, and is_postfix.
+@End Implementation
 Process called "translate_unary_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate unary expression to HIR
 
@@ -380,6 +480,14 @@ Process called "translate_unary_expr" takes context as Integer, expr_node as Int
     Return hir_dict
 End Process
 
+@Reasoning:
+`callee(arg1, arg2, ...)`. Function pointer calls and ordinary
+function calls share this form; the callee can be any expression.
+@End Reasoning
+@Implementation:
+Translate callee; iterate arguments list recursively translating each;
+build HIR call node with callee and args list.
+@End Implementation
 Process called "translate_call_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate call expression to HIR
 
@@ -415,6 +523,15 @@ Process called "translate_call_expr" takes context as Integer, expr_node as Inte
     Return hir_dict
 End Process
 
+@Reasoning:
+`array[index]`. C subscript is sugar for `*(array + index)` but HIR
+preserves the subscript form so downstream consumers can do bounds
+checking and array-specific optimization.
+@End Reasoning
+@Implementation:
+Read array and index expressions; translate both; build HIR subscript
+node.
+@End Implementation
 Process called "translate_subscript_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate subscript expression to HIR
 
@@ -440,6 +557,14 @@ Process called "translate_subscript_expr" takes context as Integer, expr_node as
     Return hir_dict
 End Process
 
+@Reasoning:
+`obj.field` and `ptr->field`. The is_arrow flag distinguishes between
+them. -> is sugar for `(*ptr).field` but preserved for clarity in HIR.
+@End Reasoning
+@Implementation:
+Read base expression, field name, and is_arrow flag; translate base;
+build HIR member node with base, field, and is_arrow.
+@End Implementation
 Process called "translate_member_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate member access expression to HIR
 
@@ -474,6 +599,15 @@ Process called "translate_member_expr" takes context as Integer, expr_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+C assignment is itself an EXPRESSION (returns the assigned value),
+distinct from a statement. The operator field carries `=` or any
+compound form (`+=`, `<<=`, etc.).
+@End Reasoning
+@Implementation:
+Read lhs, rhs, operator; translate both sides; build HIR assignment
+node.
+@End Implementation
 Process called "translate_assign_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate assignment expression to HIR
 
@@ -506,6 +640,14 @@ Process called "translate_assign_expr" takes context as Integer, expr_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+`cond ? then : else`. The three sub-expressions are stored separately
+because each may be arbitrarily complex.
+@End Reasoning
+@Implementation:
+Read condition, then_branch, else_branch; translate all three; build
+HIR conditional node.
+@End Implementation
 Process called "translate_ternary_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate ternary expression to HIR
 
@@ -534,6 +676,15 @@ Process called "translate_ternary_expr" takes context as Integer, expr_node as I
     Return hir_dict
 End Process
 
+@Reasoning:
+`sizeof(type)` and `sizeof(expr)`. The HIR preserves the form
+distinction because they're compiled differently downstream (one
+returns a constant from type info, one evaluates expr type at compile
+time).
+@End Reasoning
+@Implementation:
+Read the inner type or expression; translate it; build HIR sizeof node.
+@End Implementation
 Process called "translate_sizeof_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate sizeof expression to HIR
 
@@ -554,6 +705,13 @@ Process called "translate_sizeof_expr" takes context as Integer, expr_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+`(type)expr` C-style cast. The target type is preserved as HIR so
+type checking can reject illegal casts (e.g., struct-to-int).
+@End Reasoning
+@Implementation:
+Read cast_type and operand; translate both; build HIR cast node.
+@End Implementation
 Process called "translate_cast_expr" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate cast expression to HIR
 
@@ -582,6 +740,16 @@ Note: ==========================================================================
 Note: Statement Translation
 Note: ============================================================================
 
+@Reasoning:
+Central statement dispatch. C statements cover compound (`{...}`), expr
+statements, declarations, if/while/for/do-while/switch/case/default,
+return, break, continue, goto, label. Each routes to its dedicated
+translator.
+@End Reasoning
+@Implementation:
+Read stmt tag@0; if/Otherwise If chain on C_*_STMT tags dispatching to
+translate_<kind>_stmt. Unknown tags record translation error.
+@End Implementation
 Process called "translate_statement_to_hir" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate C statement to HIR
 
@@ -672,6 +840,14 @@ Process called "translate_statement_to_hir" takes context as Integer, stmt_node 
     Return proc create_hir_error_node from HIR with "UnknownStatement"
 End Process
 
+@Reasoning:
+`{ stmt; stmt; ... }` introduces a new scope. The HIR block preserves
+ordering since C's declaration-before-use rules depend on it.
+@End Reasoning
+@Implementation:
+Build HIR block; iterate stmts list, recursively translate each, append
+non-null results. Return the block.
+@End Implementation
 Process called "translate_compound_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate compound statement to HIR
 
@@ -704,6 +880,14 @@ Process called "translate_compound_stmt" takes context as Integer, stmt_node as 
     Return hir_dict
 End Process
 
+@Reasoning:
+`expr;` - a value-producing expression whose value is discarded. Distinct
+from a bare expression node because HIR consumers may treat statements
+differently (e.g., side-effect tracking).
+@End Reasoning
+@Implementation:
+Read inner expression; translate it; wrap in HIR expression-statement.
+@End Implementation
 Process called "translate_expr_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate expression statement to HIR
 
@@ -724,6 +908,15 @@ Process called "translate_expr_stmt" takes context as Integer, stmt_node as Inte
     Return hir_dict
 End Process
 
+@Reasoning:
+`if (cond) then [else alt]`. The else branch is optional. C does NOT
+have elif - chained ifs come through as nested else-if's which become
+nested HIR if nodes.
+@End Reasoning
+@Implementation:
+Translate condition, then_stmt, optional else_stmt; build HIR if node
+with the three pieces (else may be null).
+@End Implementation
 Process called "translate_if_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate if statement to HIR
 
@@ -756,6 +949,12 @@ Process called "translate_if_stmt" takes context as Integer, stmt_node as Intege
     Return hir_dict
 End Process
 
+@Reasoning:
+`while (cond) body`. Condition is tested before each iteration.
+@End Reasoning
+@Implementation:
+Translate condition and body; build HIR while node.
+@End Implementation
 Process called "translate_while_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate while statement to HIR
 
@@ -782,6 +981,15 @@ Process called "translate_while_stmt" takes context as Integer, stmt_node as Int
     Return hir_dict
 End Process
 
+@Reasoning:
+`for (init; cond; update) body`. All three header parts are independently
+optional in C (`for (;;)` is valid for an infinite loop). Each is
+recursed only if present.
+@End Reasoning
+@Implementation:
+Translate init, cond, update (each may be null), and body; build HIR
+for-loop node with the four parts.
+@End Implementation
 Process called "translate_for_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate for statement to HIR
 
@@ -838,6 +1046,13 @@ Process called "translate_for_stmt" takes context as Integer, stmt_node as Integ
     Return hir_dict
 End Process
 
+@Reasoning:
+`do body while (cond);`. Condition is tested AFTER each iteration, so
+the body runs at least once. Distinct from while in HIR.
+@End Reasoning
+@Implementation:
+Translate body and condition; build HIR do-while node.
+@End Implementation
 Process called "translate_do_while_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate do-while statement to HIR
 
@@ -864,6 +1079,15 @@ Process called "translate_do_while_stmt" takes context as Integer, stmt_node as 
     Return hir_dict
 End Process
 
+@Reasoning:
+`switch (discriminant) { cases }`. C's fall-through semantics (case
+without break falls into next case) are preserved by emitting the case
+list in source order.
+@End Reasoning
+@Implementation:
+Translate discriminant; translate body (which contains case and default
+stmts at its top level); build HIR switch node.
+@End Implementation
 Process called "translate_switch_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate switch statement to HIR
 
@@ -890,6 +1114,14 @@ Process called "translate_switch_stmt" takes context as Integer, stmt_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+`case constant:` introduces a labeled branch in a switch. The case value
+must be a constant expression per C standard; this layer doesn't verify
+that constraint.
+@End Reasoning
+@Implementation:
+Translate value expression; build HIR case node carrying just the value.
+@End Implementation
 Process called "translate_case_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate case statement to HIR
 
@@ -910,6 +1142,12 @@ Process called "translate_case_stmt" takes context as Integer, stmt_node as Inte
     Return hir_dict
 End Process
 
+@Reasoning:
+`default:` is the catch-all branch in a switch. No value to translate.
+@End Reasoning
+@Implementation:
+Build HIR default-case node (no fields to populate).
+@End Implementation
 Process called "translate_default_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate default statement to HIR
 
@@ -921,6 +1159,14 @@ Process called "translate_default_stmt" takes context as Integer, stmt_node as I
     Return hir_dict
 End Process
 
+@Reasoning:
+`return [expr];`. Bare `return` in void function returns no value. The
+HIR carries an optional value.
+@End Reasoning
+@Implementation:
+Read optional value expression; if non-null translate; build HIR return
+node.
+@End Implementation
 Process called "translate_return_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate return statement to HIR
 
@@ -941,6 +1187,13 @@ Process called "translate_return_stmt" takes context as Integer, stmt_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+`goto label;`. The label is a bare name; resolution to the actual
+target statement happens at HIR consumption time (not here).
+@End Reasoning
+@Implementation:
+Read label name string; build HIR goto node with the name.
+@End Implementation
 Process called "translate_goto_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate goto statement to HIR
 
@@ -959,6 +1212,14 @@ Process called "translate_goto_stmt" takes context as Integer, stmt_node as Inte
     Return hir_dict
 End Process
 
+@Reasoning:
+`label: stmt` introduces a goto target. The labeled statement that
+follows is recursively translated and attached.
+@End Reasoning
+@Implementation:
+Read label name and following statement; translate the statement; build
+HIR label node.
+@End Implementation
 Process called "translate_label_stmt" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate label statement to HIR
 
@@ -981,6 +1242,15 @@ Note: ==========================================================================
 Note: Declaration Translation
 Note: ============================================================================
 
+@Reasoning:
+Variable declaration: `type name [= initializer];`. The initializer is
+optional. Storage class (static, extern, auto, register) and qualifiers
+(const, volatile) come through other HIR fields.
+@End Reasoning
+@Implementation:
+Read name, type_node, optional initializer; translate type and
+initializer; build HIR variable-declaration node.
+@End Implementation
 Process called "translate_variable_to_hir" takes context as Integer, var_node as Integer returns Integer:
     Note: Translate variable declaration to HIR
 
@@ -1012,6 +1282,17 @@ Process called "translate_variable_to_hir" takes context as Integer, var_node as
     Return hir_dict
 End Process
 
+@Reasoning:
+Function definition or declaration: `return_type name(params) [body]`.
+The body may be absent (prototype declaration) - we emit a HIR function
+node with null body in that case so the parser can still register the
+signature.
+@End Reasoning
+@Implementation:
+Read name, return_type, params list, optional body; translate
+return_type, each param (with its type), and body if present; build HIR
+function node.
+@End Implementation
 Process called "translate_function_to_hir" takes context as Integer, func_node as Integer returns Integer:
     Note: Translate function declaration to HIR
 
@@ -1079,6 +1360,17 @@ Note: ==========================================================================
 Note: Program Translation
 Note: ============================================================================
 
+@Reasoning:
+Top-level C translation unit: a sequence of declarations (functions,
+variables, typedefs, struct/union/enum definitions, preprocessor
+directives). Order is preserved because C semantic depend on
+declaration order (no forward references for non-function symbols).
+@End Reasoning
+@Implementation:
+Build HIR program; iterate program_node's declarations; dispatch each to
+the appropriate translator (function/variable/typedef/etc); append
+results.
+@End Implementation
 Process called "translate_program_to_hir" takes context as Integer, program_node as Integer returns Integer:
     Note: Translate C program to HIR
 
@@ -1139,6 +1431,16 @@ Note: ==========================================================================
 Note: Top-Level Translation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Public entry point. Manages context lifetime (create + destroy bracket
+the work). On translation error returns null HIR rather than a partial
+result so consumers don't have to inspect both.
+@End Reasoning
+@Implementation:
+Create context; call translate_program_to_hir; check has_translation_error;
+if set, destroy context and return 0; otherwise return the HIR and let
+the caller destroy the context later.
+@End Implementation
 Process called "translate_c_to_hir" takes c_ast as Integer returns Integer:
     Note: Translate C AST to HIR (top-level entry point)
 

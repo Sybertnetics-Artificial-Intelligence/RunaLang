@@ -89,6 +89,21 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+Compact context for SwiftUI -> HIR translation: just the error channel
+(sticky-error pattern) and position info that gets updated as the walk
+descends. Position tracking lives on the context, not threaded through
+arguments, so deeply-nested view hierarchies don't need to pass line/
+column down every call.
+@End Reasoning
+
+@Implementation:
+32-byte record (4 x i64): error_message at offset 0 (owned, allocated
+copy), has_error at offset 8 (sticky flag), line at offset 16 and
+column at offset 24 (updated by translate_swiftui_node_to_hir on every
+node visit so error reporting cites the most recent node's coordinates).
+@End Implementation
+
 Type called "SwiftUIToHIRContext":
     error_message as Integer    Note: Error message (if any)
     has_error as Integer        Note: Boolean: 1 if error occurred
@@ -99,6 +114,19 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Builds a fresh translation context with cleared error state. The
+context is short-lived — one translation per SwiftUI AST input — so
+no resource pooling is attempted; allocation cost is amortised across
+the resulting HIR tree.
+@End Reasoning
+
+@Implementation:
+Single 32-byte allocation, OOM short-circuits to 0, all four slots
+explicitly initialised to 0 (no fields are left uninitialised because
+the destructor reads error_message to decide whether to free it).
+@End Implementation
 
 Process called "create_translation_context" returns Integer:
     Note: Create SwiftUI to HIR translation context
@@ -118,6 +146,19 @@ Process called "create_translation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Releases the context plus any owned error message. The only owned
+heap resource on the context is the error_message buffer; everything
+else is integer/pointer-aliased. Null context returns success so
+defensive double-destroy is safe.
+@End Reasoning
+
+@Implementation:
+Reads error_message at offset 0, frees it via Layout deallocate if
+non-null, then deallocates the 32-byte context struct. Returns 1 on
+all paths including null-context (already-destroyed contract).
+@End Implementation
 
 Process called "destroy_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context
@@ -141,6 +182,23 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Records the current error message while replacing any previous one.
+Unlike most sticky-error implementations in this codebase, this one
+overwrites instead of preserving the first error — useful for SwiftUI
+where the last error is usually the most actionable (deep view-tree
+issues mask shallow ones).
+@End Reasoning
+
+@Implementation:
+Reads the existing error pointer from offset 0 and frees it if
+non-null (avoids leaking the prior buffer). Then computes msg_length,
+allocates msg_length+1 bytes, copies the message in via memory_copy,
+NUL-terminates at offset msg_length, and stores the new pointer at
+offset 0. Sets has_error to 1 at offset 8 (sticky thereafter — never
+cleared even if a future call overwrites the message).
+@End Implementation
 
 Process called "set_translation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set translation error message
@@ -167,6 +225,17 @@ Process called "set_translation_error" takes context as Integer, message as Inte
     Return 1
 End Process
 
+@Reasoning:
+Public predicate for the sticky-error flag. Used by the top-level
+translate_swiftui_to_hir to decide whether to discard the partial
+HIR result.
+@End Reasoning
+
+@Implementation:
+Returns the int64 at context offset 8 directly. The flag is 0/1 so
+the caller can treat the return value as a boolean.
+@End Implementation
+
 Process called "has_translation_error" takes context as Integer returns Integer:
     Note: Check if translation has error
 
@@ -174,6 +243,18 @@ Process called "has_translation_error" takes context as Integer returns Integer:
 
     Return has_error
 End Process
+
+@Reasoning:
+Public accessor that hands the caller the (owned-by-context) error
+message pointer. Caller must not free it — the context's destructor
+owns the lifetime.
+@End Reasoning
+
+@Implementation:
+Returns the pointer at offset 0. Returns 0 (null) if no error has
+been set yet. Callers reading the buffer must treat it as
+NUL-terminated since set_translation_error always writes a trailing 0.
+@End Implementation
 
 Process called "get_error_message" takes context as Integer returns Integer:
     Note: Get translation error message
@@ -187,13 +268,28 @@ Note: ==========================================================================
 Note: SwiftUI Node to HIR Translation
 Note: ============================================================================
 
+@Reasoning:
+Master dispatcher that routes SwiftUI AST nodes to their specialised
+HIR translator based on the node-type tag at offset 0. Ten node kinds
+are handled: view struct, view body, container (VStack/HStack/ZStack),
+element (Text/Button/Image), modifier, property (with @State/@Binding/
+etc wrappers), closure, expression, literal, identifier. Position info
+on the context is updated on every visit so error reports cite the
+current source location even after recursing.
+@End Reasoning
+
+@Implementation:
+Null swiftui_node triggers a "Null SwiftUI node" error and returns 0.
+Reads node_type at offset 0 plus line at offset 64 and column at
+offset 72 (SwiftUI AST nodes are 80+ bytes — position lives near the
+end). Writes line/column back to context offsets 16/24. Then runs a
+linear sequence of If/Return on each of the 10 SWIFTUI_* tags from
+the Parser module. Unknown tags hit the fallthrough which sets an
+"Unknown SwiftUI node type" error and returns 0.
+@End Implementation
+
 Process called "translate_swiftui_node_to_hir" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI AST node to HIR node
-
-    @Reasoning:
-    Dispatches to appropriate translator based on SwiftUI node type.
-    Creates corresponding HIR dictionary, list, or literal node.
-    @End Reasoning
 
     If swiftui_node is equal to 0:
         proc set_translation_error with context, "Null SwiftUI node"
@@ -258,16 +354,28 @@ Note: ==========================================================================
 Note: View Structure Translation
 Note: ============================================================================
 
+@Reasoning:
+A SwiftUI `struct MyView: View` is a top-level UI declaration. The HIR
+representation flattens its name, its property list (each `@State var`
+etc.), and its body (the var body { ... } block) into a single dict
+tagged "view_struct". Children of the struct node are heterogeneous
+(properties and one view-body) so a single pass over children performs
+both jobs by inspecting child type tags.
+@End Reasoning
+
+@Implementation:
+Reads struct_name from offset 8 and children list from offset 48.
+Creates a HIR dictionary, attaches "_type"="view_struct" and "name"
+entries. Then iterates children in a single pass, dispatching:
+SWIFTUI_PROPERTY -> translate_property and append to properties_list;
+SWIFTUI_VIEW_BODY -> translate_view_body and remember as body_hir.
+After the loop, adds "properties" (list) and conditionally "body"
+(only if found) to the dict. The properties list is always added
+even when empty so consumers can iterate without null checks.
+@End Implementation
+
 Process called "translate_view_struct" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI view struct to HIR dictionary
-
-    @Reasoning:
-    View structs map to dictionaries containing:
-    - Type metadata ("view_struct")
-    - Struct name
-    - List of properties (with wrappers)
-    - View body
-    @End Reasoning
 
     Note: Get struct properties
     Let struct_name be proc memory_get_int64 from Layout with swiftui_node, 8
@@ -328,13 +436,26 @@ Process called "translate_view_struct" takes context as Integer, swiftui_node as
     Return hir_dict
 End Process
 
+@Reasoning:
+The `var body: some View { ... }` of a SwiftUI struct typically wraps
+a single root view (a container or element). The HIR shape is a tiny
+dict tagged "view_body" with one "view" entry pointing at the root.
+This intermediate wrapper exists so the downstream HIR consumer knows
+where the actual UI tree starts versus the surrounding struct metadata.
+@End Reasoning
+
+@Implementation:
+Reads children at offset 48. Creates the HIR dict and tags it. If
+there's at least one child, takes the first as the root view and
+recursively translates it through translate_swiftui_node_to_hir, then
+attaches as "view". Multiple-child bodies (which SwiftUI permits via
+implicit Group wrapping) currently use only the first child — known
+limitation, would need a Group wrapper in HIR if multi-root bodies
+need preservation.
+@End Implementation
+
 Process called "translate_view_body" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI view body to HIR dictionary
-
-    @Reasoning:
-    View body contains the view hierarchy. We translate it as a dictionary
-    with the view tree.
-    @End Reasoning
 
     Note: Get children (view hierarchy)
     Let children be proc memory_get_int64 from Layout with swiftui_node, 48
@@ -369,17 +490,29 @@ Process called "translate_view_body" takes context as Integer, swiftui_node as I
     Return hir_dict
 End Process
 
+@Reasoning:
+Container views (VStack/HStack/ZStack/ScrollView/List/etc.) carry both
+children (the stacked subviews) and parameters (alignment, spacing).
+The HIR dict captures all four facets — name, parameters, children,
+modifiers — so a renderer can reconstruct the layout call without
+losing modifier order or parameter values.
+@End Reasoning
+
+@Implementation:
+Reads container_name (offset 8), modifiers (offset 40), children
+(offset 48), parameters (offset 56). Creates the HIR dict and attaches
+_type and name first. Parameters are translated via translate_parameters
+if present. Children are iterated and each translated recursively
+through the master dispatcher; only successful translations get added
+(failed translations are dropped silently, the sticky-error flag
+catches the failure for the top-level checker). Modifiers are iterated
+similarly, using translate_view_modifier for each. Empty children or
+modifier lists do not produce empty HIR entries — the keys are simply
+absent when there's nothing to attach.
+@End Implementation
+
 Process called "translate_view_container" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI container view to HIR dictionary
-
-    @Reasoning:
-    Container views (VStack, HStack, ZStack) map to dictionaries with:
-    - Type metadata ("container")
-    - Container name (VStack, HStack, ZStack)
-    - Parameters (alignment, spacing, etc.)
-    - Children (list of child views)
-    - Modifiers (list of modifier dictionaries)
-    @End Reasoning
 
     Note: Get container properties
     Let container_name be proc memory_get_int64 from Layout with swiftui_node, 8
@@ -461,17 +594,27 @@ Process called "translate_view_container" takes context as Integer, swiftui_node
     Return hir_dict
 End Process
 
+@Reasoning:
+Leaf view elements (Text, Button, Image, TextField, Toggle, etc.)
+have the same HIR shape as containers — name + parameters + children
++ modifiers — because some elements like Button still carry "children"
+in the form of action closures or label views. Unifying the HIR shape
+across containers and elements lets downstream renderers use a single
+view-tree walk regardless of whether a node is structural or leaf.
+@End Reasoning
+
+@Implementation:
+Same field offsets as translate_view_container: name (8), modifiers
+(40), children (48), parameters (56). HIR dict construction follows
+the same pattern with _type set to "element" instead of "container".
+Children handling supports closure children (Button labels, sheet
+content) by recursing through the master dispatcher which can handle
+SWIFTUI_CLOSURE nodes. Modifier list iteration is identical to
+container translation.
+@End Implementation
+
 Process called "translate_view_element" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI element view to HIR dictionary
-
-    @Reasoning:
-    Element views (Text, Button, Image, etc.) map to dictionaries with:
-    - Type metadata ("element")
-    - Element name (Text, Button, Image, etc.)
-    - Parameters
-    - Children (for Button closures, etc.)
-    - Modifiers
-    @End Reasoning
 
     Note: Get element properties
     Let element_name be proc memory_get_int64 from Layout with swiftui_node, 8
@@ -553,15 +696,26 @@ Process called "translate_view_element" takes context as Integer, swiftui_node a
     Return hir_dict
 End Process
 
+@Reasoning:
+Modifiers (.padding(), .foregroundColor(), .background(), .frame())
+are the most common SwiftUI extension point — they post-process a view
+with parameters. The HIR shape is name + parameters (no children, no
+nested modifiers — SwiftUI modifiers are flat at the AST level even
+though they chain syntactically). Order matters and is preserved by
+the containing view's "modifiers" list ordering.
+@End Reasoning
+
+@Implementation:
+Reads modifier_name from offset 8 and parameters from offset 56.
+Builds the HIR dict with _type="modifier" and the name entry.
+Parameters are translated through the shared translate_parameters
+helper which understands both named and positional argument forms.
+Modifiers without parameters (e.g., .padding() with default value)
+simply omit the "parameters" key.
+@End Implementation
+
 Process called "translate_view_modifier" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI view modifier to HIR dictionary
-
-    @Reasoning:
-    View modifiers (.padding(), .background(), etc.) map to dictionaries with:
-    - Type metadata ("modifier")
-    - Modifier name
-    - Parameters
-    @End Reasoning
 
     Note: Get modifier properties
     Let modifier_name be proc memory_get_int64 from Layout with swiftui_node, 8
@@ -595,17 +749,28 @@ Process called "translate_view_modifier" takes context as Integer, swiftui_node 
     Return hir_dict
 End Process
 
+@Reasoning:
+Properties on a SwiftUI struct carry a property wrapper that drives
+state behaviour: @State (owned local state), @Binding (borrowed state
+from parent), @StateObject (owned ObservableObject), @ObservedObject
+(borrowed ObservableObject), @EnvironmentObject (DI-injected), etc.
+The wrapper name is the single most important piece of metadata to
+preserve because downstream tooling routes state-binding logic based
+on it.
+@End Reasoning
+
+@Implementation:
+Reads name (offset 8), wrapper (offset 24), type_annotation (offset 32),
+children (offset 48, where the optional initial-value expression lives).
+HIR dict gets _type="property" and the property name unconditionally.
+Wrapper and type_annotation are added only when non-null (a property
+might be a plain `var` without a wrapper, or untyped). The initial
+value, if present, is the first child and gets translated recursively
+through translate_swiftui_node_to_hir then attached as "initial_value".
+@End Implementation
+
 Process called "translate_property" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI property to HIR dictionary
-
-    @Reasoning:
-    Properties (@State var x: Int) map to dictionaries with:
-    - Type metadata ("property")
-    - Property name
-    - Wrapper name (@State, @Binding, etc.)
-    - Type annotation (optional)
-    - Initial value (optional)
-    @End Reasoning
 
     Note: Get property properties
     Let property_name be proc memory_get_int64 from Layout with swiftui_node, 8
@@ -659,15 +824,28 @@ Process called "translate_property" takes context as Integer, swiftui_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+SwiftUI closures appear in many places: Button actions ({ ... }),
+ForEach iterations ({ item in ... }), .onAppear handlers, sheet
+content builders, etc. The HIR captures the optional single parameter
+name (Swift's `value in` form) and the body as an ordered list of
+statements. Multiple statements survive as a list rather than a block
+node because SwiftUI closure bodies are flat statement sequences.
+@End Reasoning
+
+@Implementation:
+Reads parameter_name (offset 8) and children (offset 48, where body
+statements live). HIR dict gets _type="closure" and parameter (only
+if parameter_name is non-null — many closures take no named parameter).
+Iterates children, recursively translating each through the master
+dispatcher, accumulating results into a HIR list named "body". The
+list is only attached when at least one child translated successfully;
+empty bodies are common with placeholder closures and don't merit
+an empty list entry.
+@End Implementation
+
 Process called "translate_closure" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI closure to HIR dictionary
-
-    @Reasoning:
-    Closures ({ ... } or { value in ... }) map to dictionaries with:
-    - Type metadata ("closure")
-    - Parameter name (optional)
-    - Body (list of statements)
-    @End Reasoning
 
     Note: Get closure properties
     Let parameter_name be proc memory_get_int64 from Layout with swiftui_node, 8
@@ -721,16 +899,29 @@ Note: ==========================================================================
 Note: Expression and Literal Translation
 Note: ============================================================================
 
+@Reasoning:
+Four expression flavours are flattened here based on lexical inspection
+of the value string: $-prefix => state binding, contains-`.` =>
+member access, name+parameters => function call, else identifier.
+Doing the classification here means the SwiftUI parser doesn't need
+distinct AST tags for each — the lexical hints carry enough info.
+The state-binding detection in particular relies entirely on the `$`
+prefix because SwiftUI source uses `$state` syntax verbatim.
+@End Reasoning
+
+@Implementation:
+Reads expr_value (offset 16), expr_name (offset 8), parameters
+(offset 56). Two-stage dispatch. Stage 1 (expr_value present): first
+byte test for ASCII 36 ($) -> emit binding dict; otherwise scan for
+ASCII 46 (.) via memory_get_byte loop and emit member_access dict if
+found; else emit a bare string literal. Stage 2 (expr_value null
+but expr_name with parameters present): emit a function_call dict
+with name and translated parameters. Falls through to "Invalid
+expression" error if neither stage matches.
+@End Implementation
+
 Process called "translate_expression" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI expression to HIR
-
-    @Reasoning:
-    Expressions can be:
-    - State bindings ($variable) → Dictionary with "_type": "binding"
-    - Member access (Color.red) → Dictionary with "_type": "member_access"
-    - Function calls → Dictionary with "_type": "function_call"
-    - Identifiers → String literal
-    @End Reasoning
 
     Note: Get expression value
     Let expr_value be proc memory_get_int64 from Layout with swiftui_node, 16
@@ -828,13 +1019,29 @@ Process called "translate_expression" takes context as Integer, swiftui_node as 
     Return 0
 End Process
 
+@Reasoning:
+SwiftUI literals arrive from the parser as strings without type tags.
+This routine recovers the typed HIR literal by inspecting the string
+shape: "true"/"false" -> bool, all-digit (with optional dot/minus)
+-> int/float, anything else -> string. Recovering the type lets the
+HIR carry strongly-typed literal nodes which the optimiser and
+renderer can use without parsing again.
+@End Reasoning
+
+@Implementation:
+Reads literal_value at offset 16. Null triggers error+0. Three-pass
+classification: (1) strings_equal against "true" and "false" routes
+to create_hir_boolean_literal; (2) iterate the bytes, every char must
+be ASCII 48-57 (digit), 46 (.), or 45 (-) — if all pass, route based
+on whether a dot appeared (string_to_float -> float literal, else
+string_to_int -> integer literal); (3) fall through to
+create_hir_string_literal for the raw value. The numeric scanner is
+permissive — it accepts `-` anywhere, not just leading — but the
+downstream string_to_int/float will reject malformed forms.
+@End Implementation
+
 Process called "translate_literal" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI literal to HIR literal
-
-    @Reasoning:
-    Literals (strings, numbers, booleans) translate directly to HIR literals.
-    We need to detect the type from the value format.
-    @End Reasoning
 
     Note: Get literal value
     Let literal_value be proc memory_get_int64 from Layout with swiftui_node, 16
@@ -907,6 +1114,22 @@ Process called "translate_literal" takes context as Integer, swiftui_node as Int
     Return proc create_hir_string_literal from HIR with literal_value
 End Process
 
+@Reasoning:
+Bare identifiers (variable references, view names) become HIR string
+literals — there's no separate "identifier" HIR node because the
+identifier-vs-string distinction is recovered later from context
+(an identifier appearing in a parameter slot is a name reference;
+in a content slot it's display text).
+@End Reasoning
+
+@Implementation:
+Reads identifier_name from offset 8. Null triggers a "Null identifier
+name" error and returns 0. Otherwise creates a HIR string literal
+via create_hir_string_literal, which itself may fail (returns 0)
+under OOM — in that case sets a "Failed to create HIR string literal"
+error and returns 0.
+@End Implementation
+
 Process called "translate_identifier" takes context as Integer, swiftui_node as Integer returns Integer:
     Note: Translate SwiftUI identifier to HIR string literal
 
@@ -933,14 +1156,25 @@ Note: ==========================================================================
 Note: Parameter Translation
 Note: ============================================================================
 
+@Reasoning:
+SwiftUI parameters live as a Dict keyed by either parameter name
+(for named args like `alignment: .center`) or string-form integer
+indices (for positional args). Preserving both forms uniformly as
+Dict keys lets the HIR consumer treat them homogeneously — the
+shape is "any string -> expression" without needing two paths.
+@End Reasoning
+
+@Implementation:
+Null parameters_dict returns 0 (no parameters to translate). Otherwise
+creates a HIR dict, gets the parameter keys via `keys from Dict`,
+iterates the key list, fetches each value via `get from Dict`, and
+recursively translates it through the master dispatcher. Successful
+translations are attached to the HIR dict under the same key. Empty
+key list returns the empty HIR dict.
+@End Implementation
+
 Process called "translate_parameters" takes context as Integer, parameters_dict as Integer returns Integer:
     Note: Translate SwiftUI parameters dictionary to HIR dictionary
-
-    @Reasoning:
-    Parameters are stored as a dictionary with either:
-    - Named parameters: key = parameter name, value = expression
-    - Positional parameters: key = index string, value = expression
-    @End Reasoning
 
     If parameters_dict is equal to 0:
         Return 0
@@ -985,13 +1219,26 @@ Note: ==========================================================================
 Note: Top-Level Translation
 Note: ============================================================================
 
+@Reasoning:
+Public top-level entry point. Manages the context lifetime so callers
+just pass a SwiftUI AST and get a HIR dict (or 0 on error). The
+context is created, used, and destroyed in this routine — callers
+never see it. This isolation keeps the SwiftUI frontend's internal
+state invisible to the rest of the driver.
+@End Reasoning
+
+@Implementation:
+Three-step sequence: create_translation_context (returns 0 on OOM),
+translate_swiftui_node_to_hir on the root AST, then check
+has_translation_error. On error, destroys the context and returns 0,
+discarding the partial HIR result. On success, still destroys the
+context (otherwise it leaks) and returns the HIR result. Note the
+HIR result is independent of the context's lifetime — it's a separate
+allocation chain owned by the HIR module.
+@End Implementation
+
 Process called "translate_swiftui_to_hir" takes swiftui_ast as Integer returns Integer:
     Note: Translate SwiftUI AST to HIR (top-level entry point)
-
-    @Reasoning:
-    Entry point for translating SwiftUI AST (typically a view struct)
-    to HIR representation.
-    @End Reasoning
 
     Note: Create translation context
     Let context be proc create_translation_context

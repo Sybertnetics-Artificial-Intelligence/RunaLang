@@ -24,6 +24,21 @@ Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 
 Note: ==================== Emitter State ====================
 
+@Reasoning:
+Composite emitter state: a flat 48-byte block whose first 24 bytes
+exactly match the emitter_common raw-header layout (buffer/capacity/
+length), allowing the byte-emission helpers from EmitterCommon to be
+reused without copying. The remaining fields track VHDL-specific
+state — indent level, deferred-indent flag, and current line counter.
+@End Reasoning
+
+@Implementation:
+6 x i64 record (48 bytes). offsets 0/8/16 are owned by emitter_common
+(buffer pointer, capacity in bytes, written length). offset 24 =
+indent_level, 32 = needs_indent (1 right after a newline so the next
+emit prefixes whitespace), 40 = current_line for diagnostics.
+@End Implementation
+
 Type called "VhdlEmitter":
     buffer as Integer          Note: Output buffer pointer (managed by emitter_common)
     capacity as Integer        Note: Output buffer capacity (managed by emitter_common)
@@ -34,6 +49,21 @@ Type called "VhdlEmitter":
 End Type
 
 Note: ==================== Emitter Creation ====================
+
+@Reasoning:
+Allocates the 48-byte state record plus a 4 KiB initial output buffer
+in one step so callers get an emitter ready to write. Buffer grows
+geometrically via emitter_common helpers when this initial capacity
+runs out.
+@End Reasoning
+
+@Implementation:
+Allocates emitter (48 bytes); on failure returns 0. Allocates buf
+(4096 bytes); on failure rolls back the emitter allocation and returns
+0. Writes buf at offset 0, capacity 4096 at offset 8, length 0 at
+offset 16, indent_level 0 at 24, needs_indent 1 at 32 (so the first
+emit gets indent applied), current_line 1 at 40.
+@End Implementation
 
 Process called "create_emitter" returns Integer:
     Note: Create new VHDL code emitter as a 48-byte heap state. The first
@@ -62,6 +92,18 @@ Process called "create_emitter" returns Integer:
     Return emitter
 End Process
 
+@Reasoning:
+Cannot use emitter_raw_destroy because the raw helper assumes the
+header was allocated separately from the state record; here both
+live in a single 48-byte block. So we read the buffer pointer
+directly from offset 0 and free buffer + state explicitly.
+@End Reasoning
+
+@Implementation:
+Null guard returns 1. Reads buf at offset 0; if non-null, frees it via
+Layout.deallocate. Frees the emitter record. Returns 1.
+@End Implementation
+
 Process called "destroy_emitter" that takes emitter as Integer returns Integer:
     Note: Release the byte buffer and the 48-byte state in one shot. The raw
     Note: header lives at offset 0/8/16 of `emitter`, so we read it directly
@@ -83,6 +125,15 @@ End Process
 
 Note: ==================== Indentation Management ====================
 
+@Reasoning:
+Increment the running indent level. VHDL uses 4-space indentation
+applied lazily by emit_indent based on this counter.
+@End Reasoning
+
+@Implementation:
+Null guard. Reads level at offset 24, stores level+1. Returns 1.
+@End Implementation
+
 Process called "indent" that takes emitter as Integer returns Integer:
     Note: Increase indentation level
 
@@ -94,6 +145,16 @@ Process called "indent" that takes emitter as Integer returns Integer:
     proc memory_set_int64 from MemoryCore with emitter, 24, level plus 1
     Return 1
 End Process
+
+@Reasoning:
+Companion to indent that floors at zero so AST shape errors with
+mismatched indent/dedent pairs cannot underflow the counter.
+@End Reasoning
+
+@Implementation:
+Null guard. Reads level at offset 24; if > 0, stores level - 1.
+Returns 1.
+@End Implementation
 
 Process called "dedent" that takes emitter as Integer returns Integer:
     Note: Decrease indentation level, clamped at 0
@@ -109,6 +170,19 @@ Process called "dedent" that takes emitter as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Writes whitespace prefix for the current line. VHDL community style
+is 4 spaces per nesting level. After emitting the prefix the
+needs_indent flag is cleared so subsequent emit/emit_raw calls add
+content directly without re-indenting.
+@End Reasoning
+
+@Implementation:
+Null guard. Reads level. Outer loop runs level times; each iteration
+emits four space bytes (ASCII 32) via emitter_raw_emit_byte. Resets
+needs_indent (offset 32) to 0.
+@End Implementation
 
 Process called "emit_indent" that takes emitter as Integer returns Integer:
     Note: Emit current indentation to buffer. VHDL convention is 4 spaces
@@ -135,6 +209,19 @@ End Process
 
 Note: ==================== Code Emission ====================
 
+@Reasoning:
+Primary in-line emission. Lazy indentation: if needs_indent is set
+(i.e. we just consumed a newline), the indent prefix is emitted before
+the text. This keeps callers from needing to remember whether they're
+mid-line or starting a new one.
+@End Reasoning
+
+@Implementation:
+Null guard. Reads needs_indent at offset 32; if 1, calls emit_indent
+which writes the prefix and clears the flag. Then emits text via
+EmitterCommon.emitter_raw_emit_string.
+@End Implementation
+
 Process called "emit" that takes emitter as Integer, text as Integer returns Integer:
     Note: Emit text without newline. Applies indentation if we are at the
     Note: start of a fresh line, then appends bytes via the raw emitter API.
@@ -151,6 +238,19 @@ Process called "emit" that takes emitter as Integer, text as Integer returns Int
     proc emitter_raw_emit_string from EmitterCommon with emitter, text
     Return 1
 End Process
+
+@Reasoning:
+Convenience wrapper that emits text plus the line terminator. After
+the newline the needs_indent flag is set so the next emit prefixes
+indentation, and current_line is bumped for diagnostics.
+@End Reasoning
+
+@Implementation:
+Null guard. Applies lazy indent if needs_indent. Emits text via
+emitter_raw_emit_string. Emits ASCII 10 (LF) via emitter_raw_emit_byte.
+Increments current_line at offset 40. Sets needs_indent at offset 32
+to 1.
+@End Implementation
 
 Process called "emit_line" that takes emitter as Integer, text as Integer returns Integer:
     Note: Emit text followed by a newline. Newline marks needs_indent so
@@ -175,6 +275,17 @@ Process called "emit_line" that takes emitter as Integer, text as Integer return
     Return 1
 End Process
 
+@Reasoning:
+Bypass the lazy-indent machinery for content that must NOT be re-
+indented (e.g. continuing a multi-line literal, or hand-formatted
+output). Use this when emit() would interleave unwanted whitespace.
+@End Reasoning
+
+@Implementation:
+Null guard. Directly emits text via emitter_raw_emit_string with no
+needs_indent inspection or update.
+@End Implementation
+
 Process called "emit_raw" that takes emitter as Integer, text as Integer returns Integer:
     Note: Emit text without indentation handling
 
@@ -185,6 +296,17 @@ Process called "emit_raw" that takes emitter as Integer, text as Integer returns
     proc emitter_raw_emit_string from EmitterCommon with emitter, text
     Return 1
 End Process
+
+@Reasoning:
+Standalone newline emission for blank-line separators or terminating
+output without preceding text. Updates line counter and arms
+needs_indent for the next emit.
+@End Reasoning
+
+@Implementation:
+Null guard. Emits ASCII 10. Bumps current_line at offset 40. Sets
+needs_indent at offset 32 to 1.
+@End Implementation
 
 Process called "emit_newline" that takes emitter as Integer returns Integer:
     Note: Emit newline and mark that next line needs indentation
@@ -204,6 +326,17 @@ End Process
 
 Note: ==================== VHDL-Specific Helpers ====================
 
+@Reasoning:
+VHDL line comments use `-- ` prefix. The emitter wraps this in one
+helper so the comment marker is in one place if VHDL ever changes
+syntax (it won't, but the abstraction is cheap).
+@End Reasoning
+
+@Implementation:
+Emits `-- ` (with trailing space), then emit_line with the comment
+text (which terminates the line and bumps current_line).
+@End Implementation
+
 Process called "emit_comment" that takes emitter as Integer, comment_text as Integer returns Integer:
     Note: Emit VHDL comment
 
@@ -212,6 +345,18 @@ Process called "emit_comment" that takes emitter as Integer, comment_text as Int
 
     Return 1
 End Process
+
+@Reasoning:
+VHDL has no native block-comment syntax (`/* */`); multi-line
+documentation must be a sequence of `--` lines. The helper takes a
+list and prefixes each entry with the line-comment marker.
+@End Reasoning
+
+@Implementation:
+Reads list length via list_length. Loops i = 0..length, fetches each
+line via list_get, calls emit_comment to render it as a `-- line`
+entry.
+@End Implementation
 
 Process called "emit_block_comment" that takes emitter as Integer, lines as Integer returns Integer:
     Note: Emit multi-line comment block
@@ -227,12 +372,34 @@ Process called "emit_block_comment" that takes emitter as Integer, lines as Inte
     Return 1
 End Process
 
+@Reasoning:
+Visual section divider used between major VHDL constructs (entity,
+architecture, configuration blocks). Built on top of emit_comment so
+it inherits the standard line-comment formatting.
+@End Reasoning
+
+@Implementation:
+Calls emit_comment with a fixed string of 43 `=` characters. Returns
+1 unconditionally.
+@End Implementation
+
 Process called "emit_separator" that takes emitter as Integer returns Integer:
     Note: Emit separator line for visual organization
 
     proc emit_comment with emitter, "==========================================="
     Return 1
 End Process
+
+@Reasoning:
+Decorates an entity declaration with a banner-style comment so the
+generated file is easy to scan visually. Separators above and below
+match the visual style of the architecture and process headers.
+@End Reasoning
+
+@Implementation:
+Emits a separator line, then `-- Entity: <name>` line, then another
+separator. Three calls in sequence.
+@End Implementation
 
 Process called "emit_entity_header" that takes emitter as Integer, entity_name as Integer returns Integer:
     Note: Emit entity declaration header with comment
@@ -244,6 +411,17 @@ Process called "emit_entity_header" that takes emitter as Integer, entity_name a
 
     Return 1
 End Process
+
+@Reasoning:
+Architecture banner that names both the architecture and the entity
+it implements, matching VHDL's "architecture X of Y" convention so
+readers can find the matching entity without scrolling.
+@End Reasoning
+
+@Implementation:
+Emits a separator, then `-- Architecture: <arch> of <entity>` line
+built from three emit calls, then another separator.
+@End Implementation
 
 Process called "emit_architecture_header" that takes emitter as Integer, arch_name as Integer, entity_name as Integer returns Integer:
     Note: Emit architecture declaration header with comment
@@ -258,6 +436,16 @@ Process called "emit_architecture_header" that takes emitter as Integer, arch_na
     Return 1
 End Process
 
+@Reasoning:
+Lighter-weight banner than the entity/architecture headers because
+process blocks usually appear nested inside an architecture; a single
+comment line is enough.
+@End Reasoning
+
+@Implementation:
+Emits `-- Process: <label>` as a single line.
+@End Implementation
+
 Process called "emit_process_header" that takes emitter as Integer, process_label as Integer returns Integer:
     Note: Emit process header with comment
 
@@ -266,6 +454,19 @@ Process called "emit_process_header" that takes emitter as Integer, process_labe
 
     Return 1
 End Process
+
+@Reasoning:
+Generic separator-delimited list emitter used for port/generic/
+sensitivity lists. Caller supplies the separator string so the helper
+can produce both comma-delimited (`a, b, c`) and colon-delimited
+sensitivity lists.
+@End Reasoning
+
+@Implementation:
+Reads list_length, loops i = 0..length: emits the i-th signal via
+list_get + emit. Between items (i < length-1) emits the separator
+string.
+@End Implementation
 
 Process called "emit_signal_list" that takes emitter as Integer, signals as Integer, separator as Integer returns Integer:
     Note: Emit comma-separated signal list
@@ -286,6 +487,18 @@ Process called "emit_signal_list" that takes emitter as Integer, signals as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emits one port row of an entity port clause: `name : mode type`. Caller
+is responsible for placing the row inside a `port(...)` block and for
+trailing commas/semicolons since rows may be followed by either.
+@End Reasoning
+
+@Implementation:
+Five emit calls: name, ` : `, mode, single space, type. No newline —
+caller controls the line terminator so it can choose between `,` and
+`;`.
+@End Implementation
+
 Process called "emit_port_declaration" that takes emitter as Integer, port_name as Integer, port_mode as Integer, port_type as Integer returns Integer:
     Note: Emit port declaration
 
@@ -297,6 +510,17 @@ Process called "emit_port_declaration" that takes emitter as Integer, port_name 
 
     Return 1
 End Process
+
+@Reasoning:
+Generic parameters mirror port declarations but with an optional
+`:= default` clause. The optional default is omitted when the
+default_value argument is 0.
+@End Reasoning
+
+@Implementation:
+Emits name, ` : `, type. If default_value is non-zero, emits ` := `
+then the default value. No newline — caller terminates the row.
+@End Implementation
 
 Process called "emit_generic_declaration" that takes emitter as Integer, generic_name as Integer, generic_type as Integer, default_value as Integer returns Integer:
     Note: Emit generic parameter declaration
@@ -312,6 +536,17 @@ Process called "emit_generic_declaration" that takes emitter as Integer, generic
 
     Return 1
 End Process
+
+@Reasoning:
+Architecture-level signal declaration. Unlike port and generic
+declarations, this is a complete statement so the helper terminates
+with `;` + newline.
+@End Reasoning
+
+@Implementation:
+Emits `signal `, name, ` : `, type. If initial_value non-zero, emits
+` := <value>`. Closes with `;` and a newline via emit_line.
+@End Implementation
 
 Process called "emit_signal_declaration" that takes emitter as Integer, signal_name as Integer, signal_type as Integer, initial_value as Integer returns Integer:
     Note: Emit signal declaration
@@ -331,6 +566,17 @@ Process called "emit_signal_declaration" that takes emitter as Integer, signal_n
     Return 1
 End Process
 
+@Reasoning:
+Process-local variable declaration. Identical shape to signal_declaration
+but with `variable` keyword and uses the `:=` for both initial value
+and later assignments (vs signals' `<=`).
+@End Reasoning
+
+@Implementation:
+Emits `variable `, name, ` : `, type. Optional ` := <value>` when
+initial_value is non-zero. Closes with `;` + newline.
+@End Implementation
+
 Process called "emit_variable_declaration" that takes emitter as Integer, var_name as Integer, var_type as Integer, initial_value as Integer returns Integer:
     Note: Emit variable declaration
 
@@ -349,6 +595,17 @@ Process called "emit_variable_declaration" that takes emitter as Integer, var_na
     Return 1
 End Process
 
+@Reasoning:
+Constants in VHDL require a value at declaration time (unlike
+signals/variables), so the value parameter is mandatory rather than
+optional here.
+@End Reasoning
+
+@Implementation:
+Six emit calls: `constant `, name, ` : `, type, ` := `, value. Closes
+with `;` + newline via emit_line.
+@End Implementation
+
 Process called "emit_constant_declaration" that takes emitter as Integer, const_name as Integer, const_type as Integer, value as Integer returns Integer:
     Note: Emit constant declaration
 
@@ -363,6 +620,16 @@ Process called "emit_constant_declaration" that takes emitter as Integer, const_
     Return 1
 End Process
 
+@Reasoning:
+VHDL signals are driven with `<=` (the concurrent or scheduled
+assignment operator), distinguishing them from variable assignment
+which uses `:=`. The two are NOT interchangeable in VHDL semantics.
+@End Reasoning
+
+@Implementation:
+Emits target, ` <= `, value. Closes with `;` + newline via emit_line.
+@End Implementation
+
 Process called "emit_signal_assignment" that takes emitter as Integer, target as Integer, value as Integer returns Integer:
     Note: Emit signal assignment statement
 
@@ -374,6 +641,16 @@ Process called "emit_signal_assignment" that takes emitter as Integer, target as
     Return 1
 End Process
 
+@Reasoning:
+Variables in VHDL use `:=` (immediate assignment) — paired with
+emit_signal_assignment for the signal counterpart. The two operators
+have different timing semantics, so must NOT be conflated.
+@End Reasoning
+
+@Implementation:
+Emits target, ` := `, value. Closes with `;` + newline via emit_line.
+@End Implementation
+
 Process called "emit_variable_assignment" that takes emitter as Integer, target as Integer, value as Integer returns Integer:
     Note: Emit variable assignment statement
 
@@ -384,6 +661,21 @@ Process called "emit_variable_assignment" that takes emitter as Integer, target 
 
     Return 1
 End Process
+
+@Reasoning:
+Port mappings inside a component instantiation use the
+`port map (formal => actual, ...)` syntax. The helper renders the
+parenthesised association list with each association on its own line
+for readability.
+@End Reasoning
+
+@Implementation:
+Emits `port map (` + newline, indents. Loops mappings: emits each
+mapping (caller pre-formats as "formal => actual"). Between mappings
+emits `,` + newline; after the last emits just newline. Dedents and
+emits closing `)` without newline so the caller can choose to add
+either `;` or further trailing tokens.
+@End Implementation
 
 Process called "emit_port_map" that takes emitter as Integer, mappings as Integer returns Integer:
     Note: Emit port map associations
@@ -414,6 +706,18 @@ Process called "emit_port_map" that takes emitter as Integer, mappings as Intege
     Return 1
 End Process
 
+@Reasoning:
+Mirror of emit_port_map but for the generic-parameter mappings that
+precede port maps in a component instantiation. Same formatting
+strategy.
+@End Reasoning
+
+@Implementation:
+Emits `generic map (` + newline, indents. Loops mappings emitting
+each pre-formatted association with `,` separators between them and
+just newline after the last. Dedents and emits closing `)`.
+@End Implementation
+
 Process called "emit_generic_map" that takes emitter as Integer, mappings as Integer returns Integer:
     Note: Emit generic map associations
 
@@ -443,6 +747,19 @@ Process called "emit_generic_map" that takes emitter as Integer, mappings as Int
     Return 1
 End Process
 
+@Reasoning:
+Composes a complete component instantiation:
+`label : ComponentName generic map(...) port map(...);`. Generic map
+is optional (zero handle skips it); port map is also optional in
+strict VHDL but normally present.
+@End Reasoning
+
+@Implementation:
+Emits `<label> : ` and component name + newline. Indents. If
+generic_map handle is non-zero, calls emit_generic_map. If port_map
+non-zero, calls emit_port_map and terminates with `;`. Dedents.
+@End Implementation
+
 Process called "emit_component_instantiation" that takes emitter as Integer, label as Integer, component_name as Integer, generic_map as Integer, port_map as Integer returns Integer:
     Note: Emit component instantiation
 
@@ -467,6 +784,16 @@ Process called "emit_component_instantiation" that takes emitter as Integer, lab
     Return 1
 End Process
 
+@Reasoning:
+VHDL sequential-statement if header uses `if cond then` followed by
+nested statements and `end if;`. The header is split out so callers
+can interleave body statements via their own indent/emit calls.
+@End Reasoning
+
+@Implementation:
+Emits `if `, the condition, ` then` + newline.
+@End Implementation
+
 Process called "emit_if_statement" that takes emitter as Integer, condition as Integer returns Integer:
     Note: Emit if statement header
 
@@ -476,6 +803,15 @@ Process called "emit_if_statement" that takes emitter as Integer, condition as I
 
     Return 1
 End Process
+
+@Reasoning:
+VHDL uses single-word `elsif` (no space, unlike SQL or some shells).
+Emits the chained-condition clause for `if/elsif/else` constructs.
+@End Reasoning
+
+@Implementation:
+Emits `elsif `, the condition, ` then` + newline.
+@End Implementation
 
 Process called "emit_elsif_statement" that takes emitter as Integer, condition as Integer returns Integer:
     Note: Emit elsif clause
@@ -487,6 +823,15 @@ Process called "emit_elsif_statement" that takes emitter as Integer, condition a
     Return 1
 End Process
 
+@Reasoning:
+Standalone `else` keyword on its own line. Trivial wrapper; kept as
+a function so the spelling is in one place.
+@End Reasoning
+
+@Implementation:
+Emits `else` as a complete line via emit_line.
+@End Implementation
+
 Process called "emit_else_statement" that takes emitter as Integer returns Integer:
     Note: Emit else clause
 
@@ -495,6 +840,15 @@ Process called "emit_else_statement" that takes emitter as Integer returns Integ
     Return 1
 End Process
 
+@Reasoning:
+VHDL closer for a sequential if-statement is `end if;` (with
+semicolon). Without the semicolon the construct doesn't parse.
+@End Reasoning
+
+@Implementation:
+Emits `end if;` as a complete line.
+@End Implementation
+
 Process called "emit_end_if" that takes emitter as Integer returns Integer:
     Note: Emit end if
 
@@ -502,6 +856,15 @@ Process called "emit_end_if" that takes emitter as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+VHDL case statement opens with `case expr is`. Body consists of one
+or more `when choices => statements` clauses, closed with `end case;`.
+@End Reasoning
+
+@Implementation:
+Emits `case `, the expression, ` is` + newline.
+@End Implementation
 
 Process called "emit_case_statement" that takes emitter as Integer, expression as Integer returns Integer:
     Note: Emit case statement header
@@ -513,6 +876,16 @@ Process called "emit_case_statement" that takes emitter as Integer, expression a
     Return 1
 End Process
 
+@Reasoning:
+Each case arm starts with `when choices =>`. choices is a pre-formatted
+string covering single values, ranges, the `others` wildcard, or
+`val1 | val2 | ...` alternatives.
+@End Reasoning
+
+@Implementation:
+Emits `when `, the choices string, ` =>` + newline.
+@End Implementation
+
 Process called "emit_when_clause" that takes emitter as Integer, choices as Integer returns Integer:
     Note: Emit when clause in case statement
 
@@ -523,6 +896,15 @@ Process called "emit_when_clause" that takes emitter as Integer, choices as Inte
     Return 1
 End Process
 
+@Reasoning:
+Companion to emit_case_statement: emits the mandatory `end case;`
+terminator.
+@End Reasoning
+
+@Implementation:
+Emits `end case;` as a complete line.
+@End Implementation
+
 Process called "emit_end_case" that takes emitter as Integer returns Integer:
     Note: Emit end case
 
@@ -530,6 +912,16 @@ Process called "emit_end_case" that takes emitter as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+VHDL for loops use the `for var in range loop ... end loop;` shape.
+range_spec is a pre-formatted string that may contain `to`/`downto`
+syntax or a discrete-range reference.
+@End Reasoning
+
+@Implementation:
+Five emit calls: `for `, loop_var, ` in `, range_spec, ` loop` + newline.
+@End Implementation
 
 Process called "emit_for_loop" that takes emitter as Integer, loop_var as Integer, range_spec as Integer returns Integer:
     Note: Emit for loop header
@@ -543,6 +935,15 @@ Process called "emit_for_loop" that takes emitter as Integer, loop_var as Intege
     Return 1
 End Process
 
+@Reasoning:
+`while cond loop ... end loop;` form. Closes via emit_end_loop just
+like for-loops.
+@End Reasoning
+
+@Implementation:
+Emits `while `, condition, ` loop` + newline.
+@End Implementation
+
 Process called "emit_while_loop" that takes emitter as Integer, condition as Integer returns Integer:
     Note: Emit while loop header
 
@@ -553,6 +954,16 @@ Process called "emit_while_loop" that takes emitter as Integer, condition as Int
     Return 1
 End Process
 
+@Reasoning:
+VHDL's unbounded `loop` keyword (no condition) — corresponds to an
+infinite loop that must be exited via `exit when cond` or `next`. Used
+when the loop condition is internal rather than at the head.
+@End Reasoning
+
+@Implementation:
+Emits `loop` as a complete line.
+@End Implementation
+
 Process called "emit_loop" that takes emitter as Integer returns Integer:
     Note: Emit simple loop header
 
@@ -561,6 +972,14 @@ Process called "emit_loop" that takes emitter as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Universal closer for for/while/loop constructs. Semicolon required.
+@End Reasoning
+
+@Implementation:
+Emits `end loop;` as a complete line.
+@End Implementation
+
 Process called "emit_end_loop" that takes emitter as Integer returns Integer:
     Note: Emit end loop
 
@@ -568,6 +987,18 @@ Process called "emit_end_loop" that takes emitter as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+VHDL process header may carry an optional sensitivity list:
+`process(clk, reset)` triggers on signal changes. A zero
+sensitivity_list omits the parentheses entirely (combinational style).
+@End Reasoning
+
+@Implementation:
+Emits `process`. If sensitivity_list is non-zero, emits `(`, the
+comma-separated list via emit_signal_list, and `)`. Closes with a
+newline.
+@End Implementation
 
 Process called "emit_process" that takes emitter as Integer, sensitivity_list as Integer returns Integer:
     Note: Emit process header
@@ -585,6 +1016,16 @@ Process called "emit_process" that takes emitter as Integer, sensitivity_list as
     Return 1
 End Process
 
+@Reasoning:
+The `begin` keyword separates the declarative region of a process
+from its sequential-statement body. Emitted on its own line because
+the body content typically follows on indented lines.
+@End Reasoning
+
+@Implementation:
+Emits `begin` as a complete line.
+@End Implementation
+
 Process called "emit_process_begin" that takes emitter as Integer returns Integer:
     Note: Emit process begin
 
@@ -592,6 +1033,17 @@ Process called "emit_process_begin" that takes emitter as Integer returns Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Closer for a process. The optional label echoes the process label
+(`end process my_proc;`) which VHDL allows for documentation and
+which tools cross-check against the opening label.
+@End Reasoning
+
+@Implementation:
+Emits `end process`. If label is non-zero, emits a space then the
+label. Closes with `;` + newline.
+@End Implementation
 
 Process called "emit_end_process" that takes emitter as Integer, label as Integer returns Integer:
     Note: Emit end process
@@ -607,6 +1059,19 @@ Process called "emit_end_process" that takes emitter as Integer, label as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+`wait [on signals] [until cond] [for timeout];` — VHDL's
+synchronisation primitive. Any subset of the three clauses is valid
+(though at least one must be present for the statement to actually
+wait), so each is gated on a non-zero handle.
+@End Reasoning
+
+@Implementation:
+Emits `wait`. Optionally emits ` on ` + signal list (comma-separated
+via emit_signal_list); optionally ` until ` + condition; optionally
+` for ` + timeout. Closes with `;` + newline.
+@End Implementation
 
 Process called "emit_wait_statement" that takes emitter as Integer, signal_list as Integer, condition as Integer, timeout as Integer returns Integer:
     Note: Emit wait statement
@@ -633,6 +1098,18 @@ Process called "emit_wait_statement" that takes emitter as Integer, signal_list 
     Return 1
 End Process
 
+@Reasoning:
+`assert cond [report msg] [severity level];` — VHDL's runtime check
+mechanism. Message and severity clauses are optional and gated on
+non-zero handles.
+@End Reasoning
+
+@Implementation:
+Emits `assert `, condition. Optionally ` report ` + message; optionally
+` severity ` + severity (note/warning/error/failure). Closes with `;`
++ newline.
+@End Implementation
+
 Process called "emit_assert_statement" that takes emitter as Integer, condition as Integer, message as Integer, severity as Integer returns Integer:
     Note: Emit assert statement
 
@@ -654,6 +1131,16 @@ Process called "emit_assert_statement" that takes emitter as Integer, condition 
     Return 1
 End Process
 
+@Reasoning:
+`report msg [severity level];` — like assert but always fires (no
+condition). Useful for diagnostic logging.
+@End Reasoning
+
+@Implementation:
+Emits `report `, message. Optionally ` severity ` + severity. Closes
+with `;` + newline.
+@End Implementation
+
 Process called "emit_report_statement" that takes emitter as Integer, message as Integer, severity as Integer returns Integer:
     Note: Emit report statement
 
@@ -670,6 +1157,17 @@ Process called "emit_report_statement" that takes emitter as Integer, message as
     Return 1
 End Process
 
+@Reasoning:
+`library lib1, lib2, ...;` — declares external libraries available
+to the design unit (e.g. `library ieee;`). Multiple libraries may be
+declared in one clause with commas.
+@End Reasoning
+
+@Implementation:
+Emits `library `, the comma-separated name list via emit_signal_list,
+then `;` + newline.
+@End Implementation
+
 Process called "emit_library_clause" that takes emitter as Integer, library_names as Integer returns Integer:
     Note: Emit library clause
 
@@ -679,6 +1177,17 @@ Process called "emit_library_clause" that takes emitter as Integer, library_name
 
     Return 1
 End Process
+
+@Reasoning:
+`use ieee.std_logic_1164.all, ...;` — imports specific names or all
+names from a library/package. Companion to emit_library_clause and
+typically appears directly after it.
+@End Reasoning
+
+@Implementation:
+Emits `use `, the comma-separated path list via emit_signal_list,
+then `;` + newline.
+@End Implementation
 
 Process called "emit_use_clause" that takes emitter as Integer, use_names as Integer returns Integer:
     Note: Emit use clause
@@ -692,6 +1201,18 @@ End Process
 
 Note: ==================== Output Retrieval ====================
 
+@Reasoning:
+Materialises the accumulated emit output as a fresh string handle the
+caller can take ownership of (and free). Necessary because the
+emitter's internal buffer will be deallocated on destroy.
+@End Reasoning
+
+@Implementation:
+Null guard returns 0. Delegates to EmitterCommon.emitter_raw_get_output
+which copies the buffer bytes into a new null-terminated string and
+returns it.
+@End Implementation
+
 Process called "get_code" that takes emitter as Integer returns Integer:
     Note: Get the generated VHDL code as a freshly allocated null-terminated
     Note: copy of the accumulated buffer bytes. Caller owns the returned
@@ -704,6 +1225,15 @@ Process called "get_code" that takes emitter as Integer returns Integer:
     Return proc emitter_raw_get_output from EmitterCommon with emitter
 End Process
 
+@Reasoning:
+Exposes the running line counter for tooling that wants to report
+output size (e.g. a `lines generated:` summary).
+@End Reasoning
+
+@Implementation:
+Null guard returns 0. Reads i64 at offset 40 (current_line slot).
+@End Implementation
+
 Process called "get_line_count" that takes emitter as Integer returns Integer:
     Note: Get the number of lines in generated code
 
@@ -713,6 +1243,18 @@ Process called "get_line_count" that takes emitter as Integer returns Integer:
 
     Return proc memory_get_int64 from MemoryCore with emitter, 40
 End Process
+
+@Reasoning:
+Allows the emitter to be reused for a fresh code generation without
+freeing/reallocating the output buffer. Useful in batch-translation
+loops or test harnesses.
+@End Reasoning
+
+@Implementation:
+Null guard. Calls EmitterCommon.emitter_raw_reset to zero the length
+counter (keeping the buffer). Resets indent_level (offset 24) to 0,
+needs_indent (offset 32) to 1, current_line (offset 40) to 1.
+@End Implementation
 
 Process called "reset" that takes emitter as Integer returns Integer:
     Note: Reset emitter to initial state. Keeps the existing buffer
@@ -731,6 +1273,19 @@ Process called "reset" that takes emitter as Integer returns Integer:
 End Process
 
 Note: ==================== Formatting Utilities ====================
+
+@Reasoning:
+VHDL bit-string literals use a base prefix (B, O, X) before the
+quoted digits: `B"1010"`, `O"377"`, `X"FF"`. Bases other than
+2/8/16 fall back to an unprefixed quoted literal (interpreted as
+character string).
+@End Reasoning
+
+@Implementation:
+Selects the prefix string by base: 2 -> `B"`, 8 -> `O"`, 16 -> `X"`,
+else `"`. Concatenates prefix + value + closing `"` via
+StringCore.string_concat. Returns the assembled lexeme.
+@End Implementation
 
 Process called "format_bit_string" that takes value as Integer, base as Integer returns Integer:
     Note: Format bit string literal in VHDL syntax
@@ -756,6 +1311,16 @@ Process called "format_bit_string" that takes value as Integer, base as Integer 
     Return result
 End Process
 
+@Reasoning:
+VHDL time literals are numeric value followed by unit suffix
+(fs, ps, ns, us, ms, sec, min, hr) with a space between, e.g. `10 ns`.
+@End Reasoning
+
+@Implementation:
+Concatenates value + space + unit via two string_concat calls. Returns
+the resulting lexeme.
+@End Implementation
+
 Process called "format_time_literal" that takes value as Integer, unit as Integer returns Integer:
     Note: Format time literal in VHDL syntax
 
@@ -766,6 +1331,18 @@ Process called "format_time_literal" that takes value as Integer, unit as Intege
 
     Return result
 End Process
+
+@Reasoning:
+Builds a VHDL range expression `start to end` or `start downto end`.
+The direction parameter is a string compared via string_equals to
+distinguish the two; unrecognised directions default to `to` (ascending).
+@End Reasoning
+
+@Implementation:
+Concatenates start_val + space. If direction equals "downto", appends
+`downto `; otherwise appends `to `. Appends end_val. Returns the
+assembled range string.
+@End Implementation
 
 Process called "format_range" that takes start_val as Integer, end_val as Integer, direction as Integer returns Integer:
     Note: Format range specification
@@ -783,6 +1360,17 @@ Process called "format_range" that takes start_val as Integer, end_val as Intege
     Return result
 End Process
 
+@Reasoning:
+VHDL attribute references use the apostrophe syntax: `signal'event`,
+`vector'length`, `type'last`. The single quote separates the object
+from the attribute name.
+@End Reasoning
+
+@Implementation:
+Concatenates object + `'` + attribute_name via two string_concat
+calls. Returns the resulting lexeme.
+@End Implementation
+
 Process called "format_attribute" that takes object as Integer, attribute_name as Integer returns Integer:
     Note: Format attribute reference
 
@@ -791,6 +1379,19 @@ Process called "format_attribute" that takes object as Integer, attribute_name a
 
     Return result
 End Process
+
+@Reasoning:
+VHDL extended identifiers (used when names contain hyphens, spaces,
+or coincide with reserved words) are wrapped in backslashes:
+`\my-signal\`. The escape is conditional on identifier_needs_escape
+returning true.
+@End Reasoning
+
+@Implementation:
+Calls identifier_needs_escape. If 1, creates a string starting with
+backslash, concatenates the identifier, concatenates a trailing
+backslash, returns it. Otherwise returns the identifier unchanged.
+@End Implementation
 
 Process called "escape_identifier" that takes identifier as Integer returns Integer:
     Note: Escape identifier if it contains special characters or is a reserved word
@@ -810,6 +1411,22 @@ Process called "escape_identifier" that takes identifier as Integer returns Inte
 
     Return identifier
 End Process
+
+@Reasoning:
+Returns 1 when the identifier cannot be written as a basic identifier
+and must use the extended-identifier form. Three triggers: contains
+a `-`, contains a space, or matches a VHDL-93 reserved word
+(case-insensitive). Reserved-word check is the long tail and uses
+lower-cased comparison to handle ANY casing.
+@End Reasoning
+
+@Implementation:
+First checks for special characters via string_contains for `-` and
+space; returns 1 if either is found. Then lowercases the identifier
+via string_to_lowercase and compares against every VHDL-93 reserved
+word with string_equals — abs, access, after, alias, ... return 1 on
+match. Returns 0 if no trigger fires.
+@End Implementation
 
 Process called "identifier_needs_escape" that takes identifier as Integer returns Integer:
     Note: Check if identifier needs escaping
@@ -1127,6 +1744,20 @@ End Process
 
 Note: ==================== Validation ====================
 
+@Reasoning:
+Lightweight syntactic gate for VHDL basic identifiers: at minimum a
+letter-starting non-empty string. Full identifier rules (no
+double-underscores, no trailing underscore) are intentionally not
+enforced here because identifier_needs_escape handles such names by
+emitting extended-identifier syntax instead of rejecting them.
+@End Reasoning
+
+@Implementation:
+Reads identifier length; returns 0 if empty. Reads first character via
+string_char_at; runs is_alpha on it; returns 0 on failure. Otherwise
+returns 1.
+@End Implementation
+
 Process called "validate_identifier" that takes identifier as Integer returns Integer:
     Note: Validate VHDL identifier
 
@@ -1151,6 +1782,17 @@ Process called "validate_identifier" that takes identifier as Integer returns In
     Note: Valid identifier
     Return 1
 End Process
+
+@Reasoning:
+ASCII alphabetic predicate used by validate_identifier. Underscore
+is NOT included here because the only caller checks for letter-start
+specifically (VHDL identifiers must start with a letter).
+@End Reasoning
+
+@Implementation:
+Two nested range tests: ASCII 65..90 (A-Z) and 97..122 (a-z). Returns
+1 on match, 0 otherwise.
+@End Implementation
 
 Process called "is_alpha" that takes char as Integer returns Integer:
     Note: Check if character is alphabetic

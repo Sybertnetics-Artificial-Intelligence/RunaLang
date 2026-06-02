@@ -190,6 +190,18 @@ Note: ==========================================================================
 Note: Lexer Structure
 Note: ============================================================================
 
+@Reasoning:
+Lexer state must track input position alongside current-token slots so the
+parser can read both progress and the most recently scanned token from one
+handle. Line and column are maintained inline (not derived from position)
+because per-character newline tracking is amortized cheaper than re-scanning
+on demand for diagnostics.
+@End Reasoning
+@Implementation:
+80-byte layout, 10 fields at 8-byte offsets: source@0, length@8, position@16,
+line@24, column@32, token_start@40, token_type@48, token_lexeme@56,
+token_length@64. Lines and columns are 1-based to match human conventions.
+@End Implementation
 Type called "CSharpLexer":
     source as Integer           Note: Source code buffer
     length as Integer           Note: Source length
@@ -206,6 +218,16 @@ Note: ==========================================================================
 Note: Lexer Creation and Initialization
 Note: ============================================================================
 
+@Reasoning:
+Lexer factory that binds the source buffer and length up front. Position is
+zeroed; line/column start at 1 (1-based conventions for diagnostics). Token
+slots stay zero until next_token populates them on first call.
+@End Reasoning
+@Implementation:
+Allocate 80 bytes; on success write source@0, length@8, zero position@16,
+1 for line@24 and column@32, zero for token_start through token_length.
+Returns 0 on allocation failure.
+@End Implementation
 Process called "create_csharp_lexer" takes source as Integer, length as Integer returns Integer:
     Note: Create C# lexer for source code
 
@@ -229,6 +251,16 @@ Process called "create_csharp_lexer" takes source as Integer, length as Integer 
     Return lexer
 End Process
 
+@Reasoning:
+The lexer borrows the source buffer (passed in at construction); only the
+80-byte struct itself is owned. Releasing the buffer too is the caller's
+responsibility because the parser typically wants to keep the source alive
+beyond the lexer's lifetime for diagnostic snippets.
+@End Reasoning
+@Implementation:
+Null returns 1 (idempotent destroy). Otherwise deallocate the 80-byte
+lexer; source buffer is left untouched.
+@End Implementation
 Process called "destroy_csharp_lexer" takes lexer as Integer returns Integer:
     Note: Destroy C# lexer
 
@@ -244,6 +276,15 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII-only digit check (codepoints 48-57). C# permits Unicode-class Nd in
+identifiers but in NUMERIC literals only ASCII digits, so this routine is
+correct for the latter case.
+@End Reasoning
+@Implementation:
+Two nested If checks: `char >= 48 && char <= 57` (range '0'-'9'). Returns 1
+on match, 0 otherwise.
+@End Implementation
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is decimal digit (0-9)
 
@@ -256,6 +297,14 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Accepts 0-9, a-f, AND A-F because C# hex literals (`0xFF`, `0xff`, `0xFf`)
+allow mixed case freely.
+@End Reasoning
+@Implementation:
+Three range checks: 48-57 ('0'-'9'), 97-102 ('a'-'f'), 65-70 ('A'-'F').
+Any match returns 1.
+@End Implementation
 Process called "is_hex_digit" takes char as Integer returns Integer:
     Note: Check if character is hex digit (0-9, a-f, A-F)
 
@@ -280,6 +329,14 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+For C# binary literals like `0b1010_0101`. Only `0` and `1` are valid here;
+digit separators (`_`) are handled by the literal scanner, not this
+classifier.
+@End Reasoning
+@Implementation:
+Direct equality checks against 48 ('0') and 49 ('1').
+@End Implementation
 Process called "is_binary_digit" takes char as Integer returns Integer:
     Note: Check if character is binary digit (0-1)
 
@@ -294,6 +351,14 @@ Process called "is_binary_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII-letter check. C# identifiers technically allow Unicode letters per
+the spec, but this lexer treats only ASCII as identifier letters since
+upstream HIR consumers don't currently rely on Unicode identifier support.
+@End Reasoning
+@Implementation:
+Two range checks: 97-122 ('a'-'z') and 65-90 ('A'-'Z'). Any match returns 1.
+@End Implementation
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic (a-z, A-Z)
 
@@ -312,6 +377,16 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier start characters in C#: letter, underscore, or '@' (the verbatim
+identifier prefix which lets keywords be used as identifiers, e.g. `@class`).
+Digits are NOT valid as the first character.
+@End Reasoning
+@Implementation:
+Special-case underscore (95) and '@' (64), then fall through to is_alpha
+for letter detection. Returns the boolean from is_alpha as the catch-all
+result.
+@End Implementation
 Process called "is_identifier_start" takes char as Integer returns Integer:
     Note: Check if character can start an identifier (letter, underscore, @)
 
@@ -327,6 +402,14 @@ Process called "is_identifier_start" takes char as Integer returns Integer:
     Return is_letter
 End Process
 
+@Reasoning:
+Continuation characters add digits to the start-character set (since digits
+ARE allowed after the first position). '@' is intentionally NOT accepted in
+continuation - it's only meaningful at the start as the verbatim marker.
+@End Reasoning
+@Implementation:
+Underscore (95), then is_alpha, then is_digit. Returns 1 if any match.
+@End Implementation
 Process called "is_identifier_char" takes char as Integer returns Integer:
     Note: Check if character can be in identifier (letter, digit, underscore)
 
@@ -343,6 +426,15 @@ Process called "is_identifier_char" takes char as Integer returns Integer:
     Return is_num
 End Process
 
+@Reasoning:
+Recognizes the four ASCII whitespace characters that are syntactically
+insignificant in C# (space, tab, CR, LF). Form feed (\f) and vertical tab
+(\v) are not handled because they don't occur in real C# source.
+@End Reasoning
+@Implementation:
+Direct equality checks: 32 (space), 9 (tab), 13 (CR), 10 (LF). Any match
+returns 1.
+@End Implementation
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace
 
@@ -369,6 +461,15 @@ Note: ==========================================================================
 Note: Character Operations
 Note: ============================================================================
 
+@Reasoning:
+Returns the byte at the current position without advancing. EOF is signaled
+as 0 (which doesn't collide with any normal byte in valid C# source since
+NULs are not permitted in source files).
+@End Reasoning
+@Implementation:
+Read position@16 and length@8; if position >= length return 0. Otherwise
+read source@0 and load the byte at position via memory_get_byte.
+@End Implementation
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -385,6 +486,15 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Lookahead variant of peek_char; needed for two-character operators like
+`++`, `==`, `=>` where the lexer must verify the next char before
+committing to the multi-char token form.
+@End Reasoning
+@Implementation:
+Compute target_pos = position + offset; if target_pos >= length return 0
+(EOF). Otherwise read byte at target_pos.
+@End Implementation
 Process called "peek_char_ahead" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek at character at position + offset
 
@@ -402,6 +512,16 @@ Process called "peek_char_ahead" takes lexer as Integer, offset as Integer retur
     Return char
 End Process
 
+@Reasoning:
+Single advance that updates position AND line/column tracking. Newline
+detection happens here so the diagnostic position state stays consistent
+without callers needing to special-case '\n' themselves.
+@End Reasoning
+@Implementation:
+Read position and length; return 0 on EOF. Read the byte, advance position
+by 1, then update tracking: if byte is 10 ('\n') increment line and reset
+column to 1, otherwise increment column.
+@End Implementation
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character
 
@@ -431,6 +551,15 @@ Process called "advance_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Conditional consume primitive used by multi-char operator scans. Avoids the
+peek + advance pattern repeated everywhere by checking and (on match) eating
+the character in one call.
+@End Reasoning
+@Implementation:
+peek_char; if it doesn't equal `expected`, return 0 without advancing.
+Otherwise advance_char and return 1.
+@End Implementation
 Process called "match_char" takes lexer as Integer, expected as Integer returns Integer:
     Note: Match and consume character if it matches expected
 
@@ -448,6 +577,15 @@ Note: ==========================================================================
 Note: Keyword Recognition
 Note: ============================================================================
 
+@Reasoning:
+String comparison helper used by is_csharp_keyword to test a scanned
+identifier against each known keyword. Length is checked first to short-
+circuit the slower byte-level comparison.
+@End Reasoning
+@Implementation:
+If lengths differ, return 0. Otherwise delegate to StringCore.string_compare
+which performs the byte-level equality.
+@End Implementation
 Process called "check_keyword" takes lexeme as Integer, length as Integer, keyword as Integer, keyword_length as Integer returns Integer:
     Note: Check if lexeme matches keyword
 
@@ -459,6 +597,24 @@ Process called "check_keyword" takes lexeme as Integer, length as Integer, keywo
     Return matches
 End Process
 
+@Reasoning:
+Bucketing by lexeme length is a microoptimization: most keyword candidates
+are eliminated immediately by their length not matching any known keyword
+of that length. Without this, every identifier scan would do up to 77
+full string comparisons. Returns the TOKEN_* code on match, 0 (sentinel
+"not a keyword") otherwise.
+@End Reasoning
+@Implementation:
+Length-bucketed cascade: branch on length == 2, 3, 4, ..., 10. Within each
+bucket, sequentially check_keyword against every keyword of that length and
+return its TOKEN_* code on match. Final return 0 means the scanned text is
+an ordinary identifier, not a keyword.
+@End Implementation
+@Performance_Hints:
+A hash table would scale better if the keyword set grows beyond ~100 items,
+but the length-then-linear approach is faster for this size because of
+locality and branch prediction.
+@End Performance_Hints
 Process called "is_csharp_keyword" takes lexeme as Integer, length as Integer returns Integer:
     Note: Check if identifier is C# keyword
 
@@ -885,6 +1041,27 @@ Note: ==========================================================================
 Note: Main Tokenization - Complete C# Token Processing
 Note: ============================================================================
 
+@Reasoning:
+The main scan loop. Each call consumes whitespace then dispatches on the
+first non-whitespace character to the appropriate scan_* sub-routine. The
+order of checks matters: string/char/numeric literals first, then
+identifiers/keywords (alpha or '_' start), then operators by their lead
+char. Single-char operators are tried last as the fallback before TOKEN_ERROR.
+@End Reasoning
+@Implementation:
+skip_whitespace; peek_char; on 0, store TOKEN_EOF and return it. Special-
+case '/' for comment recursion (// and /* */ are skipped and the call
+re-enters via tail recursion). Dispatch on string '"', char '\'', and digit
+to dedicated readers. Long if-chain for operator lead characters; each
+operator branch checks the next char to determine 1- vs 2-char form.
+Unknown chars advance past and return TOKEN_ERROR so the parser sees the
+position but is not stuck in a loop.
+@End Implementation
+@Performance_Hints:
+The recursion on comment-skip relies on tail-call optimization; without
+TCO, files with very long comment sequences could blow the stack. The
+underlying compiler does TCO for this shape.
+@End Performance_Hints
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source - complete C# tokenization
 
@@ -1197,6 +1374,16 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Return TOKEN_ERROR
 End Process
 
+@Reasoning:
+Consumes a run of whitespace characters so next_token sees the first
+non-whitespace byte. Comments are NOT skipped here - they are handled by
+next_token's dispatcher because they have multi-character delimiters that
+need lookahead.
+@End Reasoning
+@Implementation:
+Loop with peek_char; break when is_whitespace returns 0; otherwise
+advance_char (which updates line/column tracking for newlines).
+@End Implementation
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
@@ -1218,6 +1405,14 @@ Note: ==========================================================================
 Note: Token Access
 Note: ============================================================================
 
+@Reasoning:
+Parser-facing accessor for the most recently scanned token's TOKEN_* code.
+Returns TOKEN_ERROR on null lexer so callers can blindly check the result
+against TOKEN_ERROR instead of doing null guards.
+@End Reasoning
+@Implementation:
+Null check first; otherwise read offset 48.
+@End Implementation
 Process called "get_token_type" takes lexer as Integer returns Integer:
     Note: Get current token type
 
@@ -1229,6 +1424,14 @@ Process called "get_token_type" takes lexer as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Returns a pointer into the source buffer (NOT an owned copy) so the parser
+can do byte-level comparisons without allocation. Validity ends when the
+next_token call replaces the lexeme.
+@End Reasoning
+@Implementation:
+Null check; otherwise read offset 56.
+@End Implementation
 Process called "get_token_lexeme" takes lexer as Integer returns Integer:
     Note: Get current token lexeme pointer
 
@@ -1240,6 +1443,14 @@ Process called "get_token_lexeme" takes lexer as Integer returns Integer:
     Return token_lexeme
 End Process
 
+@Reasoning:
+Length of the lexeme indicated by get_token_lexeme. Separate field rather
+than a null-terminated string so embedded NULs in literals (rare but legal
+in raw-string forms) survive correctly.
+@End Reasoning
+@Implementation:
+Null check; otherwise read offset 64.
+@End Implementation
 Process called "get_token_length" takes lexer as Integer returns Integer:
     Note: Get current token length
 
@@ -1251,6 +1462,14 @@ Process called "get_token_length" takes lexer as Integer returns Integer:
     Return token_length
 End Process
 
+@Reasoning:
+Current line number for diagnostic positioning. Returns 0 on null lexer
+(which "Error at 0:0" is a visually obvious sentinel for "no source
+position available").
+@End Reasoning
+@Implementation:
+Null check; otherwise read offset 24.
+@End Implementation
 Process called "get_line" takes lexer as Integer returns Integer:
     Note: Get current line number
 
@@ -1262,6 +1481,13 @@ Process called "get_line" takes lexer as Integer returns Integer:
     Return line
 End Process
 
+@Reasoning:
+Current column number, 1-based. Companion to get_line for diagnostic
+positioning.
+@End Reasoning
+@Implementation:
+Null check; otherwise read offset 32.
+@End Implementation
 Process called "get_column" takes lexer as Integer returns Integer:
     Note: Get current column number
 

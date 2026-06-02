@@ -105,6 +105,19 @@ Note: ==========================================================================
 Note: Parser State
 Note: ============================================================================
 
+@Reasoning:
+Cursor over a pre-tokenised stream. Storing token_count up front means
+every advance/peek path can range-check without a separate length scan
+of the token array. Index-based cursor (rather than pointer) keeps
+the parser independent of how the lexer laid out memory.
+@End Reasoning
+
+@Implementation:
+32-byte record (4 x i64): tokens pointer (0), token_count (8), current
+index (16), had_error sticky flag (24). Each token occupies 40 bytes
+in the lexer's array so current_token computes tokens + current * 40.
+@End Implementation
+
 Type called "JuliaParser":
     tokens as Integer       Note: Token array
     token_count as Integer  Note: Number of tokens
@@ -115,6 +128,22 @@ End Type
 Note: ============================================================================
 Note: AST Node Structure
 Note: ============================================================================
+
+@Reasoning:
+Hybrid AST node: fixed left/right slots support binary trees (binary
+operators, dot access, type annotation) directly while the children
+array handles variadic kinds (function call args, tuple elements,
+array literals). This dual representation avoids allocating a child
+array for every binary node, which would dominate the AST footprint.
+@End Reasoning
+
+@Implementation:
+64-byte record (8 x i64). Offsets: node_type (0), value (8, owned
+string for identifier/literal lexemes), left (16), right (24),
+children pointer (32), child_count (40), line (48), column (56).
+The children array is a flat pointer-array (not List) reallocated
+in-place by add_child as it grows.
+@End Implementation
 
 Type called "ASTNode":
     node_type as Integer    Note: Type of AST node
@@ -130,6 +159,19 @@ End Type
 Note: ============================================================================
 Note: Parser Creation
 Note: ============================================================================
+
+@Reasoning:
+Initialises the JuliaParser state from a pre-tokenised array. The
+parser does not own the tokens — they outlive the parser since the
+parse output (AST) references string lexemes held in tokens.
+@End Reasoning
+
+@Implementation:
+32-byte allocation, OOM short-circuit to 0. Stores tokens at offset 0,
+token_count at offset 8, current=0 at offset 16, had_error=0 at
+offset 24. No initial token fetch — parser methods compute the
+current token on demand from the array.
+@End Implementation
 
 Process called "create_parser" takes tokens as Integer, token_count as Integer returns Integer:
     Note: Create parser with token array
@@ -153,6 +195,18 @@ Note: ==========================================================================
 Note: AST Node Management
 Note: ============================================================================
 
+@Reasoning:
+Factory for the uniform 64-byte ASTNode. The variant-tag-plus-shared-
+fields approach lets every parser routine return a single value type
+regardless of node kind, avoiding sum-type machinery in this layer.
+@End Reasoning
+
+@Implementation:
+Allocates 64 bytes, OOM short-circuit. Writes node_type at offset 0
+and zero-initialises every other slot so consumers can safely test
+"is null" before accessing optional fields.
+@End Implementation
+
 Process called "create_node" takes node_type as Integer returns Integer:
     Note: Create new AST node
 
@@ -174,6 +228,31 @@ Process called "create_node" takes node_type as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Variadic-child append for nodes that hold a children array (function
+calls, arrays, tuples, blocks). The implementation grows the array
+one slot at a time via realloc-copy because Julia ASTs are built
+incrementally during parsing and the final arity isn't known up-front.
+@End Reasoning
+
+@Implementation:
+Null-guards both parent and child. Reads existing children pointer
+and child_count. If children is null, allocates an 8-byte (one slot)
+array. Otherwise allocates (count+1)*8 bytes, copies the existing
+slots over via a loop, deallocates the old array, and updates the
+parent's children pointer. Writes the new child into slot child_count
+and increments the count. The naive grow-by-one is O(n) per append
+making total construction O(n^2) — acceptable for typical Julia
+function arities (< 20 children) but bad for pathological inputs.
+@End Implementation
+
+@Performance_Hints:
+The O(n^2) realloc-copy growth pattern is the dominant cost for
+wide-arity AST nodes. A geometric-growth scheme (doubling capacity)
+or moving to the canonical List type would lift this to O(n log n).
+Defer until profiling proves this is the hot spot.
+@End Performance_Hints
 
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Note: Add child node to parent
@@ -227,6 +306,19 @@ Note: ==========================================================================
 Note: Token Access
 Note: ============================================================================
 
+@Reasoning:
+Computes the pointer to the current token by offsetting from the
+tokens base. The 40-byte token stride is fixed by the lexer's record
+layout — change one and the other must change in lockstep.
+@End Reasoning
+
+@Implementation:
+Reads tokens (offset 0), current (offset 16), token_count (offset 8).
+Range-guards on current >= token_count, returning 0 (sentinel for
+"past EOF"). Otherwise computes tokens + current * 40 as the token
+address. The token is aliased, not copied — caller must not free it.
+@End Implementation
+
 Process called "current_token" takes parser as Integer returns Integer:
     Note: Get current token
 
@@ -243,6 +335,18 @@ Process called "current_token" takes parser as Integer returns Integer:
     Return token_ptr
 End Process
 
+@Reasoning:
+Moves the cursor forward one token without checking bounds. The
+caller is responsible for not advancing past EOF; current_token will
+gracefully return 0 if it happens but advance does not error.
+@End Reasoning
+
+@Implementation:
+Reads current at offset 16, writes back current+1. Returns 1
+unconditionally. No range check — over-advancement merely makes
+subsequent current_token calls return 0 (EOF sentinel).
+@End Implementation
+
 Process called "advance" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -251,6 +355,17 @@ Process called "advance" takes parser as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Predicate test of the current token's type. Used inside parser loops
+to decide whether to take a branch without consuming the token.
+@End Reasoning
+
+@Implementation:
+Calls current_token; null returns 0 (no match). Otherwise reads
+token_type at token offset 0 and compares. Returns 1 on match,
+0 otherwise. Read-only — no cursor change.
+@End Implementation
 
 Process called "match_token" takes parser as Integer, token_type as Integer returns Integer:
     Note: Check if current token matches type
@@ -270,6 +385,20 @@ Process called "match_token" takes parser as Integer, token_type as Integer retu
     Return 0
 End Process
 
+@Reasoning:
+Combines match-and-advance with sticky-error on mismatch. The error
+flag is set rather than message because the parser is structured to
+do best-effort recovery; the caller (typically parse_block or a
+specialised parser) checks had_error after the recursion returns.
+@End Reasoning
+
+@Implementation:
+Calls match_token. On match advances and returns 1. On mismatch sets
+had_error at offset 24 to 1 and returns 0 without advancing — the
+cursor remains on the unexpected token so the next parse_statement
+or parser_block can attempt to resync.
+@End Implementation
+
 Process called "consume" takes parser as Integer, token_type as Integer returns Integer:
     Note: Consume token of expected type
 
@@ -288,6 +417,29 @@ End Process
 Note: ============================================================================
 Note: Expression Parsing
 Note: ============================================================================
+
+@Reasoning:
+Recognizes the atomic-expression leaves of the Julia grammar: literals
+(number/string/char/symbol/true/false/nothing), identifiers, macro
+calls (@name), parenthesized expressions or tuples (with comma
+detection), array literals (including comprehensions via array
+forwarding), and quoted expressions (:expr). Anything else returns 0,
+deferring error reporting to the caller's context.
+@End Reasoning
+
+@Implementation:
+Reads token type at the current token's offset 0. Each literal kind
+creates a corresponding NODE_* node, captures the lexeme at token
+offset 8 into the node's value slot, and advances. Identifiers and
+symbols follow the same pattern. Macro names delegate to
+parse_macro_call. Left paren advances, parses an expression, then
+peeks for comma: comma triggers tuple construction by reading
+remaining comma-separated expressions until the right paren; no
+comma means single parenthesized expression. Left bracket delegates
+to parse_array which itself decides literal-vs-comprehension. Colon
+triggers a quote-expression wrapping the following expression in a
+NODE_QUOTE_EXPR.
+@End Implementation
 
 Process called "parse_primary" takes parser as Integer returns Integer:
     Note: Parse primary expression
@@ -417,13 +569,26 @@ Process called "parse_primary" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Handles all five Julia postfix operators that wrap a primary expression:
+function call (...), parametric type {...}, indexing [...], field/
+broadcast access ., and transpose ('). Loop accumulates postfix
+operations left-to-right because Julia chains like `a(b)[c].d` parse
+as ((a(b))[c]).d.
+@End Reasoning
+
+@Implementation:
+Starts with parse_primary; returns 0 if that fails. Then loops
+examining the current token's type. Each iteration dispatches:
+left-paren -> parse_call, left-brace -> parse_parametric_type,
+left-bracket -> parse_index, dot -> parse_dot_access, transpose/
+dot_transpose -> wrap current expr in a NODE_UNARY_OP with the
+operator token stored in the value slot and the operand in the right
+slot. Anything else exits the loop and returns the accumulated expr.
+@End Implementation
+
 Process called "parse_postfix" takes parser as Integer returns Integer:
     Note: Parse postfix expressions (calls, indexing, access)
-
-    @Reasoning:
-    Julia supports function calls, indexing, parametric types, field access,
-    and transpose operators as postfix operations.
-    @End Reasoning
 
     Let expr be proc parse_primary from parser
 
@@ -479,6 +644,21 @@ Process called "parse_postfix" takes parser as Integer returns Integer:
     Return expr
 End Process
 
+@Reasoning:
+Wraps a callee expression in a NODE_CALL with comma-separated arguments.
+The callee comes from parse_postfix's accumulation (the expression
+before the open paren). Empty argument lists are handled by checking
+for immediate right-paren after the opening paren.
+@End Reasoning
+
+@Implementation:
+Consumes the left paren. Creates a NODE_CALL with callee stored at
+the left slot. If the next token isn't a right paren, parses the
+first argument and loops collecting comma-separated argument
+expressions. Consumes the closing right paren. Returns the assembled
+call node.
+@End Implementation
+
 Process called "parse_call" takes parser as Integer, callee as Integer returns Integer:
     Note: Parse function call
 
@@ -516,6 +696,21 @@ Process called "parse_call" takes parser as Integer, callee as Integer returns I
     Return node
 End Process
 
+@Reasoning:
+Julia parametric types like `Array{Float64, 2}` or `Dict{String, Vector{Int}}`
+attach type parameters to a base type using braces. The base type can
+itself be a complex expression (typically an identifier or dot-access)
+arrived at via parse_postfix accumulation.
+@End Reasoning
+
+@Implementation:
+Consumes the left brace. Creates a NODE_PARAMETRIC_TYPE with base_type
+stored at the left slot. Parses the first parameter expression and
+loops collecting comma-separated parameter expressions. Consumes the
+right brace. Each parameter is a full expression so parse_expression
+handles nested parametric types and where-clauses.
+@End Implementation
+
 Process called "parse_parametric_type" takes parser as Integer, base_type as Integer returns Integer:
     Note: Parse parametric type (e.g., Array{T,N})
 
@@ -545,6 +740,21 @@ Process called "parse_parametric_type" takes parser as Integer, base_type as Int
 
     Return node
 End Process
+
+@Reasoning:
+Julia indexing `A[i, j]` supports multi-dimensional indexing through
+comma-separated index expressions. Each dimension's index is a full
+expression, allowing range expressions like `A[1:5, end]` or compound
+expressions.
+@End Reasoning
+
+@Implementation:
+Consumes left bracket. Creates a NODE_INDEX with array stored at the
+left slot. Parses first index expression and loops collecting comma-
+separated indices via add_child. Consumes the closing right bracket.
+The `end` keyword for "last valid index" is handled by parse_expression
+(treated as identifier) since Julia's `end` is context-sensitive.
+@End Implementation
 
 Process called "parse_index" takes parser as Integer, array as Integer returns Integer:
     Note: Parse array indexing
@@ -576,6 +786,23 @@ Process called "parse_index" takes parser as Integer, array as Integer returns I
     Return node
 End Process
 
+@Reasoning:
+The dot operator in Julia serves dual roles: field access (obj.field)
+and broadcasting (.+, .*, etc., though those are scanned as single
+tokens by the lexer). This routine handles field access where the
+token following the dot is an identifier.
+@End Reasoning
+
+@Implementation:
+Consumes the dot token. Peeks the next token; if it's an identifier,
+creates a NODE_DOT_ACCESS with object at the left slot, and a
+NODE_IDENTIFIER (with the identifier's lexeme) at the right slot.
+Advances past the identifier and returns. If the post-dot token is
+not an identifier (broadcast operator handled elsewhere via lexer
+tokenization of .+ etc.), returns the unmodified object — caller
+will see the dot as something other than field access.
+@End Implementation
+
 Process called "parse_dot_access" takes parser as Integer, object as Integer returns Integer:
     Note: Parse dot access (field or broadcast)
 
@@ -600,6 +827,23 @@ Process called "parse_dot_access" takes parser as Integer, object as Integer ret
 
     Return object
 End Process
+
+@Reasoning:
+Julia array literals `[a, b, c]` and comprehensions `[expr for x in xs]`
+share the same opening bracket. Distinguishing them requires speculative
+parse: read the first expression, then check the next token. `for`
+indicates a comprehension; comma or close-bracket indicates a literal.
+@End Reasoning
+
+@Implementation:
+Consumes left bracket. Creates a NODE_ARRAY. If the next token isn't
+right-bracket, parses the first element expression. Then peeks for
+a TOKEN_FOR — if present, delegates immediately to parse_comprehension
+with the first expression as the template. Otherwise treats the first
+expression as the first array element, adds it as a child, and loops
+collecting comma-separated additional elements. Consumes the closing
+right bracket and returns the array node.
+@End Implementation
 
 Process called "parse_array" takes parser as Integer returns Integer:
     Note: Parse array literal or comprehension
@@ -648,6 +892,21 @@ Process called "parse_array" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Array comprehension `[expr for var in iter]` is a generator wrapped in
+list collection. This implementation handles the single-generator form
+only; nested generators with multiple `for` clauses and filter clauses
+would need extension here.
+@End Reasoning
+
+@Implementation:
+Creates a NODE_COMPREHENSION and adds the template expression as the
+first child. Consumes `for`, parses the loop variable expression,
+consumes `in`, parses the iterator expression, adds both as children.
+Consumes the closing right bracket. The three children are (template,
+variable, iterator) in that order.
+@End Implementation
+
 Process called "parse_comprehension" takes parser as Integer, expr as Integer returns Integer:
     Note: Parse array comprehension
 
@@ -667,6 +926,24 @@ Process called "parse_comprehension" takes parser as Integer, expr as Integer re
 
     Return node
 End Process
+
+@Reasoning:
+Julia macro calls like `@assert x > 0`, `@show var`, or
+`@printf("%d", n)` consume arguments until end-of-line or semicolon.
+Macros don't use parentheses for arg lists (though they may); this
+parser handles the bare-arg form by reading until line terminators.
+@End Reasoning
+
+@Implementation:
+Creates a NODE_MACRO_CALL and captures the macro lexeme (the
+`@name` token's text) into the value slot, then advances. Loops
+peeking the next token; on TOKEN_NEWLINE/TOKEN_SEMICOLON/TOKEN_EOF
+breaks out (by setting arg_type to TOKEN_NEWLINE — the loop guard).
+Otherwise parses an expression and adds it as a child. The
+arg-token re-peek after parsing prevents infinite loop on
+malformed input where the macro args span more than the parser
+expects.
+@End Implementation
 
 Process called "parse_macro_call" takes parser as Integer returns Integer:
     Note: Parse macro call (@macro_name args)
@@ -712,6 +989,25 @@ End Process
 Note: ============================================================================
 Note: Binary Operators
 Note: ============================================================================
+
+@Reasoning:
+Returns the precedence level of a binary operator token, matching
+Julia's operator precedence table. Higher numbers bind tighter. The
+13-level scale runs from assignment (1, weakest) through exponentiation
+(13, strongest), with the same level used for operators of equal
+precedence. Zero means "not a binary operator", used by parse_binary
+to detect when to stop accumulating.
+@End Reasoning
+
+@Implementation:
+Linear If-chain dispatching token_type to precedence number. Levels:
+1 assignment, 2 pipe operators (|>, <|), 3 ternary ?, 4 logical OR,
+5 logical AND, 6 comparisons (<, <=, >, >=, ==, !=, ===), 7 bitwise
+OR, 8 bitwise XOR, 9 bitwise AND, 10 shifts (<<, >>, >>>), 11
+addition/subtraction (and broadcasting .+/.-), 12 multiplication/
+division/modulo (and broadcasting .*/./), 13 exponentiation (^, .^).
+Unrecognised tokens return 0.
+@End Implementation
 
 Process called "get_precedence" takes token_type as Integer returns Integer:
     Note: Get operator precedence
@@ -846,6 +1142,26 @@ Process called "get_precedence" takes token_type as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Standard precedence-climbing recursive-descent for binary operators.
+Each recursive call only consumes operators at or above min_prec,
+ensuring left-association at the same precedence level and correct
+nesting for mixed-precedence chains. Ternary is treated as a special
+binary form (?: needs three operands).
+@End Reasoning
+
+@Implementation:
+Starts with parse_postfix for the left operand. Loops examining the
+current token's precedence. Exits if precedence is 0 (non-operator)
+or less than min_prec. For TOKEN_QUESTION (ternary), advances, parses
+the true-branch expression, expects colon, parses the false-branch
+expression, wraps in NODE_TERNARY with three children. For regular
+binary operators, advances past the operator, recursively calls
+parse_binary with min_prec = prec+1 (forcing left-association for
+same-precedence operators), then wraps in NODE_BINARY_OP storing
+operator at value slot, left and right at the binary slots.
+@End Implementation
+
 Process called "parse_binary" takes parser as Integer, min_prec as Integer returns Integer:
     Note: Parse binary expression with precedence climbing
 
@@ -909,6 +1225,18 @@ Process called "parse_binary" takes parser as Integer, min_prec as Integer retur
     Return left
 End Process
 
+@Reasoning:
+Public expression entry point. Starts the precedence-climbing parse
+with min_prec=0 so all operators are eligible. This makes
+parse_expression the single recursive cycle entry for nested
+expressions appearing in statements, function args, array elements,
+etc.
+@End Reasoning
+
+@Implementation:
+Single-line wrapper calling parse_binary with parser and min_prec=0.
+@End Implementation
+
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse complete expression
 
@@ -918,6 +1246,24 @@ End Process
 Note: ============================================================================
 Note: Statement Parsing
 Note: ============================================================================
+
+@Reasoning:
+Statement dispatcher. Julia has six block-starting keywords (function,
+if, for, while, return, plus break/continue), each with dedicated
+parser. Anything else is treated as an expression statement —
+including assignment, which is parsed as a low-precedence binary
+operator (assignment is operator precedence 1).
+@End Reasoning
+
+@Implementation:
+Reads current token type at offset 0 and dispatches: TOKEN_FUNCTION ->
+parse_function_def, TOKEN_IF -> parse_if, TOKEN_FOR -> parse_for,
+TOKEN_WHILE -> parse_while, TOKEN_RETURN -> parse_return,
+TOKEN_BREAK -> create NODE_BREAK_STMT and advance,
+TOKEN_CONTINUE -> create NODE_CONTINUE_STMT and advance.
+Anything else falls through to parse_expression, returning the
+result directly as the statement.
+@End Implementation
 
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse statement
@@ -965,6 +1311,25 @@ Process called "parse_statement" takes parser as Integer returns Integer:
 
     Return expr
 End Process
+
+@Reasoning:
+Julia function definition: `function name(p1::T1, p2::T2)::RetType body
+end`. All parts after the name are optional in different ways:
+parameters may be empty, type annotations on parameters and return
+type are optional. The body uses block syntax terminated by `end`.
+@End Reasoning
+
+@Implementation:
+Consumes `function`. Creates a NODE_FUNCTION_DEF. Captures function
+name from the next identifier into value slot. Consumes opening
+paren. The parameter loop reads first param via parse_parameter,
+then loops on comma-separated parameters. Consumes closing paren.
+Then checks for `::` (TOKEN_DOUBLE_COLON) indicating return type
+annotation — if present, advances and parses the type expression
+into the left slot. Then parses the body via parse_block with
+TOKEN_END as the terminator, stores body in right slot. Finally
+consumes `end`.
+@End Implementation
 
 Process called "parse_function_def" takes parser as Integer returns Integer:
     Note: Parse function definition
@@ -1034,6 +1399,23 @@ Process called "parse_function_def" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Single function parameter: either `name` (no type) or `name::Type`
+(with type annotation). The annotated case produces a
+NODE_TYPE_ANNOTATION wrapper so downstream multiple-dispatch analysis
+can inspect the type without re-parsing the AST.
+@End Reasoning
+
+@Implementation:
+Reads the parameter name identifier — bails out returning 0 if not
+an identifier (caller will see the failure as had_error if it
+mattered). Creates a NODE_IDENTIFIER with the name lexeme.
+Peeks the next token for `::`. If present, advances, parses the
+type expression, then wraps both in a NODE_TYPE_ANNOTATION with
+identifier in left slot and type in right slot, returning the
+wrapper. Otherwise returns the bare identifier node.
+@End Implementation
+
 Process called "parse_parameter" takes parser as Integer returns Integer:
     Note: Parse function parameter
 
@@ -1068,6 +1450,21 @@ Process called "parse_parameter" takes parser as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Julia if has the form: if cond block [elseif cond block]* [else block]
+end. Children alternate condition/block in declaration order so a
+downstream consumer can iterate pairs.
+@End Reasoning
+
+@Implementation:
+Consumes `if`. Creates a NODE_IF_STMT. Parses condition and adds as
+child, parses then-block (parse_block with TOKEN_END as terminator)
+and adds as child. Then loops examining elseif/else: TOKEN_ELSEIF
+advances, parses next condition + block (both added as children).
+TOKEN_ELSE advances, parses else block (only the block as child).
+Anything else exits the loop. Consumes the closing `end`.
+@End Implementation
 
 Process called "parse_if" takes parser as Integer returns Integer:
     Note: Parse if statement
@@ -1114,6 +1511,19 @@ Process called "parse_if" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Julia for-loop: `for var in iterable body end`. Both var and iterable
+are full expressions (var supports tuple destructuring patterns).
+Three children: variable, iterator, body — in order.
+@End Reasoning
+
+@Implementation:
+Consumes `for`. Creates NODE_FOR_STMT. Parses loop variable
+expression, consumes `in`, parses iterator expression, adds both
+as children. Parses body via parse_block with TOKEN_END, adds as
+child. Consumes closing `end`.
+@End Implementation
+
 Process called "parse_for" takes parser as Integer returns Integer:
     Note: Parse for loop
 
@@ -1137,6 +1547,17 @@ Process called "parse_for" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Julia while-loop: `while cond body end`. Two children: condition then
+body.
+@End Reasoning
+
+@Implementation:
+Consumes `while`. Creates NODE_WHILE_STMT. Parses condition and adds
+as child. Parses body via parse_block with TOKEN_END, adds as child.
+Consumes closing `end`.
+@End Implementation
+
 Process called "parse_while" takes parser as Integer returns Integer:
     Note: Parse while loop
 
@@ -1155,6 +1576,21 @@ Process called "parse_while" takes parser as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Julia `return` can be valueless (returns nothing) or take an
+expression. Distinguishing the two requires peeking: if the next
+token is a statement terminator (newline/semicolon) or `end`, no
+expression follows; otherwise parse one.
+@End Reasoning
+
+@Implementation:
+Consumes `return`. Creates NODE_RETURN_STMT. Peeks current token —
+if it's not TOKEN_NEWLINE, TOKEN_SEMICOLON, or TOKEN_END, parses
+an expression and stores it at offset 24 (the right slot). Otherwise
+returns the bare return node with no value slot. Used by
+parse_statement on TOKEN_RETURN dispatch.
+@End Implementation
 
 Process called "parse_return" takes parser as Integer returns Integer:
     Note: Parse return statement
@@ -1179,6 +1615,24 @@ Process called "parse_return" takes parser as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+General block parser that reads statements until a specific terminator
+token (passed by the caller, typically TOKEN_END or TOKEN_EOF). Used
+by function bodies, if-branches, loop bodies, and the top-level
+parse_program. The terminator parameter lets the same routine serve
+all block contexts without parser-specific branching.
+@End Reasoning
+
+@Implementation:
+Creates a NODE_PROGRAM (overloaded as "block of statements" — name
+is historical). Loops until current token type equals end_token or
+EOF. Each iteration skips newlines and semicolons silently (they
+separate but don't terminate statements). Otherwise calls
+parse_statement and adds the result as a child if non-null.
+Returns the block on encountering the terminator (without consuming
+it — that's the caller's job).
+@End Implementation
 
 Process called "parse_block" takes parser as Integer, end_token as Integer returns Integer:
     Note: Parse block of statements
@@ -1220,6 +1674,18 @@ End Process
 Note: ============================================================================
 Note: Program Parsing
 Note: ============================================================================
+
+@Reasoning:
+Top-level entry. The whole source program is a single block terminated
+by EOF; parse_program just delegates to parse_block with TOKEN_EOF
+as the terminator.
+@End Reasoning
+
+@Implementation:
+Single-line wrapper calling parse_block with parser and TOKEN_EOF.
+The returned NODE_PROGRAM contains all top-level statements as
+children in source order.
+@End Implementation
 
 Process called "parse_program" takes parser as Integer returns Integer:
     Note: Parse complete Julia program

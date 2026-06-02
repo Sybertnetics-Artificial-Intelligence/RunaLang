@@ -47,11 +47,35 @@ Note: ==========================================================================
 Note: Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Per-translation context for the HIR->Go generator. Holds an emitter
+handle (for byte-level output) and the current indent level. Unlike
+the PHP/Solidity contexts which keep the running output as a String
+field, the Go backend offloads accumulation to the Emitter abstraction
+so the same emitter can also feed a file or a buffer downstream.
+@End Reasoning
+
+@Implementation:
+16-byte record (2 x i64). Offset 0 emitter (Layout pointer to the
+Emitter instance). Offset 8 indent_level (Integer). Created via
+create_hir_to_go_context; freed via destroy_hir_to_go_context.
+@End Implementation
 Type called "HirToGoContext":
     emitter as Integer          Note: Go emitter instance
     indent_level as Integer     Note: Current indentation level
 End Type
 
+@Reasoning:
+Allocates a HirToGoContext bound to the caller-supplied Emitter. The
+emitter is borrowed (the context does not own it); the caller is
+responsible for the emitter's lifetime. indent_level starts at 0
+(file scope).
+@End Reasoning
+
+@Implementation:
+Layout.allocate(16). OOM returns 0. Writes emitter at offset 0,
+zero indent_level at offset 8. Returns the new context handle.
+@End Implementation
 Process called "create_hir_to_go_context" takes emitter as Integer returns Integer:
     Note: Create generation context
 
@@ -68,6 +92,17 @@ Process called "create_hir_to_go_context" takes emitter as Integer returns Integ
     Return context
 End Process
 
+@Reasoning:
+Releases the 16-byte context record. The emitter is borrowed (not
+owned) so it is NOT freed here; the caller frees the emitter
+separately. Null context is treated as a no-op so paired create/
+destroy survives an OOM-failed create.
+@End Reasoning
+
+@Implementation:
+Null short-circuits with success. Otherwise Layout.deallocate the
+16-byte record. Returns 1.
+@End Implementation
 Process called "destroy_hir_to_go_context" takes context as Integer returns Integer:
     Note: Destroy generation context
 
@@ -79,6 +114,15 @@ Process called "destroy_hir_to_go_context" takes context as Integer returns Inte
     Return 1
 End Process
 
+@Reasoning:
+Bumps the context's indent counter so subsequent emit_indent calls
+produce one more level of indentation.
+@End Reasoning
+
+@Implementation:
+Null short-circuits to 0. Reads indent_level at offset 8, writes
+level+1 back. Returns 1.
+@End Implementation
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -92,6 +136,16 @@ Process called "increase_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Drops one indent level. Saturates at 0 to defend against unbalanced
+calls; a paired-but-skipped increase (e.g., an early return inside
+a block) would otherwise leave indent_level transiently negative.
+@End Reasoning
+
+@Implementation:
+Null short-circuits to 0. Reads indent_level; if > 0 writes
+level-1 back; otherwise leaves it at 0. Returns 1.
+@End Implementation
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
 
@@ -108,6 +162,17 @@ Process called "decrease_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Delegates to the emitter's indent routine using the current
+indent_level. Go convention uses tabs, but the actual width and
+character are determined by the emitter's policy (the emitter takes
+an integer level and decides how to render it).
+@End Reasoning
+
+@Implementation:
+Null short-circuits to 0. Reads emitter (0) and level (8). Calls
+Emitter.emit_indent(emitter, level). Returns 1.
+@End Implementation
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit current indentation level
 
@@ -127,6 +192,20 @@ Note: ==========================================================================
 Note: HIR Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Convenience accessor for the common HIR shape where a dictionary
+node stores values keyed by string. The Go backend uses
+dictionary-shaped HIR throughout (mirroring the JSX/dart frontends);
+this helper centralises the get-then-coerce-to-string pattern so
+each generate_* routine stays terse.
+@End Reasoning
+
+@Implementation:
+Null dict short-circuits to 0. Calls HIR.get_dict_value(dict, key)
+to retrieve the slot. Null value returns 0. Otherwise calls
+HIR.get_dict_string(hir_node, "value") to unwrap the inner string
+literal. Returns the string handle.
+@End Implementation
 Process called "get_dict_string_value" takes dict_hir as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary
 
@@ -144,6 +223,15 @@ Process called "get_dict_string_value" takes dict_hir as Integer, key as Integer
     Return literal_value
 End Process
 
+@Reasoning:
+Sibling of get_dict_string_value that returns the raw HIR child
+without unwrapping. Used when the child is itself a dictionary or
+list rather than a string literal.
+@End Reasoning
+
+@Implementation:
+Null dict short-circuits to 0. Returns HIR.get_dict_value(dict, key).
+@End Implementation
 Process called "get_dict_hir_value" takes dict_hir as Integer, key as Integer returns Integer:
     Note: Get HIR value (dict/list) from HIR dictionary
 
@@ -159,6 +247,20 @@ Note: ==========================================================================
 Note: Program and Declaration Generation
 Note: ============================================================================
 
+@Reasoning:
+Top-level driver: walks the program HIR's "declarations" list and
+emits each top-level declaration in order. Unlike PHP/Solidity which
+emit a fixed preamble (open tag, SPDX), a Go file's preamble (package
++ imports) is itself a sequence of declarations that this routine
+iterates over, so no separate preamble logic is needed.
+@End Reasoning
+
+@Implementation:
+Null program short-circuits to 0. Reads declarations via
+get_dict_hir_value. Verifies it's a list via HIR.is_list_hir. Iterates
+0..size; each element is dispatched through generate_declaration.
+Returns 1.
+@End Implementation
 Process called "generate_program" takes context as Integer, program_hir as Integer returns Integer:
     Note: Generate complete Go program
 
@@ -190,6 +292,19 @@ Process called "generate_program" takes context as Integer, program_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Top-level declaration dispatcher. Each declaration carries its kind
+in the "_type" key (with "go_" prefix to distinguish Go-frontend HIR
+from other-language HIR sharing the same translator). Seven kinds
+are recognised: package, import, function, method, type declaration,
+var declaration, const declaration.
+@End Reasoning
+
+@Implementation:
+Reads "_type" via get_dict_string_value. Cascade of string_equals
+checks routes to the appropriate generate_* by direct call. Unknown
+or missing _type returns 0 so the caller can detect failure.
+@End Implementation
 Process called "generate_declaration" takes context as Integer, decl_hir as Integer returns Integer:
     Note: Generate top-level declaration
 
@@ -242,6 +357,19 @@ Process called "generate_declaration" takes context as Integer, decl_hir as Inte
     Return 0
 End Process
 
+@Reasoning:
+Emits 'package NAME'. Every Go file must lead with a package clause
+(though import order interleaves with declarations from the HIR
+walker's perspective, the language demands package first; the HIR
+construction layer is expected to ensure package is the first
+declaration).
+@End Reasoning
+
+@Implementation:
+Null short-circuits. Reads emitter handle from context offset 0.
+Emits "package " then the package name (looked up via
+get_dict_string_value with the "name" key).
+@End Implementation
 Process called "generate_package" takes context as Integer, package_hir as Integer returns Integer:
     Note: Generate package declaration
 
@@ -264,6 +392,19 @@ Process called "generate_package" takes context as Integer, package_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Emits a Go 'import "path"' clause (with optional alias). Go's
+import is always a quoted path; the alias clause appears before the
+path as 'import ALIAS "path"' - this single-line form is what the
+generator produces (the parenthesised multi-line form is reserved
+for grouped imports which a higher layer can synthesise).
+@End Reasoning
+
+@Implementation:
+Emits 'import '. Optional alias is read via "alias" key; if non-null
+emits ALIAS + space. Then emits '"', the path string (from "path"
+key), then '"'. Closes with a newline.
+@End Implementation
 Process called "generate_import" takes context as Integer, import_hir as Integer returns Integer:
     Note: Generate import declaration
 
@@ -301,6 +442,20 @@ Process called "generate_import" takes context as Integer, import_hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+Emits 'func NAME(params) returns body'. Functions in Go have no
+visibility modifier (capitalisation of the first letter is the
+visibility marker, and that is baked into the name itself), no
+modifiers, and a single return-type slot (which can itself be a
+parenthesised list for multiple returns).
+@End Reasoning
+
+@Implementation:
+Emits 'func NAME(' then parameter list via generate_parameter_list,
+then ')'. If return_type is non-null emits ' RET-TYPE' via
+generate_type. If body is non-null delegates to generate_statement
+(which produces a brace-delimited block).
+@End Implementation
 Process called "generate_function" takes context as Integer, func_hir as Integer returns Integer:
     Note: Generate function declaration
 
@@ -351,6 +506,19 @@ Process called "generate_function" takes context as Integer, func_hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+Emits a Go method 'func (recv RecvType) NAME(params) ret body'. The
+receiver appears between 'func' and the name; it is itself a single
+parameter (typically '(s *Self)' for pointer receivers or '(s Self)'
+for value receivers). This shape is the only thing distinguishing
+methods from free functions; everything else follows generate_function.
+@End Reasoning
+
+@Implementation:
+Emits 'func ('. Emits the receiver parameter via generate_parameter
+(reading from "receiver" key). Emits ') NAME('. Then parameter list,
+')', optional return type, and body - identical to generate_function.
+@End Implementation
 Process called "generate_method" takes context as Integer, method_hir as Integer returns Integer:
     Note: Generate method declaration
 
@@ -403,6 +571,17 @@ Process called "generate_method" takes context as Integer, method_hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+Emits a Go 'type Name Definition' declaration. The Definition can
+be any Go type (basic, pointer, array, slice, map, chan, struct,
+interface, func) - so the work is delegated to generate_type which
+dispatches on the type-flavour key.
+@End Reasoning
+
+@Implementation:
+Emits 'type NAME '. Reads the "definition" sub-HIR and recurses into
+generate_type. Closes with a newline.
+@End Implementation
 Process called "generate_type_declaration" takes context as Integer, type_decl_hir as Integer returns Integer:
     Note: Generate type declaration
 
@@ -432,6 +611,18 @@ Process called "generate_type_declaration" takes context as Integer, type_decl_h
     Return 1
 End Process
 
+@Reasoning:
+Emits 'var NAME TYPE = VALUE' for a Go variable declaration. Both
+the type and the value are optional in Go (one of them must be
+present; the other is inferred); the HIR provides what is present
+and this generator emits whichever clauses appear.
+@End Reasoning
+
+@Implementation:
+Emits 'var NAME'. If a type subtree is present emits ' TYPE' via
+generate_type. If a value subtree is present emits ' = VALUE' via
+generate_expression. Terminates with a newline.
+@End Implementation
 Process called "generate_var_declaration" takes context as Integer, var_hir as Integer returns Integer:
     Note: Generate variable declaration
 
@@ -466,6 +657,16 @@ Process called "generate_var_declaration" takes context as Integer, var_hir as I
     Return 1
 End Process
 
+@Reasoning:
+Emits 'const NAME TYPE = VALUE' for a Go const. const requires the
+initialiser at declaration time (unlike var). The optional type
+clause appears between name and value, same as var.
+@End Reasoning
+
+@Implementation:
+Emits 'const NAME'. Optional ' TYPE' via generate_type if present.
+' = VALUE' via generate_expression on the value. Newline.
+@End Implementation
 Process called "generate_const_declaration" takes context as Integer, const_hir as Integer returns Integer:
     Note: Generate constant declaration
 
@@ -504,6 +705,19 @@ Note: ==========================================================================
 Note: Type Generation
 Note: ============================================================================
 
+@Reasoning:
+Type-flavour dispatcher. Routes to the specific generate_X_type
+based on the "type_flavour" key. Covers the full Go type taxonomy:
+basic (int, string, ...), pointer (*T), array ([N]T), slice ([]T),
+map (map[K]V), chan (chan T / chan<- T / <-chan T), struct,
+interface, and func.
+@End Reasoning
+
+@Implementation:
+Reads "type_flavour" via get_dict_string_value. strings_equal
+cascade routes to the matching generate_*_type. Unknown flavour
+returns 0.
+@End Implementation
 Process called "generate_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate Go type expression
 
@@ -565,6 +779,16 @@ Process called "generate_type" takes context as Integer, type_hir as Integer ret
     Return 0
 End Process
 
+@Reasoning:
+Emits a named Go type (the predeclared types int/string/bool/etc.
+plus any user-defined type name). The HIR holds the type's textual
+name; the generator emits it verbatim because Go type names don't
+require any escaping.
+@End Reasoning
+
+@Implementation:
+Reads the "name" key. Emits the name string via Emitter.emit_string.
+@End Implementation
 Process called "generate_basic_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate basic type name
 
@@ -582,6 +806,15 @@ Process called "generate_basic_type" takes context as Integer, type_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Emits '*T' for a pointer type. The single child is the element
+type; recursion handles arbitrary nesting like '**T' or '*[]T'.
+@End Reasoning
+
+@Implementation:
+Emits '*'. Reads "element_type" sub-HIR and recurses into
+generate_type.
+@End Implementation
 Process called "generate_pointer_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate pointer type
 
@@ -601,6 +834,17 @@ Process called "generate_pointer_type" takes context as Integer, type_hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Emits '[LEN]T' for a fixed-size Go array. LEN may be a numeric
+literal or the special '...' marker (which Go uses to mean
+"infer from the literal's length"). The HIR stores it as a string
+so both forms pass through unchanged.
+@End Reasoning
+
+@Implementation:
+Emits '['. Reads "length" via get_dict_string_value and emits it.
+Emits ']'. Recurses into generate_type on "element_type".
+@End Implementation
 Process called "generate_array_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate array type
 
@@ -627,6 +871,16 @@ Process called "generate_array_type" takes context as Integer, type_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Emits '[]T' for a Go slice (dynamic length). Distinct from array
+because slices have no compile-time length; the HIR uses different
+type_flavour values for the two so the dispatcher reaches the
+correct generator.
+@End Reasoning
+
+@Implementation:
+Emits '[]'. Recurses into generate_type on "element_type".
+@End Implementation
 Process called "generate_slice_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate slice type
 
@@ -646,6 +900,15 @@ Process called "generate_slice_type" takes context as Integer, type_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Emits 'map[K]V' for a Go map type. The key and value sub-trees are
+both arbitrary types so each is recursed via generate_type.
+@End Reasoning
+
+@Implementation:
+Emits 'map['. Recurses generate_type on "key_type". Emits ']'.
+Recurses generate_type on "value_type".
+@End Implementation
 Process called "generate_map_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate map type
 
@@ -672,6 +935,19 @@ Process called "generate_map_type" takes context as Integer, type_hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+Emits Go channel types. Go distinguishes three channel directions:
+bidirectional 'chan T', send-only 'chan<- T', and receive-only
+'<-chan T'. The "direction" metadata key selects which form to
+emit; absence defaults to bidirectional.
+@End Reasoning
+
+@Implementation:
+Reads "direction" via get_dict_string_value. "receive" branch emits
+'<-chan '. "send" branch emits 'chan<- '. Default (missing or any
+other value) emits 'chan ' (bidirectional). Then recurses into
+generate_type on "element_type".
+@End Implementation
 Process called "generate_chan_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate channel type
 
@@ -713,6 +989,18 @@ Process called "generate_chan_type" takes context as Integer, type_hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Emits 'struct { field1; field2; ... }' for a Go struct type.
+Anonymous struct types appear inline in declarations (e.g. as map
+values or function parameters) so this generator does not emit a
+preceding 'type X' header; that lives in generate_type_declaration.
+@End Reasoning
+
+@Implementation:
+Emits 'struct {' + newline. increase_indent. Iterates the "fields"
+list (HIR.is_list_hir asserted) and calls generate_struct_field
+on each. decrease_indent. emit_indent + '}'.
+@End Implementation
 Process called "generate_struct_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate struct type
 
@@ -753,6 +1041,19 @@ Process called "generate_struct_type" takes context as Integer, type_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emits a single struct field 'NAME TYPE `tag`'. The struct tag (an
+optional backtick-quoted string) is used by Go's reflection package
+for JSON/XML/database mapping; it is emitted only when present in
+the HIR. The HIR layer is responsible for wrapping the tag in
+backticks already.
+@End Reasoning
+
+@Implementation:
+emit_indent. If "name" is non-null emits name + space. If
+"type_info" is non-null emits its generate_type. If "tag" is non-
+null emits ' ' + tag. Newline.
+@End Implementation
 Process called "generate_struct_field" takes context as Integer, field_hir as Integer returns Integer:
     Note: Generate struct field
 
@@ -786,6 +1087,18 @@ Process called "generate_struct_field" takes context as Integer, field_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Emits 'interface { method1; method2; ... }'. Go interfaces describe
+behaviour (a method set); embedded interfaces (type sets in Go 1.18+
+generics) would extend this with additional union/intersection
+syntax, but the bootstrap subset uses only the method-set form.
+@End Reasoning
+
+@Implementation:
+Emits 'interface {' + newline. increase_indent. Iterates the
+"methods" list, calling generate_interface_method on each. decrease_
+indent. emit_indent + '}'.
+@End Implementation
 Process called "generate_interface_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate interface type
 
@@ -826,6 +1139,17 @@ Process called "generate_interface_type" takes context as Integer, type_hir as I
     Return 1
 End Process
 
+@Reasoning:
+Emits a single interface method 'NAME(params) ReturnType'. Note
+the absence of 'func' keyword and braces - inside an interface body
+this is the Go syntax for a method signature only.
+@End Reasoning
+
+@Implementation:
+emit_indent. Emits name. Emits '('. generate_parameter_list on
+"parameters". Emits ')'. If "return_type" non-null emits ' ' +
+generate_type. Newline.
+@End Implementation
 Process called "generate_interface_method" takes context as Integer, method_hir as Integer returns Integer:
     Note: Generate interface method
 
@@ -862,6 +1186,17 @@ Process called "generate_interface_method" takes context as Integer, method_hir 
     Return 1
 End Process
 
+@Reasoning:
+Emits a Go function type 'func(params) ReturnType' used as a value
+type (e.g. for declaring callback parameters or function-typed
+fields). Distinct from generate_function which emits a named
+declaration.
+@End Reasoning
+
+@Implementation:
+Emits 'func('. generate_parameter_list on "parameters". Emits ')'.
+If "return_type" non-null emits ' ' + generate_type.
+@End Implementation
 Process called "generate_func_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate function type
 
@@ -889,6 +1224,18 @@ Process called "generate_func_type" takes context as Integer, type_hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Emits a comma-separated parameter list for any Go callable
+(function, method, interface method, func-type). The list itself
+does not include surrounding parentheses - those are emitted by the
+caller because parameter lists also appear unwrapped in some
+contexts (e.g. multi-value return types).
+@End Reasoning
+
+@Implementation:
+Asserts the input is a list via HIR.is_list_hir. Iterates 0..size:
+generate_parameter on each element; ", " between adjacent entries.
+@End Implementation
 Process called "generate_parameter_list" takes context as Integer, params_hir as Integer returns Integer:
     Note: Generate function parameter list
 
@@ -920,6 +1267,18 @@ Process called "generate_parameter_list" takes context as Integer, params_hir as
     Return 1
 End Process
 
+@Reasoning:
+Emits a single parameter 'NAME TYPE'. Unlike many languages where
+name precedes type with an intervening colon or annotation marker,
+Go places the bare name immediately before the type. Anonymous
+parameters (no name) emit just the type.
+@End Reasoning
+
+@Implementation:
+If "name" non-null emits NAME + space. If "type_info" non-null
+emits generate_type. Producing only a type when name is absent is
+the right shape for Go's anonymous parameters.
+@End Implementation
 Process called "generate_parameter" takes context as Integer, param_hir as Integer returns Integer:
     Note: Generate single parameter
 
@@ -947,6 +1306,24 @@ Note: ==========================================================================
 Note: Statement Generation
 Note: ============================================================================
 
+@Reasoning:
+Statement-level dispatcher. Routes on the "_type" key. Go's
+statement set is richer than most languages because of its
+concurrency primitives: select_stmt, go_stmt, defer_stmt, and
+fallthrough_stmt are distinct top-level statement kinds. The
+dispatcher recognises all 14 statement kinds.
+@End Reasoning
+
+@Implementation:
+Reads "_type" via get_dict_string_value. Cascade of strings_equal:
+"block" -> generate_block; "if_stmt" -> generate_if_statement;
+"for_stmt" -> generate_for_statement; "switch_stmt", "select_stmt"
+-> their generators; "return_stmt"/"break_stmt"/"continue_stmt"/
+"fallthrough_stmt"/"goto_stmt" -> their generators;
+"defer_stmt"/"go_stmt" -> their generators; "assign_stmt" /
+"short_var_decl" / "expr_stmt" -> their generators. Unknown kind
+returns 0.
+@End Implementation
 Process called "generate_statement" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate Go statement
 
@@ -1038,6 +1415,18 @@ Process called "generate_statement" takes context as Integer, stmt_hir as Intege
     Return 0
 End Process
 
+@Reasoning:
+Emits a Go brace-delimited block '{ statements... }'. The opening
+brace lands inline (Allman is non-idiomatic in Go); the closing
+brace is on its own indented line. Indent is increased while
+emitting the body.
+@End Reasoning
+
+@Implementation:
+Emits '{' + newline. increase_indent. Iterates "statements" list,
+recursing generate_statement. decrease_indent. emit_indent + '}' +
+newline.
+@End Implementation
 Process called "generate_block" takes context as Integer, block_hir as Integer returns Integer:
     Note: Generate block statement
 
@@ -1078,6 +1467,19 @@ Process called "generate_block" takes context as Integer, block_hir as Integer r
     Return 1
 End Process
 
+@Reasoning:
+Emits 'if init; cond { ... } else ...'. Go's if statement
+optionally allows an init statement before the condition (scoped
+to the if), unlike most languages. When present, the init clause
+is emitted followed by '; ' before the condition.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'if '. If "init" non-null: generate_statement(init)
++ '; '. generate_expression on "condition". Space. generate_
+statement on "then_block". If "else_block" non-null: emit_indent +
+'else ' + generate_statement(else_block).
+@End Implementation
 Process called "generate_if_statement" takes context as Integer, if_hir as Integer returns Integer:
     Note: Generate if statement
 
@@ -1118,6 +1520,24 @@ Process called "generate_if_statement" takes context as Integer, if_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Emits Go's three loop forms: three-part C-style 'for init; cond;
+post { ... }', condition-only 'for cond { ... }', and range-based
+'for k, v := range expr { ... }'. The "loop_type" key with value
+"range" selects the range form; all other values fall through to
+the three-part form. The HIR is responsible for elision of any
+clauses that should not appear (e.g. condition-only loops omit
+init and post).
+@End Reasoning
+
+@Implementation:
+emit_indent + 'for '. Reads "loop_type". If "range" branch:
+generate_statement on init (the 'k, v := ' part), emit ' range ',
+generate_expression on the iterable. Else branch: generate_statement
+on init, '; ', generate_expression on condition, '; ',
+generate_statement on post. Either way, then ' ' + generate_statement
+on body.
+@End Implementation
 Process called "generate_for_statement" takes context as Integer, for_hir as Integer returns Integer:
     Note: Generate for statement
 
@@ -1180,6 +1600,19 @@ Process called "generate_for_statement" takes context as Integer, for_hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Emits 'switch init; tag { cases... }'. Like 'if', Go's switch
+admits an optional init statement before the discriminant ('tag').
+The tag itself is also optional (a bare 'switch' is allowed,
+behaving like a chained if/else if). Both forms are supported here.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'switch '. Optional init: generate_statement(init)
++ '; '. Optional tag: generate_expression(tag) + ' '. '{' +
+newline. Iterates "cases" list calling generate_case_clause on
+each. emit_indent + '}' + newline.
+@End Implementation
 Process called "generate_switch_statement" takes context as Integer, switch_hir as Integer returns Integer:
     Note: Generate switch statement
 
@@ -1231,6 +1664,18 @@ Process called "generate_switch_statement" takes context as Integer, switch_hir 
     Return 1
 End Process
 
+@Reasoning:
+Emits Go's 'select { cases... }' channel multiplexer. Each case is
+either 'case ch <- value:' (send), 'case v := <-ch:' (receive), or
+'default:'. The same generate_case_clause routine handles all three
+shapes because the case header is emitted as an arbitrary
+statement subtree.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'select ' + '{' + newline. Iterates "cases" list,
+calling generate_case_clause on each. emit_indent + '}' + newline.
+@End Implementation
 Process called "generate_select_statement" takes context as Integer, select_hir as Integer returns Integer:
     Note: Generate select statement
 
@@ -1269,6 +1714,23 @@ Process called "generate_select_statement" takes context as Integer, select_hir 
     Return 1
 End Process
 
+@Reasoning:
+Emits a single case clause for switch or select. Three forms are
+covered: 'default:' (when is_default metadata is "true"); 'case e1,
+e2, ...:' (when is_default is some other non-null value, listing
+multiple match expressions); and the malformed fallback for missing
+is_default which emits an empty 'case :' (acts as a parser-friendly
+placeholder).
+@End Reasoning
+
+@Implementation:
+emit_indent. Reads "is_default" string. If string is "true" emits
+'default:' + newline. Else if non-null emits 'case ', iterates the
+"expressions" list emitting each (separated by ", "), then ':' +
+newline. Default branch: emits 'case :' + newline. After header,
+increase_indent and iterate "statements" list calling
+generate_statement. decrease_indent.
+@End Implementation
 Process called "generate_case_clause" takes context as Integer, case_hir as Integer returns Integer:
     Note: Generate case clause
 
@@ -1348,6 +1810,18 @@ Process called "generate_case_clause" takes context as Integer, case_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emits 'return v1, v2, ...'. Go supports multi-value return; the
+HIR's "values" list may contain zero, one, or many expressions.
+A bare 'return' produces no value list (used in functions that
+either return nothing or use named returns).
+@End Reasoning
+
+@Implementation:
+emit_indent + 'return'. If "values" list non-null and size > 0:
+emits space then iterates the list emitting each expression with
+", " separators. Newline.
+@End Implementation
 Process called "generate_return_statement" takes context as Integer, return_hir as Integer returns Integer:
     Note: Generate return statement
 
@@ -1391,6 +1865,15 @@ Process called "generate_return_statement" takes context as Integer, return_hir 
     Return 1
 End Process
 
+@Reasoning:
+Emits 'break'. The optional labelled-break form ('break LABEL') is
+not currently emitted; the HIR layer flattens labelled breaks to
+the unlabelled form via control-flow normalisation.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'break' + newline.
+@End Implementation
 Process called "generate_break_statement" takes context as Integer, break_hir as Integer returns Integer:
     Note: Generate break statement
 
@@ -1407,6 +1890,14 @@ Process called "generate_break_statement" takes context as Integer, break_hir as
     Return 1
 End Process
 
+@Reasoning:
+Emits 'continue'. As with break, labelled continue is not currently
+emitted.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'continue' + newline.
+@End Implementation
 Process called "generate_continue_statement" takes context as Integer, continue_hir as Integer returns Integer:
     Note: Generate continue statement
 
@@ -1423,6 +1914,15 @@ Process called "generate_continue_statement" takes context as Integer, continue_
     Return 1
 End Process
 
+@Reasoning:
+Emits 'fallthrough', Go's explicit case-fall-through within a switch.
+Unlike C, Go switches do not fall through implicitly; this statement
+opts a case into the next one.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'fallthrough' + newline.
+@End Implementation
 Process called "generate_fallthrough_statement" takes context as Integer, fallthrough_hir as Integer returns Integer:
     Note: Generate fallthrough statement
 
@@ -1439,6 +1939,15 @@ Process called "generate_fallthrough_statement" takes context as Integer, fallth
     Return 1
 End Process
 
+@Reasoning:
+Emits 'goto LABEL'. Go's goto is restricted to within-function jumps
+(no goto across functions or into blocks that would skip variable
+declarations) - the HIR is assumed to encode only valid jumps.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'goto ' + label string (from "label" key) + newline.
+@End Implementation
 Process called "generate_goto_statement" takes context as Integer, goto_hir as Integer returns Integer:
     Note: Generate goto statement
 
@@ -1461,6 +1970,17 @@ Process called "generate_goto_statement" takes context as Integer, goto_hir as I
     Return 1
 End Process
 
+@Reasoning:
+Emits 'defer CALL'. defer is Go's stack-based scheduled-on-function-
+exit mechanism (used for resource cleanup like file.Close()). The
+operand must be a function call expression; HIR validation is
+expected to enforce this.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'defer '. Reads "call" sub-HIR and recurses into
+generate_expression. Newline.
+@End Implementation
 Process called "generate_defer_statement" takes context as Integer, defer_hir as Integer returns Integer:
     Note: Generate defer statement
 
@@ -1483,6 +2003,17 @@ Process called "generate_defer_statement" takes context as Integer, defer_hir as
     Return 1
 End Process
 
+@Reasoning:
+Emits 'go CALL', Go's goroutine launch (concurrent execution). Like
+defer the operand must be a function call expression. The runtime
+schedules the call on a goroutine; the current goroutine continues
+immediately.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'go '. Reads "call" sub-HIR and recurses into
+generate_expression. Newline.
+@End Implementation
 Process called "generate_go_statement" takes context as Integer, go_hir as Integer returns Integer:
     Note: Generate go statement (goroutine)
 
@@ -1505,6 +2036,18 @@ Process called "generate_go_statement" takes context as Integer, go_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Emits 'LEFT OP RIGHT' for any Go assignment-class statement. The
+operator string carried by HIR covers regular assignment '=' and
+all compound forms ('+=', '-=', '<<=', '&^=', etc.). When the
+HIR omits the operator, '=' is used as the default.
+@End Reasoning
+
+@Implementation:
+emit_indent. generate_expression on "left". Space. Emits operator
+from "operator" key, or '=' if absent. Space. generate_expression
+on "right". Newline.
+@End Implementation
 Process called "generate_assign_statement" takes context as Integer, assign_hir as Integer returns Integer:
     Note: Generate assignment statement
 
@@ -1543,6 +2086,19 @@ Process called "generate_assign_statement" takes context as Integer, assign_hir 
     Return 1
 End Process
 
+@Reasoning:
+Emits 'VARS := VALUES', Go's short variable declaration (function-
+scope only). The 'variables' and 'values' sub-trees are expressions;
+when multiple variables are declared they appear as a comma-
+separated expression list (the HIR encodes the multi-target form
+inside a single expression node so this generator does not need
+list iteration).
+@End Reasoning
+
+@Implementation:
+emit_indent. generate_expression on "variables". ' := '.
+generate_expression on "values". Newline.
+@End Implementation
 Process called "generate_short_var_decl" takes context as Integer, short_var_hir as Integer returns Integer:
     Note: Generate short variable declaration (:=)
 
@@ -1571,6 +2127,17 @@ Process called "generate_short_var_decl" takes context as Integer, short_var_hir
     Return 1
 End Process
 
+@Reasoning:
+Emits an expression evaluated for its side effects. Go's grammar
+constrains expression statements: only call, receive-from-channel,
+and send-to-channel expressions are valid in statement position;
+this generator does not enforce that constraint - it trusts the
+HIR layer to have already validated.
+@End Reasoning
+
+@Implementation:
+emit_indent. generate_expression on "expression". Newline.
+@End Implementation
 Process called "generate_expr_statement" takes context as Integer, expr_stmt_hir as Integer returns Integer:
     Note: Generate expression statement
 
@@ -1596,6 +2163,18 @@ Note: ==========================================================================
 Note: Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+Expression-level dispatcher. Routes on the "_type" key. Covers Go's
+expression taxonomy: binary, unary, call, index (a[i]), slice
+(a[i:j]), selector (a.b), type assertion (x.(T)), composite literal
+({a: b}), function literal (anonymous func), identifier, and
+literal.
+@End Reasoning
+
+@Implementation:
+Reads "_type" key. strings_equal cascade routes to the matching
+generate_X. Unknown kind returns 0.
+@End Implementation
 Process called "generate_expression" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate Go expression
 
@@ -1667,6 +2246,17 @@ Process called "generate_expression" takes context as Integer, expr_hir as Integ
     Return 0
 End Process
 
+@Reasoning:
+Emits 'LEFT OP RIGHT' for a Go binary operation. Operator string is
+HIR-supplied and emitted verbatim - Go's binary operators (arithmetic,
+comparison, logical, bitwise, channel receive '<-') all use a uniform
+syntactic shape so no per-operator special-casing is needed.
+@End Reasoning
+
+@Implementation:
+generate_expression on "left". Space + operator + space.
+generate_expression on "right".
+@End Implementation
 Process called "generate_binary_expr" takes context as Integer, binary_hir as Integer returns Integer:
     Note: Generate binary expression
 
@@ -1698,6 +2288,16 @@ Process called "generate_binary_expr" takes context as Integer, binary_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Emits 'OP OPERAND' for a Go unary prefix operation. Go's unary ops:
+'+', '-', '!', '^' (bitwise complement), '*' (deref), '&'
+(address-of), '<-' (channel receive). All are prefix; Go has no
+postfix unary operators (++ and -- are statements, not expressions).
+@End Reasoning
+
+@Implementation:
+Emits operator string. generate_expression on "operand".
+@End Implementation
 Process called "generate_unary_expr" takes context as Integer, unary_hir as Integer returns Integer:
     Note: Generate unary expression
 
@@ -1720,6 +2320,19 @@ Process called "generate_unary_expr" takes context as Integer, unary_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emits 'CALLEE(arg1, arg2, ...)'. Variadic calls in Go append '...'
+to the final argument; the HIR carries an "is_variadic" flag on the
+last argument node which generate_expression must surface. The
+spread-suffix is handled at the call-expression level here.
+@End Reasoning
+
+@Implementation:
+generate_expression on "callee". '('. Iterates "arguments" list:
+each entry through generate_expression; ", " between adjacent
+entries; trailing '...' emitted when "is_variadic" metadata of the
+call is "true". ')'.
+@End Implementation
 Process called "generate_call_expr" takes context as Integer, call_hir as Integer returns Integer:
     Note: Generate function call expression
 
@@ -1763,6 +2376,17 @@ Process called "generate_call_expr" takes context as Integer, call_hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Emits 'OBJ[INDEX]'. Works for arrays, slices, maps - Go uses
+identical syntax for all. Generic instantiation '[T]' (Go 1.18+)
+is not handled here; it would need a distinct HIR kind because the
+expression's semantics differ.
+@End Reasoning
+
+@Implementation:
+generate_expression on "object". '['. generate_expression on
+"index". ']'.
+@End Implementation
 Process called "generate_index_expr" takes context as Integer, index_hir as Integer returns Integer:
     Note: Generate index expression
 
@@ -1789,6 +2413,18 @@ Process called "generate_index_expr" takes context as Integer, index_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emits Go's slice expression 'OBJ[LOW:HIGH]' or three-index form
+'OBJ[LOW:HIGH:MAX]'. Each index is optional in the binary form
+(absent low defaults to 0; absent high defaults to len(obj)).
+@End Reasoning
+
+@Implementation:
+generate_expression on "object". '['. Optional "low" expression
+followed by ':'. Optional "high" expression. If "max" is present:
+emit a second ':' followed by max expression (three-index form).
+']'.
+@End Implementation
 Process called "generate_slice_expr" takes context as Integer, slice_hir as Integer returns Integer:
     Note: Generate slice expression
 
@@ -1822,6 +2458,17 @@ Process called "generate_slice_expr" takes context as Integer, slice_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emits 'OBJ.FIELD' for Go member access. Used for struct fields,
+method references, and package qualifications (the parser treats
+'pkg.Func' and 'obj.Field' as the same syntactic form because Go
+resolves identifier scope after parse).
+@End Reasoning
+
+@Implementation:
+generate_expression on "object". '.'. Emits the selector name
+string from "selector" or "name" key.
+@End Implementation
 Process called "generate_selector_expr" takes context as Integer, selector_hir as Integer returns Integer:
     Note: Generate selector expression (x.y)
 
@@ -1846,6 +2493,17 @@ Process called "generate_selector_expr" takes context as Integer, selector_hir a
     Return 1
 End Process
 
+@Reasoning:
+Emits 'EXPR.(TYPE)', Go's type assertion. The asserted-to type may be
+any type expression; the special 'type' switch form 'x.(type)' is not
+handled here because it only appears inside switch headers and is
+emitted by generate_switch_statement directly.
+@End Reasoning
+
+@Implementation:
+generate_expression on "expression". '.('. Recurses
+generate_type on "type". ')'.
+@End Implementation
 Process called "generate_type_assert_expr" takes context as Integer, assert_hir as Integer returns Integer:
     Note: Generate type assertion expression (x.(T))
 
@@ -1872,6 +2530,21 @@ Process called "generate_type_assert_expr" takes context as Integer, assert_hir 
     Return 1
 End Process
 
+@Reasoning:
+Emits a Go composite literal 'TYPE{elements...}'. Handles struct,
+array, slice, and map composites with their shared shape. Each
+element may be a key-value pair (struct fields, map entries) or a
+bare value (positional struct or array element). The HIR records
+the key explicitly on entries that need it.
+@End Reasoning
+
+@Implementation:
+If "type" is present generate_type emits the prefix type. '{'.
+Iterates "elements" list: each entry may have a "key" sub-tree
+(if so emit generate_expression(key) + ': ') and always has a "value"
+sub-tree (generate_expression(value)). Separator ", " between
+adjacent entries. '}'.
+@End Implementation
 Process called "generate_composite_lit" takes context as Integer, composite_hir as Integer returns Integer:
     Note: Generate composite literal
 
@@ -1915,6 +2588,18 @@ Process called "generate_composite_lit" takes context as Integer, composite_hir 
     Return 1
 End Process
 
+@Reasoning:
+Emits an anonymous function literal 'func(params) ret { body }'.
+These appear inline as expression values (e.g. for go-routine
+launch, defer payload, or as a callback argument). Identical shape
+to generate_function minus the leading name.
+@End Reasoning
+
+@Implementation:
+Emits 'func('. generate_parameter_list on "parameters". ')'.
+Optional ' ' + generate_type on "return_type". ' '.
+generate_statement on "body".
+@End Implementation
 Process called "generate_func_lit" takes context as Integer, func_lit_hir as Integer returns Integer:
     Note: Generate function literal (anonymous function)
 
@@ -1949,6 +2634,17 @@ Process called "generate_func_lit" takes context as Integer, func_lit_hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Emits an identifier (variable, function, type, or package name).
+Go identifier visibility is encoded by the first character's case
+(capitalised => exported) so the name is emitted verbatim with no
+transformation.
+@End Reasoning
+
+@Implementation:
+Reads the "name" key via get_dict_string_value. Emits it via
+Emitter.emit_string.
+@End Implementation
 Process called "generate_identifier" takes context as Integer, id_hir as Integer returns Integer:
     Note: Generate identifier
 
@@ -1966,6 +2662,17 @@ Process called "generate_identifier" takes context as Integer, id_hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+Emits a literal token (number, string, character, boolean, nil).
+Strings include their surrounding quotes - the HIR is responsible
+for choosing between double-quoted, backquoted, and raw forms. All
+other literals are emitted as the verbatim lexeme.
+@End Reasoning
+
+@Implementation:
+Reads the "value" key via get_dict_string_value. Emits it as-is via
+Emitter.emit_string.
+@End Implementation
 Process called "generate_literal" takes context as Integer, literal_hir as Integer returns Integer:
     Note: Generate literal
 
@@ -1987,6 +2694,20 @@ Note: ==========================================================================
 Note: Main Generation Entry
 Note: ============================================================================
 
+@Reasoning:
+Public entry-point. Constructs an emitter, wires up a context,
+runs generate_program, and returns the emitter's accumulated output.
+This is the symbol called by the translation pipeline driver when
+the target language is "go".
+@End Reasoning
+
+@Implementation:
+Creates a Go emitter via Emitter.create_emitter. Creates a context
+binding it. Runs generate_program(context, hir_input). Captures the
+emitter's resulting output buffer via Emitter.get_output. Destroys
+the context (does not free the emitter; caller does that or
+consults emitter output before destroying). Returns the output.
+@End Implementation
 Process called "generate_hir_to_go" takes hir_input as Integer returns Integer:
     Note: Main entry point for HIR to Go code generation
 

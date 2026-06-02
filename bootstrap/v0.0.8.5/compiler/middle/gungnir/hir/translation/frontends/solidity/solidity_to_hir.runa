@@ -17,6 +17,22 @@ Note: ===================================================================
 Note: TRANSLATION CONTEXT
 Note: ===================================================================
 
+@Reasoning:
+Translation cursor tracking the HIR module being built plus the
+contract/function/scope contexts. Current pointers update as the
+walker descends and restore as it ascends, so nested constructs
+(modifier inside contract inside module) can resolve enclosing
+context without backtracking.
+@End Reasoning
+
+@Implementation:
+Four Integer fields stored as a value-type struct. hir_module is the
+top-level HIR module pointer; current_contract is the enclosing
+class HIR (null at top-level); current_function is the enclosing
+function HIR (null outside function bodies); current_scope is the
+lexical scope cursor for variable resolution.
+@End Implementation
+
 Type called "TranslationContext":
     hir_module as Integer
     current_contract as Integer
@@ -28,11 +44,37 @@ Note: ===================================================================
 Note: MAIN TRANSLATION ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+Public entry point: builds a translation context, walks the Solidity
+AST, returns the assembled HIR module. The context's hir_module slot
+holds the result accumulated through the walk.
+@End Reasoning
+
+@Implementation:
+create_context returns a fresh context with an empty HIR module.
+translate_program walks the AST top-down, registering each top-level
+declaration into the module via add_class/add_import/etc. Returns
+ctx.hir_module.
+@End Implementation
+
 Process called "translate_solidity_to_hir" takes solidity_ast as Integer returns Integer:
     Let ctx be proc create_context
     proc translate_program with ctx, solidity_ast
     Return ctx.hir_module
 End Process
+
+@Reasoning:
+Constructs a fresh translation context bound to a new HIR module
+named "solidity_module". The named module lets downstream tooling
+distinguish Solidity-derived HIR from other source languages.
+@End Reasoning
+
+@Implementation:
+Calls hir_create_module to allocate the underlying HIR module.
+Constructs a TranslationContext value-type with hir_module set and
+the three current_* cursors nulled out (we're at top-level on
+entry).
+@End Implementation
 
 Process called "create_context" returns Integer:
     Let hir_module be proc hir_create_module from HIR with "solidity_module"
@@ -50,6 +92,18 @@ Note: ===================================================================
 Note: PROGRAM TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Walks the program AST iterating top-level declarations in source
+order. Each child is dispatched through translate_top_level_declaration
+to its kind-specific handler.
+@End Reasoning
+
+@Implementation:
+Reads children list via solidity_ast_children. Iterates list calling
+translate_top_level_declaration on each. No early termination —
+errors handled at child-handler level via metadata.
+@End Implementation
+
 Process called "translate_program" takes ctx as Integer, program_node as Integer:
     Let children be proc solidity_ast_children from SolidityParser with program_node
     Let count be proc list_length from ListCore with children
@@ -65,6 +119,18 @@ End Process
 Note: ===================================================================
 Note: TOP-LEVEL DECLARATION TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Top-level declaration dispatcher. Solidity has seven top-level kinds:
+pragma, import, contract, interface, library, using, error. Each
+maps to a specialised translator.
+@End Reasoning
+
+@Implementation:
+Reads node_type via solidity_ast_type. Nested If-chain comparing
+against each SolidityParser.SOL_* constant; on match invokes the
+corresponding translator and returns.
+@End Implementation
 
 Process called "translate_top_level_declaration" takes ctx as Integer, node as Integer:
     Let node_type be proc solidity_ast_type from SolidityParser with node
@@ -102,6 +168,19 @@ Note: ===================================================================
 Note: PRAGMA TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Solidity `pragma solidity ^0.8.0;` directives are recorded as module
+metadata rather than as HIR declarations because they affect compiler
+behaviour, not the runtime semantics of the contract.
+@End Reasoning
+
+@Implementation:
+Reads pragma_type (the directive name like "solidity") and metadata
+dict containing the value. Sets two metadata fields on the HIR
+module: "solidity_pragma_type" and "solidity_pragma_value" (only if
+value is non-empty).
+@End Implementation
+
 Process called "translate_pragma" takes ctx as Integer, pragma_node as Integer:
     Let pragma_type be proc solidity_ast_value from SolidityParser with pragma_node
     Let metadata be proc solidity_ast_metadata from SolidityParser with pragma_node
@@ -119,6 +198,19 @@ End Process
 Note: ===================================================================
 Note: IMPORT TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Translates `import "path";` and `import "path" as Name;` to a HIR
+import node attached to the module. Alias (if present) becomes
+metadata on the import.
+@End Reasoning
+
+@Implementation:
+Reads metadata, extracts "path" and "alias" via get_metadata_value.
+Creates HIR import via hir_create_import, adds to module via
+hir_module_add_import. If alias non-empty, attaches as
+"solidity_alias" metadata on the import.
+@End Implementation
 
 Process called "translate_import" takes ctx as Integer, import_node as Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with import_node
@@ -139,6 +231,23 @@ End Process
 Note: ===================================================================
 Note: CONTRACT TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Translates a Solidity `contract` declaration to a HIR class with
+"solidity_type"="contract" metadata so downstream tooling knows it
+came from Solidity (versus a generic class). Inheritance is captured
+through metadata since HIR's class model doesn't natively know about
+Solidity's multiple-inheritance specifics.
+@End Reasoning
+
+@Implementation:
+Reads contract_name. Creates HIR class. Pushes ctx.current_contract.
+Sets source_language and solidity_type metadata. Reads metadata dict
+for "abstract" flag and "bases" inheritance list; attaches as
+metadata. Iterates contract children invoking translate_contract_member
+on each. Adds the class to the module. Restores ctx.current_contract
+to 0 (we're leaving contract scope).
+@End Implementation
 
 Process called "translate_contract" takes ctx as TranslationContext, contract_node as Integer:
     Let contract_name be proc solidity_ast_value from SolidityParser with contract_node
@@ -179,6 +288,18 @@ Process called "translate_contract" takes ctx as TranslationContext, contract_no
     Set ctx.current_contract to 0
 End Process
 
+@Reasoning:
+Records inheritance via metadata since HIR's basic class model doesn't
+directly express Solidity's C3-linearized multiple-inheritance. Each
+base class is added as a separate "solidity_inherits" metadata entry.
+@End Reasoning
+
+@Implementation:
+Iterates bases list. For each base name, calls hir_set_metadata to
+attach as "solidity_inherits" — multiple sets with the same key
+accumulate into a list at the HIR level.
+@End Implementation
+
 Process called "translate_inheritance" takes ctx as Integer, hir_class as Integer, bases as Integer:
     Let count be proc list_length from ListCore with bases
     Let i be 0
@@ -193,6 +314,19 @@ End Process
 Note: ===================================================================
 Note: INTERFACE TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Solidity interfaces are like abstract contracts with only function
+signatures (no implementations). HIR represents them as classes with
+solidity_type="interface" metadata.
+@End Reasoning
+
+@Implementation:
+Same shape as translate_contract: reads name, creates HIR class,
+pushes current_contract, sets metadata (source_language, solidity_type
+= "interface"), iterates members, adds to module, restores
+current_contract.
+@End Implementation
 
 Process called "translate_interface" takes ctx as TranslationContext, interface_node as Integer:
     Let interface_name be proc solidity_ast_value from SolidityParser with interface_node
@@ -229,6 +363,18 @@ Note: ===================================================================
 Note: LIBRARY TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Solidity libraries are stateless code collections that can be called
+via `using` directives or qualified `LibName.function()` syntax. HIR
+treats them as classes with solidity_type="library" metadata.
+@End Reasoning
+
+@Implementation:
+Same pattern as contract/interface: reads name, creates HIR class
+with solidity_type="library" metadata, pushes current_contract,
+translates members, restores cursor.
+@End Implementation
+
 Process called "translate_library" takes ctx as TranslationContext, library_node as Integer:
     Let library_name be proc solidity_ast_value from SolidityParser with library_node
 
@@ -257,6 +403,18 @@ Note: ===================================================================
 Note: USING DIRECTIVE TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Solidity's `using LibName for Type;` directive attaches library
+methods to a type so they can be called via dot notation. Recorded
+as module metadata since there's no direct HIR analog.
+@End Reasoning
+
+@Implementation:
+Reads library_name (the library name) and target_type from metadata.
+Attaches as module metadata "solidity_using_library" and
+"solidity_using_for_type" respectively.
+@End Implementation
+
 Process called "translate_using" takes ctx as Integer, using_node as Integer:
     Let library_name be proc solidity_ast_value from SolidityParser with using_node
     Let metadata be proc solidity_ast_metadata from SolidityParser with using_node
@@ -270,6 +428,18 @@ End Process
 Note: ===================================================================
 Note: ERROR DEFINITION TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Solidity 0.8.4+ custom errors `error MyError(uint256 code);` are
+exception-like types used with `revert` for cheaper error reporting.
+HIR records them as classes with solidity_type="error".
+@End Reasoning
+
+@Implementation:
+Reads error name, creates a HIR class with the
+solidity_type="error" metadata tag. Iterates parameters and adds
+them as fields on the class.
+@End Implementation
 
 Process called "translate_error_definition" takes ctx as Integer, error_node as Integer:
     Let error_name be proc solidity_ast_value from SolidityParser with error_node
@@ -297,6 +467,19 @@ End Process
 Note: ===================================================================
 Note: CONTRACT MEMBER TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Contract member dispatcher. Within a contract, members can be:
+struct, enum, event, modifier, function, constructor, fallback,
+receive, state variable, error (Solidity 0.8.4+), or nested type.
+Each routes to its specialised translator.
+@End Reasoning
+
+@Implementation:
+Reads node_type and dispatches via nested If-chain against the
+SolidityParser.SOL_* constants for each member kind, calling the
+corresponding translate_* handler.
+@End Implementation
 
 Process called "translate_contract_member" takes ctx as Integer, member_node as Integer:
     Let node_type be proc solidity_ast_type from SolidityParser with member_node
@@ -350,6 +533,16 @@ Note: ===================================================================
 Note: STRUCT TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Translates `struct Name { field; field; }` to a HIR class with
+solidity_type="struct". Struct fields map to HIR class fields.
+@End Reasoning
+
+@Implementation:
+Reads struct name, creates HIR class, attaches solidity_type metadata.
+Iterates fields and adds each as a field on the class.
+@End Implementation
+
 Process called "translate_struct" takes ctx as Integer, struct_node as Integer:
     Let struct_name be proc solidity_ast_value from SolidityParser with struct_node
 
@@ -380,6 +573,18 @@ Note: ===================================================================
 Note: ENUM TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Translates `enum Name { A, B, C }` to a HIR class with members for
+each enum constant. Solidity enums are sequentially-numbered
+constants represented as uint values.
+@End Reasoning
+
+@Implementation:
+Reads enum name, creates HIR class with solidity_type="enum" metadata.
+Iterates enum value children adding each as a static field on the
+class.
+@End Implementation
+
 Process called "translate_enum" takes ctx as Integer, enum_node as Integer:
     Let enum_name be proc solidity_ast_value from SolidityParser with enum_node
 
@@ -406,6 +611,19 @@ End Process
 Note: ===================================================================
 Note: EVENT TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Solidity events `event Name(args)` emit log entries on the
+blockchain. HIR represents them as functions (since emit is a
+call-like operation) with solidity_type="event" metadata to
+distinguish them.
+@End Reasoning
+
+@Implementation:
+Reads event name, creates HIR function with solidity_type="event"
+metadata. Iterates parameters adding each. Optionally handles
+"anonymous" flag on the event.
+@End Implementation
 
 Process called "translate_event" takes ctx as TranslationContext, event_node as Integer:
     Let event_name be proc solidity_ast_value from SolidityParser with event_node
@@ -452,6 +670,19 @@ Note: ===================================================================
 Note: MODIFIER TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Solidity modifiers `modifier onlyOwner() { ...; _; }` are aspect-style
+preconditions that wrap function bodies. HIR represents them as
+functions with solidity_type="modifier" so consumers can decide whether
+to inline them or keep them as named blocks.
+@End Reasoning
+
+@Implementation:
+Reads modifier name, creates HIR function. Sets solidity_type="modifier"
+metadata. Iterates parameters and adds the body block (containing the
+`_` placeholder where the wrapped function inserts).
+@End Implementation
+
 Process called "translate_modifier" takes ctx as TranslationContext, modifier_node as Integer:
     Let modifier_name be proc solidity_ast_value from SolidityParser with modifier_node
 
@@ -491,6 +722,19 @@ End Process
 Note: ===================================================================
 Note: FUNCTION TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Solidity function with full metadata: visibility (public/private/
+external/internal), state mutability (pure/view/payable), modifiers
+list, return type. Each piece is captured on the HIR function.
+@End Reasoning
+
+@Implementation:
+Reads function name, creates HIR function, pushes ctx.current_function.
+Reads metadata for visibility, mutability; attaches each as metadata.
+Iterates parameters, return values, modifiers. Translates body if
+present. Pops current_function on exit.
+@End Implementation
 
 Process called "translate_function" takes ctx as TranslationContext, function_node as Integer:
     Let function_name be proc solidity_ast_value from SolidityParser with function_node
@@ -544,6 +788,17 @@ Process called "translate_function" takes ctx as TranslationContext, function_no
     proc hir_class_add_method from HIR with ctx.current_contract, hir_function
 End Process
 
+@Reasoning:
+Attaches Solidity function modifiers (e.g., `onlyOwner`) as metadata
+on the HIR function. Each modifier name is added separately so they
+can be applied in order.
+@End Reasoning
+
+@Implementation:
+Reads modifiers list from metadata. Iterates calling hir_set_metadata
+on each with key "solidity_function_modifier".
+@End Implementation
+
 Process called "translate_function_modifiers" takes ctx as Integer, hir_function as Integer, metadata as Integer:
     Let modifiers be proc get_metadata_value with metadata, "modifiers"
 
@@ -564,6 +819,18 @@ End Process
 Note: ===================================================================
 Note: CONSTRUCTOR TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Solidity constructors run once at contract deployment. Represented as
+HIR functions with a special "<init>" name and
+solidity_type="constructor" metadata.
+@End Reasoning
+
+@Implementation:
+Creates a HIR function with name "<init>". Reads metadata for
+visibility and mutability and attaches as metadata. Translates
+parameters and body identically to a regular function.
+@End Implementation
 
 Process called "translate_constructor" takes ctx as TranslationContext, constructor_node as Integer:
     Note: Create HIR function for constructor
@@ -606,6 +873,17 @@ Note: ===================================================================
 Note: FALLBACK AND RECEIVE TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Solidity `fallback()` function is invoked when a call has no matching
+function selector or when ether is sent without data. HIR represents
+as a named function with solidity_type="fallback".
+@End Reasoning
+
+@Implementation:
+Creates HIR function named "fallback" with solidity_type="fallback"
+metadata. Iterates parameters (usually empty), translates body.
+@End Implementation
+
 Process called "translate_fallback" takes ctx as TranslationContext, fallback_node as Integer:
     Let hir_fallback be proc hir_create_function from HIR with "fallback"
     proc hir_set_metadata from HIR with hir_fallback, "source_language", "solidity"
@@ -635,6 +913,18 @@ Process called "translate_fallback" takes ctx as TranslationContext, fallback_no
 
     proc hir_class_add_method from HIR with ctx.current_contract, hir_fallback
 End Process
+
+@Reasoning:
+Solidity 0.6.0+ `receive()` function is a specialised fallback for
+plain ether transfers (no data). HIR represents as a named function
+with solidity_type="receive".
+@End Reasoning
+
+@Implementation:
+Creates HIR function named "receive" with solidity_type="receive"
+metadata. Receive must be payable per Solidity rules; the payable
+metadata is also attached.
+@End Implementation
 
 Process called "translate_receive" takes ctx as TranslationContext, receive_node as Integer:
     Let hir_receive be proc hir_create_function from HIR with "receive"
@@ -669,6 +959,20 @@ End Process
 Note: ===================================================================
 Note: STATE VARIABLE TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+State variables persist on the blockchain across calls. Solidity
+captures visibility (public/private/internal) and mutability
+(constant/immutable) modifiers on state vars. HIR represents them
+as class fields with attached metadata.
+@End Reasoning
+
+@Implementation:
+Reads variable name, type, visibility, mutability, and initializer
+from the AST node. Creates HIR field on the current_contract,
+attaches visibility/mutability as metadata. Translates initializer
+expression if present.
+@End Implementation
 
 Process called "translate_state_variable" takes ctx as TranslationContext, var_node as Integer:
     Let var_name be proc solidity_ast_value from SolidityParser with var_node
@@ -705,6 +1009,18 @@ End Process
 Note: ===================================================================
 Note: STATEMENT TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Statement-kind dispatcher. Solidity has block, if, while, for,
+do-while, return, emit, revert, try, expression-statement, plus
+break/continue (handled separately). Routes each to its translator.
+@End Reasoning
+
+@Implementation:
+Reads node_type via solidity_ast_type and uses nested If-chain to
+dispatch against SolidityParser.SOL_*_STMT constants. Each match
+returns the corresponding translate_*_statement result.
+@End Implementation
 
 Process called "translate_statement" takes ctx as Integer, stmt_node as Integer returns Integer:
     Let node_type be proc solidity_ast_type from SolidityParser with stmt_node
@@ -761,6 +1077,16 @@ Process called "translate_statement" takes ctx as Integer, stmt_node as Integer 
     Return 0
 End Process
 
+@Reasoning:
+Block statement `{ s1; s2; }`. Wraps a sequence of statements in a
+HIR block node.
+@End Reasoning
+
+@Implementation:
+Creates HIR block, iterates children statements translating each
+via translate_statement, appending to the block's body.
+@End Implementation
+
 Process called "translate_block" takes ctx as Integer, block_node as Integer returns Integer:
     Let hir_block be proc hir_create_block from HIR
 
@@ -781,6 +1107,17 @@ Process called "translate_block" takes ctx as Integer, block_node as Integer ret
 
     Return hir_block
 End Process
+
+@Reasoning:
+`if (cond) { then } else { else }`. Creates HIR if with condition,
+then-block, and optional else-block.
+@End Reasoning
+
+@Implementation:
+Reads condition, then-block, optional else-block from children.
+Recursively translates each via translate_expression /
+translate_statement. Constructs HIR if-statement.
+@End Implementation
 
 Process called "translate_if_statement" takes ctx as Integer, if_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with if_node
@@ -805,6 +1142,15 @@ Process called "translate_if_statement" takes ctx as Integer, if_node as Integer
     Return hir_if
 End Process
 
+@Reasoning:
+`while (cond) body`. Creates HIR while-loop with condition and body.
+@End Reasoning
+
+@Implementation:
+Reads condition and body from children; recursively translates both.
+Constructs HIR while-loop.
+@End Implementation
+
 Process called "translate_while_statement" takes ctx as Integer, while_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with while_node
     Let condition be proc get_metadata_value with metadata, "condition"
@@ -818,6 +1164,17 @@ Process called "translate_while_statement" takes ctx as Integer, while_node as I
     Let hir_while be proc hir_create_while_statement from HIR with hir_condition, hir_body
     Return hir_while
 End Process
+
+@Reasoning:
+C-style `for (init; cond; update) body`. All three header slots are
+optional. HIR captures them in a structured for-loop node.
+@End Reasoning
+
+@Implementation:
+Reads init, condition, update, body from children. Each optional;
+nulls preserved on absent slots. Recursively translates each
+present part.
+@End Implementation
 
 Process called "translate_for_statement" takes ctx as Integer, for_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with for_node
@@ -867,6 +1224,17 @@ Process called "translate_for_statement" takes ctx as Integer, for_node as Integ
     Return hir_block
 End Process
 
+@Reasoning:
+`do body while (cond);` — body executes once before condition is
+tested. Creates HIR do-while statement.
+@End Reasoning
+
+@Implementation:
+Reads body and condition from children. Recursively translates both
+and constructs the HIR do-while node with the body-first semantics
+preserved.
+@End Implementation
+
 Process called "translate_do_while_statement" takes ctx as Integer, do_while_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with do_while_node
     Let condition be proc get_metadata_value with metadata, "condition"
@@ -887,6 +1255,17 @@ Process called "translate_do_while_statement" takes ctx as Integer, do_while_nod
     Return hir_block
 End Process
 
+@Reasoning:
+`return value;` or bare `return;`. HIR return statement carries the
+optional value expression.
+@End Reasoning
+
+@Implementation:
+Reads optional return expression child; if present, translates via
+translate_expression and attaches as the return value. Otherwise
+emits a value-less return.
+@End Implementation
+
 Process called "translate_return_statement" takes ctx as Integer, return_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with return_node
     Let value be proc get_metadata_value with metadata, "value"
@@ -900,6 +1279,17 @@ Process called "translate_return_statement" takes ctx as Integer, return_node as
     Return hir_return
 End Process
 
+@Reasoning:
+Solidity `emit EventName(args);` fires an event log. HIR translates
+to a call expression with solidity_type="emit" metadata so consumers
+recognise it as an event emission rather than a regular call.
+@End Reasoning
+
+@Implementation:
+Reads the event call expression child, recursively translates it,
+attaches solidity_type="emit" metadata.
+@End Implementation
+
 Process called "translate_emit_statement" takes ctx as Integer, emit_node as Integer returns Integer:
     Note: Emit statement translates to function call
     Let children be proc solidity_ast_children from SolidityParser with emit_node
@@ -910,6 +1300,18 @@ Process called "translate_emit_statement" takes ctx as Integer, emit_node as Int
 
     Return hir_stmt
 End Process
+
+@Reasoning:
+`revert();` or `revert MyError(args);` aborts execution and refunds
+remaining gas. The optional error argument uses the custom-error
+syntax (Solidity 0.8.4+) or a string-message form.
+@End Reasoning
+
+@Implementation:
+Reads optional argument child. Wraps in HIR revert statement with
+metadata "solidity_revert_kind" set to "error" or "message" based
+on the argument shape.
+@End Implementation
 
 Process called "translate_revert_statement" takes ctx as Integer, revert_node as Integer returns Integer:
     Note: Revert translates to exception throw
@@ -928,6 +1330,17 @@ Process called "translate_revert_statement" takes ctx as Integer, revert_node as
     Let hir_throw be proc hir_create_throw_statement from HIR with hir_exception
     Return hir_throw
 End Process
+
+@Reasoning:
+`try expression { success } catch ErrorName(args) { handler }` is
+Solidity 0.6+ external-call error recovery. HIR represents as a
+try-catch with a list of catch clauses (Error, Panic, low-level).
+@End Reasoning
+
+@Implementation:
+Reads try-call expression and the catch clauses list. Translates the
+expression and each catch clause via translate_catch_clause.
+@End Implementation
 
 Process called "translate_try_statement" takes ctx as Integer, try_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with try_node
@@ -964,6 +1377,17 @@ Process called "translate_try_statement" takes ctx as Integer, try_node as Integ
     Return hir_try
 End Process
 
+@Reasoning:
+Each catch clause has a catch-kind (Error, Panic, low-level/no-name)
+plus optional parameter binding and a body block.
+@End Reasoning
+
+@Implementation:
+Reads catch_kind from the AST node and parameters/body from
+children. Constructs a HIR catch clause with kind metadata, parameter
+list, and translated body.
+@End Implementation
+
 Process called "translate_catch_clause" takes ctx as Integer, catch_node as Integer returns Integer:
     Note: Translate catch clause
     Let children be proc solidity_ast_children from SolidityParser with catch_node
@@ -992,6 +1416,16 @@ Process called "translate_catch_clause" takes ctx as Integer, catch_node as Inte
     Return hir_catch
 End Process
 
+@Reasoning:
+Wraps a single expression as a statement (for side-effect calls and
+assignments at statement level).
+@End Reasoning
+
+@Implementation:
+Reads the wrapped expression child and recursively translates via
+translate_expression, wrapping in a HIR expression-statement node.
+@End Implementation
+
 Process called "translate_expression_statement" takes ctx as Integer, expr_stmt as Integer returns Integer:
     Let children be proc solidity_ast_children from SolidityParser with expr_stmt
     Let expr_node be proc list_get from ListCore with children, 0
@@ -1005,6 +1439,19 @@ End Process
 Note: ===================================================================
 Note: EXPRESSION TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+Expression-kind dispatcher. Solidity expression kinds: binary, unary,
+ternary, assign, call, new, member access, index, array literal,
+identifier, literal. Each routes to its translator.
+@End Reasoning
+
+@Implementation:
+Reads node_type via solidity_ast_type and dispatches via nested
+If-chain against SolidityParser.SOL_*_EXPR / SOL_LITERAL /
+SOL_IDENTIFIER constants. Each match returns the corresponding
+translate_*_expression result.
+@End Implementation
 
 Process called "translate_expression" takes ctx as Integer, expr_node as Integer returns Integer:
     Let node_type be proc solidity_ast_type from SolidityParser with expr_node
@@ -1070,6 +1517,17 @@ Process called "translate_expression" takes ctx as Integer, expr_node as Integer
     Return 0
 End Process
 
+@Reasoning:
+Emits HIR binary expression. Solidity binary operators include
+arithmetic (+ - * / % **), comparison (== != < > <= >=), logical
+(&& ||), bitwise (& | ^ << >>).
+@End Reasoning
+
+@Implementation:
+Reads operator from metadata, left and right from children.
+Recursively translates each operand and constructs HIR binary node.
+@End Implementation
+
 Process called "translate_binary_expression" takes ctx as Integer, binary_node as Integer returns Integer:
     Let operator be proc solidity_ast_value from SolidityParser with binary_node
     Let metadata be proc solidity_ast_metadata from SolidityParser with binary_node
@@ -1084,6 +1542,18 @@ Process called "translate_binary_expression" takes ctx as Integer, binary_node a
     Return hir_binary
 End Process
 
+@Reasoning:
+Unary expression: prefix (++, --, !, ~, +, -, delete) and postfix
+(++, --). Solidity distinguishes prefix/postfix; the AST stores the
+position flag.
+@End Reasoning
+
+@Implementation:
+Reads operator and is_prefix flag from metadata, operand from
+children. Recursively translates operand and constructs HIR unary
+node with prefix/postfix indication.
+@End Implementation
+
 Process called "translate_unary_expression" takes ctx as Integer, unary_node as Integer returns Integer:
     Let operator be proc solidity_ast_value from SolidityParser with unary_node
     Let metadata be proc solidity_ast_metadata from SolidityParser with unary_node
@@ -1094,6 +1564,16 @@ Process called "translate_unary_expression" takes ctx as Integer, unary_node as 
     Let hir_unary be proc hir_create_unary_expression from HIR with operator, hir_operand
     Return hir_unary
 End Process
+
+@Reasoning:
+Conditional expression `cond ? then : else`. Three children
+representing condition, then-value, else-value.
+@End Reasoning
+
+@Implementation:
+Reads three children, recursively translates each via
+translate_expression. Constructs HIR ternary node.
+@End Implementation
 
 Process called "translate_ternary_expression" takes ctx as Integer, ternary_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with ternary_node
@@ -1110,6 +1590,18 @@ Process called "translate_ternary_expression" takes ctx as Integer, ternary_node
     Return hir_ternary
 End Process
 
+@Reasoning:
+Assignment `lhs = rhs` or compound `lhs += rhs`. Solidity assignments
+are expressions (return the assigned value) but commonly appear in
+statement position.
+@End Reasoning
+
+@Implementation:
+Reads operator from metadata, left and right children. Recursively
+translates both operands and constructs HIR assignment node with
+the operator string preserved.
+@End Implementation
+
 Process called "translate_assign_expression" takes ctx as Integer, assign_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with assign_node
 
@@ -1122,6 +1614,19 @@ Process called "translate_assign_expression" takes ctx as Integer, assign_node a
     Let hir_assign be proc hir_create_assign_expression from HIR with hir_target, hir_value
     Return hir_assign
 End Process
+
+@Reasoning:
+Function call `f(args)`. The callee can be any expression yielding
+a callable (identifier, member access, address.call). Solidity also
+has named-argument calls `f({a: 1, b: 2})` which the metadata flag
+distinguishes.
+@End Reasoning
+
+@Implementation:
+Reads callee (first child) and arguments (remaining children).
+Recursively translates each. Reads named_args flag from metadata
+to record call style. Constructs HIR call expression.
+@End Implementation
 
 Process called "translate_call_expression" takes ctx as Integer, call_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with call_node
@@ -1152,6 +1657,18 @@ Process called "translate_call_expression" takes ctx as Integer, call_node as In
     Return hir_call
 End Process
 
+@Reasoning:
+`new Contract(args)` or `new Type[](size)` for array creation. The
+new operator allocates a new instance on the blockchain (contract
+deployment) or in memory (arrays).
+@End Reasoning
+
+@Implementation:
+Reads target type from child and optional arguments. Recursively
+translates both. Constructs HIR new-expression with the type and
+argument list.
+@End Implementation
+
 Process called "translate_new_expression" takes ctx as Integer, new_node as Integer returns Integer:
     Let type_name be proc solidity_ast_value from SolidityParser with new_node
 
@@ -1172,6 +1689,15 @@ Process called "translate_new_expression" takes ctx as Integer, new_node as Inte
     Return hir_new
 End Process
 
+@Reasoning:
+Member access `x.y` for field/method/contract-member references.
+@End Reasoning
+
+@Implementation:
+Reads object (first child) and member name from metadata. Recursively
+translates object and constructs HIR member-access node.
+@End Implementation
+
 Process called "translate_member_expression" takes ctx as Integer, member_node as Integer returns Integer:
     Let member_name be proc solidity_ast_value from SolidityParser with member_node
     Let metadata be proc solidity_ast_metadata from SolidityParser with member_node
@@ -1182,6 +1708,16 @@ Process called "translate_member_expression" takes ctx as Integer, member_node a
     Let hir_member be proc hir_create_member_expression from HIR with hir_object, member_name
     Return hir_member
 End Process
+
+@Reasoning:
+Index access `a[i]` for arrays and mappings. Solidity index works on
+arrays (numeric index) and mappings (any-type key).
+@End Reasoning
+
+@Implementation:
+Reads array (first child) and index (second child). Recursively
+translates both and constructs HIR index-access node.
+@End Implementation
 
 Process called "translate_index_expression" takes ctx as Integer, index_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with index_node
@@ -1195,6 +1731,17 @@ Process called "translate_index_expression" takes ctx as Integer, index_node as 
     Let hir_index_expr be proc hir_create_index_expression from HIR with hir_object, hir_index
     Return hir_index_expr
 End Process
+
+@Reasoning:
+Array literal `[1, 2, 3]` creates an inline array. Element types
+must be uniform (or coercible to a common type).
+@End Reasoning
+
+@Implementation:
+Iterates child element expressions, recursively translates each via
+translate_expression, accumulates into the HIR array literal's
+elements list.
+@End Implementation
 
 Process called "translate_array_literal" takes ctx as Integer, array_node as Integer returns Integer:
     Let hir_array be proc hir_create_array_literal from HIR
@@ -1216,6 +1763,18 @@ End Process
 Note: ===================================================================
 Note: METADATA UTILITIES
 Note: ===================================================================
+
+@Reasoning:
+Generic accessor for Solidity AST metadata dictionaries. Centralised
+helper so translation routines don't repeat the same Dict-lookup
+boilerplate.
+@End Reasoning
+
+@Implementation:
+If metadata is null returns 0 (empty string). Otherwise queries the
+underlying Dict via dict_get_value for the given key, returning the
+stored value or 0 if absent.
+@End Implementation
 
 Process called "get_metadata_value" takes metadata as Integer, key as Integer returns Integer:
     If metadata is equal to 0:
@@ -1249,6 +1808,16 @@ End Process
 Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
+
+@Reasoning:
+Alternative public entry point matching the file-level naming
+convention. Functionally identical to translate_solidity_to_hir;
+exists for API consistency with other frontends.
+@End Reasoning
+
+@Implementation:
+Single-line wrapper delegating to translate_solidity_to_hir.
+@End Implementation
 
 Process called "solidity_to_hir" takes solidity_ast as Integer returns Integer:
     Return proc translate_solidity_to_hir from solidity_ast

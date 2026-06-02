@@ -79,6 +79,21 @@ Note: ===================================================================
 Note: AST NODE STRUCTURE
 Note: ===================================================================
 
+@Reasoning:
+The PHP AST uses a uniform four-field shape for every node kind: a
+node_type discriminator (one of the PHP_* constants), a value slot
+holding the lexeme for leaf nodes (identifiers, literals) or 0 for
+interior nodes, a children pointer to a ListCore list of sub-nodes,
+and a metadata pointer for kind-specific extra data (visibility flags,
+modifiers, etc.). This uniformity lets a single tree walker handle
+every PHP construct without per-kind dispatch tables.
+@End Reasoning
+
+@Implementation:
+Four 8-byte slots laid out in declaration order:
+node_type@0, value@8, children@16, metadata@24.
+@End Implementation
+
 Type called "ASTNode":
     node_type as Integer
     value as Integer
@@ -90,6 +105,21 @@ Note: ===================================================================
 Note: PARSER STATE
 Note: ===================================================================
 
+@Reasoning:
+The parser state carries everything needed by the recursive-descent
+walkers: the token stream produced by the lexer, the running position
+within it (incremented by advance/consume), and the pre-computed
+length so end-of-stream tests are O(1). Position is tracked by index
+rather than by pointer so debug/error messages can report token
+numbers without pointer arithmetic.
+@End Reasoning
+
+@Implementation:
+Three 8-byte slots: tokens@0 (ListCore handle to the token sequence),
+position@8 (0-based index of the next token to consume), length@16
+(total token count, fixed at construction).
+@End Implementation
+
 Type called "Parser":
     tokens as Integer
     position as Integer
@@ -100,18 +130,44 @@ Note: ===================================================================
 Note: MAIN PARSER ENTRY POINTS
 Note: ===================================================================
 
+@Reasoning:
+Public entry point: takes raw PHP source string, tokenises via the
+PHP lexer, constructs a parser, and runs it to completion. No
+intermediate persistence - this is the one-shot "give me an AST"
+facade that test harnesses and the CLI driver call.
+@End Reasoning
+
+@Implementation:
+Calls PHPLexer.php_lex(source) to produce a ListCore token sequence.
+Calls create_parser(tokens) to wrap it in a Parser state. Tail-calls
+parse_program(parser) which walks the entire token stream into a
+single PHP_PROGRAM root node. Returns the root AST.
+@End Implementation
+
 Process called "parse_php_source" takes source as Integer returns Integer:
     Let tokens be proc php_lex from PHPLexer with source
     Let parser be proc create_parser from tokens
     Return proc parse_program from parser
 End Process
 
+@Reasoning:
+Parser constructor. Initialises position to 0 (first token) and
+precomputes length so end-of-stream checks throughout the parser are
+constant-time. Using value-of-type with field-as-value initialisation
+gives us a flat struct without separate field writes.
+@End Reasoning
+
+@Implementation:
+Constructs a Parser record with tokens=tokens, position=0,
+length=ListCore.list_length(tokens). Returns the parser handle.
+@End Implementation
+
 Process called "create_parser" takes tokens as Integer returns Integer:
     Let parser be a value of type Parser with
         tokens as tokens,
         position as 0,
         length as proc list_length from ListCore with tokens
-    
+
     Return parser
 End Process
 
@@ -119,9 +175,24 @@ Note: ===================================================================
 Note: PROGRAM PARSING
 Note: ===================================================================
 
+@Reasoning:
+Top-level entry for parsing a PHP file. PHP source starts with an
+optional `<?php` opening tag; the lexer emits TOKEN_PHP_OPEN for it
+which we silently consume since the AST has no concept of "PHP mode"
+vs HTML interleaving (a future bootstrap concern). The loop runs
+until end-of-stream collecting every top-level declaration.
+@End Reasoning
+
+@Implementation:
+Creates the PHP_PROGRAM root node with empty value. If the current
+token is TOKEN_PHP_OPEN, advances past it. Loops while not_at_end:
+calls parse_declaration and, if non-zero, appends to the program's
+children. Returns the program node.
+@End Implementation
+
 Process called "parse_program" takes parser as Integer returns Integer:
     Let program be proc create_node with PHP_PROGRAM, ""
-    
+
     Note: Skip PHP opening tag if present
     If proc check with parser, PHPLexer.TOKEN_PHP_OPEN:
         proc advance from parser
@@ -137,6 +208,26 @@ Process called "parse_program" takes parser as Integer returns Integer:
     
     Return program
 End Process
+
+@Reasoning:
+Top-level declaration dispatcher. PHP permits at file scope:
+namespaces, use declarations, classes (with optional abstract/final
+modifiers), interfaces, traits, free functions, and free statements.
+The dispatch order matters - modifiers (abstract, final) must be
+checked BEFORE class so they don't get treated as identifiers; class
+itself runs through the same parse_class regardless of which modifier
+introduced it because the modifier-collection happens inside that
+parser.
+@End Reasoning
+
+@Implementation:
+Sequence of check-and-dispatch tests on the current token:
+TOKEN_NAMESPACE -> parse_namespace, TOKEN_USE -> parse_use_declaration,
+TOKEN_CLASS / TOKEN_ABSTRACT / TOKEN_FINAL -> parse_class (each path
+parses any modifiers internally), TOKEN_INTERFACE -> parse_interface,
+TOKEN_TRAIT -> parse_trait, TOKEN_FUNCTION -> parse_function. Falls
+through to parse_statement for anything else.
+@End Implementation
 
 Process called "parse_declaration" takes parser as Integer returns Integer:
     Note: Namespace
@@ -185,6 +276,25 @@ Note: ===================================================================
 Note: NAMESPACE PARSING
 Note: ===================================================================
 
+@Reasoning:
+PHP namespaces have two surface forms: simple `namespace Foo\Bar;`
+(applies to entire rest of file) and block `namespace Foo\Bar { ... }`
+(applies only within the braces). We distinguish by peeking at what
+comes after the qualified name - LEFT_BRACE means block form,
+SEMICOLON (or anything else) means simple form. The simple form has
+no body; the block form recursively parses declarations until the
+matching closing brace.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_NAMESPACE. Parses qualified name (handles `Foo\Bar\Baz`).
+Creates PHP_NAMESPACE node with the name as value. If next is
+LEFT_BRACE: consumes it, then loops while not_at_end - on
+RIGHT_BRACE consumes and returns ns_node; otherwise calls
+parse_declaration and appends non-zero results to ns_node.
+Otherwise consumes the terminating SEMICOLON. Returns ns_node.
+@End Implementation
+
 Process called "parse_namespace" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_NAMESPACE
     
@@ -212,6 +322,22 @@ Process called "parse_namespace" takes parser as Integer returns Integer:
     
     Return ns_node
 End Process
+
+@Reasoning:
+PHP qualified names use backslash as the namespace separator:
+`Foo\Bar\Baz`. A leading backslash denotes fully-qualified (rooted)
+names: `\Foo\Bar` means "Foo in the root namespace". We preserve
+that prefix in the returned string so resolution code can
+distinguish absolute from relative names without re-parsing.
+@End Reasoning
+
+@Implementation:
+Initialises name="". If current is TOKEN_BACKSLASH, advances and
+prepends "\\". Calls expect(TOKEN_IDENTIFIER) for the first segment
+and concatenates onto name. Loops while current is TOKEN_BACKSLASH:
+advances, concatenates "\\", calls expect(TOKEN_IDENTIFIER) and
+concatenates. Returns name.
+@End Implementation
 
 Process called "parse_qualified_name" takes parser as Integer returns Integer:
     Let name be ""
@@ -241,6 +367,23 @@ Note: ===================================================================
 Note: USE DECLARATION PARSING
 Note: ===================================================================
 
+@Reasoning:
+`use Foo\Bar` and `use Foo\Bar as Baz` are PHP's import mechanism -
+they bring a namespaced name into the current scope under either
+its own short name or an alias. We preserve the alias in metadata
+because the same use-declaration is referenced by every subsequent
+unqualified reference to the imported name, and resolution needs
+to know whether `Baz` originally was an alias for `Foo\Bar`.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_USE. Parses qualified name. Creates
+PHP_USE_DECLARATION node with the name as value. If current is
+TOKEN_AS, consumes AS, expects TOKEN_IDENTIFIER for the alias,
+sets metadata "alias" to the identifier. Consumes terminating
+SEMICOLON. Returns use_node.
+@End Implementation
+
 Process called "parse_use_declaration" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_USE
     
@@ -261,6 +404,29 @@ End Process
 Note: ===================================================================
 Note: CLASS PARSING
 Note: ===================================================================
+
+@Reasoning:
+PHP class declarations have a rich modifier set (abstract, final),
+optional `extends Parent`, optional `implements I1, I2, ...`, and a
+brace-delimited body of members. Modifiers are collected into a List
+so the AST consumer can iterate them uniformly. extends is single
+(PHP has single inheritance) but implements is plural - we use
+separate metadata keys to preserve that distinction without forcing
+the consumer to type-test.
+@End Reasoning
+
+@Implementation:
+Creates modifiers List. If current is TOKEN_ABSTRACT, advances and
+appends "abstract". If current is TOKEN_FINAL, advances and appends
+"final". Consumes TOKEN_CLASS. Expects TOKEN_IDENTIFIER for the
+class name. Creates PHP_CLASS node. Stores modifiers metadata. If
+current is TOKEN_EXTENDS, consumes, parses parent qualified name,
+sets "extends" metadata. If current is TOKEN_IMPLEMENTS, consumes,
+calls parse_interface_list, sets "implements" metadata. Consumes
+LEFT_BRACE then loops parsing members via parse_class_member until
+RIGHT_BRACE. Appends each non-zero member to the class node.
+Returns class_node.
+@End Implementation
 
 Process called "parse_class" takes parser as Integer returns Integer:
     Note: Parse modifiers
@@ -316,6 +482,21 @@ Process called "parse_class" takes parser as Integer returns Integer:
     Return class_node
 End Process
 
+@Reasoning:
+Parses a comma-separated list of interface names following
+`implements` or `extends` (for interface-extends-interfaces). At
+least one name is required; subsequent names are introduced by
+commas. Returns a List rather than a single value because PHP
+classes can implement multiple interfaces.
+@End Reasoning
+
+@Implementation:
+Creates an empty interfaces List. Parses the first qualified name
+and appends it. Loops while current is TOKEN_COMMA: advances,
+parses next qualified name, appends to interfaces. Returns the
+interfaces list.
+@End Implementation
+
 Process called "parse_interface_list" takes parser as Integer returns Integer:
     Let interfaces be proc list_create from ListCore
     
@@ -330,6 +511,27 @@ Process called "parse_interface_list" takes parser as Integer returns Integer:
     
     Return interfaces
 End Process
+
+@Reasoning:
+A class body member can be a property, method, or constant - each
+introduced by their own keyword - but ANY of them can be preceded by
+visibility modifiers (public/protected/private), static, abstract, or
+final in any combination (though PHP semantically rejects some
+combinations like abstract+final). We collect ALL the modifiers
+first, then dispatch on the next token. Visibility defaults to public
+when no explicit modifier is given.
+@End Reasoning
+
+@Implementation:
+Initialises visibility="public". Tests for TOKEN_PUBLIC/PROTECTED/
+PRIVATE, advancing past whichever appears and updating visibility.
+Initialises is_static, is_abstract, is_final to 0. Tests TOKEN_STATIC/
+ABSTRACT/FINAL, advancing past matches and setting the flag. Then
+dispatches on the next token: TOKEN_CONST -> parse_class_constant;
+TOKEN_FUNCTION -> parse_method (with all collected flags);
+TOKEN_VARIABLE -> parse_property (with visibility and is_static).
+Returns 0 (failure) if none match.
+@End Implementation
 
 Process called "parse_class_member" takes parser as Integer returns Integer:
     Note: Parse visibility modifiers
@@ -386,6 +588,23 @@ Process called "parse_class_member" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+PHP class properties are introduced by a `$variable` token (PHP
+variable syntax includes the dollar sign). They can have an optional
+default value following `=`. Visibility and is_static come in as
+parameters because they were collected by parse_class_member before
+dispatch.
+@End Reasoning
+
+@Implementation:
+Reads current token (the variable), extracts its lexeme via
+PHPLexer.php_token_value, advances past it. Creates PHP_PROPERTY
+node with var_name as value. Sets metadata "visibility" and
+"is_static". If current is TOKEN_ASSIGN, advances and calls
+parse_expression to read the default value, appending it as a child.
+Consumes terminating TOKEN_SEMICOLON. Returns prop_node.
+@End Implementation
+
 Process called "parse_property" takes parser as Integer, visibility as Integer, is_static as Integer returns Integer:
     Let var_token be proc current from parser
     Let var_name be proc php_token_value from PHPLexer with var_token
@@ -406,6 +625,22 @@ Process called "parse_property" takes parser as Integer, visibility as Integer, 
     Return prop_node
 End Process
 
+@Reasoning:
+Class constants `const NAME = value;` are accessed via `Class::NAME`.
+They REQUIRE a value at declaration (no forward declarations) so the
+expression after `=` is non-optional. The visibility parameter
+typically defaults to public (older PHP only allowed public consts;
+PHP 7.1+ allows visibility modifiers).
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_CONST. Expects TOKEN_IDENTIFIER for the constant name.
+Creates PHP_CONSTANT node with the name as value. Sets metadata
+"visibility". Consumes TOKEN_ASSIGN. Calls parse_expression for the
+value, appends it as a child. Consumes terminating TOKEN_SEMICOLON.
+Returns const_node.
+@End Implementation
+
 Process called "parse_class_constant" takes parser as Integer, visibility as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_CONST
     
@@ -421,6 +656,27 @@ Process called "parse_class_constant" takes parser as Integer, visibility as Int
     proc consume with parser, PHPLexer.TOKEN_SEMICOLON
     Return const_node
 End Process
+
+@Reasoning:
+Class method parsing. Methods share most structure with free functions
+(name, parameters, return type, body) but carry additional class-
+context flags: visibility, is_static, is_abstract, is_final. Abstract
+methods skip the body entirely - they end with a semicolon instead of
+a brace block. This shape divergence is checked explicitly because
+trying to parse_block on an abstract method would consume the next
+real method's body.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_FUNCTION. Expects TOKEN_IDENTIFIER for the method name.
+Creates PHP_METHOD node. Sets metadata "visibility", "is_static",
+"is_abstract", "is_final". Consumes LEFT_PAREN, calls
+parse_parameter_list, stores "parameters" metadata, consumes
+RIGHT_PAREN. If next is TOKEN_COLON, advances and parses return type,
+stores "return_type" metadata. If is_abstract == 1, consumes
+SEMICOLON and skips the body. Otherwise parses block via parse_block
+and appends as a child. Returns method_node.
+@End Implementation
 
 Process called "parse_method" takes parser as Integer, visibility as Integer, is_static as Integer, is_abstract as Integer, is_final as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_FUNCTION
@@ -462,6 +718,24 @@ Note: ===================================================================
 Note: INTERFACE PARSING
 Note: ===================================================================
 
+@Reasoning:
+PHP interfaces declare type signatures without implementations. They
+support multiple inheritance (an interface can extend multiple
+interfaces - unlike classes), so the extends clause uses
+parse_interface_list to collect the comma-separated parents.
+Interface members are restricted to method signatures and constants;
+parse_interface_member enforces that.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_INTERFACE. Expects TOKEN_IDENTIFIER for the interface
+name. Creates PHP_INTERFACE node. If next is TOKEN_EXTENDS, consumes
+and calls parse_interface_list, stores "extends" metadata. Consumes
+LEFT_BRACE then loops members via parse_interface_member, appending
+non-zero results to the interface node until RIGHT_BRACE. Returns
+interface_node.
+@End Implementation
+
 Process called "parse_interface" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_INTERFACE
     
@@ -492,6 +766,25 @@ Process called "parse_interface" takes parser as Integer returns Integer:
     
     Return interface_node
 End Process
+
+@Reasoning:
+Interface members are EITHER method signatures (no body, just the
+shape) OR constants. Methods are implicitly public AND abstract (no
+modifier needed; redundant `public` is allowed and silently consumed
+because legacy PHP code commonly writes it). Properties are NOT
+allowed in interfaces - if encountered, we return 0 letting the
+caller produce an error.
+@End Reasoning
+
+@Implementation:
+If current is TOKEN_PUBLIC, advances past it (silently consumed -
+redundant in interfaces). If next is TOKEN_FUNCTION: consumes,
+expects identifier name, creates PHP_METHOD with metadata
+visibility="public" is_abstract=1; parses parameter list, stores
+"parameters" metadata; optionally parses return type; consumes
+terminating SEMICOLON. If TOKEN_CONST, dispatches to
+parse_class_constant with visibility="public". Otherwise returns 0.
+@End Implementation
 
 Process called "parse_interface_member" takes parser as Integer returns Integer:
     Note: Interface methods are always public and abstract
@@ -533,6 +826,22 @@ Note: ===================================================================
 Note: TRAIT PARSING
 Note: ===================================================================
 
+@Reasoning:
+PHP traits are reusable method/property fragments that classes can
+"use" via `use TraitName`. Structurally they parse exactly like
+classes (properties, methods, constants) but they're not
+instantiable on their own and can't extend or implement. We reuse
+parse_class_member for body parsing because the member shapes are
+identical.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_TRAIT. Expects TOKEN_IDENTIFIER for the trait name.
+Creates PHP_TRAIT node. Consumes LEFT_BRACE. Loops parsing members
+via parse_class_member until RIGHT_BRACE, appending non-zero results
+to the trait node. Returns trait_node.
+@End Implementation
+
 Process called "parse_trait" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_TRAIT
     
@@ -561,6 +870,22 @@ Note: ===================================================================
 Note: FUNCTION PARSING
 Note: ===================================================================
 
+@Reasoning:
+Top-level (free) PHP function. No visibility or modifiers because
+free functions can't be abstract or have visibility. Otherwise
+identical shape to a method: name, parameter list, optional return
+type, body.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_FUNCTION. Expects TOKEN_IDENTIFIER for the name.
+Creates PHP_FUNCTION node. Consumes LEFT_PAREN, calls
+parse_parameter_list, stores "parameters" metadata, consumes
+RIGHT_PAREN. If next is TOKEN_COLON, advances and parses return
+type, stores "return_type". Parses block via parse_block and
+appends as a child. Returns func_node.
+@End Implementation
+
 Process called "parse_function" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_FUNCTION
     
@@ -587,13 +912,26 @@ Process called "parse_function" takes parser as Integer returns Integer:
     Return func_node
 End Process
 
+@Reasoning:
+Parameter lists are comma-separated and CAN be empty (just `()`).
+The empty-paren short-circuit at the top is what permits zero-arg
+functions without trying to parse a missing first parameter.
+@End Reasoning
+
+@Implementation:
+Creates empty params List. If current is TOKEN_RIGHT_PAREN, returns
+the empty list immediately. Otherwise parses the first parameter via
+parse_parameter and appends. Loops while current is TOKEN_COMMA:
+advances, parses next parameter, appends. Returns params.
+@End Implementation
+
 Process called "parse_parameter_list" takes parser as Integer returns Integer:
     Let params be proc list_create from ListCore
-    
+
     If proc check with parser, PHPLexer.TOKEN_RIGHT_PAREN:
         Return params
     End If
-    
+
     Note: Parse first parameter
     Let param be proc parse_parameter from parser
     proc list_append from ListCore with params, param
@@ -607,6 +945,25 @@ Process called "parse_parameter_list" takes parser as Integer returns Integer:
     
     Return params
 End Process
+
+@Reasoning:
+A PHP parameter has up to four pieces in order: optional type hint
+(`int`, `?MyClass`, etc.), optional by-reference marker (`&`), the
+variable name (`$foo`), and an optional default value (`= expr`). We
+test each section in turn and store its presence in metadata. The
+type hint test uses is_type_keyword to handle both built-in types and
+qualified names.
+@End Reasoning
+
+@Implementation:
+Creates PHP_PARAMETER node. If is_type_keyword returns 1, calls
+parse_type and stores "type" metadata. If current is
+TOKEN_BITWISE_AND, advances and sets "by_reference" metadata to 1.
+Reads variable name from current token via php_token_value, consumes
+TOKEN_VARIABLE, stores "name" metadata. If current is TOKEN_ASSIGN,
+advances and calls parse_expression for the default, appending as a
+child. Returns param_node.
+@End Implementation
 
 Process called "parse_parameter" takes parser as Integer returns Integer:
     Let param_node be proc create_node with PHP_PARAMETER, ""
@@ -638,6 +995,24 @@ Process called "parse_parameter" takes parser as Integer returns Integer:
     
     Return param_node
 End Process
+
+@Reasoning:
+PHP type hints accept an optional `?` nullable prefix plus one of:
+a built-in type keyword (int/float/string/bool/array/callable/void/
+mixed/object/iterable) or a class qualified name (`Foo\Bar`). The
+nullable prefix is recorded by prepending `?` to the returned type
+name so callers can detect nullable-ness with a single string check.
+@End Reasoning
+
+@Implementation:
+Initialises is_nullable=0. If current is TOKEN_QUESTION, advances and
+sets is_nullable=1. Cascading If-tests for each built-in type token
+(TOKEN_INT/FLOAT/STRING_TYPE/BOOL/ARRAY/CALLABLE/VOID/MIXED/OBJECT/
+ITERABLE), each advancing and setting type_name to the canonical
+lowercase name. If none match, calls parse_qualified_name as the
+fallback (class names). If is_nullable == 1, prepends "?" to
+type_name. Returns type_name.
+@End Implementation
 
 Process called "parse_type" takes parser as Integer returns Integer:
     Note: Check for nullable type (?)
@@ -710,6 +1085,21 @@ Process called "parse_type" takes parser as Integer returns Integer:
     Return type_name
 End Process
 
+@Reasoning:
+Predicate that returns 1 if the current token could legitimately
+start a type hint. Used by parse_parameter to decide whether to
+attempt parse_type before reading the variable name. We include
+TOKEN_QUESTION (nullable prefix) and TOKEN_IDENTIFIER (class names)
+in addition to the built-in type keywords.
+@End Reasoning
+
+@Implementation:
+Sequence of If-checks against each token type that's valid as the
+start of a type hint: TOKEN_INT/FLOAT/STRING_TYPE/BOOL/ARRAY/CALLABLE/
+VOID/MIXED/OBJECT/ITERABLE/IDENTIFIER/QUESTION. Returns 1 on first
+match. Returns 0 after all tests fail.
+@End Implementation
+
 Process called "is_type_keyword" takes parser as Integer returns Integer:
     If proc check with parser, PHPLexer.TOKEN_INT:
         Return 1
@@ -753,6 +1143,30 @@ End Process
 Note: ===================================================================
 Note: STATEMENT PARSING
 Note: ===================================================================
+
+@Reasoning:
+Statement dispatcher. PHP has a rich statement vocabulary - control
+flow (if/while/do-while/for/foreach/switch), flow modifiers (return/
+break/continue), exception handling (try/throw), I/O (echo), scope
+modifiers (global/static), and bare expression statements as the
+fallback. Order matters where prefix tokens overlap (e.g., `static`
+can introduce a static-variable statement OR be a method modifier;
+in statement context it's the former).
+@End Reasoning
+
+@Implementation:
+Long sequence of check-and-dispatch tests on the current token,
+each tail-calling its dedicated parser: LEFT_BRACE -> parse_block,
+IF -> parse_if_statement, WHILE -> parse_while_statement, DO ->
+parse_do_while_statement, FOR -> parse_for_statement, FOREACH ->
+parse_foreach_statement, SWITCH -> parse_switch_statement, RETURN ->
+parse_return_statement, BREAK/CONTINUE -> advance, consume SEMICOLON,
+create PHP_BREAK_STMT/PHP_CONTINUE_STMT, TRY -> parse_try_statement,
+THROW -> parse_throw_statement, ECHO -> parse_echo_statement, GLOBAL
+-> parse_global_statement, STATIC -> parse_static_statement.
+Fallthrough: parses expression, consumes SEMICOLON, wraps in
+PHP_EXPRESSION_STMT.
+@End Implementation
 
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Block
@@ -843,6 +1257,19 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Return stmt
 End Process
 
+@Reasoning:
+Brace-delimited statement block. Used by function/method bodies and
+nested compound statements (`if (...) { ... }`). Statements are
+parsed recursively, allowing blocks to nest arbitrarily.
+@End Reasoning
+
+@Implementation:
+Consumes LEFT_BRACE. Creates PHP_BLOCK_STMT node. Loops while
+not_at_end: if RIGHT_BRACE consumes it and returns block. Otherwise
+calls parse_statement and appends non-zero results to the block.
+Returns block.
+@End Implementation
+
 Process called "parse_block" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_LEFT_BRACE
     
@@ -862,6 +1289,23 @@ Process called "parse_block" takes parser as Integer returns Integer:
     
     Return block
 End Process
+
+@Reasoning:
+PHP if/elseif/else chains parse with right-recursion: an `elseif`
+branch recursively parses as another if-statement, naturally building
+a nested-if tree. This is the cleanest way to capture
+arbitrarily-long `if elseif elseif elseif else` chains without a
+sentinel-loop.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_IF and LEFT_PAREN. Parses condition expression.
+Consumes RIGHT_PAREN. Parses then_branch via parse_statement. Creates
+PHP_IF_STMT node and appends condition then then_branch as children.
+If current is TOKEN_ELSEIF, recursively calls parse_if_statement and
+appends the result. Otherwise if TOKEN_ELSE, advances and parses
+else_branch via parse_statement, appends. Returns if_stmt.
+@End Implementation
 
 Process called "parse_if_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_IF
@@ -891,6 +1335,18 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
     Return if_stmt
 End Process
 
+@Reasoning:
+`while (cond) body` - pre-test loop. Children stored in [condition,
+body] order matching execution order so the AST consumer doesn't have
+to remember reversed positions.
+@End Reasoning
+
+@Implementation:
+Consumes WHILE, LEFT_PAREN, parses condition expression, consumes
+RIGHT_PAREN. Parses body via parse_statement. Creates PHP_WHILE_STMT,
+appends condition then body. Returns while_stmt.
+@End Implementation
+
 Process called "parse_while_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_WHILE
     
@@ -906,6 +1362,19 @@ Process called "parse_while_statement" takes parser as Integer returns Integer:
     
     Return while_stmt
 End Process
+
+@Reasoning:
+`do body while (cond);` - post-test loop guaranteeing at least one
+body execution. The terminating semicolon (uncommon for control
+structures) is mandatory in PHP and must be consumed explicitly.
+@End Reasoning
+
+@Implementation:
+Consumes DO. Parses body via parse_statement. Consumes WHILE,
+LEFT_PAREN. Parses condition. Consumes RIGHT_PAREN, SEMICOLON.
+Creates PHP_DO_WHILE_STMT, appends body then condition (matching
+source order). Returns do_while_stmt.
+@End Implementation
 
 Process called "parse_do_while_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_DO
@@ -924,6 +1393,22 @@ Process called "parse_do_while_statement" takes parser as Integer returns Intege
     
     Return do_while_stmt
 End Process
+
+@Reasoning:
+C-style `for (init; cond; update) body`. Each of init/cond/update is
+optional (`for (;;)` is the infinite-loop idiom). We use 0 sentinels
+to represent missing clauses and only append non-zero ones to the
+AST, so the consumer can detect missing pieces by counting children.
+@End Reasoning
+
+@Implementation:
+Consumes FOR, LEFT_PAREN. Initialises init=0; if next isn't SEMICOLON,
+parses init expression. Consumes SEMICOLON. Same pattern for
+condition then SEMICOLON, then update then RIGHT_PAREN. Parses body
+via parse_statement. Creates PHP_FOR_STMT; appends init, condition,
+update each only if non-zero, then appends body unconditionally.
+Returns for_stmt.
+@End Implementation
 
 Process called "parse_for_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_FOR
@@ -967,6 +1452,24 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
     Return for_stmt
 End Process
 
+@Reasoning:
+PHP foreach has two syntactic shapes: value-only (`foreach ($arr as
+$value)`) and key-value (`foreach ($arr as $key => $value)`). We
+parse the first expression after `as`, then peek for `=>` to
+disambiguate: if present the first expression was the key, otherwise
+it was the value. has_key is recorded so the consumer can iterate
+the right shape.
+@End Reasoning
+
+@Implementation:
+Consumes FOREACH, LEFT_PAREN. Parses iterable expression. Consumes
+TOKEN_AS. Parses first expression. If current is TOKEN_DOUBLE_ARROW,
+advances, sets has_key=1, sets key=first, parses value expression.
+Otherwise sets value=first. Consumes RIGHT_PAREN. Parses body.
+Creates PHP_FOREACH_STMT, appends iterable, optionally key, value,
+body. Returns foreach_stmt.
+@End Implementation
+
 Process called "parse_foreach_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_FOREACH
     proc consume with parser, PHPLexer.TOKEN_LEFT_PAREN
@@ -1005,6 +1508,23 @@ Process called "parse_foreach_statement" takes parser as Integer returns Integer
     Return foreach_stmt
 End Process
 
+@Reasoning:
+PHP switch with case and default clauses. The discriminant expression
+becomes the FIRST child; all case/default clauses follow in source
+order. Like JavaScript, PHP switch has fall-through unless `break`
+appears - we preserve clause boundaries faithfully so the consumer
+can detect missing breaks.
+@End Reasoning
+
+@Implementation:
+Consumes SWITCH, LEFT_PAREN, parses discriminant expression, consumes
+RIGHT_PAREN, LEFT_BRACE. Creates PHP_SWITCH_STMT and appends
+discriminant as first child. Loops while not_at_end: RIGHT_BRACE
+consumes and returns; TOKEN_CASE -> parse_case_clause and append;
+TOKEN_DEFAULT -> parse_default_clause and append. Returns
+switch_stmt.
+@End Implementation
+
 Process called "parse_switch_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_SWITCH
     proc consume with parser, PHPLexer.TOKEN_LEFT_PAREN
@@ -1036,6 +1556,20 @@ Process called "parse_switch_statement" takes parser as Integer returns Integer:
     Return switch_stmt
 End Process
 
+@Reasoning:
+A `case <value>: stmts` clause. PHP's fall-through means stmts are
+parsed until we see the next case/default/closing-brace - those
+boundary tokens tell us to stop. The value expression is appended as
+the first child; subsequent children are statements.
+@End Reasoning
+
+@Implementation:
+Consumes CASE. Parses value expression. Consumes COLON. Creates
+PHP_CASE_CLAUSE node and appends value. Loops while not_at_end: on
+CASE/DEFAULT/RIGHT_BRACE returns case_node. Otherwise parses a
+statement via parse_statement and appends. Returns case_node.
+@End Implementation
+
 Process called "parse_case_clause" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_CASE
     Let value be proc parse_expression from parser
@@ -1063,6 +1597,19 @@ Process called "parse_case_clause" takes parser as Integer returns Integer:
     Return case_node
 End Process
 
+@Reasoning:
+Default clause within switch. Has no value expression - the literal
+string "default" goes into the node's value slot to distinguish it
+from regular case clauses without needing a new node-type constant.
+Otherwise identical statement-collection logic to parse_case_clause.
+@End Reasoning
+
+@Implementation:
+Consumes DEFAULT, COLON. Creates PHP_CASE_CLAUSE with value="default".
+Loops while not_at_end: on CASE/DEFAULT/RIGHT_BRACE returns;
+otherwise parses statement and appends. Returns case_node.
+@End Implementation
+
 Process called "parse_default_clause" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_DEFAULT
     proc consume with parser, PHPLexer.TOKEN_COLON
@@ -1087,6 +1634,18 @@ Process called "parse_default_clause" takes parser as Integer returns Integer:
     Return case_node
 End Process
 
+@Reasoning:
+`return;` (void return) and `return expr;` (with value). We test for
+immediate SEMICOLON to decide whether to parse an expression. The
+optional-child shape means the consumer can detect void return via
+empty children list.
+@End Reasoning
+
+@Implementation:
+Consumes RETURN. Creates PHP_RETURN_STMT. If next is NOT SEMICOLON,
+parses expression and appends. Consumes SEMICOLON. Returns return_stmt.
+@End Implementation
+
 Process called "parse_return_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_RETURN
     
@@ -1100,6 +1659,21 @@ Process called "parse_return_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_SEMICOLON
     Return return_stmt
 End Process
+
+@Reasoning:
+PHP try/catch/finally with multiple catch clauses supported. The body
+is required (always first child); zero-or-more catch clauses follow;
+an optional finally comes last. Empty children after the body indicate
+a bare try (which PHP requires to have AT LEAST one catch or finally;
+the parser is liberal here, validation belongs in semantic analysis).
+@End Reasoning
+
+@Implementation:
+Consumes TRY. Parses body via parse_block. Creates PHP_TRY_STMT and
+appends body. Loops while next is TOKEN_CATCH: calls
+parse_catch_clause and appends. If next is TOKEN_FINALLY: calls
+parse_finally_clause and appends. Returns try_stmt.
+@End Implementation
 
 Process called "parse_try_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_TRY
@@ -1123,6 +1697,23 @@ Process called "parse_try_statement" takes parser as Integer returns Integer:
     
     Return try_stmt
 End Process
+
+@Reasoning:
+`catch (ExceptionType $var) { body }`. The exception type is a
+qualified name (can be `\Namespace\ClassName`). The bound variable is
+OPTIONAL in PHP 8+ (`catch (Exception)` is valid) - we permit empty
+var_name. Both type and variable are stored in metadata, the body is
+the only child.
+@End Reasoning
+
+@Implementation:
+Consumes CATCH, LEFT_PAREN. Parses exception_type via
+parse_qualified_name. Initialises var_name="". If next is
+TOKEN_VARIABLE, reads its name via php_token_value, advances. Consumes
+RIGHT_PAREN. Parses body via parse_block. Creates PHP_CATCH_CLAUSE,
+sets metadata "exception_type" and "variable". Appends body. Returns
+catch_node.
+@End Implementation
 
 Process called "parse_catch_clause" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_CATCH
@@ -1149,6 +1740,16 @@ Process called "parse_catch_clause" takes parser as Integer returns Integer:
     Return catch_node
 End Process
 
+@Reasoning:
+`finally { body }`. Always runs after try and any matching catch.
+No type or variable - just a body block.
+@End Reasoning
+
+@Implementation:
+Consumes FINALLY. Parses body via parse_block. Creates
+PHP_FINALLY_CLAUSE, appends body. Returns finally_node.
+@End Implementation
+
 Process called "parse_finally_clause" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_FINALLY
     
@@ -1159,6 +1760,19 @@ Process called "parse_finally_clause" takes parser as Integer returns Integer:
     
     Return finally_node
 End Process
+
+@Reasoning:
+`throw expr;` - the expression must evaluate to an instance of
+Throwable (a runtime check, not a parse-time one). PHP 8 made throw
+an EXPRESSION too (usable in ternary, etc.) but we keep it as a
+statement here because the bootstrap parser doesn't yet handle the
+expression form.
+@End Reasoning
+
+@Implementation:
+Consumes THROW. Parses expression. Consumes SEMICOLON. Creates
+PHP_THROW_STMT and appends expression. Returns throw_stmt.
+@End Implementation
 
 Process called "parse_throw_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_THROW
@@ -1171,6 +1785,20 @@ Process called "parse_throw_statement" takes parser as Integer returns Integer:
     
     Return throw_stmt
 End Process
+
+@Reasoning:
+`echo expr1, expr2, ...;` outputs one or more expressions
+concatenated. PHP also has `print` (function-like, returns 1) but
+they're parsed via expression statement, not here. Each expression
+becomes a child of the echo node; the consumer concatenates them at
+emit time.
+@End Reasoning
+
+@Implementation:
+Consumes ECHO. Creates PHP_ECHO_STMT. Parses first expression and
+appends. Loops while current is TOKEN_COMMA: advances, parses next
+expression, appends. Consumes SEMICOLON. Returns echo_stmt.
+@End Implementation
 
 Process called "parse_echo_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_ECHO
@@ -1190,6 +1818,22 @@ Process called "parse_echo_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_SEMICOLON
     Return echo_stmt
 End Process
+
+@Reasoning:
+`global $a, $b, $c;` imports global-scope variables into function-
+local scope. PHP scoping defaults are function-local; without an
+explicit global declaration, accessing `$a` inside a function gets a
+new local. Each declared variable becomes a child of the global
+node.
+@End Reasoning
+
+@Implementation:
+Consumes GLOBAL. Creates PHP_GLOBAL_STMT. Reads first variable token,
+extracts name via php_token_value, consumes TOKEN_VARIABLE. Creates a
+PHP_VARIABLE node and appends to global_stmt. Loops while current is
+TOKEN_COMMA: advances, reads next variable, creates PHP_VARIABLE
+node, appends. Consumes SEMICOLON. Returns global_stmt.
+@End Implementation
 
 Process called "parse_global_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_GLOBAL
@@ -1216,6 +1860,21 @@ Process called "parse_global_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_SEMICOLON
     Return global_stmt
 End Process
+
+@Reasoning:
+`static $var = init;` declares a function-local variable that
+PERSISTS across calls (initialised once, on first entry). Bootstrap
+parser handles single-variable form only; PHP also permits
+comma-separated forms which higher versions will extend.
+@End Reasoning
+
+@Implementation:
+Consumes STATIC. Creates PHP_STATIC_STMT. Reads variable token,
+extracts name, consumes TOKEN_VARIABLE. Creates PHP_VARIABLE node. If
+next is TOKEN_ASSIGN, advances and parses initial value, appending to
+the variable node. Appends the variable node to static_stmt.
+Consumes SEMICOLON. Returns static_stmt.
+@End Implementation
 
 Process called "parse_static_statement" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_STATIC
@@ -1245,9 +1904,35 @@ Note: ===================================================================
 Note: EXPRESSION PARSING
 Note: ===================================================================
 
+@Reasoning:
+Entry point for expression parsing. Delegates to parse_ternary, which
+is the lowest-precedence operator in PHP. Each precedence level is a
+separate function and they cascade in precedence order (lowest at
+top); standard recursive-descent shape.
+@End Reasoning
+
+@Implementation:
+Tail-calls parse_ternary(parser) and returns its result.
+@End Implementation
+
 Process called "parse_expression" takes parser as Integer returns Integer:
     Return proc parse_ternary from parser
 End Process
+
+@Reasoning:
+PHP's `cond ? then : else` ternary expression. Right-associative
+(parses recursively into parse_expression for both branches) so
+chained `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`.
+@End Reasoning
+
+@Implementation:
+Parses left-hand expression via parse_logical_or. If next is
+TOKEN_QUESTION: advances, parses then_expr via recursive
+parse_expression, consumes COLON, parses else_expr via recursive
+parse_expression. Creates PHP_TERNARY_EXPR with value="?:", appends
+condition, then_expr, else_expr. Returns the ternary. Otherwise
+returns the left expression unchanged.
+@End Implementation
 
 Process called "parse_ternary" takes parser as Integer returns Integer:
     Let expr be proc parse_logical_or from parser
@@ -1267,6 +1952,24 @@ Process called "parse_ternary" takes parser as Integer returns Integer:
     
     Return expr
 End Process
+
+@Reasoning:
+PHP has TWO short-circuit OR operators with DIFFERENT precedence: `||`
+(high precedence, same level as `&&`) and `or` (very low precedence,
+below assignment). Most languages have just one - PHP keeps both for
+shell-script-style idioms. We handle both here but with subtle
+precedence ordering: `||` is left-associative within the while loop;
+`or` is checked AFTER the while loop terminates so it binds looser.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_logical_and. Loop while current is
+TOKEN_LOGICAL_OR (`||`): reads operator lexeme, advances, parses
+right via parse_logical_and, creates PHP_BINARY_EXPR with the
+operator, appends left and right; sets left = new binary (left-
+associative). After the loop, if current is TOKEN_OR (`or`): same
+shape but only once because `or` binds the loosest. Returns left.
+@End Implementation
 
 Process called "parse_logical_or" takes parser as Integer returns Integer:
     Let left be proc parse_logical_and from parser
@@ -1300,6 +2003,18 @@ Process called "parse_logical_or" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+PHP's `&&` (high precedence) and `and` (very low precedence) - same
+duality as ||/or, kept for the same legacy-script reasons.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_equality. Loops while TOKEN_LOGICAL_AND
+collecting binary nodes left-associatively. After the loop, single
+test for TOKEN_AND (`and`) which produces one binary if present.
+Returns left.
+@End Implementation
+
 Process called "parse_logical_and" takes parser as Integer returns Integer:
     Let left be proc parse_equality from parser
     
@@ -1332,6 +2047,21 @@ Process called "parse_logical_and" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Equality operators: `==`, `!=`, `===` (identical, no type coercion),
+`!==` (not identical). PHP's loose `==` is famously footgun-prone -
+we just preserve the operator lexeme in the binary node; downstream
+type-checking warns about loose comparisons.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_comparison. Loops while match_any returns one
+of TOKEN_EQUAL/NOT_EQUAL/IDENTICAL/NOT_IDENTICAL (match_any
+auto-advances on match): reads the matched operator via previous,
+parses right via parse_comparison, creates PHP_BINARY_EXPR with that
+operator, appends left and right, sets left=binary. Returns left.
+@End Implementation
+
 Process called "parse_equality" takes parser as Integer returns Integer:
     Let left be proc parse_comparison from parser
     
@@ -1350,6 +2080,18 @@ Process called "parse_equality" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Comparison operators: `<`, `<=`, `>`, `>=`, and PHP's spaceship `<=>`
+(returns -1/0/1 like Perl/C++). The spaceship is sort-friendly and
+fits the same precedence level.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_bitwise_or. Loops while match_any returns one
+of LESS_THAN/LESS_EQUAL/GREATER_THAN/GREATER_EQUAL/SPACESHIP. Builds
+left-associative PHP_BINARY_EXPR chain. Returns left.
+@End Implementation
+
 Process called "parse_comparison" takes parser as Integer returns Integer:
     Let left be proc parse_bitwise_or from parser
     
@@ -1367,6 +2109,17 @@ Process called "parse_comparison" takes parser as Integer returns Integer:
     
     Return left
 End Process
+
+@Reasoning:
+Bitwise OR (`|`). Just below XOR in precedence. Left-associative.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_bitwise_xor. Loops while current is
+TOKEN_BITWISE_OR: reads operator, advances, parses right via
+parse_bitwise_xor, builds PHP_BINARY_EXPR with the operator
+left-associatively. Returns left.
+@End Implementation
 
 Process called "parse_bitwise_or" takes parser as Integer returns Integer:
     Let left be proc parse_bitwise_xor from parser
@@ -1387,6 +2140,17 @@ Process called "parse_bitwise_or" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Bitwise XOR (`^`). Below OR (in PHP precedence terms higher than OR
+but the implementation cascades downward into AND). Left-associative.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_bitwise_and. Loops while current is
+TOKEN_BITWISE_XOR: same pattern as bitwise_or - operator, advance,
+right, binary, left=binary. Returns left.
+@End Implementation
+
 Process called "parse_bitwise_xor" takes parser as Integer returns Integer:
     Let left be proc parse_bitwise_and from parser
     
@@ -1405,6 +2169,18 @@ Process called "parse_bitwise_xor" takes parser as Integer returns Integer:
     
     Return left
 End Process
+
+@Reasoning:
+Bitwise AND (`&`). The same token is reused at parameter position for
+by-reference (`function f(&$x)`) - the parser context determines which.
+Here in expression context it's always bitwise AND.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_shift. Loops while current is TOKEN_BITWISE_AND:
+operator, advance, right, build binary left-associatively. Returns
+left.
+@End Implementation
 
 Process called "parse_bitwise_and" takes parser as Integer returns Integer:
     Let left be proc parse_shift from parser
@@ -1425,6 +2201,18 @@ Process called "parse_bitwise_and" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Bit-shift operators (`<<` left-shift, `>>` arithmetic right-shift).
+No unsigned-shift in PHP (unlike Java's `>>>`).
+@End Reasoning
+
+@Implementation:
+Parses left via parse_addition. Loops while match_any returns one of
+TOKEN_LEFT_SHIFT or TOKEN_RIGHT_SHIFT (auto-advancing): reads operator
+via previous, parses right via parse_addition, builds binary
+left-associatively. Returns left.
+@End Implementation
+
 Process called "parse_shift" takes parser as Integer returns Integer:
     Let left be proc parse_addition from parser
     
@@ -1442,6 +2230,19 @@ Process called "parse_shift" takes parser as Integer returns Integer:
     
     Return left
 End Process
+
+@Reasoning:
+Additive operators: `+`, `-`, AND PHP's string-concat `.` - they share
+the same precedence level in PHP (unusual; many languages give concat
+its own level). All three are handled in one loop with match_any.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_multiplication. Loops while match_any returns
+PLUS, MINUS, or CONCAT (`.`). Reads operator via previous, parses
+right via parse_multiplication, builds binary left-associatively.
+Returns left.
+@End Implementation
 
 Process called "parse_addition" takes parser as Integer returns Integer:
     Let left be proc parse_multiplication from parser
@@ -1461,6 +2262,18 @@ Process called "parse_addition" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Multiplicative operators: `*`, `/`, `%`. Higher precedence than
+addition. PHP's `/` always produces float (no separate int division
+operator).
+@End Reasoning
+
+@Implementation:
+Parses left via parse_power. Loops while match_any returns STAR,
+SLASH, or PERCENT. Reads operator, parses right via parse_power,
+builds binary left-associatively. Returns left.
+@End Implementation
+
 Process called "parse_multiplication" takes parser as Integer returns Integer:
     Let left be proc parse_power from parser
     
@@ -1478,6 +2291,20 @@ Process called "parse_multiplication" takes parser as Integer returns Integer:
     
     Return left
 End Process
+
+@Reasoning:
+Power operator `**`. RIGHT-associative (unlike most binary ops) so
+`2 ** 3 ** 2` = `2 ** 9` = 512, not `8 ** 2` = 64. This matches
+mathematical convention. Implementation: recurse into parse_power
+(not parse_instanceof) for the right operand.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_instanceof. If current is TOKEN_POWER (only
+once, not looped, because right-associativity): reads operator,
+advances, recursively calls parse_power for the right operand, builds
+binary, returns it. Otherwise returns left unchanged.
+@End Implementation
 
 Process called "parse_power" takes parser as Integer returns Integer:
     Let left be proc parse_instanceof from parser
@@ -1498,6 +2325,20 @@ Process called "parse_power" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+`$obj instanceof ClassName` tests whether the object is of (or
+inherits from) the given class. The right side MUST be a class name -
+not an arbitrary expression - so we use parse_qualified_name and put
+the result in the node's value slot rather than as a child.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_unary. If current is TOKEN_INSTANCEOF: advances,
+parses type_name via parse_qualified_name, creates
+PHP_INSTANCEOF_EXPR with type_name as value, appends left as the
+sole child. Otherwise returns left.
+@End Implementation
+
 Process called "parse_instanceof" takes parser as Integer returns Integer:
     Let left be proc parse_unary from parser
     
@@ -1513,6 +2354,24 @@ Process called "parse_instanceof" takes parser as Integer returns Integer:
     
     Return left
 End Process
+
+@Reasoning:
+Unary prefix operators: `!`, `~`, `+`, `-`, `++`, `--`, and `clone`.
+Most produce a PHP_UNARY_EXPR with prefix=1 in metadata; clone is
+distinct (PHP_CLONE_EXPR) because it has its own runtime semantics.
+We recursively call parse_unary for the operand to support chained
+prefix operators like `!!$x`.
+@End Reasoning
+
+@Implementation:
+If match_any returns one of LOGICAL_NOT/BITWISE_NOT/PLUS/MINUS/
+INCREMENT/DECREMENT: reads operator via previous, recursively calls
+parse_unary for operand, creates PHP_UNARY_EXPR with operator,
+sets metadata "prefix"=1, appends operand, returns. If current is
+TOKEN_CLONE: advances, parses operand via recursive parse_unary,
+creates PHP_CLONE_EXPR, appends operand, returns. Fallthrough:
+tail-calls parse_postfix(parser).
+@End Implementation
 
 Process called "parse_unary" takes parser as Integer returns Integer:
     Note: Prefix operators
@@ -1541,6 +2400,32 @@ Process called "parse_unary" takes parser as Integer returns Integer:
     Note: Postfix and primary
     Return proc parse_postfix from parser
 End Process
+
+@Reasoning:
+Postfix-and-chained-access handler. After a primary expression we
+may chain any number of postfix operators (++/--), function calls
+(`(args)`), member accesses (`->member`), static accesses
+(`::member`), or array indexing (`[index]`). This is the looping
+core of PHP's "expression suffix" grammar. After the loop, we ALSO
+handle assignment operators (`=`, `+=`, etc.) at this level because
+assignment in PHP has lower precedence than most things but binds
+tighter than the comma operator.
+@End Reasoning
+
+@Implementation:
+Parses expr via parse_primary. Loop with done flag: INCREMENT/
+DECREMENT advance and wrap expr in PHP_UNARY_EXPR with metadata
+"prefix"=0; LEFT_PAREN dispatches to parse_call(parser, expr); ARROW
+(`->`) advances, expects identifier, creates PHP_MEMBER_EXPR with
+member name, appends expr, replaces expr; DOUBLE_COLON (`::`) same
+shape but PHP_STATIC_MEMBER_EXPR; LEFT_BRACKET advances, parses index,
+consumes RIGHT_BRACKET, creates PHP_INDEX_EXPR appending expr+index.
+Anything else sets done=1. After loop, if match_any returns one of
+ASSIGN/PLUS_ASSIGN/MINUS_ASSIGN/STAR_ASSIGN/SLASH_ASSIGN/PERCENT_ASSIGN/
+CONCAT_ASSIGN: reads operator via previous, parses right via
+parse_expression (full precedence, so RHS can be a ternary etc.),
+creates PHP_ASSIGN_EXPR with operator. Returns expr or assign.
+@End Implementation
 
 Process called "parse_postfix" takes parser as Integer returns Integer:
     Let expr be proc parse_primary from parser
@@ -1618,6 +2503,21 @@ Process called "parse_postfix" takes parser as Integer returns Integer:
     Return expr
 End Process
 
+@Reasoning:
+Function call parser. The callee is passed in (already parsed by
+parse_postfix - might be an identifier, a member access, etc.) and we
+parse the (args) part. Empty argument lists are valid; arguments are
+comma-separated full expressions. The callee becomes children[0] and
+args follow as children[1..N].
+@End Reasoning
+
+@Implementation:
+Consumes LEFT_PAREN. Creates PHP_CALL_EXPR and appends callee as
+first child. If next is NOT RIGHT_PAREN, parses first argument and
+appends, then loops on TOKEN_COMMA parsing additional args. Consumes
+RIGHT_PAREN. Returns call_expr.
+@End Implementation
+
 Process called "parse_call" takes parser as Integer, callee as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_LEFT_PAREN
     
@@ -1639,6 +2539,31 @@ Process called "parse_call" takes parser as Integer, callee as Integer returns I
     proc consume with parser, PHPLexer.TOKEN_RIGHT_PAREN
     Return call_expr
 End Process
+
+@Reasoning:
+The base case of the expression-parsing recursion. Recognises every
+"atomic" expression form: number/string/boolean/null literals, $vars,
+identifiers (function names, constants, class names), `new ...`
+expressions, array literals in both legacy `array(...)` and modern
+`[...]` syntax, closures `function() { ... }`, arrow functions
+`fn() => expr`, and parenthesised sub-expressions. Returning 0 for an
+unrecognised token lets the caller (parse_unary or above) decide
+whether to report an error or treat the absence as legitimate (e.g.
+in `for(;;)` clauses).
+@End Reasoning
+
+@Implementation:
+Sequence of token-type tests, each handling its case and returning:
+TOKEN_NUMBER -> PHP_NUMBER_LITERAL with value; TOKEN_STRING ->
+PHP_STRING_LITERAL; TOKEN_TRUE/FALSE -> PHP_BOOLEAN_LITERAL with
+"true"/"false"; TOKEN_NULL -> PHP_NULL_LITERAL with "null";
+TOKEN_VARIABLE -> PHP_VARIABLE with name; TOKEN_IDENTIFIER ->
+PHP_IDENTIFIER; TOKEN_NEW -> parse_new_expression; TOKEN_ARRAY ->
+parse_array_expression; TOKEN_LEFT_BRACKET -> parse_short_array;
+TOKEN_FUNCTION -> parse_closure; TOKEN_FN -> parse_arrow_function;
+TOKEN_LEFT_PAREN -> advance, recursively parse_expression, consume
+RIGHT_PAREN, return the inner expression. Falls through to Return 0.
+@End Implementation
 
 Process called "parse_primary" takes parser as Integer returns Integer:
     Note: Literals
@@ -1723,6 +2648,22 @@ Process called "parse_primary" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+`new ClassName(args)` constructs an instance. The class name is a
+qualified name (can include namespace separators). Constructor
+arguments are optional (`new Foo` and `new Foo()` are both valid -
+the constructor's parameter list determines which forms are
+semantically valid).
+@End Reasoning
+
+@Implementation:
+Consumes NEW. Parses class_name via parse_qualified_name. Creates
+PHP_NEW_EXPR with class_name as value. If next is TOKEN_LEFT_PAREN:
+advances; if NOT RIGHT_PAREN parses first argument, appends, then
+loops on COMMA parsing more args. Consumes RIGHT_PAREN. Returns
+new_expr.
+@End Implementation
+
 Process called "parse_new_expression" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_NEW
     
@@ -1750,6 +2691,21 @@ Process called "parse_new_expression" takes parser as Integer returns Integer:
     
     Return new_expr
 End Process
+
+@Reasoning:
+Legacy `array(...)` syntax. Accepts a comma-separated list of array
+elements (each either `value` or `key => value` per parse_array_element).
+Trailing commas are explicitly permitted - PHP has always allowed them
+unlike many older languages.
+@End Reasoning
+
+@Implementation:
+Consumes ARRAY then LEFT_PAREN. Creates PHP_ARRAY_EXPR. If next is
+NOT RIGHT_PAREN: parses first element via parse_array_element, appends,
+then loops on COMMA: each iteration tests for trailing comma (next is
+RIGHT_PAREN) before parsing the next element. Consumes RIGHT_PAREN.
+Returns array_expr.
+@End Implementation
 
 Process called "parse_array_expression" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_ARRAY
@@ -1779,6 +2735,19 @@ Process called "parse_array_expression" takes parser as Integer returns Integer:
     Return array_expr
 End Process
 
+@Reasoning:
+Modern `[...]` array syntax (PHP 5.4+). Identical semantics to
+parse_array_expression but uses brackets. Both produce PHP_ARRAY_EXPR
+nodes so the AST consumer doesn't need to distinguish source syntax.
+@End Reasoning
+
+@Implementation:
+Consumes LEFT_BRACKET. Creates PHP_ARRAY_EXPR. If next is NOT
+RIGHT_BRACKET: parses first element, appends, loops on COMMA with
+trailing-comma tolerance (RIGHT_BRACKET ends). Consumes RIGHT_BRACKET.
+Returns array_expr.
+@End Implementation
+
 Process called "parse_short_array" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_LEFT_BRACKET
     
@@ -1805,6 +2774,21 @@ Process called "parse_short_array" takes parser as Integer returns Integer:
     Return array_expr
 End Process
 
+@Reasoning:
+A single array element: either a bare value (sequential numeric key
+auto-assigned) or `key => value` pair. We disambiguate by parsing
+the first expression, then peeking for `=>`. Returning a
+PHP_BINARY_EXPR with op `=>` for the pair form lets the array
+consumer recognise keyed elements uniformly.
+@End Reasoning
+
+@Implementation:
+Parses first expression. If current is TOKEN_DOUBLE_ARROW (`=>`):
+advances, parses value expression, creates PHP_BINARY_EXPR with
+op="=>", appends first as key and value as value, returns the pair.
+Otherwise returns the first expression as-is (bare value).
+@End Implementation
+
 Process called "parse_array_element" takes parser as Integer returns Integer:
     Note: Check for key => value syntax
     Let first be proc parse_expression from parser
@@ -1822,6 +2806,26 @@ Process called "parse_array_element" takes parser as Integer returns Integer:
     
     Return first
 End Process
+
+@Reasoning:
+PHP closures (anonymous functions): `function(params) use ($a, $b) {
+body }`. The `use` clause is unique to PHP - it explicitly captures
+variables from the enclosing scope (PHP does NOT auto-capture like
+JavaScript). Arrow functions (parse_arrow_function) auto-capture, so
+those don't have a use clause. Capture variables are stored as
+metadata "uses" list of names; the body is the only child.
+@End Reasoning
+
+@Implementation:
+Consumes FUNCTION. Creates PHP_CLOSURE_EXPR. Consumes LEFT_PAREN,
+parses parameters via parse_parameter_list, sets metadata
+"parameters", consumes RIGHT_PAREN. If current is TOKEN_USE: advances,
+consumes LEFT_PAREN, reads first variable name, consumes
+TOKEN_VARIABLE, appends to uses list; loops on COMMA to collect more
+variables. Consumes RIGHT_PAREN, sets metadata "uses". If COLON:
+advances and parses return type, sets metadata "return_type". Parses
+body via parse_block, appends. Returns closure.
+@End Implementation
 
 Process called "parse_closure" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_FUNCTION
@@ -1872,6 +2876,22 @@ Process called "parse_closure" takes parser as Integer returns Integer:
     Return closure
 End Process
 
+@Reasoning:
+PHP 7.4+ arrow functions (`fn(args): RT => expr`) are syntactic sugar for a
+single-expression closure that auto-captures every variable it references.
+Unlike parse_closure they take no `use` clause and have an expression body
+rather than a statement block — we lower body to a single expression node
+rather than calling parse_block.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_FN, then parenthesised parameter list (parse_parameter_list
+attached as "parameters" metadata), optional `: ReturnType` clause
+(attached as "return_type" metadata), the mandatory TOKEN_DOUBLE_ARROW
+`=>`, and finally one expression via parse_expression added as the single
+child. No body block, no use-clause.
+@End Implementation
+
 Process called "parse_arrow_function" takes parser as Integer returns Integer:
     proc consume with parser, PHPLexer.TOKEN_FN
     
@@ -1904,19 +2924,55 @@ Note: ===================================================================
 Note: AST NODE UTILITIES
 Note: ===================================================================
 
+@Reasoning:
+Single allocation site for every AST node so every walker sees identical
+shape regardless of construct. Children and metadata get fresh empty
+ListCore lists at construction so callers can always append without first
+checking for null — this kills a large class of NPE bugs in the parser
+recursion.
+@End Reasoning
+
+@Implementation:
+Builds an ASTNode struct literal: caller-supplied node_type and value, plus
+two freshly-allocated empty ListCore lists for children and metadata. No
+validation of node_type — callers are responsible for passing a defined
+PHP_* constant.
+@End Implementation
+
 Process called "create_node" takes node_type as Integer, value as Integer returns Integer:
     Let node be a value of type ASTNode with
         node_type as node_type,
         value as value,
         children as proc list_create from ListCore,
         metadata as proc list_create from ListCore
-    
+
     Return node
 End Process
+
+@Reasoning:
+Order-preserving append onto the children list. The list maintains
+declaration/source order which downstream HIR translation relies on for
+e.g. method body statements appearing in original sequence.
+@End Reasoning
 
 Process called "add_child" takes node as ASTNode, child as Integer:
     proc list_append from ListCore with node.children, child
 End Process
+
+@Reasoning:
+PHP nodes need richer attribution than a flat children list can express —
+visibility ("public"), modifiers ("static"/"abstract"), return types, etc.
+We encode these as `[key, value]` pair lists appended to metadata, giving
+each node an associative scratch space without needing a per-kind struct
+extension.
+@End Reasoning
+
+@Implementation:
+Allocates a fresh 2-element ListCore list, appends key then value, and
+appends that pair list onto node.metadata. Lookup by key requires a linear
+scan of metadata pairs — acceptable because per-node metadata count is
+small (typically under five entries).
+@End Implementation
 
 Process called "set_metadata" takes node as ASTNode, key as Integer, value as Integer:
     Note: Store as key-value pair
@@ -1930,6 +2986,13 @@ Note: ===================================================================
 Note: PARSER NAVIGATION
 Note: ===================================================================
 
+@Reasoning:
+End-of-stream test driven by TOKEN_EOF rather than by position bounds —
+the PHP lexer guarantees an EOF sentinel at the end of the token list, so
+checking the type of the current token is both safer (no off-by-one) and
+matches how all consume/check sites already query.
+@End Reasoning
+
 Process called "not_at_end" takes parser as Integer returns Integer:
     Let token be proc current from parser
     Let token_type be proc php_token_type from PHPLexer with token
@@ -1938,6 +3001,13 @@ Process called "not_at_end" takes parser as Integer returns Integer:
     End If
     Return 1
 End Process
+
+@Reasoning:
+Non-consuming type peek: returns 1 iff the parser is not at EOF AND the
+current token's type matches the requested type. The EOF guard is critical
+because php_token_type on an out-of-range index would dereference invalid
+memory.
+@End Reasoning
 
 Process called "check" takes parser as Integer, token_type as Integer returns Integer:
     If proc not_at_end from parser:
@@ -1950,6 +3020,12 @@ Process called "check" takes parser as Integer, token_type as Integer returns In
     Return 0
 End Process
 
+@Reasoning:
+Logical negation of check, exposed as its own predicate to keep the
+recursive-descent call sites readable (e.g. `If proc not_check with ...`
+parses better than nesting a `not`). Mirrors check's EOF safety.
+@End Reasoning
+
 Process called "not_check" takes parser as Integer, token_type as Integer returns Integer:
     Let result be proc check with parser, token_type
     If result is equal to 1:
@@ -1957,6 +3033,21 @@ Process called "not_check" takes parser as Integer, token_type as Integer return
     End If
     Return 1
 End Process
+
+@Reasoning:
+Up-to-five-way variadic alternative match used by operator-precedence
+parsers (e.g. parse_addition picks one of +, -, .). Tested in order; on
+the first hit the parser advances and returns 1, otherwise leaves position
+untouched and returns 0. Five was chosen because no PHP precedence class
+needs more — when one does, callers chain two match_any calls.
+@End Reasoning
+
+@Implementation:
+Five sequential check/advance/return blocks, each guarded by a check
+call so unused slots can be passed as any safe sentinel (callers commonly
+duplicate type1 when fewer than five alternatives are needed; the
+duplicate hit is harmless because the first match already returned).
+@End Implementation
 
 Process called "match_any" takes parser as Integer, type1 as Integer, type2 as Integer, type3 as Integer, type4 as Integer, type5 as Integer returns Integer:
     If proc check with parser, type1:
@@ -1982,26 +3073,60 @@ Process called "match_any" takes parser as Integer, type1 as Integer, type2 as I
     Return 0
 End Process
 
+@Reasoning:
+Position increment guarded by not_at_end so calling advance past EOF is a
+no-op rather than a buffer overrun. This makes recovery code safe even
+when an outer caller has already passed the end without realising.
+@End Reasoning
+
 Process called "advance" takes parser as Integer:
     If proc not_at_end from parser:
         Set parser.position to parser.position plus 1
     End If
 End Process
 
+@Reasoning:
+Returns the token at the current parse cursor without advancing. Wraps
+list_get so the position-indexed access remains the single point that
+might need optimisation (e.g. cached pointer) later without touching every
+call site.
+@End Reasoning
+
 Process called "current" takes parser as Integer returns Integer:
     Return proc list_get from ListCore with parser.tokens, parser.position
 End Process
+
+@Reasoning:
+Look-behind by one slot for error messages and disambiguation passes that
+need to know what was just consumed (e.g. distinguishing a binary `-`
+from a unary one). Assumes position > 0 at the call site — the recursive
+descent never calls previous before advance has run at least once.
+@End Reasoning
 
 Process called "previous" takes parser as Integer returns Integer:
     Let prev_pos be parser.position minus 1
     Return proc list_get from ListCore with parser.tokens, prev_pos
 End Process
 
+@Reasoning:
+Soft consume: if the current token matches expected_type, advance past
+it; otherwise leave position untouched. No error is raised — the parser
+intentionally accepts skipped optional tokens this way (e.g. trailing
+semicolons after closing braces in some PHP statements).
+@End Reasoning
+
 Process called "consume" takes parser as Integer, expected_type as Integer:
     If proc check with parser, expected_type:
         proc advance from parser
     End If
 End Process
+
+@Reasoning:
+Reads the lexeme/value of the current token, then consumes it. Used where
+the parser needs to capture an identifier or literal text and move past it
+atomically — e.g. `$value = expect(TOKEN_IDENTIFIER)` to get a variable
+name and the cursor positioned ready for the next decision.
+@End Reasoning
 
 Process called "expect" takes parser as Integer, expected_type as Integer returns Integer:
     Let token be proc current from parser
@@ -2014,21 +3139,53 @@ Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
 
+@Reasoning:
+Public entry point matching the naming convention used by sibling
+frontends (e.g. `java_parse`, `solidity_parse`). External callers do not
+need to know about the internal parse_php_source name; this thin alias
+gives a stable surface even if the internal pipeline is refactored.
+@End Reasoning
+
 Process called "php_parse" takes source as Integer returns Integer:
     Return proc parse_php_source from source
 End Process
+
+@Reasoning:
+Accessor exposing the node_type discriminant to HIR translation passes
+that cannot see the ASTNode field layout directly. Encapsulation here is
+important because the struct order may change for cache locality without
+breaking external consumers.
+@End Reasoning
 
 Process called "php_ast_node_type" takes node as ASTNode returns Integer:
     Return node.node_type
 End Process
 
+@Reasoning:
+Accessor for the leaf-node lexeme (identifier text, string literal,
+numeric literal, etc.). Returns 0 for interior nodes that carry their data
+in children/metadata instead.
+@End Reasoning
+
 Process called "php_ast_node_value" takes node as ASTNode returns Integer:
     Return node.value
 End Process
 
+@Reasoning:
+Accessor returning the ListCore handle of the node's ordered children.
+Callers walk it with list_get/list_length; the handle itself stays owned
+by the ASTNode for lifetime purposes.
+@End Reasoning
+
 Process called "php_ast_node_children" takes node as ASTNode returns Integer:
     Return node.children
 End Process
+
+@Reasoning:
+Accessor returning the ListCore handle of the node's [key, value] pair
+list. Callers iterate pair-by-pair to find a specific key — see
+set_metadata for the storage format.
+@End Reasoning
 
 Process called "php_ast_node_metadata" takes node as ASTNode returns Integer:
     Return node.metadata

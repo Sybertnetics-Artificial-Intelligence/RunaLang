@@ -56,6 +56,21 @@ Note: ==========================================================================
 Note: Code Generator State
 Note: ============================================================================
 
+@Reasoning:
+The R code generator carries an emitter (the buffer that actually
+holds the produced source) plus three counters: indent_level for
+pretty-printing, in_function for nested-context tracking (R closures
+have lexical scope), and error_count to surface unrecoverable
+translation issues to the driver without aborting mid-emit.
+@End Reasoning
+
+@Implementation:
+4 x i64 record (32 bytes). offsets: 0 = REmitter handle (owns the
+output buffer; freed in destroy_generator), 8 = indent_level (bumped by
+indent/dedent), 16 = in_function depth, 24 = error_count. Layout
+matches create_generator's 32-byte allocation.
+@End Implementation
+
 Type called "HIRToRGenerator":
     emitter as Integer          Note: R code emitter
     indent_level as Integer     Note: Current indentation level
@@ -67,13 +82,26 @@ Note: ==========================================================================
 Note: Generator Creation
 Note: ============================================================================
 
+@Reasoning:
+The R generator is a small fixed record (32 bytes / 4 slots) tracking the
+emitter handle plus three integer state counters (indent_level, in_function
+depth, error_count). The two-stage construction (allocate generator, then
+allocate emitter) means we must roll back the generator allocation if the
+emitter allocation fails - otherwise we leak the 32 bytes. We zero the
+state counters explicitly rather than relying on calloc semantics because
+allocate from Layout is not guaranteed to return zeroed memory.
+@End Reasoning
+
+@Implementation:
+Calls Layout.allocate(32) for the generator record; returns 0 if it fails.
+Calls REmitter.create_r_emitter() for the emitter; if that fails, frees
+the generator and returns 0. On success, writes: offset 0 = emitter handle,
+offset 8 = 0 (indent_level), offset 16 = 0 (in_function depth), offset 24
+= 0 (error_count). Returns the generator handle as an opaque Integer.
+@End Implementation
+
 Process called "create_generator" returns Integer:
     Note: Create HIR to R code generator
-
-    @Reasoning:
-    Initialize code generator with emitter and state tracking.
-    Manages indentation and context for proper R code generation.
-    @End Reasoning
 
     Let generator_size be 32  Note: HIRToRGenerator: 4 fields × 8 bytes
     Let generator be proc allocate from Layout with generator_size
@@ -97,6 +125,19 @@ Process called "create_generator" returns Integer:
     Return generator
 End Process
 
+@Reasoning:
+The generator owns the REmitter it allocated in create_generator;
+destruction must release that emitter (which itself owns the output
+buffer) before deallocating the generator record. Forgetting this
+leaks the entire output buffer plus the emitter's own state.
+@End Reasoning
+
+@Implementation:
+Null guard returns 1. Reads emitter at offset 0; if non-null calls
+REmitter.destroy_r_emitter (which frees the inner buffer). Then
+Layout.deallocate releases the 32-byte generator record itself.
+@End Implementation
+
 Process called "destroy_generator" takes generator as Integer returns Integer:
     Note: Destroy generator and free resources
 
@@ -119,6 +160,19 @@ Note: ==========================================================================
 Note: Indentation Management
 Note: ============================================================================
 
+@Reasoning:
+Increase the running indentation level by one. R's two-space-per-level
+convention is applied by emit_indent based on this counter, so keeping
+the counter separate from the actual character emission means nested
+constructs can save/restore it cheaply.
+@End Reasoning
+
+@Implementation:
+Reads i64 at offset 8 (indent_level), stores level+1 back. No bounds
+check — pathological nesting could overflow but in practice the AST
+depth is bounded by parser stack limits.
+@End Implementation
+
 Process called "indent" takes generator as Integer returns Integer:
     Note: Increase indentation level
 
@@ -127,6 +181,19 @@ Process called "indent" takes generator as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Companion to indent. Floors at zero so a buggy AST that contains
+mismatched block-enter/block-exit pairs cannot produce a negative
+indent level (which would crash emit_indent's repeat loop on Integer
+underflow).
+@End Reasoning
+
+@Implementation:
+Reads i64 at offset 8; only writes level-1 back when level > 0.
+Otherwise leaves the counter at zero, silently swallowing the extra
+dedent. Returns 1 unconditionally.
+@End Implementation
 
 Process called "dedent" takes generator as Integer returns Integer:
     Note: Decrease indentation level
@@ -139,6 +206,18 @@ Process called "dedent" takes generator as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Writes indent_level units of indentation to the output buffer via the
+REmitter. Delegating the "how many spaces per level" decision to the
+emitter keeps the generator policy-free.
+@End Reasoning
+
+@Implementation:
+Loads the emitter from offset 0 and the level from offset 8, then
+calls REmitter.emit_indent with both. The emitter expands the level
+count into the correct whitespace (two spaces per level for R style).
+@End Implementation
 
 Process called "emit_indent" takes generator as Integer returns Integer:
     Note: Emit current indentation
@@ -154,6 +233,23 @@ End Process
 Note: ============================================================================
 Note: Expression Generation
 Note: ============================================================================
+
+@Reasoning:
+Universal expression dispatcher. Every HIR node that can appear in
+expression position is routed here; the function inspects the
+node_type at offset 0 and forwards to the specialised generator
+(number, string, identifier, binary_op, call, formula, etc.). Null
+input returns 0 so callers can chain without explicit guards.
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0 of hir_node. Long Match chain: NUMBER_LITERAL,
+STRING_LITERAL, BOOL_LITERAL, NULL_LITERAL, NA/NaN/Inf via SPECIAL,
+IDENTIFIER, BINARY_OP, UNARY_OP, ASSIGN, CALL, INDEX, MEMBER_ACCESS,
+QUALIFIED_NAME, FORMULA, FUNCTION_DEF, LAMBDA. Unrecognised node types
+fall through and return 0 — callers should treat that as a
+"don't-know-how-to-emit" signal.
+@End Implementation
 
 Process called "generate_expression" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R expression from HIR node
@@ -246,6 +342,20 @@ Note: ==========================================================================
 Note: Literal Generation
 Note: ============================================================================
 
+@Reasoning:
+R distinguishes integer literals (suffix `L`) from double literals (no
+suffix). The HIR carries the originally parsed type at offset 64, which
+is preserved here so round-tripping Runa-to-R does not silently widen
+ints to doubles.
+@End Reasoning
+
+@Implementation:
+Reads value lexeme at offset 8, emits it verbatim, then appends an "L"
+suffix when type at offset 64 equals HIR.TYPE_INT32. Complex literals
+already carry their `i` suffix in the lexeme so no special handling is
+needed.
+@End Implementation
+
 Process called "generate_number" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R number literal
 
@@ -265,6 +375,19 @@ Process called "generate_number" takes generator as Integer, hir_node as Integer
     Return 1
 End Process
 
+@Reasoning:
+String literals in HIR are stored already-quoted (the parser preserved
+the exact source bytes including delimiters), so emission is a direct
+copy. No re-escaping is performed — that's the parser's responsibility
+when it consumed the literal.
+@End Reasoning
+
+@Implementation:
+Reads value handle at offset 8 and forwards to REmitter.emit_string.
+Caller (typically generate_expression) is responsible for context-
+appropriate use.
+@End Implementation
+
 Process called "generate_string" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R string literal
 
@@ -276,6 +399,18 @@ Process called "generate_string" takes generator as Integer, hir_node as Integer
 
     Return 1
 End Process
+
+@Reasoning:
+R booleans are written as `TRUE` / `FALSE` (uppercase, no quotes).
+Delegating to dedicated emit_true/emit_false in the REmitter keeps the
+exact spelling configurable in one place.
+@End Reasoning
+
+@Implementation:
+Reads value at offset 8; emits emit_true when 1, emit_false otherwise.
+Any non-zero non-one value would still go to the false branch — the
+HIR builder is expected to canonicalise booleans to {0, 1}.
+@End Implementation
 
 Process called "generate_bool" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R boolean literal
@@ -292,6 +427,18 @@ Process called "generate_bool" takes generator as Integer, hir_node as Integer r
     Return 1
 End Process
 
+@Reasoning:
+R's `NULL` is distinct from NA, NaN, and Inf — it represents the
+absence of a value, particularly used to drop list elements. Emitting
+through the dedicated REmitter.emit_null keeps the spelling consistent
+with the rest of R-specific keyword emissions.
+@End Reasoning
+
+@Implementation:
+Reads the emitter handle and calls REmitter.emit_null. hir_node is
+unused (the literal carries no payload).
+@End Implementation
+
 Process called "generate_null" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R NULL literal
 
@@ -302,13 +449,27 @@ Process called "generate_null" takes generator as Integer, hir_node as Integer r
     Return 1
 End Process
 
+@Reasoning:
+R has three first-class non-finite/missing literals (NA, NaN, Inf) that
+each have a dedicated emitter entry point - they cannot be expressed as
+ordinary identifiers because some are reserved words and others would
+require quoting in non-default locales. The HIR represents them as
+named-special nodes whose name string is the canonical R spelling.
+Anything that isn't one of the three known forms falls through to a
+generic string emit, which preserves forward compatibility for special
+values added by future R versions without forcing a generator update.
+@End Reasoning
+
+@Implementation:
+Reads emitter (offset 0) and the name string (offset 8 of hir_node).
+Sequentially compares the name against "NA", "NaN", "Inf" using
+StringCore.strings_equal; each match calls the corresponding REmitter
+entry point (emit_na/emit_nan/emit_inf) and returns 1. Falls through
+to REmitter.emit_string for unknown special names.
+@End Implementation
+
 Process called "generate_special" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R special value (NA, NaN, Inf)
-
-    @Reasoning:
-    R has special values for missing data (NA), not-a-number (NaN),
-    and infinity (Inf). These are generated as literal constants.
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with generator, 0
     Let name be proc memory_get_int64 from Layout with hir_node, 8
@@ -334,6 +495,18 @@ Process called "generate_special" takes generator as Integer, hir_node as Intege
     Return 1
 End Process
 
+@Reasoning:
+Identifiers in HIR are stored as bare name strings. R identifier rules
+match the HIR's, so the name can be emitted unchanged — no quoting,
+mangling, or namespace prefix required at this stage.
+@End Reasoning
+
+@Implementation:
+Reads the name string at offset 8 and forwards to REmitter.emit_string.
+For backtick-quoted names with special characters, the HIR builder is
+expected to have preserved the backticks in the lexeme.
+@End Implementation
+
 Process called "generate_identifier" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R identifier
 
@@ -349,13 +522,27 @@ Note: ==========================================================================
 Note: Operation Generation
 Note: ============================================================================
 
+@Reasoning:
+R binary ops are vectorised by default, so generated code never needs
+explicit broadcast logic - the runtime applies element-wise semantics
+automatically. The job here is purely syntactic: emit `left OP right`
+with operator-appropriate spacing. We delegate operator spelling to
+generate_operator so that op-specific concerns (e.g. `%%` vs `%/%` vs
+`*`, or `&&` vs `&` for short-circuit-vs-vectorised AND) live in one
+place rather than being scattered across the binary-op generator.
+@End Reasoning
+
+@Implementation:
+Reads left (offset 16), right (offset 24), and op_type (offset 64) from
+the HIR node. Recurses generate_expression on the left operand, calls
+generate_operator(generator, op_type) to emit the operator spelling,
+then recurses generate_expression on the right operand. No parenthesis
+insertion - operator-precedence handling is the responsibility of the
+HIR builder upstream.
+@End Implementation
+
 Process called "generate_binary_op" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R binary operation
-
-    @Reasoning:
-    R binary operations are vectorized by default. We generate
-    idiomatic R code with proper spacing around operators.
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with generator, 0
     Let left be proc memory_get_int64 from Layout with hir_node, 16
@@ -373,6 +560,23 @@ Process called "generate_binary_op" takes generator as Integer, hir_node as Inte
 
     Return 1
 End Process
+
+@Reasoning:
+Maps HIR.OP_* constants to R operator spellings. Several R operators
+have unusual spelling (`%%` for modulo, `%/%` for integer division,
+`^` for power) that differ from typical C-family languages, so a
+dedicated translation table is required rather than emitting the HIR
+op symbol verbatim.
+@End Reasoning
+
+@Implementation:
+Sequential If chain over HIR.OP_ADD/SUBTRACT/MULTIPLY/DIVIDE/MODULO
+(`%%`)/INT_DIVIDE (`%/%`)/POWER (`^`), then comparison ops
+(==, !=, <, <=, >, >=), logical ops (R uses `&` element-wise and `&&`
+short-circuit), special ops (`%in%`, `|>` pipe). Returns 1 on first
+match. Falls through with no emission (returns 1) for unrecognised
+ops so the caller does not break the surrounding expression.
+@End Implementation
 
 Process called "generate_operator" takes generator as Integer, op_type as Integer returns Integer:
     Note: Generate R operator
@@ -499,6 +703,20 @@ Process called "generate_operator" takes generator as Integer, op_type as Intege
     Return 1
 End Process
 
+@Reasoning:
+R's prefix unary operators (`!`, `-`, `+`) match those of most C-style
+languages, so emission is direct. The operator is emitted before the
+operand to preserve prefix syntax.
+@End Reasoning
+
+@Implementation:
+Reads operand at offset 24, op_type at offset 64. Emits the appropriate
+symbol via REmitter.emit_string (HIR.OP_NOT -> "!", OP_NEGATE -> "-",
+OP_UNARY_PLUS -> "+"). Then recurses into generate_expression for the
+operand. No parentheses are added — the parser would have wrapped the
+operand in a parenthesised expression node if precedence required it.
+@End Implementation
+
 Process called "generate_unary_op" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R unary operation
 
@@ -529,13 +747,26 @@ Note: ==========================================================================
 Note: Assignment Generation
 Note: ============================================================================
 
+@Reasoning:
+R has three assignment forms (`<-`, `=`, `->`) with subtly different
+scoping rules at top-level vs function-call argument positions. Style
+guides (tidyverse, Google) uniformly recommend `<-` for clarity, and
+that is what REmitter.emit_assignment produces. Using one canonical
+spelling at the HIR-to-R boundary avoids accidentally introducing the
+function-call-argument confusion that `=` would create (where `f(x=1)`
+binds an argument but `f(x<-1)` assigns to x in the caller's frame).
+@End Reasoning
+
+@Implementation:
+Reads emitter (offset 0), target (offset 16), and value (offset 24)
+from the HIR node. Recurses generate_expression on the target,
+forwards to REmitter.emit_assignment (which emits ` <- `), then
+recurses generate_expression on the value. No multi-assignment
+support - chained assignment is decomposed by the HIR builder.
+@End Implementation
+
 Process called "generate_assign" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R assignment
-
-    @Reasoning:
-    R prefers <- over = for assignment (style guide convention).
-    We generate idiomatic R with <- and proper spacing.
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with generator, 0
     Let target be proc memory_get_int64 from Layout with hir_node, 16
@@ -556,6 +787,20 @@ End Process
 Note: ============================================================================
 Note: Function Call Generation
 Note: ============================================================================
+
+@Reasoning:
+Standard call syntax `callee(arg1, arg2, ...)`. Named arguments are
+handled implicitly because the HIR represents them as assignment
+expressions in argument position, which generate_expression already
+formats correctly as `name = value`.
+@End Reasoning
+
+@Implementation:
+Reads callee at offset 16, recurses to emit it. Emits `(`. Reads
+children list at offset 32 and count at offset 40, iterates emitting
+each argument via generate_expression and a `, ` separator between
+them (only when i < count-1). Closes with `)`.
+@End Implementation
 
 Process called "generate_call" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R function call
@@ -595,13 +840,31 @@ Note: ==========================================================================
 Note: Indexing and Access Generation
 Note: ============================================================================
 
+@Reasoning:
+R distinguishes two indexing operators with materially different
+semantics: `x[i]` returns a subset preserving the container type
+(list-subset returns a list), while `x[[i]]` extracts a single element
+unwrapping one container layer (list-extract returns the element).
+The HIR carries this distinction via the `r_extract` attribute set by
+the R frontend - it cannot be inferred from syntax alone. Single-bracket
+indexing also accepts multiple indices (for matrices/arrays/dataframes)
+whereas double-bracket is fundamentally single-index, so the code paths
+diverge: extract reads ONE index from offset 24, subset iterates a
+children list at offset 32/40.
+@End Reasoning
+
+@Implementation:
+Recurses generate_expression on the object (offset 16). Reads the
+`r_extract` HIR attribute. If equal to 1, emits `[[`, recurses on the
+single index at offset 24, emits `]]`. Otherwise emits `[`, iterates
+the children list (offset 32, count at offset 40) emitting each index
+with `, ` separators between them (only when i < count-1), then emits
+`]`. Reuses the existing `index` local from the extract branch in the
+subset loop body (`Set index to ...`).
+@End Implementation
+
 Process called "generate_index" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R indexing
-
-    @Reasoning:
-    R has two indexing operators: [...] for subsets and [[...]]
-    for element extraction. Check HIR attributes to determine which.
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with generator, 0
     Let object be proc memory_get_int64 from Layout with hir_node, 16
@@ -646,13 +909,32 @@ Process called "generate_index" takes generator as Integer, hir_node as Integer 
     Return 1
 End Process
 
+@Reasoning:
+R has two structurally-similar but semantically-distinct member access
+operators: `$` for list/dataframe component access (S3 objects, named
+list elements) and `@` for S4 slot access (formally-declared slots with
+type signatures). The `r_s4_slot` HIR attribute records which one the
+source used because they cannot be cross-applied: `obj@field` requires
+obj to be a formal S4 object and will fail at runtime on a plain list.
+Additionally, when the member is a simple identifier, R syntax permits
+unquoted names directly after the operator; we preserve this by
+detecting NODE_IDENTIFIER and reading its name field rather than
+recursively dispatching (which would force quoting).
+@End Reasoning
+
+@Implementation:
+Reads emitter (offset 0), object (offset 16), member (offset 24).
+Recurses generate_expression on object. Reads `r_s4_slot` attribute;
+if 1 calls REmitter.emit_slot_access (emits `@`), else calls
+REmitter.emit_member_access (emits `$`). Inspects member node_type at
+offset 0: if HIR.NODE_IDENTIFIER, reads the name string at offset 8
+and emits it directly via REmitter.emit_string (avoiding any wrapping
+the generic expression generator might add); otherwise recurses
+generate_expression on the member subtree.
+@End Implementation
+
 Process called "generate_member_access" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R member access ($ or @)
-
-    @Reasoning:
-    R uses $ for list/dataframe member access and @ for S4 slot access.
-    Check HIR attributes to determine which operator to use.
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with generator, 0
     Let object be proc memory_get_int64 from Layout with hir_node, 16
@@ -683,6 +965,22 @@ Process called "generate_member_access" takes generator as Integer, hir_node as 
     Return 1
 End Process
 
+@Reasoning:
+R distinguishes between public package access (`pkg::name`) and
+internal access (`pkg:::name`). The HIR attribute `r_internal` records
+which form was originally used; we preserve that on output rather than
+canonicalising, because the two forms have different semantics (the
+triple-colon form requires the user to have explicit access to package
+internals).
+@End Reasoning
+
+@Implementation:
+Reads package at offset 16 and name at offset 24, recurses to emit
+package. Calls get_attribute(hir_node, "r_internal") to learn whether
+to emit `::` (public) or `:::` (internal). Forwards the boolean to
+REmitter.emit_namespace, then recurses to emit name.
+@End Implementation
+
 Process called "generate_qualified_name" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R namespace access (:: or :::)
 
@@ -708,13 +1006,29 @@ Note: ==========================================================================
 Note: Formula Generation
 Note: ============================================================================
 
+@Reasoning:
+R formulas are first-class language objects, not just syntactic sugar -
+they capture both LHS (response) and RHS (predictors) as un-evaluated
+expressions that statistical functions (lm, glm, etc.) parse and act
+on. Therefore the `~` operator is positional and ORDER-SIGNIFICANT:
+swapping sides changes semantics. Both sides can be arbitrary
+expressions including operators like `:`, `*`, `+`, `-` that have
+formula-specific meanings (interaction, crossed terms, removal), but
+the generator does not need to know - those nested operators emit
+themselves correctly through the normal binary-op path.
+@End Reasoning
+
+@Implementation:
+Reads emitter (offset 0), response (offset 16), predictors (offset 24)
+from the HIR formula node. Recurses generate_expression on response,
+calls REmitter.emit_formula (which emits ` ~ ` with surrounding spaces),
+then recurses generate_expression on predictors. No special wrapping
+because formulas at top-level or argument position are syntactically
+identical in R.
+@End Implementation
+
 Process called "generate_formula" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R formula (y ~ x)
-
-    @Reasoning:
-    R formulas are fundamental to statistical modeling. Generate
-    clean formula syntax with proper spacing.
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with generator, 0
     Let response be proc memory_get_int64 from Layout with hir_node, 16
@@ -736,14 +1050,29 @@ Note: ==========================================================================
 Note: Function Definition Generation
 Note: ============================================================================
 
+@Reasoning:
+R offers two surface forms for function definitions: `function(...) body`
+(introduced 1996) and `\(...) body` (introduced R 4.1.0). We canonicalise
+on the `function` keyword because (a) it's compatible with every R
+version still in production, (b) it's the form preferred by all major
+style guides, and (c) the lambda form has parser-edge-case issues with
+single-expression bodies that the explicit-keyword form avoids. The
+in_function depth counter (offset 16) is bumped on entry and decremented
+on exit so that any nested return/break emitters can detect that they're
+inside a function and emit `return()` rather than top-level `quit()`.
+@End Reasoning
+
+@Implementation:
+Reads emitter (offset 0). Increments the in_function depth at generator
+offset 16. Emits `function(`. Reads params (offset 16 of hir_node); if
+non-zero, walks its children list (offset 32, count offset 40) emitting
+each parameter via generate_expression with `, ` separators between
+them. Emits `) `. Reads body (offset 24 of hir_node) and recurses
+generate_statement. Decrements depth at generator offset 16 to balance.
+@End Implementation
+
 Process called "generate_function_def" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R function definition
-
-    @Reasoning:
-    R functions can be defined with the function keyword or using
-    lambda syntax (\). We use function keyword for clarity unless
-    it's a simple lambda.
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with generator, 0
 
@@ -794,13 +1123,27 @@ Note: ==========================================================================
 Note: Array Literal Generation
 Note: ============================================================================
 
+@Reasoning:
+R has no special array-literal syntax - vectors are constructed via
+the built-in `c()` function (combine) and heterogeneous collections via
+`list()`. The `r_vector` HIR attribute records whether the source
+intended a homogeneous vector (atomic type, c()) vs a mixed list
+(list()) - critical because c() applies type coercion (a c(1, "a")
+silently becomes character) while list() preserves per-element types.
+Defaulting to `list()` when the attribute is absent is the safe
+choice: it never silently coerces.
+@End Reasoning
+
+@Implementation:
+Reads emitter (offset 0). Calls get_attribute(hir_node, "r_vector");
+if 1 emits `c(` via emit_vector_function, else emits `list(` via
+emit_list_function. Reads children (offset 32) and count (offset 40),
+loops over each child emitting it via generate_expression with `, `
+separators between elements (only when i < count-1). Closes with `)`.
+@End Implementation
+
 Process called "generate_array_literal" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R vector/array literal
-
-    @Reasoning:
-    R uses the c() function to create vectors. Check if this is
-    marked as an R vector and generate accordingly.
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with generator, 0
 
@@ -840,6 +1183,22 @@ End Process
 Note: ============================================================================
 Note: Statement Generation
 Note: ============================================================================
+
+@Reasoning:
+Statement-level dispatcher. R is expression-oriented but the HIR
+distinguishes statement positions to track break/continue/return
+contexts and to control where pretty-print newlines go. Anything that
+doesn't match a control-flow or block node is treated as an expression
+statement and emitted via generate_expression.
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0 with null guard. Sequential dispatch:
+NODE_IF, NODE_WHILE, NODE_FOREACH, NODE_RETURN, NODE_BREAK,
+NODE_CONTINUE, NODE_BLOCK each go to their dedicated generator. Fall-
+through calls generate_expression and returns 1, treating the node as
+an expression statement.
+@End Implementation
 
 Process called "generate_statement" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R statement
@@ -886,6 +1245,19 @@ Process called "generate_statement" takes generator as Integer, hir_node as Inte
     Return 1
 End Process
 
+@Reasoning:
+R's `if (cond) then_stmt else else_stmt` shape uses a parenthesised
+condition and conventional control flow. Children list slots: [0] =
+condition, [1] = then-branch, [2] = optional else-branch.
+@End Reasoning
+
+@Implementation:
+Reads children at offset 32 and count at offset 40. Pulls condition
+from children[0] (offset 0) and then-branch from children[1] (offset
+8). Emits `if (cond) then_stmt`. If child_count > 2, also pulls
+else-branch from children[2] (offset 16) and emits ` else else_stmt`.
+@End Implementation
+
 Process called "generate_if" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R if statement
 
@@ -921,6 +1293,19 @@ Process called "generate_if" takes generator as Integer, hir_node as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+R while loops use `while (cond) body` syntax; the parenthesised
+condition is required. Children list slots: [0] = condition,
+[1] = body. break/continue inside the body are handled by their own
+emitters and produce `break` / `next`.
+@End Reasoning
+
+@Implementation:
+Reads children at offset 32. Pulls condition from children[0]
+(offset 0) and body from children[1] (offset 8). Emits `while (`,
+the condition expression, `) `, and the body statement.
+@End Implementation
+
 Process called "generate_while" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R while loop
 
@@ -944,13 +1329,28 @@ Process called "generate_while" takes generator as Integer, hir_node as Integer 
     Return 1
 End Process
 
+@Reasoning:
+HIR foreach matches R's `for (var in sequence) body` shape exactly,
+including iteration semantics: the loop binds `var` to each element of
+`sequence` in turn, which works for vectors, lists, and any object
+with a length method. R has no C-style for(init; cond; step) loop -
+those are encoded as while loops in the HIR and handled separately.
+Children slots are positionally fixed: [0] = iteration variable,
+[1] = sequence expression, [2] = body. Anything outside that shape is
+a malformed foreach node and is the upstream builder's bug.
+@End Reasoning
+
+@Implementation:
+Reads emitter (offset 0) and children list (offset 32). Pulls var
+from children[0] (offset 0), sequence from children[1] (offset 8),
+body from children[2] (offset 16). Emits `for (`, recurses on var,
+emits ` in `, recurses on sequence, emits `) `, recurses
+generate_statement on body. No newline emission - the statement
+generator's caller is responsible for line termination.
+@End Implementation
+
 Process called "generate_foreach" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R for loop
-
-    @Reasoning:
-    HIR foreach maps directly to R's for (var in sequence) loop.
-    Generate idiomatic R for loop syntax.
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with generator, 0
     Let children be proc memory_get_int64 from Layout with hir_node, 32
@@ -979,6 +1379,19 @@ Process called "generate_foreach" takes generator as Integer, hir_node as Intege
     Return 1
 End Process
 
+@Reasoning:
+R's `return()` is a function call, not a keyword. It takes either zero
+arguments (early return with implicit NULL) or one argument (the value
+to return). We always emit explicit parentheses to make the call shape
+unambiguous.
+@End Reasoning
+
+@Implementation:
+Emits `return`. Reads value at offset 24 of hir_node. If non-zero,
+wraps the value expression in `(value)`; otherwise emits `()` for an
+empty return. Both forms produce valid R.
+@End Implementation
+
 Process called "generate_return" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R return statement
 
@@ -1000,6 +1413,17 @@ Process called "generate_return" takes generator as Integer, hir_node as Integer
     Return 1
 End Process
 
+@Reasoning:
+R's loop-exit keyword is `break`, matching most C-family languages.
+Emitted via the dedicated REmitter keyword helper to keep the spelling
+in one place.
+@End Reasoning
+
+@Implementation:
+Reads emitter at offset 0 and calls REmitter.emit_break_keyword. The
+hir_node argument is unused since `break` carries no payload.
+@End Implementation
+
 Process called "generate_break" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R break statement
 
@@ -1010,6 +1434,18 @@ Process called "generate_break" takes generator as Integer, hir_node as Integer 
     Return 1
 End Process
 
+@Reasoning:
+R uses `next` rather than `continue` for the skip-to-next-iteration
+keyword. This is a critical translation distinction: emitting
+`continue` would produce invalid R. The dedicated emit_next_keyword
+helper enforces the right spelling.
+@End Reasoning
+
+@Implementation:
+Reads emitter at offset 0 and calls REmitter.emit_next_keyword.
+hir_node carries no payload and is unused.
+@End Implementation
+
 Process called "generate_continue" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R next statement (R's continue)
 
@@ -1019,6 +1455,21 @@ Process called "generate_continue" takes generator as Integer, hir_node as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+R blocks are brace-delimited and visually indented one level deeper
+than their containing statement. Each interior statement gets its own
+indentation prefix and a trailing newline. The closing brace returns
+to the outer indent level.
+@End Reasoning
+
+@Implementation:
+Emits `{` then a newline. Calls indent to bump the level. Reads
+children list at offset 32 and count at offset 40, iterates: for each
+stmt — emit_indent, then generate_statement, then newline. After the
+loop calls dedent. Emits the trailing indent (now at the outer level)
+and the closing `}`.
+@End Implementation
 
 Process called "generate_block" takes generator as Integer, hir_node as Integer returns Integer:
     Note: Generate R block {...}
@@ -1057,13 +1508,29 @@ Note: ==========================================================================
 Note: Module/Program Generation
 Note: ============================================================================
 
+@Reasoning:
+R has no concept of a module declaration in source code - a `.R` file
+is simply a list of top-level statements executed in order when sourced
+or run as a script. The HIR's Module wrapper exists only to give the
+translator a single root to walk. Each top-level statement gets a
+trailing newline (so subsequent statements start on fresh lines); an
+EXTRA blank line is inserted between statements (but not after the
+last one) to match the readability convention used by base-R sources
+and CRAN package code. Returns 0 (failure) only when called with a
+null module - empty modules return 1 having produced no output.
+@End Reasoning
+
+@Implementation:
+Null-guards hir_module (returns 0). Reads emitter (offset 0). Reads
+children (offset 32) and child_count (offset 40) from the module.
+Loops over each statement: pulls children[i] (offset i*8), recurses
+generate_statement on it, emits a newline via REmitter.emit_newline.
+If i < count-1 emits a second newline to create the inter-statement
+blank line. Returns 1 unconditionally on completion.
+@End Implementation
+
 Process called "generate_module" takes generator as Integer, hir_module as Integer returns Integer:
     Note: Generate complete R program from HIR module
-
-    @Reasoning:
-    R programs are sequences of top-level statements. We generate
-    each statement with proper formatting and newlines.
-    @End Reasoning
 
     If hir_module is equal to 0:
         Return 0
@@ -1092,6 +1559,18 @@ Process called "generate_module" takes generator as Integer, hir_module as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+Final accessor: pulls the emitted R source as a single string from the
+emitter. Callers use this after generate_module completes to get the
+output suitable for writing to disk or further processing.
+@End Reasoning
+
+@Implementation:
+Reads emitter handle at offset 0 and forwards to REmitter.get_output.
+Returns the borrowed string handle — the buffer is still owned by the
+emitter (and released when destroy_generator runs).
+@End Implementation
 
 Process called "get_output" takes generator as Integer returns Integer:
     Note: Get generated R code as string

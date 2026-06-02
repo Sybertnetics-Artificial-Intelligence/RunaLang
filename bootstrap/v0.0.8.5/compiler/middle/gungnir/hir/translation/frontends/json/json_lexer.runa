@@ -58,6 +58,14 @@ Note: ==========================================================================
 Note: Token Structure
 Note: ============================================================================
 
+@Reasoning:
+JSON tokens carry their type tag plus a lexeme pointer/length pair
+(zero-copy view into the source buffer rather than allocated substrings),
+source position for diagnostics, and three numeric-specific fields
+because JSON numbers can be either int or float at the syntactic level
+and we want to preserve which one the source used.
+@End Reasoning
+
 Type called "JSONToken":
     token_type as Integer       Note: Token type constant
     lexeme as Integer           Note: Pointer to token text
@@ -73,6 +81,13 @@ Note: ==========================================================================
 Note: Lexer State Structure
 Note: ============================================================================
 
+@Reasoning:
+Lexer carries the source buffer pointer plus precomputed length (so
+is_at_end is O(1)), the running cursor position, line/column counters
+for diagnostics, and a latched error message pointer for the first
+encountered lex error. 48 bytes total (6 * 8).
+@End Reasoning
+
 Type called "JSONLexer":
     source as Integer           Note: Pointer to JSON source string
     source_length as Integer    Note: Length of source
@@ -85,6 +100,13 @@ End Type
 Note: ============================================================================
 Note: Lexer Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Allocates the lexer record and initialises every field. source_length
+is precomputed once via string_length so the inner scanning loops can
+compare against a cached value rather than re-walking the buffer.
+Cursor starts at 0, line and column at 1 (1-indexed for diagnostics).
+@End Reasoning
 
 Process called "create_json_lexer" takes source as Integer returns Integer:
     Note: Create JSON lexer from source string
@@ -123,6 +145,13 @@ Process called "create_json_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+Releases the error_message buffer (if any was allocated) before freeing
+the lexer record. Source buffer is NOT freed because it's caller-owned.
+Null lexer is a no-op success so destroy can run unconditionally in
+caller cleanup paths.
+@End Reasoning
+
 Process called "destroy_json_lexer" takes lexer as Integer returns Integer:
     Note: Destroy JSON lexer and free resources
 
@@ -147,6 +176,12 @@ Note: ==========================================================================
 Note: Character Access and Advancement
 Note: ============================================================================
 
+@Reasoning:
+Cheap end-of-source predicate used by every scanning loop. Reads
+cursor (offset 16) and source_length (offset 8) and returns 1 when the
+cursor has reached the cached length. Constant-time, no allocation.
+@End Reasoning
+
 Process called "is_at_end" takes lexer as Integer returns Integer:
     Note: Check if lexer is at end of source
 
@@ -159,6 +194,13 @@ Process called "is_at_end" takes lexer as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Returns the byte at the current cursor without advancing. Returns 0
+(treated as EOF sentinel by callers) when at end of source. Used by
+the dispatch in next_token to route on the first character of each
+token.
+@End Reasoning
 
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Get current character without advancing
@@ -175,6 +217,13 @@ Process called "peek_char" takes lexer as Integer returns Integer:
 
     Return char
 End Process
+
+@Reasoning:
+One-character look-ahead. Used by scan_number to distinguish "-3"
+(negative integer) from "-." (lookahead suggests "-0.x" form needing
+the integer-part default). Returns 0 if the look-ahead would overshoot
+the source.
+@End Reasoning
 
 Process called "peek_next_char" takes lexer as Integer returns Integer:
     Note: Get next character without advancing
@@ -193,6 +242,13 @@ Process called "peek_next_char" takes lexer as Integer returns Integer:
 
     Return char
 End Process
+
+@Reasoning:
+Consumes the current byte and updates cursor + line/column. Newline
+(0x0A) bumps the line counter and resets column to 1; any other byte
+advances column. Returns the byte that was consumed so callers can
+inspect it without a separate peek.
+@End Reasoning
 
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character and return current
@@ -226,6 +282,13 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+Returns 1 only for the four whitespace bytes JSON's RFC 8259 permits
+between tokens: space (0x20), horizontal tab (0x09), line feed (0x0A),
+and carriage return (0x0D). Strict — does NOT include form feed or
+vertical tab even though some non-conformant parsers do.
+@End Reasoning
+
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is JSON whitespace (space, tab, newline, carriage return)
 
@@ -248,6 +311,11 @@ Process called "is_whitespace" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII '0' (0x30) through '9' (0x39) range check. JSON numbers are ASCII
+per spec, so no Unicode digit handling is needed.
+@End Reasoning
+
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is digit (0-9)
 
@@ -259,6 +327,12 @@ Process called "is_digit" takes char as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Recognises ASCII hex digits: 0-9, A-F, a-f. Needed only for the
+\uXXXX Unicode escape sequence in string literals — JSON does not
+otherwise admit hex numbers.
+@End Reasoning
 
 Process called "is_hex_digit" takes char as Integer returns Integer:
     Note: Check if character is hexadecimal digit (0-9, a-f, A-F)
@@ -288,6 +362,12 @@ Note: ==========================================================================
 Note: Skip Whitespace
 Note: ============================================================================
 
+@Reasoning:
+Advances past every consecutive whitespace byte. JSON has no comment
+syntax to skip — strictly whitespace per the spec. Called at the top
+of next_token so token scanning always starts at significant content.
+@End Reasoning
+
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip all whitespace characters
 
@@ -314,6 +394,13 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Latches an error message at offset 40 of the lexer. Allocates a copy
+of the message string so the lexer owns the buffer independent of the
+caller's lifetime. Only the first error is preserved (latched, not
+overwritten) so later scans don't clobber the most useful diagnostic.
+@End Reasoning
 
 Process called "set_lexer_error" takes lexer as Integer, message as Integer returns Integer:
     Note: Set lexer error message
@@ -343,6 +430,13 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Allocates a JSONToken record with the basic fields set. value_int /
+value_float / is_integer slots are zero-initialised; the number-scanning
+path fills them in after this call when the token type is TOKEN_NUMBER.
+Other token types leave them at 0.
+@End Reasoning
+
 Process called "create_token" takes token_type as Integer, lexeme as Integer, lexeme_length as Integer, line as Integer, column as Integer returns Integer:
     Note: Create token with given parameters
 
@@ -369,6 +463,21 @@ End Process
 Note: ============================================================================
 Note: String Tokenization
 Note: ============================================================================
+
+@Reasoning:
+JSON string literal scan. The opening " has already been consumed by
+the dispatcher. Reads bytes until the matching closing ", processing
+escape sequences (\", \\, \/, \b, \f, \n, \r, \t, \uXXXX). Unicode
+escapes are validated as four hex digits. Raw control characters
+(0x00-0x1F) inside a string are an error per RFC 8259.
+@End Reasoning
+
+@Security_Scope:
+\uXXXX escape sequences expand to actual Unicode code points; surrogate
+pairs are joined. Malformed escapes raise an error rather than emit
+garbage bytes. No surrogate-half emission to keep the output buffer
+well-formed UTF-8.
+@End Security_Scope
 
 Process called "scan_string" takes lexer as Integer returns Integer:
     Note: Scan JSON string literal with escape handling
@@ -589,6 +698,14 @@ Note: ==========================================================================
 Note: Number Tokenization
 Note: ============================================================================
 
+@Reasoning:
+JSON number scan per RFC 8259 grammar: optional minus, integer part
+(0 alone or [1-9][0-9]*), optional fraction (.[0-9]+), optional
+exponent ([eE][+-]?[0-9]+). The presence of "." or "e/E" flips
+is_integer to 0 so downstream consumers can use the int representation
+when safe and the float representation otherwise.
+@End Reasoning
+
 Process called "scan_number" takes lexer as Integer returns Integer:
     Note: Scan JSON number (integer or float, including scientific notation)
 
@@ -806,6 +923,13 @@ Process called "scan_number" takes lexer as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+String-to-int conversion for the integer body of a JSON number. Handles
+leading minus, accumulates decimal digits. Caller has already verified
+the lexeme is valid integer syntax — this function does NOT re-validate
+and will produce undefined results on malformed input.
+@End Reasoning
+
 Process called "parse_integer" takes str as Integer returns Integer:
     Note: Parse integer from string
 
@@ -852,6 +976,14 @@ Note: ==========================================================================
 Note: Keyword Tokenization
 Note: ============================================================================
 
+@Reasoning:
+Generic keyword recogniser used for the three JSON reserved literals:
+true, false, null. Compares the expected keyword character-by-character
+against the source starting at the cursor and reports an error if a
+prefix matches but the remainder diverges (e.g., "trun" partial of
+"true" is an error, not a fallback to identifier).
+@End Reasoning
+
 Process called "scan_keyword" takes lexer as Integer, keyword as Integer, token_type as Integer returns Integer:
     Note: Scan expected keyword
 
@@ -887,6 +1019,14 @@ End Process
 Note: ============================================================================
 Note: Main Tokenization
 Note: ============================================================================
+
+@Reasoning:
+Main entry: skip whitespace, then dispatch on the first character.
+Punctuation ({, }, [, ], :, ,) produces a single-character token; "
+starts a string; - or 0-9 starts a number; t/f/n start keyword
+candidates. Any other character is reported as a lexer error and
+produces a TOKEN_ERROR result.
+@End Reasoning
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from lexer

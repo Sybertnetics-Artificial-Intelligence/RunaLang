@@ -53,6 +53,23 @@ Note: ==========================================================================
 Note: Generator Context
 Note: ============================================================================
 
+@Reasoning:
+The PowerShell generator threads two pieces of state through every HIR
+node it visits: the emitter that owns the output buffer (so write
+operations append in source order) and the current indent depth (so
+nested script blocks and hashtable bodies receive the correct number of
+4-space prefixes). Keeping these in a 16-byte struct rather than passing
+them as separate parameters lets the dispatcher and helpers share a
+single handle and makes future fields (e.g. type context, scope frames)
+cheap to add.
+@End Reasoning
+
+@Implementation:
+Two pointer-sized fields, total size 16 bytes (matching CONTEXT_SIZE).
+Field 0: emitter pointer (constructed by create_powershell_emitter).
+Field 8: indent_level Integer (0 at construction, mutated by
+increase_indent / decrease_indent).
+@End Implementation
 Type called "PowerShellGeneratorContext":
     emitter as Integer          Note: PowerShell emitter
     indent_level as Integer     Note: Current indentation level
@@ -60,6 +77,20 @@ End Type
 
 Constant CONTEXT_SIZE as Integer is 16  Note: 2 fields × 8 bytes
 
+@Reasoning:
+Allocates a fresh PowerShellGeneratorContext and binds it to an already-
+constructed emitter so the two lifetimes can be managed independently:
+the caller can keep the emitter alive after the generator finishes (e.g.
+to read the output buffer) without coupling the lifetime of the indent
+counter to it.
+@End Reasoning
+
+@Implementation:
+Calls Layout.allocate(CONTEXT_SIZE=16) and propagates allocation failure
+by returning 0. On success, writes the emitter pointer at offset 0 and
+explicitly initializes indent_level at offset 8 to 0 so freshly-emitted
+top-level constructs do not inherit indentation from earlier runs.
+@End Implementation
 Process called "create_generator_context" takes emitter as Integer returns Integer:
     Note: Create PowerShell generator context
 
@@ -75,6 +106,20 @@ Process called "create_generator_context" takes emitter as Integer returns Integ
     Return context
 End Process
 
+@Reasoning:
+Releases the 16-byte context struct without touching the emitter, because
+the emitter is owned by the caller (generate_powershell_from_hir) and
+freed via destroy_powershell_emitter on a separate code path. Decoupling
+the two destroys avoids double-free when callers retain the emitter to
+extract its output after generation completes.
+@End Reasoning
+
+@Implementation:
+Treats context==0 as already-freed (returns 1, idempotent). Otherwise
+calls Layout.deallocate on the struct pointer. Does not zero or null
+the emitter field because the struct memory is reclaimed in the same
+call.
+@End Implementation
 Process called "destroy_generator_context" takes context as Integer returns Integer:
     Note: Destroy generator context
 
@@ -87,6 +132,18 @@ Process called "destroy_generator_context" takes context as Integer returns Inte
     Return 1
 End Process
 
+@Reasoning:
+PowerShell uses brace-delimited blocks but generated output still needs
+consistent indentation for readability of nested script blocks, classes,
+hashtables, and switch statements. A single counter incremented on entry
+and decremented on exit gives the emitter a precise depth value to expand
+into the appropriate number of 4-space units.
+@End Reasoning
+
+@Implementation:
+Reads indent_level (offset 8), writes back `level + 1`. Always returns 1
+because the increment cannot fail given a valid context pointer.
+@End Implementation
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -96,6 +153,17 @@ Process called "increase_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Counterpart to increase_indent. The positive-only guard is required so a
+malformed HIR (extra close brace, mismatched nesting) cannot underflow
+the counter into a giant unsigned value that would cause the emitter to
+spin emitting indentation forever.
+@End Reasoning
+
+@Implementation:
+Reads indent_level. If strictly positive, decrements by 1 and writes
+back. Otherwise leaves the field at 0. Always returns 1.
+@End Implementation
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
 
@@ -112,24 +180,64 @@ Note: ==========================================================================
 Note: HIR Access Helpers (REAL IMPLEMENTATIONS)
 Note: ============================================================================
 
+@Reasoning:
+Thin alias over Dict.hashtable_get used to give HIR-string accesses a
+domain-specific name at call sites. Centralizing the lookup means
+substitutions (e.g. cache layer, instrumentation) only have to be made
+in one place.
+@End Reasoning
+
+@Implementation:
+Delegates directly to hashtable_get from the Dict module. No copies, no
+ownership transfer - the returned pointer is borrowed from the dict.
+@End Implementation
 Process called "get_dict_string_value" takes dict as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary using real hashtable_get
 
     Return proc hashtable_get from Dict with dict, key
 End Process
 
+@Reasoning:
+Parallel of get_dict_string_value but typed-named for HIR-subtree
+accesses (left, right, body, etc.). The distinction is purely
+documentary; semantically both call the same hashtable_get because
+HIR nodes are themselves hashtables and strings stored uniformly.
+@End Reasoning
+
+@Implementation:
+Delegates to Dict.hashtable_get. Returns the borrowed value pointer.
+@End Implementation
 Process called "get_dict_hir_value" takes dict as Integer, key as Integer returns Integer:
     Note: Get HIR value from HIR dictionary using real hashtable_get
 
     Return proc hashtable_get from Dict with dict, key
 End Process
 
+@Reasoning:
+Wraps List.list_length so iteration loops use a HIR-domain name that
+makes the intent (counting child nodes such as parameters, statements,
+or cases) obvious at the call site.
+@End Reasoning
+
+@Implementation:
+Delegates to List.list_length and returns the integer count unchanged.
+@End Implementation
 Process called "get_list_count" takes list as Integer returns Integer:
     Note: Get HIR list count using real list_length
 
     Return proc list_length from List with list
 End Process
 
+@Reasoning:
+Indexed accessor over List.list_get used by every "iterate over HIR
+children" loop in this file. Naming this with the HIR-domain `get_list_item`
+keeps the recursive descent code self-documenting.
+@End Reasoning
+
+@Implementation:
+Delegates to List.list_get with the same index. Returned pointer is
+borrowed by the caller; no allocation occurs.
+@End Implementation
 Process called "get_list_item" takes list as Integer, index as Integer returns Integer:
     Note: Get HIR list item using real list_get
 
@@ -140,6 +248,17 @@ Note: ==========================================================================
 Note: Literal and Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+PowerShell string literals must be quoted; the double-quote form is
+chosen so embedded $variables are interpolated by the runtime, matching
+HIR's interpolation-by-default semantics for string nodes.
+@End Reasoning
+
+@Implementation:
+Null-guards hir (returns 1, no-op). Reads emitter from context offset 0
+and the "value" key string from the HIR node. Emits `"`, the value, and
+a closing `"` via the emitter.
+@End Implementation
 Process called "generate_string_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell string literal with quotes
 
@@ -157,6 +276,18 @@ Process called "generate_string_literal" takes context as Integer, hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Number literals are stored as already-formatted strings on the HIR node
+(integer, decimal, or scientific form preserved from the source) so the
+emitter just needs to pass them through verbatim. PowerShell accepts the
+same literal grammar Runa's HIR carries, so no transformation is needed.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Reads emitter and the "value" string; emits the value
+through emit_string. No quoting is added because numeric literals are
+bare tokens in PowerShell.
+@End Implementation
 Process called "generate_number_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell number literal
 
@@ -172,6 +303,17 @@ Process called "generate_number_literal" takes context as Integer, hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+The HIR layer stores boolean values as PowerShell-ready strings ("$true"
+or "$false") so this routine is a straight pass-through. Doing the
+canonicalization at HIR-build time keeps target-specific dollar-prefix
+formatting out of the lowering step.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Reads emitter and the "value" string; emits it via
+emit_string with no quoting or transformation.
+@End Implementation
 Process called "generate_boolean_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell boolean literal
 
@@ -187,6 +329,16 @@ Process called "generate_boolean_literal" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+PowerShell's automatic null variable is `$null`. Hardcoding the literal
+here avoids depending on the HIR node carrying a value field for this
+case, since null has no representation other than the keyword itself.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits the literal string "$null" through emit_string.
+The hir argument is consulted only for the guard.
+@End Implementation
 Process called "generate_null_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell null literal
 
@@ -201,6 +353,17 @@ Process called "generate_null_literal" takes context as Integer, hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+PowerShell variables always carry a `$` sigil. Centralizing the sigil
+emission in the emitter's emit_variable rather than concatenating here
+keeps escape handling (e.g. for variable names containing colons or
+braces) localized to the emitter layer.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Reads the "name" string from the HIR node and forwards
+it to emit_variable, which prepends the `$` sigil.
+@End Implementation
 Process called "generate_variable_reference" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell variable reference $variable
 
@@ -216,6 +379,20 @@ Process called "generate_variable_reference" takes context as Integer, hir as In
     Return 1
 End Process
 
+@Reasoning:
+PowerShell cmdlet parameters use a `-Name` form optionally followed by a
+value. The HIR represents the parameter name as a nested identifier
+(under "name" key with its own "value" subkey) and the optional value
+as a separate HIR subtree, allowing arbitrary expressions as parameter
+values (e.g. `-Path (Get-Location)`).
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Reads the "name" HIR child and pulls its "value" string
+for emit_parameter (which writes `-<name>`). If the "value" HIR child is
+present, emits a space and dispatches the value subtree through
+generate_node.
+@End Implementation
 Process called "generate_parameter" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell parameter (-Parameter)
 
@@ -241,6 +418,19 @@ Process called "generate_parameter" takes context as Integer, hir as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+PowerShell's `$( ... )` operator evaluates an embedded expression in
+string-interpolation contexts and is also commonly used to disambiguate
+complex expressions. Wrapping the body in the operator allows downstream
+emitter contexts to treat the result as a single token.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits the subexpression-start delimiter `$(`, then
+dispatches the `body` HIR child through generate_node, then emits the
+closing `)`. Both delimiters go through dedicated emitter helpers so any
+future quoting changes stay isolated.
+@End Implementation
 Process called "generate_subexpression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell subexpression $()
 
@@ -262,6 +452,18 @@ Process called "generate_subexpression" takes context as Integer, hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+PowerShell's `@( ... )` array sub-expression is the unambiguous way to
+construct an array literal; comma-only forms lose their array semantics
+when used with a single element, so `@(...)` is preferred for the
+generated output regardless of element count.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits the array-start delimiter `@(`. Iterates the
+"elements" HIR list, inserting `, ` separators between elements and
+dispatching each element through generate_node. Closes with `)`.
+@End Implementation
 Process called "generate_array_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell array @()
 
@@ -295,6 +497,20 @@ Process called "generate_array_literal" takes context as Integer, hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+PowerShell hashtables use `@{ ... }` with newline-separated entries (or
+semicolons inline). The routine deliberately formats multi-pair tables
+across multiple lines because that is the idiomatic shape PowerShell
+linters accept and because it keeps generated code reviewable.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits `@{`. When the "pairs" list is non-empty: emits
+newline, increments indent, iterates pairs emitting indent + the pair
+expression, places `;` between consecutive pairs, and a newline after
+each. Decrements indent and emits the trailing indented `}`. Empty
+tables collapse to `@{}` on one line.
+@End Implementation
 Process called "generate_hashtable_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell hashtable @{}
 
@@ -341,6 +557,18 @@ Process called "generate_hashtable_literal" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Inside `@{ ... }`, each entry is `key = value`. Separating the key and
+value as full HIR subtrees lets callers use any expression for either
+position (computed keys, complex value expressions).
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Dispatches the "key" subtree, emits the assignment
+operator (` = ` from emitter), then dispatches the "value" subtree.
+Either subtree being null is tolerated to keep partial HIR fragments
+emittable.
+@End Implementation
 Process called "generate_key_value_pair" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell key-value pair (key = value)
 
@@ -369,6 +597,20 @@ Note: ==========================================================================
 Note: Binary and Unary Operations
 Note: ============================================================================
 
+@Reasoning:
+PowerShell binary operators are space-delimited and the operator token
+itself (e.g. `+`, `-eq`, `-and`) is stored as a string on the HIR node so
+no per-operator translation table is required at emit time. Spaces
+around the operator are mandatory for word-prefixed operators like
+`-eq` and `-replace`.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Dispatches the "left" subtree, emits a space, the
+"operator" string, another space, then dispatches the "right" subtree.
+No parenthesization is added; the HIR layer is responsible for inserting
+explicit grouping nodes when precedence requires.
+@End Implementation
 Process called "generate_binary_operation" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell binary operation
 
@@ -400,6 +642,17 @@ Process called "generate_binary_operation" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Unary operators in PowerShell are written prefix-style. Always emitting
+a trailing space keeps tokens like `-not` distinguishable from the
+following expression even when that expression begins with a digit or
+parenthesis, which the parser otherwise might mistreat.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. If the "operator" string is present, emits it followed
+by a space. Then dispatches the "operand" subtree through generate_node.
+@End Implementation
 Process called "generate_unary_operation" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell unary operation
 
@@ -423,6 +676,18 @@ Process called "generate_unary_operation" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Property access uses dot syntax (`$obj.Property`). The member name is
+read from a nested identifier node so the same shape can carry source
+position metadata when present.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Dispatches the "object" subtree, emits the dot, then
+reads the "member" HIR child and pulls its "value" string for emission.
+No quoting of the property name is applied because PowerShell property
+names are bare identifiers.
+@End Implementation
 Process called "generate_member_access" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell member access (object.property)
 
@@ -448,6 +713,17 @@ Process called "generate_member_access" takes context as Integer, hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+PowerShell uses `array[index]` square-bracket subscripting for both
+arrays and hashtables. The index is dispatched as a full HIR subtree so
+arbitrary expressions (including ranges like `0..-1`) can appear inside
+the brackets.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Dispatches the "object" subtree, emits the left bracket,
+dispatches the "index" subtree, emits the right bracket.
+@End Implementation
 Process called "generate_index_access" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell index access (array[index])
 
@@ -474,6 +750,20 @@ Process called "generate_index_access" takes context as Integer, hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+PowerShell method calls (`.NET` style) require parenthesized,
+comma-separated arguments rather than the bare-space form used for
+cmdlets. Distinguishing method_call from cmdlet_invocation at the HIR
+node level lets the dispatcher pick the correct calling convention
+without trying to infer it from name shape.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Dispatches the "object" subtree, emits dot and the
+method name (read from the nested "method" identifier's "value" key),
+emits `(`, iterates the "arguments" list inserting `, ` separators and
+dispatching each via generate_node, then emits `)`.
+@End Implementation
 Process called "generate_method_call" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell method call (object.method())
 
@@ -524,6 +814,17 @@ Note: ==========================================================================
 Note: Cmdlet and Pipeline Generation
 Note: ============================================================================
 
+@Reasoning:
+A bare cmdlet name (Verb-Noun) is emitted as a single identifier; this
+helper exists so generate_cmdlet_invocation can split the name from its
+parameters and so test code can emit a cmdlet token in isolation.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Reads the "name" string from the node and writes it
+through emit_string. No verb/noun decomposition is performed because
+the HIR already stores the joined Verb-Noun form.
+@End Implementation
 Process called "generate_cmdlet" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell cmdlet name
 
@@ -539,6 +840,22 @@ Process called "generate_cmdlet" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+A cmdlet invocation in PowerShell is `Verb-Noun -Param Value Arg`. The
+shape is fundamentally different from a method call: parameters are
+space-separated and dash-prefixed, positional arguments come after named
+parameters, and there are no surrounding parentheses. Keeping this in a
+separate routine from method_call preserves both calling conventions.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Dispatches the "cmdlet" child via generate_cmdlet to
+emit the Verb-Noun token. Iterates the "parameters" list, prepending a
+space before each and calling generate_parameter. Then iterates the
+"arguments" list the same way, dispatching each through generate_node.
+The two-loop ordering preserves the standard PowerShell convention of
+named parameters first.
+@End Implementation
 Process called "generate_cmdlet_invocation" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell cmdlet invocation with parameters
 
@@ -585,6 +902,21 @@ Process called "generate_cmdlet_invocation" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+PowerShell pipelines are the primary composition mechanism (`|` between
+stages). The pipeline emits its own leading indent because each pipeline
+is a statement at the current indent level, but child commands must not
+re-emit indentation. Suppressing child indent via a save/restore around
+the inner dispatch keeps the stages cleanly separated by `|`.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Reads indent_level once, emits the leading indent, then
+iterates the "commands" list. Between consecutive commands emits the
+pipeline separator (`|`). For each command, saves the indent_level,
+zeroes it in the context (preventing nested indent emission), dispatches
+the command via generate_node, then restores the saved level.
+@End Implementation
 Process called "generate_pipeline" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell pipeline (cmd1 | cmd2 | cmd3)
 
@@ -626,6 +958,24 @@ Note: ==========================================================================
 Note: Control Structure Generation
 Note: ============================================================================
 
+@Reasoning:
+PowerShell's `if (cond) { body } else { ... }` form is brace-delimited
+and the condition lives in parentheses with no indentation inside.
+Zeroing the indent before dispatching the condition prevents the
+condition's own statement-style indentation from corrupting the `if (`
+single-line prefix.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Reads indent_level. Emits indent + `if (`. Saves indent
+to 0 around dispatching the "condition" subtree, then restores it. Emits
+`) {` and a newline, increments indent, dispatches "then_body" via
+generate_node, emits newline, decrements indent, emits indent + `}`.
+Iterates the "branches" list: when at least one branch exists, emits
+` else {` block wrapping the first branch (the else_body) with
+increment/decrement around it. The current shape supports a single else
+branch; multiple elseif branches use additional if_statement nodes.
+@End Implementation
 Process called "generate_if_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell if-elseif-else statement
 
@@ -688,6 +1038,19 @@ Process called "generate_if_statement" takes context as Integer, hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+PowerShell `while` mirrors `if` structurally: a parenthesized condition
+followed by a braced body. The same indent-zeroing trick around the
+condition keeps the prefix on a single line when the condition itself
+would otherwise emit its own indent.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Reads indent_level, emits indent + `while (`. Zeroes
+indent, dispatches "condition", restores indent, then emits `) {` and
+newline. Increments indent, dispatches "body", emits newline, decrements,
+emits indent + `}`.
+@End Implementation
 Process called "generate_while_loop" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell while loop
 
@@ -727,6 +1090,20 @@ Process called "generate_while_loop" takes context as Integer, hir as Integer re
     Return 1
 End Process
 
+@Reasoning:
+PowerShell `for (init; cond; update) { body }` uses three semicolon-
+separated expression slots. Each slot is dispatched with indent zeroed
+so they remain on one line; the body block then gets normal indented
+treatment.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent + `for (`. For each of "initialization",
+"condition", "update": saves indent to 0, dispatches the subtree,
+restores indent, and emits `; ` between the first two and before the
+closing paren after the third. Emits `) {`, newline, indented body via
+generate_node, newline, dedented `}`.
+@End Implementation
 Process called "generate_for_loop" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell for loop
 
@@ -784,6 +1161,18 @@ Process called "generate_for_loop" takes context as Integer, hir as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+PowerShell's `foreach ($var in $collection) { body }` is the canonical
+collection-iteration form. The loop variable is emitted with its sigil
+via emit_variable so its appearance in the body matches user code style.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent + `foreach (`. Reads the "variable" string
+and emits `$<variable>` via emit_variable. Emits ` in `. Saves indent
+to 0, dispatches "collection", restores indent. Emits `) {` newline,
+indented body via generate_node, newline, dedented `}`.
+@End Implementation
 Process called "generate_foreach_loop" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell foreach loop
 
@@ -833,6 +1222,19 @@ Process called "generate_foreach_loop" takes context as Integer, hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+PowerShell `switch ($expr) { pattern { body }; ... }` is preferable to
+chained if/elseif because it carries first-class match semantics, regex
+support, and wildcards. The cases are emitted indented one level deeper
+than the switch keyword itself.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent + `switch (`. Zeroes indent around
+dispatching "expression", restores it. Emits `) {`, newline. Increments
+indent, iterates "cases" calling generate_switch_case followed by
+newline, decrements indent. Emits indent + `}`.
+@End Implementation
 Process called "generate_switch_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell switch statement
 
@@ -883,6 +1285,18 @@ Process called "generate_switch_statement" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Each switch arm is `pattern { body }`. The pattern dispatch suppresses
+indentation so the arm stays on one line; the body is indented and
+emitted on subsequent lines so multi-statement arm bodies remain
+readable.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent. Zeroes indent around dispatching the
+"pattern" subtree, restores it. Emits ` {`, newline. Increments indent,
+dispatches "body", newline, decrements. Emits indent + `}`.
+@End Implementation
 Process called "generate_switch_case" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell switch case
 
@@ -922,6 +1336,21 @@ Note: ==========================================================================
 Note: Function and Class Generation
 Note: ============================================================================
 
+@Reasoning:
+PowerShell function definitions use `function Name (params) { body }`.
+The parenthesized parameter list is only emitted when there is at least
+one parameter; PowerShell accepts both `function Name { ... }` and
+`function Name (...) { ... }`, but omitting empty parens keeps the
+generated source idiomatic.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent + `function `. Emits the "name" string if
+present. If the "parameters" list is non-empty: emits ` (`, iterates
+parameters with `, ` separators dispatching each via generate_node, and
+closes with `)`. Emits ` {`, newline, indented body via generate_node,
+newline, dedented `}`.
+@End Implementation
 Process called "generate_function_definition" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell function definition
 
@@ -984,6 +1413,19 @@ Process called "generate_function_definition" takes context as Integer, hir as I
     Return 1
 End Process
 
+@Reasoning:
+PowerShell 5.0+ supports class declarations with `class Name { ... }`
+syntax. Members (properties, methods, constructors) are emitted
+indented; each member is dispatched through generate_node so any member
+kind already covered by the dispatcher is supported uniformly.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent + `class `, then the "name" string if
+present. Emits ` {`, newline. If "members" list is present: increments
+indent, iterates members dispatching each through generate_node followed
+by a newline, decrements indent. Emits indent + `}`.
+@End Implementation
 Process called "generate_class_definition" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell class definition
 
@@ -1036,6 +1478,20 @@ Note: ==========================================================================
 Note: Exception Handling Generation
 Note: ============================================================================
 
+@Reasoning:
+PowerShell `try { } catch { } finally { }` requires the catch and
+finally clauses to appear on the same logical statement, so the closing
+`}` of one block is separated from the next keyword by only a space.
+Catch clauses are emitted by a dedicated helper because each may carry
+its own typed exception filter.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent + `try {`, newline, indented "try_body",
+newline, dedented `}`. For each catch in "catch_clauses": emits a space
+then dispatches generate_catch_clause. If "finally_body" is present:
+emits ` finally {`, newline, indented body, newline, dedented `}`.
+@End Implementation
 Process called "generate_try_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell try-catch-finally statement
 
@@ -1097,6 +1553,20 @@ Process called "generate_try_statement" takes context as Integer, hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+A catch clause may be untyped (catches all exceptions) or typed
+(`catch [Type] { ... }`). The exception type is emitted in square
+brackets like a .NET type literal. The catch keyword is written without
+leading indent because the calling try statement emitted a space before
+this clause to keep it on the same visual line as the previous `}`.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits `catch`. If "exception_type" is present: emits
+space, `[`, dispatched type subtree, `]`. Emits ` {`, newline, indented
+"body", newline, dedented `}`. The "variable" key is read but not yet
+emitted; HIR may carry it for downstream extensions.
+@End Implementation
 Process called "generate_catch_clause" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell catch clause
 
@@ -1141,6 +1611,19 @@ Note: ==========================================================================
 Note: Statement Generation
 Note: ============================================================================
 
+@Reasoning:
+Assignment statements (`$var = expr`) are line-oriented, so the
+left-hand side is emitted through generate_variable_reference (which
+applies the `$` sigil) and the right-hand side through generate_node
+allowing arbitrary expressions including subexpressions and pipelines.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent. Dispatches the "variable" subtree via
+generate_variable_reference. Emits the assignment operator ` = ` via
+emit_assignment_operator. Dispatches the "value" subtree via
+generate_node.
+@End Implementation
 Process called "generate_assignment" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell assignment ($var = value)
 
@@ -1170,6 +1653,17 @@ Process called "generate_assignment" takes context as Integer, hir as Integer re
     Return 1
 End Process
 
+@Reasoning:
+PowerShell `return` is optional in functions (last-expression-wins
+semantics) but the HIR may carry explicit return nodes when the source
+intent is to short-circuit. The optional value expression is emitted
+only when present so bare `return` lines parse identically.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent + `return`. If "value" is present, emits a
+space then dispatches the value through generate_node.
+@End Implementation
 Process called "generate_return_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell return statement
 
@@ -1193,6 +1687,15 @@ Process called "generate_return_statement" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+`break` is a single-token statement. Emitting through a dedicated routine
+keeps the dispatcher uniform and lets future label support (`break label`)
+slot in without changing the call site.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent + `break` via emit_break_keyword.
+@End Implementation
 Process called "generate_break_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell break statement
 
@@ -1209,6 +1712,15 @@ Process called "generate_break_statement" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Mirror of generate_break_statement for the `continue` token. Separating
+the two keeps the dispatcher's case list flat and future-proofs against
+extensions like `continue label`.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent + `continue` via emit_continue_keyword.
+@End Implementation
 Process called "generate_continue_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell continue statement
 
@@ -1225,6 +1737,16 @@ Process called "generate_continue_statement" takes context as Integer, hir as In
     Return 1
 End Process
 
+@Reasoning:
+`throw` may appear bare (re-raise the current exception inside a catch)
+or with an expression that becomes the exception payload. Making the
+expression optional preserves both shapes from the HIR.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Emits indent + `throw`. If "expression" is present,
+emits a space then dispatches the expression through generate_node.
+@End Implementation
 Process called "generate_throw_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell throw statement
 
@@ -1248,6 +1770,19 @@ Process called "generate_throw_statement" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+A script block is a sequence of statements without surrounding braces -
+the caller (function/class/if/foreach) is responsible for the braces.
+Newlines separate consecutive statements but no trailing newline is
+emitted, so the parent can place its closing brace on the same logical
+line that the last statement's newline introduced.
+@End Reasoning
+
+@Implementation:
+Null-guards hir. Iterates the "statements" list, dispatching each via
+generate_node. Between consecutive statements (i.e. not after the last)
+emits a newline through emit_newline.
+@End Implementation
 Process called "generate_script_block" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PowerShell script block {}
 
@@ -1279,6 +1814,32 @@ Note: ==========================================================================
 Note: Main Node Generation Dispatcher
 Note: ============================================================================
 
+@Reasoning:
+The single central dispatcher means every code path that needs to emit a
+HIR subtree calls one function, which routes to the right specialized
+emitter by inspecting the "node_type" string. Using a flat If chain
+(rather than a hashtable-driven dispatch) avoids per-call allocation of
+lookup keys and keeps the code easy to read when adding new node kinds.
+@End Reasoning
+
+@Implementation:
+Null-guards hir (returns 1). Reads the "node_type" string; returns 1
+when absent. Compares node_type against each known kind via
+StringCore.string_equals and forwards to the matching generate_* helper:
+- literals: string_literal, number_literal, boolean_literal, null_literal
+- expressions: variable_reference, binary_operation, unary_operation,
+  member_access, index_access, method_call
+- PowerShell-specific: cmdlet, cmdlet_invocation, parameter, pipeline,
+  subexpression, array_literal, hashtable_literal, key_value_pair
+- control: if_statement, while_loop, for_loop, foreach_loop,
+  switch_statement, switch_case
+- declarations: function_definition, class_definition
+- exceptions: try_statement, catch_clause
+- statements: assignment, return_statement, break_statement,
+  continue_statement, throw_statement, script_block, script
+Unknown node_type returns 1 (no-op success), keeping unfamiliar HIR
+extensions from crashing the generator.
+@End Implementation
 Process called "generate_node" takes context as Integer, hir as Integer returns Integer:
     Note: Main HIR node generation dispatcher
 

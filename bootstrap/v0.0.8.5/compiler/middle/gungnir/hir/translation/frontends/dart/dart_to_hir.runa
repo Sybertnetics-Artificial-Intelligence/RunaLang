@@ -31,6 +31,24 @@ Note: ===================================================================
 Note: Maintains state during Dart→HIR translation including symbol tables,
 Note: type mappings, and nested scope tracking.
 
+@Reasoning:
+Thread-of-state for Dart->HIR translation. Symbol table and type map
+are separate dictionaries because they have different invalidation
+schedules: type_map is seeded once and read-only thereafter, while
+symbol_table is mutated as each class/method introduces new bindings.
+late_variables and nullable_types track Dart-specific null-safety
+attributes that don't map to a single HIR flag, so we sideband them
+through the context.
+@End Reasoning
+
+@Implementation:
+scope_depth supports nested scopes via lexical scoping: add_symbol
+suffixes names with "_<depth>" so the same Dart identifier can shadow
+across nested blocks without colliding in the flat dictionary.
+current_class and current_function are 0 when not inside one, used
+by method resolution and "this" binding. is_async / is_generator
+control valid yield/await sites.
+@End Implementation
 Type called "DartTranslationContext":
     Note: Symbol table mapping Dart identifiers to HIR references
     symbol_table as Integer
@@ -67,6 +85,13 @@ Note: ===================================================================
 Note: CONTEXT MANAGEMENT
 Note: ===================================================================
 
+@Reasoning:
+Builds a fully populated context with all dict/list fields eagerly
+allocated so downstream translators can blind-call dict_set / list_append
+without nil-checks. The standard type mappings are seeded immediately
+because every type translation will look them up; deferring would just
+push the seeding into the first type translation with no benefit.
+@End Reasoning
 Process called "create_translation_context" returns Integer:
     Let ctx be a value of type DartTranslationContext with
         symbol_table as proc dict_create from DictCore,
@@ -86,6 +111,15 @@ Process called "create_translation_context" returns Integer:
     Return ctx
 End Process
 
+@Reasoning:
+Dart's predeclared types map to HIR primitives by name. The lossy
+mappings are intentional: num collapses to FLOAT (the broader of
+int/double), Object collapses to ANY, and dynamic collapses to ANY.
+These erase static type information that HIR doesn't represent, but
+preserve runtime behavior. Future/Stream map to dedicated HIR
+asynchronous types because their semantics differ from plain
+collections.
+@End Reasoning
 Process called "register_standard_type_mappings" takes ctx as DartTranslationContext:
     Note: Map Dart primitive types to HIR types
     proc dict_set from DictCore with ctx.type_map, "int", HIR.HIR_TYPE_INTEGER
@@ -108,20 +142,47 @@ Process called "register_standard_type_mappings" takes ctx as DartTranslationCon
     proc dict_set from DictCore with ctx.type_map, "Stream", HIR.HIR_TYPE_STREAM
 End Process
 
+@Reasoning:
+Increment-only sentinel; the actual scope's bindings remain in the
+flat symbol_table dictionary, distinguished by the "_<depth>" suffix
+added by add_symbol. We don't clear bindings on pop; they're shadowed,
+not deleted, so a later push_scope at the same depth correctly
+overwrites them via dict_set.
+@End Reasoning
 Process called "push_scope" takes ctx as DartTranslationContext:
     Set ctx.scope_depth to ctx.scope_depth plus 1
 End Process
 
+@Reasoning:
+Decrements scope_depth so subsequent lookups skip the inner scope's
+suffixed entries. The old entries remain in the dictionary but become
+unreachable from lookup_symbol because the depth ratchet falls below
+their suffix; this is leak-tolerated across one translation unit.
+@End Reasoning
 Process called "pop_scope" takes ctx as DartTranslationContext:
     Set ctx.scope_depth to ctx.scope_depth minus 1
 End Process
 
+@Reasoning:
+Suffixes the name with "_<scope_depth>" before insertion so the
+same source identifier in nested scopes lives under distinct keys.
+This is simpler than maintaining a stack of dictionaries and lets a
+single dict_get bounded loop in lookup_symbol search outward.
+@End Reasoning
 Process called "add_symbol" takes ctx as Integer, name as Integer, hir_ref as Integer:
     Let scoped_name be proc string_concat from StringCore with name, "_"
     Set scoped_name to proc string_concat from StringCore with scoped_name, proc int_to_string from StringCore with ctx.scope_depth
     proc dict_set from DictCore with ctx.symbol_table, scoped_name, hir_ref
 End Process
 
+@Reasoning:
+Walks scope depths outward from the current depth toward 0,
+constructing the suffixed key at each level and returning the first
+hit. This implements lexical shadowing: an inner-scope binding wins
+over an outer-scope binding with the same name. Returns 0 when
+nothing is found at any depth; callers must distinguish "missing"
+from "valid HIR ref equal to 0" by their own conventions.
+@End Reasoning
 Process called "lookup_symbol" takes ctx as Integer, name as Integer returns Integer:
     Note: Search from current scope up to global scope
     Let depth be ctx.scope_depth
@@ -145,6 +206,14 @@ Note: ===================================================================
 Note: MAIN TRANSLATION ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+Public entry point for the Dart frontend. Creates a fresh translation
+context per call (no global state), creates a fresh HIR module to
+populate, dispatches translation on the root node kind, then attaches
+any accumulated errors as HIR metadata. Returns the HIR module
+regardless of error count; downstream stages can inspect the metadata
+to decide whether to proceed.
+@End Reasoning
 Process called "translate_dart_to_hir" takes dart_ast as Integer returns Integer:
     Let ctx be proc create_translation_context of type DartTranslationContext
 
@@ -173,6 +242,15 @@ Note: ===================================================================
 Note: PROGRAM STRUCTURE TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Walks the DART_PROGRAM children once and dispatches each to the
+appropriate translator. The order of If branches matches Dart's
+top-level grammar: directives (library/import/export/part) precede
+declarations (class/enum/mixin/extension/typedef/function/variable).
+Mismatched node kinds are silently skipped rather than erroring,
+because the parser may produce comment or placeholder nodes the
+translator doesn't model.
+@End Reasoning
 Process called "translate_program" takes ctx as Integer, program_node as Integer, hir_module as Integer:
     Let child_count be proc ast_node_child_count from program_node
     Let i be 0
@@ -247,6 +325,11 @@ Process called "translate_program" takes ctx as Integer, program_node as Integer
     End While
 End Process
 
+@Reasoning:
+Dart's "library name;" sets the module's canonical identity. We map
+it directly to hir_set_module_name. The library name is stored as
+the AST node value (a String), reachable by reading child 0's value.
+@End Reasoning
 Process called "translate_library_directive" takes ctx as Integer, directive_node as Integer, hir_module as Integer:
     Note: Extract library name from directive
     Let name_child be proc ast_node_child with directive_node, 0
@@ -256,6 +339,14 @@ Process called "translate_library_directive" takes ctx as Integer, directive_nod
     proc hir_set_module_name from HIR with hir_module, library_name
 End Process
 
+@Reasoning:
+Dart imports support "import 'uri' as alias show A hide B;" with all
+clauses optional. We always emit a hir_import with the URI populated;
+the alias and show/hide combinators are conditional on additional
+child nodes. Show and hide are mutually exclusive in Dart but the
+translator preserves both - any ill-formed source is the parser's
+responsibility to reject.
+@End Reasoning
 Process called "translate_import_directive" takes ctx as Integer, directive_node as Integer, hir_module as Integer:
     Note: Create HIR import node
     Let hir_import be proc hir_create_import from HIR
@@ -289,6 +380,11 @@ Process called "translate_import_directive" takes ctx as Integer, directive_node
     proc hir_add_import from HIR with hir_module, hir_import
 End Process
 
+@Reasoning:
+Iterates the show clause's identifier children and registers each
+with the HIR import as an explicit visibility allowlist. Order is
+preserved because hir_add_import_show appends to an ordered list.
+@End Reasoning
 Process called "translate_import_show" takes ctx as Integer, show_node as Integer, hir_import as Integer:
     Let child_count be proc ast_node_child_count from show_node
     Let i be 0
@@ -301,6 +397,12 @@ Process called "translate_import_show" takes ctx as Integer, show_node as Intege
     End While
 End Process
 
+@Reasoning:
+Symmetric to translate_import_show but builds a denylist. HIR keeps
+show and hide as separate lists rather than merging into a single
+visibility set, because Dart's runtime resolver needs to distinguish
+"explicitly hidden" from "not in show list" for diagnostics.
+@End Reasoning
 Process called "translate_import_hide" takes ctx as Integer, hide_node as Integer, hir_import as Integer:
     Let child_count be proc ast_node_child_count from hide_node
     Let i be 0
@@ -313,6 +415,11 @@ Process called "translate_import_hide" takes ctx as Integer, hide_node as Intege
     End While
 End Process
 
+@Reasoning:
+Mirrors translate_import_directive but writes to the module's export
+list. Export does not support "as" aliases (no rename on re-export
+in Dart) so only the show/hide combinators are honored.
+@End Reasoning
 Process called "translate_export_directive" takes ctx as Integer, directive_node as Integer, hir_module as Integer:
     Note: Create HIR export node
     Let hir_export be proc hir_create_export from HIR
@@ -340,6 +447,10 @@ Process called "translate_export_directive" takes ctx as Integer, directive_node
     proc hir_add_export from HIR with hir_module, hir_export
 End Process
 
+@Reasoning:
+Iterates show identifiers and registers each as part of the export's
+allowlist. Mirrors translate_import_show against the export side.
+@End Reasoning
 Process called "translate_export_show" takes ctx as Integer, show_node as Integer, hir_export as Integer:
     Let child_count be proc ast_node_child_count from show_node
     Let i be 0
@@ -352,6 +463,9 @@ Process called "translate_export_show" takes ctx as Integer, show_node as Intege
     End While
 End Process
 
+@Reasoning:
+Builds the export's denylist mirroring translate_import_hide.
+@End Reasoning
 Process called "translate_export_hide" takes ctx as Integer, hide_node as Integer, hir_export as Integer:
     Let child_count be proc ast_node_child_count from hide_node
     Let i be 0
@@ -364,6 +478,12 @@ Process called "translate_export_hide" takes ctx as Integer, hide_node as Intege
     End While
 End Process
 
+@Reasoning:
+Dart's "part 'file.dart';" splices another file's declarations into
+this library's namespace. HIR represents this as a "part" relationship
+(hir_add_part) rather than inlining, so the module loader can resolve
+parts lazily without forcing them into a single AST.
+@End Reasoning
 Process called "translate_part_directive" takes ctx as Integer, directive_node as Integer, hir_module as Integer:
     Note: Dart's part directive includes code from another file
     Note: In HIR, we represent this as a module inclusion
@@ -377,6 +497,15 @@ Note: ===================================================================
 Note: CLASS DECLARATION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Classes set ctx.current_class for the duration of their body so
+nested method translators can resolve "this" and instance member
+references. We save/restore the previous class context to support
+the (rare) case of nested class declarations. Members are walked
+starting at child 1 because child 0 is the class name; type
+parameters, extends/implements/with clauses, fields, methods, and
+constructors are each routed to specialized translators.
+@End Reasoning
 Process called "translate_class_declaration" takes ctx as DartTranslationContext, class_node as Integer returns Integer:
     Note: Create HIR class node
     Let hir_class be proc hir_create_class from HIR
@@ -447,6 +576,13 @@ Process called "translate_class_declaration" takes ctx as DartTranslationContext
     Return hir_class
 End Process
 
+@Reasoning:
+Translates "class Foo<T, U extends Comparable>" generics. The
+constraint (Dart "T extends X") is stored as the parameter's
+metadata "constraint" key by the parser, not as a child node,
+because Dart's grammar allows the bound to be a complex type
+expression that's easier to look up by key than by index.
+@End Reasoning
 Process called "translate_type_parameters" takes ctx as Integer, params_node as Integer, hir_class as Integer:
     Let child_count be proc ast_node_child_count from params_node
     Let i be 0
@@ -471,6 +607,12 @@ Process called "translate_type_parameters" takes ctx as Integer, params_node as 
     End While
 End Process
 
+@Reasoning:
+"class Foo implements I, J, K" - we walk each interface type child
+and register it on the HIR class. Dart allows implementing classes
+(structural typing) so the bound translates as a normal type
+annotation, not a separate interface-only kind.
+@End Reasoning
 Process called "translate_implements_clause" takes ctx as Integer, implements_node as Integer, hir_class as Integer:
     Let child_count be proc ast_node_child_count from implements_node
     Let i be 0
@@ -483,6 +625,12 @@ Process called "translate_implements_clause" takes ctx as Integer, implements_no
     End While
 End Process
 
+@Reasoning:
+"class Foo extends Bar with M1, M2" - mixin linearization is left
+to the HIR consumer; we just record the mixin list in source order.
+HIR distinguishes mixins from interfaces because Dart's runtime
+treats them differently (mixins introduce concrete state).
+@End Reasoning
 Process called "translate_with_clause" takes ctx as Integer, with_node as Integer, hir_class as Integer:
     Let child_count be proc ast_node_child_count from with_node
     Let i be 0
@@ -495,6 +643,14 @@ Process called "translate_with_clause" takes ctx as Integer, with_node as Intege
     End While
 End Process
 
+@Reasoning:
+Field nodes carry name (child 0), type (child 1), optional
+initializer (child 2), plus modifier flags (static/final/late/const)
+exposed by the parser as boolean attributes. The "late" modifier is
+both flagged on the HIR field AND recorded in ctx.late_variables
+because late initialization requires special codegen (guard check
+on first read) that the consumer accesses through the context.
+@End Reasoning
 Process called "translate_field_declaration" takes ctx as Integer, field_node as Integer returns Integer:
     Note: Create HIR field node
     Let hir_field be proc hir_create_field from HIR
@@ -542,6 +698,15 @@ Process called "translate_field_declaration" takes ctx as Integer, field_node as
     Return hir_field
 End Process
 
+@Reasoning:
+Methods need save/restore of three context fields: current_function
+(so nested closure declarations know their enclosing method),
+is_async (controls validity of await), is_generator (controls
+validity of yield). Async and generator are NOT the same flag because
+Dart distinguishes "async" (returns Future) from "async*" (returns
+Stream) from "sync*" (returns Iterable). Children: name (0), return
+type (1), parameter list (2), optional body (3).
+@End Reasoning
 Process called "translate_method_declaration" takes ctx as Integer, method_node as Integer returns Integer:
     Note: Save previous function context
     Let prev_function be ctx.current_function
@@ -611,6 +776,15 @@ Process called "translate_method_declaration" takes ctx as Integer, method_node 
     Return hir_method
 End Process
 
+@Reasoning:
+Constructors carry name (which may be empty for the unnamed
+default constructor), parameter list, and a multi-purpose tail
+of children: field initializers, exactly one super(...) call,
+exactly one this.named(...) redirect, and a body block. The parser
+emits them in encounter order so we walk linearly and dispatch by
+node kind, calling hir_set_* for the at-most-one targets and
+hir_add_* for the multi-valued ones.
+@End Reasoning
 Process called "translate_constructor_declaration" takes ctx as Integer, ctor_node as Integer returns Integer:
     Note: Create HIR constructor node
     Let hir_ctor be proc hir_create_constructor from HIR
@@ -672,6 +846,13 @@ Process called "translate_constructor_declaration" takes ctx as Integer, ctor_no
     Return hir_ctor
 End Process
 
+@Reasoning:
+"Foo(this.x) : y = expr" style initializer. Child 0 is the field
+name as IDENTIFIER, child 1 is the value expression. We construct
+a hir_field_init that pairs them as an opaque value-pair on the
+constructor; the HIR consumer materializes them into stores during
+the constructor entry block.
+@End Reasoning
 Process called "translate_field_initializer" takes ctx as Integer, init_node as Integer returns Integer:
     Note: Field initializer in constructor: field: value
     Let field_name_child be proc ast_node_child with init_node, 0
@@ -684,6 +865,12 @@ Process called "translate_field_initializer" takes ctx as Integer, init_node as 
     Return hir_init
 End Process
 
+@Reasoning:
+"Foo() : super(args)" calls the parent constructor. Child 0 is the
+argument list; super doesn't carry a name (always implicit parent
+type). The HIR consumer is responsible for resolving "which super
+constructor" via the class's hir_set_base_class link.
+@End Reasoning
 Process called "translate_super_call" takes ctx as Integer, super_node as Integer returns Integer:
     Note: Create HIR super call node
     Let hir_super be proc hir_create_super_call from HIR
@@ -695,6 +882,12 @@ Process called "translate_super_call" takes ctx as Integer, super_node as Intege
     Return hir_super
 End Process
 
+@Reasoning:
+"Foo.named() : this(args)" redirects to another constructor in the
+same class. Unlike super, this DOES carry a target name (child 0)
+because Dart allows multiple named constructors. The HIR redirect
+is exclusive with a body - the parser already enforces that.
+@End Reasoning
 Process called "translate_this_call" takes ctx as Integer, this_node as Integer returns Integer:
     Note: Create HIR this call node (constructor redirection)
     Let hir_this be proc hir_create_this_call from HIR
@@ -715,6 +908,14 @@ Note: ===================================================================
 Note: ENUM DECLARATION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Dart 2.17+ enhanced enums can declare fields and methods alongside
+simple value cases. The first child is the enum name, then children
+are mixed DART_ENUM_VALUE (simple identifier cases) and
+DART_FIELD_DECL/DART_METHOD_DECL for enhanced-enum members. We
+dispatch each kind separately because HIR keeps value cases and
+member declarations in different sublists on the enum node.
+@End Reasoning
 Process called "translate_enum_declaration" takes ctx as Integer, enum_node as Integer returns Integer:
     Note: Create HIR enum node
     Let hir_enum be proc hir_create_enum from HIR
@@ -758,6 +959,13 @@ Note: ===================================================================
 Note: MIXIN DECLARATION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Mixins in Dart are like classes but can only be applied via "with"
+clauses, never instantiated directly. The "on" clause restricts
+which types the mixin can be applied to. Members are limited to
+fields and methods (no constructors), enforced here by only
+handling DART_FIELD_DECL and DART_METHOD_DECL children.
+@End Reasoning
 Process called "translate_mixin_declaration" takes ctx as Integer, mixin_node as Integer returns Integer:
     Note: Create HIR mixin node
     Let hir_mixin be proc hir_create_mixin from HIR
@@ -803,6 +1011,11 @@ Process called "translate_mixin_declaration" takes ctx as Integer, mixin_node as
     Return hir_mixin
 End Process
 
+@Reasoning:
+"mixin M on A, B" - the mixin can only be used "with" classes that
+extend A or B (or types implementing them). HIR records these
+constraints so type-checking can reject illegal mixin applications.
+@End Reasoning
 Process called "translate_on_clause" takes ctx as Integer, on_node as Integer, hir_mixin as Integer:
     Note: 'on' clause specifies which types the mixin can be applied to
     Let child_count be proc ast_node_child_count from on_node
@@ -816,6 +1029,12 @@ Process called "translate_on_clause" takes ctx as Integer, on_node as Integer, h
     End While
 End Process
 
+@Reasoning:
+Mixins can implement interfaces too. We use a separate
+hir_add_mixin_interface (not the class-level hir_add_interface)
+because the HIR keeps mixin and class hierarchies in distinct
+sublists.
+@End Reasoning
 Process called "translate_mixin_implements" takes ctx as Integer, implements_node as Integer, hir_mixin as Integer:
     Let child_count be proc ast_node_child_count from implements_node
     Let i be 0
@@ -832,6 +1051,14 @@ Note: ===================================================================
 Note: EXTENSION DECLARATION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+"extension Name on Type { members }" attaches methods/getters/
+setters to an existing type without subclassing. Child 0 is the
+optional name (may be empty for anonymous extensions), child 1 is
+the extended type, then members from index 2 onward. Extensions
+cannot define fields or constructors, so we only dispatch method,
+getter, and setter children.
+@End Reasoning
 Process called "translate_extension_declaration" takes ctx as Integer, ext_node as Integer returns Integer:
     Note: Create HIR extension node
     Let hir_ext be proc hir_create_extension from HIR
@@ -877,6 +1104,13 @@ Process called "translate_extension_declaration" takes ctx as Integer, ext_node 
     Return hir_ext
 End Process
 
+@Reasoning:
+"Type get name => body" or "Type get name { body }". Three fixed
+children: name (0), return type (1), body (2). No parameter list
+because getters take none. HIR distinguishes getters from
+zero-arg methods because property-access syntax must dispatch to
+getters and not require parens.
+@End Reasoning
 Process called "translate_getter_declaration" takes ctx as Integer, getter_node as Integer returns Integer:
     Note: Create HIR getter node
     Let hir_getter be proc hir_create_getter from HIR
@@ -899,6 +1133,12 @@ Process called "translate_getter_declaration" takes ctx as Integer, getter_node 
     Return hir_getter
 End Process
 
+@Reasoning:
+"set name(Type param) { body }". Three children: name (0), single
+parameter identifier (1), body (2). Setter parameter has no explicit
+type annotation in this AST shape - the type comes from the property
+type at the class level. We pass through only the parameter name.
+@End Reasoning
 Process called "translate_setter_declaration" takes ctx as Integer, setter_node as Integer returns Integer:
     Note: Create HIR setter node
     Let hir_setter be proc hir_create_setter from HIR
@@ -925,6 +1165,13 @@ Note: ===================================================================
 Note: TYPEDEF TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+"typedef Name = Type" or the older "typedef ReturnType Name(...)".
+HIR represents both as a name->type alias. Child 0 is name, child 1
+is the aliased type. We do not need to track function-typedef vs
+type-typedef separately because the aliased type already carries
+its kind information.
+@End Reasoning
 Process called "translate_typedef" takes ctx as Integer, typedef_node as Integer returns Integer:
     Note: Create HIR typedef node
     Let hir_typedef be proc hir_create_typedef from HIR
@@ -946,6 +1193,13 @@ Note: ===================================================================
 Note: FUNCTION DECLARATION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Top-level functions share the method's async/generator/return-type/
+params/body shape but are not bound to a class. Unlike methods, we
+also register the function in the symbol table via add_symbol so
+references in subsequent declarations can resolve it. Save/restore
+the three context fields per same rationale as translate_method.
+@End Reasoning
 Process called "translate_function_declaration" takes ctx as Integer, func_node as Integer returns Integer:
     Note: Save previous function context
     Let prev_function be ctx.current_function
@@ -999,6 +1253,15 @@ Process called "translate_function_declaration" takes ctx as Integer, func_node 
     Return hir_function
 End Process
 
+@Reasoning:
+Dart's grammar mixes three parameter kinds: positional (required),
+named (in {} braces), and optional positional (in [] brackets).
+The parser emits them as DART_PARAM / DART_NAMED_PARAM /
+DART_OPTIONAL_PARAM children so we dispatch on the node kind. Each
+kind gets its own hir_add helper because HIR keeps separate sublists
+for positional / named / optional to enforce calling convention
+during code generation.
+@End Reasoning
 Process called "translate_parameter_list" takes ctx as Integer, params_node as Integer, hir_callable as Integer:
     Let child_count be proc ast_node_child_count from params_node
     Let i be 0
@@ -1029,6 +1292,13 @@ Process called "translate_parameter_list" takes ctx as Integer, params_node as I
     End While
 End Process
 
+@Reasoning:
+Positional parameter base translator - handles name, type, and the
+"required" modifier (which only matters for named params but the
+parser may attach it here too in error-recovery scenarios).
+translate_named_parameter and translate_optional_parameter delegate
+to this then layer on their kind-specific flags and defaults.
+@End Reasoning
 Process called "translate_parameter" takes ctx as Integer, param_node as Integer returns Integer:
     Note: Create HIR parameter node
     Let hir_param be proc hir_create_parameter from HIR
@@ -1052,6 +1322,12 @@ Process called "translate_parameter" takes ctx as Integer, param_node as Integer
     Return hir_param
 End Process
 
+@Reasoning:
+Named params layer the "named" flag and an optional default value
+on top of translate_parameter. Default is at child index 2 if
+present (after name and type). HIR uses this flag to enforce
+keyword-argument calling at call sites.
+@End Reasoning
 Process called "translate_named_parameter" takes ctx as Integer, param_node as Integer returns Integer:
     Let hir_param be proc translate_parameter with ctx, param_node
 
@@ -1069,6 +1345,12 @@ Process called "translate_named_parameter" takes ctx as Integer, param_node as I
     Return hir_param
 End Process
 
+@Reasoning:
+Optional positional params (in [] brackets) layer the "optional"
+flag and an optional default on top of translate_parameter. They
+must appear after required positional params in the parameter list;
+that ordering invariant is the parser's responsibility, not ours.
+@End Reasoning
 Process called "translate_optional_parameter" takes ctx as Integer, param_node as Integer returns Integer:
     Let hir_param be proc translate_parameter with ctx, param_node
 
@@ -1090,6 +1372,13 @@ Note: ===================================================================
 Note: VARIABLE DECLARATION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Top-level or block-scoped variable. Same shape as field declarations
+but registered in the symbol table (not a class member list). The
+late modifier is recorded both as HIR metadata and in
+ctx.late_variables because late-init analysis needs to look up
+"is this name late?" without walking the full HIR tree.
+@End Reasoning
 Process called "translate_variable_declaration" takes ctx as Integer, var_node as Integer returns Integer:
     Note: Create HIR variable node
     Let hir_var be proc hir_create_variable from HIR
@@ -1139,6 +1428,12 @@ Note: ===================================================================
 Note: TYPE ANNOTATION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Top-level type-AST dispatcher. Recognizes simple references, function
+types, generic instantiations, and nullable (T?) wrappers. Unknown
+type-AST kinds collapse to HIR_TYPE_ANY rather than erroring, so a
+partially recognized type doesn't crash the whole translation.
+@End Reasoning
 Process called "translate_type_annotation" takes ctx as Integer, type_node as Integer returns Integer:
     Let type_kind be proc ast_node_type from type_node
 
@@ -1166,6 +1461,13 @@ Process called "translate_type_annotation" takes ctx as Integer, type_node as In
     Return HIR.HIR_TYPE_ANY
 End Process
 
+@Reasoning:
+For a bare type name we first check the standard mapping table
+(seeded by register_standard_type_mappings). A hit returns the
+pre-mapped HIR primitive directly; a miss creates a custom type
+reference that the HIR resolver will bind later when it sees the
+matching class/typedef declaration.
+@End Reasoning
 Process called "translate_type_reference" takes ctx as DartTranslationContext, type_node as Integer returns Integer:
     Let type_name be proc ast_node_value from type_node
 
@@ -1181,6 +1483,13 @@ Process called "translate_type_reference" takes ctx as DartTranslationContext, t
     Return hir_type
 End Process
 
+@Reasoning:
+"int Function(String, bool)" - first-class function types. Child 0
+is the return type, child 1 is a list of parameter types (just
+types, no names; parameter names are not part of a function type's
+identity in Dart). We translate each param type and add it in
+positional order.
+@End Reasoning
 Process called "translate_function_type" takes ctx as Integer, type_node as Integer returns Integer:
     Note: Create HIR function type
     Let hir_func_type be proc hir_create_function_type from HIR
@@ -1205,6 +1514,13 @@ Process called "translate_function_type" takes ctx as Integer, type_node as Inte
     Return hir_func_type
 End Process
 
+@Reasoning:
+"List<int>" or "Map<K, V>" - generic instantiation. Child 0 is the
+base type name (stored by name string, not as a resolved type ref,
+because HIR's generic-type representation matches names later),
+child 1 is the list of type argument children which we recursively
+translate.
+@End Reasoning
 Process called "translate_generic_type" takes ctx as Integer, type_node as Integer returns Integer:
     Note: Create HIR generic type
     Let hir_generic_type be proc hir_create_generic_type from HIR
@@ -1229,6 +1545,13 @@ Process called "translate_generic_type" takes ctx as Integer, type_node as Integ
     Return hir_generic_type
 End Process
 
+@Reasoning:
+"T?" wraps any base type in HIR's nullable marker. The base name is
+also recorded in ctx.nullable_types as a fast lookup for null-safety
+analysis (e.g., enforce non-null assignment doesn't go into a
+non-nullable variable). Recursively translates the base because it
+may itself be a generic or function type.
+@End Reasoning
 Process called "translate_nullable_type" takes ctx as Integer, type_node as Integer returns Integer:
     Note: Get base type
     Let base_type_child be proc ast_node_child with type_node, 0
@@ -1248,6 +1571,13 @@ Note: ===================================================================
 Note: STATEMENT TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Statement-AST dispatcher. Break and continue are inlined because
+they have no payload - they just construct a marker node. All other
+kinds dispatch to a dedicated translator. Unknown statement types
+collapse to a hir_create_nop so the surrounding block still has a
+valid (no-op) statement slot rather than a null pointer.
+@End Reasoning
 Process called "translate_statement" takes ctx as Integer, stmt_node as Integer returns Integer:
     Let stmt_type be proc ast_node_type from stmt_node
 
@@ -1338,6 +1668,12 @@ Process called "translate_statement" takes ctx as Integer, stmt_node as Integer 
     Return hir_nop
 End Process
 
+@Reasoning:
+Brackets push/pop scope so let-declarations inside the block live
+in their own lexical layer. The translator walks each child and
+appends to the HIR block in source order. Empty blocks produce an
+empty hir_block, which is still a valid statement target.
+@End Reasoning
 Process called "translate_block_statement" takes ctx as Integer, block_node as Integer returns Integer:
     Let hir_block be proc hir_create_block from HIR
 
@@ -1358,6 +1694,12 @@ Process called "translate_block_statement" takes ctx as Integer, block_node as I
     Return hir_block
 End Process
 
+@Reasoning:
+Wraps an expression in a statement node so a function call with
+discarded result can appear in statement position. HIR keeps this
+explicit (rather than allowing raw expressions in statement lists)
+to make side-effect ordering visible to optimizers.
+@End Reasoning
 Process called "translate_expression_statement" takes ctx as Integer, expr_stmt_node as Integer returns Integer:
     Let expr_child be proc ast_node_child with expr_stmt_node, 0
     Let hir_expr be proc translate_expression with ctx, expr_child
@@ -1366,6 +1708,12 @@ Process called "translate_expression_statement" takes ctx as Integer, expr_stmt_
     Return hir_expr_stmt
 End Process
 
+@Reasoning:
+"return;" (no value, returns void/null) versus "return expr;" both
+produce a hir_create_return; only the value is conditionally set.
+Bare return is valid in Dart for void functions and from inside
+generators/setters.
+@End Reasoning
 Process called "translate_return_statement" takes ctx as Integer, return_node as Integer returns Integer:
     Let hir_return be proc hir_create_return from HIR
 
@@ -1380,6 +1728,12 @@ Process called "translate_return_statement" takes ctx as Integer, return_node as
     Return hir_return
 End Process
 
+@Reasoning:
+Three-slot if/else: condition (0), then (1), optional else (2). We
+do not flatten elseif chains - each "else if" in source produces a
+nested if whose then-branch is the next conditional. HIR optimizers
+can flatten later if needed.
+@End Reasoning
 Process called "translate_if_statement" takes ctx as Integer, if_node as Integer returns Integer:
     Let hir_if be proc hir_create_if from HIR
 
@@ -1404,6 +1758,12 @@ Process called "translate_if_statement" takes ctx as Integer, if_node as Integer
     Return hir_if
 End Process
 
+@Reasoning:
+C-style "for (init; cond; update) body". The loop body introduces a
+new scope (push/pop) because Dart hoists the init's declarations to
+loop scope. Children are fixed at 4: init (0), condition (1),
+update (2), body (3); none are optional in this AST shape.
+@End Reasoning
 Process called "translate_for_statement" takes ctx as Integer, for_node as Integer returns Integer:
     Let hir_for be proc hir_create_for from HIR
 
@@ -1434,6 +1794,13 @@ Process called "translate_for_statement" takes ctx as Integer, for_node as Integ
     Return hir_for
 End Process
 
+@Reasoning:
+"for (var x in iter) body" iterates by invoking the iterable's
+iterator protocol. The loop variable is stored as a name string
+(not a full variable declaration node) because the type comes from
+the iterable's element type, resolved later by the HIR type checker.
+A scope is pushed so the loop variable is local.
+@End Reasoning
 Process called "translate_for_in_statement" takes ctx as Integer, for_in_node as Integer returns Integer:
     Let hir_for_in be proc hir_create_for_in from HIR
 
@@ -1459,6 +1826,11 @@ Process called "translate_for_in_statement" takes ctx as Integer, for_in_node as
     Return hir_for_in
 End Process
 
+@Reasoning:
+Pre-test loop: condition (child 0), body (child 1). No scope push
+because while doesn't bind loop variables; any declarations inside
+the body are handled by translate_block_statement's own push/pop.
+@End Reasoning
 Process called "translate_while_statement" takes ctx as Integer, while_node as Integer returns Integer:
     Let hir_while be proc hir_create_while from HIR
 
@@ -1475,6 +1847,12 @@ Process called "translate_while_statement" takes ctx as Integer, while_node as I
     Return hir_while
 End Process
 
+@Reasoning:
+Post-test loop: body (child 0) executes once unconditionally before
+condition (child 1) is checked. HIR represents do_while as a
+distinct node from while because the post-test branch requires
+different control-flow lowering.
+@End Reasoning
 Process called "translate_do_while_statement" takes ctx as Integer, do_while_node as Integer returns Integer:
     Let hir_do_while be proc hir_create_do_while from HIR
 
@@ -1491,6 +1869,13 @@ Process called "translate_do_while_statement" takes ctx as Integer, do_while_nod
     Return hir_do_while
 End Process
 
+@Reasoning:
+"switch (expr) { case A: ... default: ... }" - the discriminant is
+child 0; subsequent children are DART_CASE or DART_DEFAULT nodes.
+At most one default is enforced by hir_set_switch_default (set, not
+add). HIR preserves case order which lets the lowering decide
+between jump-table and if-chain implementations.
+@End Reasoning
 Process called "translate_switch_statement" takes ctx as Integer, switch_node as Integer returns Integer:
     Let hir_switch be proc hir_create_switch from HIR
 
@@ -1523,6 +1908,11 @@ Process called "translate_switch_statement" takes ctx as Integer, switch_node as
     Return hir_switch
 End Process
 
+@Reasoning:
+"case VAL: body" - two children. Dart case values must be compile-
+time constants but we don't enforce that here; the HIR type checker
+validates it later when it has full constant-evaluation context.
+@End Reasoning
 Process called "translate_switch_case" takes ctx as Integer, case_node as Integer returns Integer:
     Let hir_case be proc hir_create_switch_case from HIR
 
@@ -1539,6 +1929,12 @@ Process called "translate_switch_case" takes ctx as Integer, case_node as Intege
     Return hir_case
 End Process
 
+@Reasoning:
+The default case has no value, only a body. We return the body's
+HIR statement directly (not wrapped in a case node) because the
+caller uses hir_set_switch_default to attach it as the dedicated
+default slot.
+@End Reasoning
 Process called "translate_switch_default" takes ctx as Integer, default_node as Integer returns Integer:
     Note: Get default body
     Let body_child be proc ast_node_child with default_node, 0
@@ -1546,6 +1942,13 @@ Process called "translate_switch_default" takes ctx as Integer, default_node as 
     Return hir_body
 End Process
 
+@Reasoning:
+"try { } on T catch (e, s) { } finally { }" - try block at child 0,
+then any mix of DART_CATCH and DART_FINALLY children. At most one
+finally (enforced by hir_set_finally_block) but multiple catches
+allowed (matched in source order). Each catch can have an exception
+type filter.
+@End Reasoning
 Process called "translate_try_statement" takes ctx as Integer, try_node as Integer returns Integer:
     Let hir_try be proc hir_create_try from HIR
 
@@ -1579,6 +1982,14 @@ Process called "translate_try_statement" takes ctx as Integer, try_node as Integ
     Return hir_try
 End Process
 
+@Reasoning:
+"on E catch (e, s) { body }" - all of exception type, exception
+variable, and stack-trace variable are optional. We track child
+count and conditionally bind each. The stack-trace variable is
+stored as metadata "dart_stack_trace_var" because HIR's generic
+catch model has only one binding slot. The body is always the
+last child.
+@End Reasoning
 Process called "translate_catch_clause" takes ctx as Integer, catch_node as Integer returns Integer:
     Let hir_catch be proc hir_create_catch from HIR
 
@@ -1613,6 +2024,11 @@ Process called "translate_catch_clause" takes ctx as Integer, catch_node as Inte
     Return hir_catch
 End Process
 
+@Reasoning:
+"throw expr" - expression is mandatory (child 0). Dart does not
+allow bare "throw;" except as a re-throw inside a catch block, which
+has its own dedicated AST node, so we always expect a child.
+@End Reasoning
 Process called "translate_throw_statement" takes ctx as Integer, throw_node as Integer returns Integer:
     Let hir_throw be proc hir_create_throw from HIR
 
@@ -1624,6 +2040,12 @@ Process called "translate_throw_statement" takes ctx as Integer, throw_node as I
     Return hir_throw
 End Process
 
+@Reasoning:
+"assert(cond)" or "assert(cond, msg)" - assertions are only checked
+in checked mode; HIR records both condition and optional message so
+the backend can either emit a runtime check or strip them in
+production builds.
+@End Reasoning
 Process called "translate_assert_statement" takes ctx as Integer, assert_node as Integer returns Integer:
     Let hir_assert be proc hir_create_assert from HIR
 
@@ -1643,6 +2065,12 @@ Process called "translate_assert_statement" takes ctx as Integer, assert_node as
     Return hir_assert
 End Process
 
+@Reasoning:
+"yield expr" or "yield* expr" - only valid in generator functions.
+The yield_each flag distinguishes single-element yield from
+delegation to another generator. We record yield_each as metadata
+because HIR's generic yield model has one node kind.
+@End Reasoning
 Process called "translate_yield_statement" takes ctx as Integer, yield_node as Integer returns Integer:
     Let hir_yield be proc hir_create_yield from HIR
 
@@ -1666,6 +2094,13 @@ Note: ===================================================================
 Note: This section will be continued in the next part of the file...
 Note: (Character limit reached - continuing in next segment)
 
+@Reasoning:
+Expression-AST dispatcher. Null, this, and super are inlined
+because they construct a parameterless node directly. All other
+kinds dispatch to a dedicated translator. Unknown kinds return a
+hir_create_error node so the surrounding HIR remains structurally
+valid for incremental tooling (LSP, etc.) even with parse errors.
+@End Reasoning
 Process called "translate_expression" takes ctx as Integer, expr_node as Integer returns Integer:
     Let expr_type be proc ast_node_type from expr_node
 
@@ -1793,6 +2228,13 @@ Process called "translate_expression" takes ctx as Integer, expr_node as Integer
     Return hir_error
 End Process
 
+@Reasoning:
+Parses the lexeme's text form ("42", "0xFF", "1_000_000" etc.) via
+string_to_int and constructs an HIR int literal. Dart's int is
+arbitrary precision in checked mode but the bootstrap StringCore
+parser caps at the native int width; literals exceeding this overflow
+silently, which the type checker may diagnose later.
+@End Reasoning
 Process called "translate_int_literal" takes ctx as Integer, lit_node as Integer returns Integer:
     Let value_str be proc ast_node_value from lit_node
     Let value be proc string_to_int from StringCore with value_str
@@ -1800,6 +2242,11 @@ Process called "translate_int_literal" takes ctx as Integer, lit_node as Integer
     Return hir_int
 End Process
 
+@Reasoning:
+Parses the lexeme text via string_to_float (handles standard IEEE
+syntax: "3.14", "1e10", "2.5e-3"). Constructs a HIR float literal
+node which downstream defaults to FLOAT (mapped from Dart's double).
+@End Reasoning
 Process called "translate_double_literal" takes ctx as Integer, lit_node as Integer returns Integer:
     Let value_str be proc ast_node_value from lit_node
     Let value be proc string_to_float from StringCore with value_str
@@ -1807,12 +2254,24 @@ Process called "translate_double_literal" takes ctx as Integer, lit_node as Inte
     Return hir_double
 End Process
 
+@Reasoning:
+The lexer already processed escape sequences and stored the cooked
+text as the AST value. We pass through unchanged. Note: string
+interpolation ("Hello $name") is parsed into a separate AST node
+kind (not exercised here) so this routine handles only raw strings.
+@End Reasoning
 Process called "translate_string_literal" takes ctx as Integer, lit_node as Integer returns Integer:
     Let value be proc ast_node_value from lit_node
     Let hir_string be proc hir_create_string_literal from HIR with value
     Return hir_string
 End Process
 
+@Reasoning:
+Compares the lexeme string to "true" via string_equals - any other
+spelling (including "True", "TRUE", "1") yields the integer-encoded
+false (0). Dart's boolean literal lexer should only produce "true"
+or "false" so the otherwise case is defensive.
+@End Reasoning
 Process called "translate_bool_literal" takes ctx as Integer, lit_node as Integer returns Integer:
     Let value_str be proc ast_node_value from lit_node
     Let is_true be proc string_equals from StringCore with value_str, "true"
@@ -1824,12 +2283,26 @@ Process called "translate_bool_literal" takes ctx as Integer, lit_node as Intege
     Return hir_bool
 End Process
 
+@Reasoning:
+Free-standing name reference. We do NOT resolve to a symbol here -
+HIR's identifier node carries just the name. Resolution happens
+later in a dedicated semantic pass that can handle forward
+references (Dart allows top-level forward refs without declaration
+ordering constraints).
+@End Reasoning
 Process called "translate_identifier" takes ctx as Integer, id_node as Integer returns Integer:
     Let name be proc ast_node_value from id_node
     Let hir_id be proc hir_create_identifier from HIR with name
     Return hir_id
 End Process
 
+@Reasoning:
+Dart's binary expression AST stores operator as child 1, left as 0,
+right as 2 (operator-in-middle layout). We recursively translate
+both operands and map the operator string to an HIR opcode via
+map_binary_operator. Short-circuiting for && and || happens later
+in HIR lowering, not here.
+@End Reasoning
 Process called "translate_binary_expression" takes ctx as Integer, binary_node as Integer returns Integer:
     Note: Get operator
     Let op_child be proc ast_node_child with binary_node, 1
@@ -1850,6 +2323,14 @@ Process called "translate_binary_expression" takes ctx as Integer, binary_node a
     Return hir_binary
 End Process
 
+@Reasoning:
+String-keyed dispatch from Dart's lexeme spelling to HIR opcode.
+Covers arithmetic (+, -, *, /, %), integer division "~/" (Dart-
+specific, distinct from "/"), comparison, logical, bitwise, shift,
+and the null-coalescing "??" operator. Falls back to HIR_OP_ADD on
+unknown input to ensure the expression node has a non-zero opcode;
+the type checker will flag the suspect node.
+@End Reasoning
 Process called "map_binary_operator" takes op_type as Integer returns Integer:
     Note: Arithmetic operators
     Let is_plus be proc string_equals from StringCore with op_type, "+"
@@ -1961,6 +2442,13 @@ Process called "map_binary_operator" takes op_type as Integer returns Integer:
     Return HIR.HIR_OP_ADD
 End Process
 
+@Reasoning:
+Unary node layout: operator at child 0, operand at child 1. Used
+for both prefix forms (-, !, ~, ++, --) and the post-increment/
+decrement (the parser may produce the same node kind for pre/post
+forms; postfix-ness is recorded via metadata in the parser if
+needed).
+@End Reasoning
 Process called "translate_unary_expression" takes ctx as Integer, unary_node as Integer returns Integer:
     Note: Get operator
     Let op_child be proc ast_node_child with unary_node, 0
@@ -1978,6 +2466,12 @@ Process called "translate_unary_expression" takes ctx as Integer, unary_node as 
     Return hir_unary
 End Process
 
+@Reasoning:
+Maps Dart's unary operator lexemes (!, -, ~, ++, --) to HIR opcodes.
+Default fallback is LOGICAL_NOT because that's the most common
+unary and gives the type checker a defined opcode to inspect on an
+unknown input.
+@End Reasoning
 Process called "map_unary_operator" takes op_type as Integer returns Integer:
     Let is_not be proc string_equals from StringCore with op_type, "!"
     If is_not is equal to 1:
@@ -2007,6 +2501,13 @@ Process called "map_unary_operator" takes op_type as Integer returns Integer:
     Return HIR.HIR_OP_LOGICAL_NOT
 End Process
 
+@Reasoning:
+"cond ? then : else" - three required children. Both branches are
+fully translated even though only one will run at runtime; HIR
+optimizers may later fold one branch away when the condition is a
+constant. The HIR ternary node is distinct from a regular if
+because it's an expression (produces a value).
+@End Reasoning
 Process called "translate_ternary_expression" takes ctx as Integer, ternary_node as Integer returns Integer:
     Note: Get condition
     Let cond_child be proc ast_node_child with ternary_node, 0
@@ -2025,6 +2526,11 @@ Process called "translate_ternary_expression" takes ctx as Integer, ternary_node
     Return hir_ternary
 End Process
 
+@Reasoning:
+"callee(args)" - callee at child 0 (any expression: identifier,
+member access, lambda invocation), argument list at child 1.
+translate_argument_list handles the positional/named split.
+@End Reasoning
 Process called "translate_call_expression" takes ctx as Integer, call_node as Integer returns Integer:
     Note: Get callee
     Let callee_child be proc ast_node_child with call_node, 0
@@ -2040,6 +2546,14 @@ Process called "translate_call_expression" takes ctx as Integer, call_node as In
     Return hir_call
 End Process
 
+@Reasoning:
+Dart calls support both positional and named ("name: value")
+arguments in the same call. Positional are added via
+hir_add_argument; named via hir_add_named_argument with the name
+string. Order is preserved within each kind; HIR keeps named args
+in a separate sublist so the call-site lowering can match them by
+name against the callee's named-parameter declarations.
+@End Reasoning
 Process called "translate_argument_list" takes ctx as Integer, args_node as Integer, hir_call as Integer:
     Let child_count be proc ast_node_child_count from args_node
     Let i be 0
@@ -2069,6 +2583,12 @@ Process called "translate_argument_list" takes ctx as Integer, args_node as Inte
     End While
 End Process
 
+@Reasoning:
+"obj.member" or "obj?.member". The null_aware flag distinguishes
+the two forms. HIR member nodes always store a name string (not an
+expression for the member side) because Dart member access is a
+fixed-name property lookup; dynamic-key access uses index expressions.
+@End Reasoning
 Process called "translate_member_expression" takes ctx as Integer, member_node as Integer returns Integer:
     Note: Get object
     Let obj_child be proc ast_node_child with member_node, 0
@@ -2091,6 +2611,11 @@ Process called "translate_member_expression" takes ctx as Integer, member_node a
     Return hir_member
 End Process
 
+@Reasoning:
+"obj[key]" - bracket access for lists, maps, and any user type
+implementing operator[]. Distinct from member_expression because
+the key is a runtime-computed expression, not a static name.
+@End Reasoning
 Process called "translate_index_expression" takes ctx as Integer, index_node as Integer returns Integer:
     Note: Get object
     Let obj_child be proc ast_node_child with index_node, 0
@@ -2105,6 +2630,14 @@ Process called "translate_index_expression" takes ctx as Integer, index_node as 
     Return hir_index_expr
 End Process
 
+@Reasoning:
+"lhs OP= rhs" - covers plain "=" and all compound assignments
+(+=, -=, etc.). The operator is at child 1; lhs at 0, rhs at 2.
+Compound forms are NOT desugared here (we keep them as a single
+HIR assign with a compound opcode) because downstream
+optimization can fuse the read-modify-write into one operation
+on overloaded operators.
+@End Reasoning
 Process called "translate_assignment_expression" takes ctx as Integer, assign_node as Integer returns Integer:
     Note: Get left-hand side
     Let lhs_child be proc ast_node_child with assign_node, 0
@@ -2126,6 +2659,12 @@ Process called "translate_assignment_expression" takes ctx as Integer, assign_no
     Return hir_assign
 End Process
 
+@Reasoning:
+Maps assignment operator lexemes to HIR opcodes. Includes Dart's
+"??=" null-coalescing assign which only writes the right side if
+the left is currently null. Fallback is HIR_ASSIGN_SIMPLE so
+unrecognized compound forms degrade to plain "=" semantically.
+@End Reasoning
 Process called "map_assignment_operator" takes op_type as Integer returns Integer:
     Let is_simple be proc string_equals from StringCore with op_type, "="
     If is_simple is equal to 1:
@@ -2165,6 +2704,11 @@ Process called "map_assignment_operator" takes op_type as Integer returns Intege
     Return HIR.HIR_ASSIGN_SIMPLE
 End Process
 
+@Reasoning:
+"[e1, e2, e3]" - children are elements in source order. We do not
+infer a List<T> element type here; that's a job for the HIR type
+inferencer which can see the surrounding context type.
+@End Reasoning
 Process called "translate_list_literal" takes ctx as Integer, list_node as Integer returns Integer:
     Note: Create HIR list literal
     Let hir_list be proc hir_create_list_literal from HIR
@@ -2183,6 +2727,11 @@ Process called "translate_list_literal" takes ctx as Integer, list_node as Integ
     Return hir_list
 End Process
 
+@Reasoning:
+"{k1: v1, k2: v2}" - children are pair nodes, each with key (0)
+and value (1). We translate both sides independently and add to
+the HIR map. Same as list literal, no static type inference here.
+@End Reasoning
 Process called "translate_map_literal" takes ctx as Integer, map_node as Integer returns Integer:
     Note: Create HIR map literal
     Let hir_map be proc hir_create_map_literal from HIR
@@ -2207,6 +2756,14 @@ Process called "translate_map_literal" takes ctx as Integer, map_node as Integer
     Return hir_map
 End Process
 
+@Reasoning:
+"(args) => expr" arrow form versus "(args) { body }" block form.
+We dispatch via the "arrow" flag: arrow lambdas have an expression
+body (set via hir_set_lambda_expression_body) while block lambdas
+have a statement body (set via hir_set_lambda_block_body). HIR
+keeps them distinct because arrow lambdas have implicit return
+of the expression value.
+@End Reasoning
 Process called "translate_lambda_expression" takes ctx as Integer, lambda_node as Integer returns Integer:
     Note: Create HIR lambda expression
     Let hir_lambda be proc hir_create_lambda from HIR
@@ -2232,6 +2789,12 @@ Process called "translate_lambda_expression" takes ctx as Integer, lambda_node a
     Return hir_lambda
 End Process
 
+@Reasoning:
+"await expr" - only valid inside an async function (enforced
+upstream by the parser). HIR await wraps the operand; the
+ctx.is_async flag was set when we entered the enclosing function,
+so callers that need to validate context can consult it.
+@End Reasoning
 Process called "translate_await_expression" takes ctx as Integer, await_node as Integer returns Integer:
     Note: Get awaited expression
     Let expr_child be proc ast_node_child with await_node, 0
@@ -2242,6 +2805,14 @@ Process called "translate_await_expression" takes ctx as Integer, await_node as 
     Return hir_await
 End Process
 
+@Reasoning:
+"obj..method1()..method2()..field = x" - cascade applies multiple
+operations to the same target, returning the target after the last
+operation. Child 0 is the target expression; children 1..n are each
+a sub-expression that operates on it. HIR preserves the cascade
+form rather than rewriting to sequential statements because the
+target should be evaluated only once.
+@End Reasoning
 Process called "translate_cascade_expression" takes ctx as Integer, cascade_node as Integer returns Integer:
     Note: Get target object
     Let target_child be proc ast_node_child with cascade_node, 0
@@ -2264,6 +2835,14 @@ Process called "translate_cascade_expression" takes ctx as Integer, cascade_node
     Return hir_cascade
 End Process
 
+@Reasoning:
+"a ?? b" - the ?? operator returns b when a is null, otherwise a.
+We desugar to a regular binary expression with the
+HIR_OP_NULL_COALESCE opcode because HIR has a dedicated opcode but
+no dedicated node kind. Short-circuit semantics (b is not evaluated
+when a is non-null) are encoded in the opcode and respected by
+optimizers.
+@End Reasoning
 Process called "translate_null_aware_expression" takes ctx as Integer, null_aware_node as Integer returns Integer:
     Note: Get left expression
     Let left_child be proc ast_node_child with null_aware_node, 0
@@ -2278,6 +2857,12 @@ Process called "translate_null_aware_expression" takes ctx as Integer, null_awar
     Return hir_null_aware
 End Process
 
+@Reasoning:
+"expr as T" - dynamic cast. Throws at runtime if expr is not a T.
+HIR's cast node carries both the expression and target type;
+backends decide whether to elide the check when the static type
+is provably compatible.
+@End Reasoning
 Process called "translate_as_expression" takes ctx as Integer, as_node as Integer returns Integer:
     Note: Get expression to cast
     Let expr_child be proc ast_node_child with as_node, 0
@@ -2292,6 +2877,12 @@ Process called "translate_as_expression" takes ctx as Integer, as_node as Intege
     Return hir_cast
 End Process
 
+@Reasoning:
+"expr is T" or "expr is! T" - runtime type test returning a Bool.
+The negated flag distinguishes "is!" from "is" without needing a
+separate AST node kind. HIR records the negation as metadata
+"dart_is_negated" so the codegen emits the appropriate compare.
+@End Reasoning
 Process called "translate_is_expression" takes ctx as Integer, is_node as Integer returns Integer:
     Note: Get expression to check
     Let expr_child be proc ast_node_child with is_node, 0
@@ -2314,6 +2905,13 @@ Process called "translate_is_expression" takes ctx as Integer, is_node as Intege
     Return hir_is
 End Process
 
+@Reasoning:
+"new Foo(args)" or implicit "Foo(args)" or "const Foo(args)" all
+land here. Const constructors are marked with metadata so the
+backend knows to canonicalize equivalent const instances. The type
+name is stored as a string; resolution to a concrete class happens
+during later HIR analysis.
+@End Reasoning
 Process called "translate_new_expression" takes ctx as Integer, new_node as Integer returns Integer:
     Note: Get type to instantiate
     Let type_child be proc ast_node_child with new_node, 0
@@ -2339,6 +2937,13 @@ Note: ===================================================================
 Note: ERROR HANDLING
 Note: ===================================================================
 
+@Reasoning:
+Append-only error reporter. Errors accumulate in ctx.errors which
+is later attached to the HIR module as metadata so callers can
+diagnose without inspecting per-node state. Does not throw or
+abort; translation continues even with errors to maximize
+diagnostic surface area for IDE/LSP integration.
+@End Reasoning
 Process called "add_translation_error" takes ctx as DartTranslationContext, message as Integer:
     proc list_append from ListCore with ctx.errors, message
 End Process

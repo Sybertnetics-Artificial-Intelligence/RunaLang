@@ -153,6 +153,17 @@ Note: ==========================================================================
 Note: Lexer Structure
 Note: ============================================================================
 
+@Reasoning:
+Slightly different state shape from the C# lexer: this one caches the
+current character at offset 40 so peek_char becomes a load rather than a
+function call. The trade-off is one extra field that must be kept in sync
+on every advance, but the lookup is the hottest operation in tokenization.
+@End Reasoning
+@Implementation:
+40-byte layout (declared as 6 fields, but allocated as 48 in
+create_javascript_lexer to leave room for the current_char cache at offset
+40): source@0, position@8, length@16, line@24, column@32, current_char@40.
+@End Implementation
 Type called "JavaScriptLexer":
     source as Integer           Note: Source code string
     position as Integer         Note: Current position in source
@@ -166,6 +177,16 @@ Note: ==========================================================================
 Note: Lexer Creation and Initialization
 Note: ============================================================================
 
+@Reasoning:
+Factory primes the current_char cache from the source's first byte (or 0
+if empty) so the lexer is immediately ready to peek without an initial
+explicit-advance.
+@End Reasoning
+@Implementation:
+Allocate 40 bytes. Compute source_len via StringCore. Store source@0,
+position=0@8, length@16, line=1@24, column=1@32. If source_len > 0, cache
+first char at offset 40; otherwise cache 0 (EOF sentinel).
+@End Implementation
 Process called "create_javascript_lexer" takes source as Integer returns Integer:
     Note: Create JavaScript lexer from source code
 
@@ -195,6 +216,12 @@ Process called "create_javascript_lexer" takes source as Integer returns Integer
     Return lexer
 End Process
 
+@Reasoning:
+The source string is borrowed; only the lexer struct itself is owned.
+@End Reasoning
+@Implementation:
+If lexer non-null, deallocate. Returns 1 unconditionally.
+@End Implementation
 Process called "destroy_javascript_lexer" takes lexer as Integer returns Integer:
     Note: Destroy JavaScript lexer
 
@@ -209,6 +236,18 @@ Note: ==========================================================================
 Note: Character Navigation
 Note: ============================================================================
 
+@Reasoning:
+Single step that maintains the current_char cache and the line/column
+counters. Newline handling happens against the OUTGOING character (the
+one being consumed) rather than the incoming one - this matches the
+convention that the newline ends the current line.
+@End Reasoning
+@Implementation:
+Read position, length, current_char. If current_char is 10 (LF), increment
+line and reset column to 1; otherwise increment column. Advance position
+by 1; if still inside source, reload current_char from the new position
+via string_char_at, otherwise set current_char to 0 (EOF).
+@End Implementation
 Process called "advance" takes lexer as Integer returns Integer:
     Note: Move to next character
 
@@ -241,6 +280,15 @@ Process called "advance" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Lookahead by `offset` bytes from the current position. Distinct from the
+cached current_char (which is offset 0). Used by next_token to disambiguate
+multi-character operators and `/` vs comment.
+@End Reasoning
+@Implementation:
+Compute peek_pos = position + offset; if peek_pos >= length return 0 (EOF).
+Otherwise load the byte via string_char_at.
+@End Implementation
 Process called "peek" takes lexer as Integer, offset as Integer returns Integer:
     Note: Look ahead at character at offset
 
@@ -262,6 +310,13 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII digit check, codepoints 48-57. JavaScript numeric literals use only
+ASCII digits in their decimal grammar.
+@End Reasoning
+@Implementation:
+Range test 48 <= char <= 57.
+@End Implementation
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is digit (0-9)
 
@@ -274,6 +329,16 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+JavaScript identifier start characters: ASCII letters PLUS underscore (95)
+and dollar sign (36). Unicode identifiers are not handled here - they would
+arrive as bytes that fail this test and need a fallback path the producer
+does not currently provide.
+@End Reasoning
+@Implementation:
+Ranges 65-90 ('A'-'Z') and 97-122 ('a'-'z'); plus direct equality with 95
+('_') and 36 ('$').
+@End Implementation
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -300,6 +365,15 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier continuation predicate: identifier-start chars (letters, _, $)
+PLUS digits. The lexer uses this to extend the identifier scan past the
+first character.
+@End Reasoning
+@Implementation:
+is_alpha first (covers letters and _ and $); if false, fall through to
+is_digit.
+@End Implementation
 Process called "is_alphanumeric" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
 
@@ -312,6 +386,13 @@ Process called "is_alphanumeric" takes char as Integer returns Integer:
     Return digit_check
 End Process
 
+@Reasoning:
+JavaScript treats space, tab, CR, LF as token separators. Unicode
+whitespace (NBSP, etc.) is rare in source files and not handled.
+@End Reasoning
+@Implementation:
+Equality checks against 32, 9, 10, 13.
+@End Implementation
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace
 
@@ -338,6 +419,15 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Token allocation. Tokens are 32 bytes containing tag, lexeme pointer, and
+source position. Distinct from the lexer state so multiple tokens (the
+token list) can outlive the lexer if needed.
+@End Reasoning
+@Implementation:
+Allocate 32 bytes; on success write type@0, lexeme@8, line@16, column@24.
+Return 0 on allocation failure.
+@End Implementation
 Process called "create_token" takes token_type as Integer, lexeme as Integer, line as Integer, column as Integer returns Integer:
     Note: Create token with type, lexeme, and position
 
@@ -360,6 +450,15 @@ Note: ==========================================================================
 Note: Skip Whitespace and Comments
 Note: ============================================================================
 
+@Reasoning:
+Consumes a run of whitespace, leveraging the cached current_char to avoid
+function-call overhead in the inner loop. Loop terminates on EOF (current
+== 0) or first non-whitespace.
+@End Reasoning
+@Implementation:
+Read current_char; loop while current is non-zero and is_whitespace; each
+iteration advances and reloads the cache.
+@End Implementation
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
@@ -379,6 +478,16 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes from current position to and INCLUDING the next newline (or EOF).
+The trailing newline is left in the stream because it might be significant
+for ASI (Automatic Semicolon Insertion). Caller of next_token re-enters
+the dispatch which will then handle the newline as whitespace.
+@End Reasoning
+@Implementation:
+Loop advancing until current_char is 10 (LF) or 0 (EOF). On LF the loop
+breaks WITHOUT consuming it.
+@End Implementation
 Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Note: Skip single-line comment (//)
 
@@ -396,6 +505,16 @@ Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes up to and INCLUDING the closing `*/`. Block comments do NOT nest
+in JavaScript. Returns 1 on successful close, 0 if EOF hit before closing
+(an unterminated comment).
+@End Reasoning
+@Implementation:
+Loop checking for '*' (42) at current position with peek(1) for '/' (47);
+on match, advance past both and return 1. Otherwise advance one char.
+On EOF, return 0.
+@End Implementation
 Process called "skip_block_comment" takes lexer as Integer returns Integer:
     Note: Skip multi-line comment (/* */)
 
@@ -423,6 +542,20 @@ Note: ==========================================================================
 Note: Keyword Recognition
 Note: ============================================================================
 
+@Reasoning:
+JavaScript has ~40 reserved words across lengths 2-11. Length-bucketed
+dispatch eliminates most candidates immediately; within each bucket,
+short-words (2-char) use direct byte-equality on first/second char while
+longer words call out to string_compare. Returns TOKEN_IDENTIFIER as the
+catch-all so callers don't need to distinguish "keyword" from "identifier"
+at this layer.
+@End Reasoning
+@Implementation:
+Read length via string_length. Branch on lengths 2-11. For 2-char keywords
+(if/in/do/as/of) directly compare first/second char (ASCII codes). For
+longer keywords, call string_compare. On match return TOKEN_*; otherwise
+fall through to TOKEN_IDENTIFIER.
+@End Implementation
 Process called "check_keyword" takes lexeme as Integer returns Integer:
     Note: Check if identifier is a keyword
 
@@ -696,6 +829,19 @@ Note: ==========================================================================
 Note: Tokenization - Numbers
 Note: ============================================================================
 
+@Reasoning:
+JavaScript numeric literals come in 5 shapes: decimal (123, 1.5, 1e10),
+hex (0x...), octal (0o...), binary (0b...). The 0-prefix check
+disambiguates the radix forms; absent a prefix, fall through to decimal
++ optional fractional + optional exponent scanning.
+@End Reasoning
+@Implementation:
+Snapshot start_pos. If current is '0' (48), peek(1) for 'x'/'o'/'b' (120/
+111/98); on match consume both and dispatch to scan_hex/octal/binary. For
+decimal: loop accepting digits OR a single '.'. Then optional 'e'/'E'
+exponent with optional '+'/'-' followed by digits. Build the lexeme from
+[start_pos, current_pos) and create a TOKEN_NUMBER.
+@End Implementation
 Process called "scan_number" takes lexer as Integer returns Integer:
     Note: Scan numeric literal (integer, float, hex, octal, binary)
 
@@ -774,6 +920,15 @@ Process called "scan_number" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_NUMBER, lexeme, line, column
 End Process
 
+@Reasoning:
+After scan_number consumed the `0x` prefix, this routine eats the hex
+digits 0-9, a-f, A-F. Mixed case is permitted per the spec.
+@End Reasoning
+@Implementation:
+Loop while current is a digit OR in range 65-70 ('A'-'F') OR in range 97-
+102 ('a'-'f'). On non-hex break. Build lexeme from start_pos to current
+position and emit TOKEN_NUMBER.
+@End Implementation
 Process called "scan_hex_number" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Scan hexadecimal number
 
@@ -813,6 +968,14 @@ Process called "scan_hex_number" takes lexer as Integer, start_pos as Integer re
     Return proc create_token with TOKEN_NUMBER, lexeme, line, column
 End Process
 
+@Reasoning:
+After scan_number consumed the `0o` prefix, this routine eats digits 0-7.
+Note that octal-without-prefix (legacy `0777`) is NOT handled by this
+routine; scan_number would just consume it as a decimal-looking literal.
+@End Reasoning
+@Implementation:
+Loop while current is in [48..55]. Build lexeme and emit TOKEN_NUMBER.
+@End Implementation
 Process called "scan_octal_number" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Scan octal number
 
@@ -839,6 +1002,13 @@ Process called "scan_octal_number" takes lexer as Integer, start_pos as Integer 
     Return proc create_token with TOKEN_NUMBER, lexeme, line, column
 End Process
 
+@Reasoning:
+After scan_number consumed the `0b` prefix, this routine eats digits 0 or
+1 only.
+@End Reasoning
+@Implementation:
+Loop accepting char 48 or 49. Build lexeme and emit TOKEN_NUMBER.
+@End Implementation
 Process called "scan_binary_number" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Scan binary number
 
@@ -867,6 +1037,22 @@ Note: ==========================================================================
 Note: Tokenization - Strings and Templates
 Note: ============================================================================
 
+@Reasoning:
+Quote-aware string scan supporting both single (') and double (") quoted
+literals via the quote_char parameter. Backslash escapes consume the
+backslash AND the following char so escape sequences like `\"` don't
+prematurely terminate the literal.
+@End Reasoning
+@Implementation:
+Snapshot start_pos and consume the opening quote. Loop: if current matches
+quote_char, advance past it and break; if current is '\\' (92), advance
+twice (eat backslash + escapee); otherwise advance one. Build lexeme
+including the surrounding quotes and emit TOKEN_STRING.
+@End Implementation
+@Security_Scope:
+Does NOT validate that escape sequences are well-formed - producer-side
+checking is required for strict ECMA-262 conformance.
+@End Security_Scope
 Process called "scan_string" takes lexer as Integer, quote_char as Integer returns Integer:
     Note: Scan string literal (single or double quoted)
 
@@ -900,6 +1086,17 @@ Process called "scan_string" takes lexer as Integer, quote_char as Integer retur
     Return proc create_token with TOKEN_STRING, lexeme, line, column
 End Process
 
+@Reasoning:
+Backtick-delimited template literal `text${expr}text`. This minimal scan
+treats the entire literal as one token; it does NOT split into quasi/expr
+pieces. The parser is responsible for re-scanning the lexeme if it needs
+the interpolated structure.
+@End Reasoning
+@Implementation:
+Consume opening backtick (96). Loop: if current is backtick, advance and
+break; if '\\', advance twice; otherwise advance one. Build lexeme and
+emit TOKEN_TEMPLATE.
+@End Implementation
 Process called "scan_template_literal" takes lexer as Integer returns Integer:
     Note: Scan template literal (`string ${expr}`)
 
@@ -937,6 +1134,17 @@ Note: ==========================================================================
 Note: Tokenization - Identifiers
 Note: ============================================================================
 
+@Reasoning:
+After is_alpha confirms the first char is identifier-start, this routine
+extends the lexeme while is_alphanumeric. The resulting lexeme is then
+passed to check_keyword which returns TOKEN_IDENTIFIER if it's not a
+reserved word.
+@End Reasoning
+@Implementation:
+Snapshot start_pos; loop while current is alphanumeric. Build the lexeme;
+call check_keyword to get the actual TOKEN_*; emit the token with that
+type.
+@End Implementation
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Note: Scan identifier or keyword
 
@@ -967,6 +1175,17 @@ Note: ==========================================================================
 Note: Helper Functions
 Note: ============================================================================
 
+@Reasoning:
+Materializes a fresh null-terminated copy of source[start_pos..end_pos)
+so tokens can outlive the lexer. Null termination is added so the buffer
+is usable with C-string APIs even though the explicit length is also
+known.
+@End Reasoning
+@Implementation:
+Compute length = end - start, allocate length+1 bytes. Copy byte-by-byte
+from source via string_char_at + memory_set_byte. Append a 0 sentinel.
+Returns 0 on allocation failure.
+@End Implementation
 Process called "extract_lexeme" takes lexer as Integer, start_pos as Integer, end_pos as Integer returns Integer:
     Note: Extract substring from source
 
@@ -995,6 +1214,20 @@ Note: ==========================================================================
 Note: Main Tokenization Function
 Note: ============================================================================
 
+@Reasoning:
+The driver loop: skip whitespace, then dispatch on the first non-WS
+character to a scan_* helper. EOF returns a TOKEN_EOF wrapper with the
+current line/column. Comments cause a tail-recursive re-entry so the next
+real token is returned.
+@End Reasoning
+@Implementation:
+skip_whitespace; if current is 0 emit TOKEN_EOF with empty lexeme. If '/'
+(47) and peek(1) is '/' or '*', skip the comment then re-enter next_token.
+Otherwise dispatch on character class to scan_number / scan_string /
+scan_template_literal / scan_identifier / specific operator cases. The
+operator dispatch (continued past this point in the file) handles every
+JS operator and punctuation token.
+@End Implementation
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
 
@@ -1583,6 +1816,18 @@ Note: ==========================================================================
 Note: Public API
 Note: ============================================================================
 
+@Reasoning:
+Driver-facing public API: take a source String and return a tokenized
+form. Loops calling next_token until EOF or ERROR. The token list
+container here is minimal (8-byte allocation containing a head pointer) -
+a richer list type could replace it without affecting next_token.
+@End Reasoning
+@Implementation:
+Create lexer (returns 0 on alloc failure). Allocate 8-byte head pointer
+and zero it. Loop calling next_token, incrementing token_count. Break on
+token == 0 or token_type == TOKEN_EOF or TOKEN_ERROR. Destroy the lexer
+(token list survives) and return the head pointer.
+@End Implementation
 Process called "tokenize_javascript" takes source as Integer returns Integer:
     Note: Tokenize JavaScript source code into token list
 

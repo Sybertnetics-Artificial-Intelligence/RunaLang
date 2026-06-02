@@ -86,6 +86,26 @@ Note: ==========================================================================
 Note: AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+Single uniform AST node type for all Bash grammar productions so the
+parser can produce and walk trees with a homogeneous representation; the
+node_type constant disambiguates which production yielded the node, and
+children/child_count/child_capacity implement a dynamic vector so any
+production can have any number of subnodes (Bash case items, command
+arguments, redirections, etc.) without separate per-production storage.
+@End Reasoning
+
+@Implementation:
+56-byte record (AST_NODE_SIZE) laid out as:
+- node_type @0 (8 bytes) - AST_* constant
+- value @8 - pointer to associated string, e.g. command name or word text
+- line @16, column @24 - source location for diagnostics
+- children @32 - pointer to a heap array of child node pointers
+- child_count @40 - active child count
+- child_capacity @48 - allocated slot count (grown 2x on overflow)
+Field offsets are hand-managed via memory_set_int64; add_child handles the
+growth invariant child_count <= child_capacity.
+@End Implementation
 Type called "ASTNode":
     node_type as Integer       Note: AST node type constant
     value as Integer           Note: Node value (string pointer)
@@ -103,6 +123,22 @@ Note: ==========================================================================
 Note: Parser Structure
 Note: ============================================================================
 
+@Reasoning:
+Minimal recursive-descent parser state: a reference to the streaming
+lexer, a one-token lookahead buffer (current_token), and a sticky error
+flag. Bash's grammar is mostly LL(1) once command-vs-assignment is
+disambiguated by character lookahead inside parse_command, so a single
+token of structured lookahead suffices.
+@End Reasoning
+
+@Implementation:
+24-byte record (PARSER_SIZE) laid out as:
+- lexer @0 - pointer to the BashLexer producing tokens
+- current_token @8 - currently-buffered token from the lexer
+- has_error @16 - 0 / 1 sticky error indicator set by expect()
+create_parser primes current_token with the first lexer token; advance()
+destroys the prior token and replaces it.
+@End Implementation
 Type called "BashParser":
     lexer as Integer           Note: Bash lexer
     current_token as Integer   Note: Current token
@@ -115,6 +151,19 @@ Note: ==========================================================================
 Note: AST Node Operations
 Note: ============================================================================
 
+@Reasoning:
+AST node allocation is centralized so all 56-byte record initializations
+zero every field. Without zero-init, a freshly-created node could be
+treated as having children (non-zero children pointer) by add_child, which
+would dereference uninitialized memory.
+@End Reasoning
+
+@Implementation:
+Allocates AST_NODE_SIZE (56) bytes via Layout.allocate. On allocation
+failure returns 0 so callers can short-circuit. Stores node_type @0 and
+explicitly zeroes value @8, line @16, column @24, children @32,
+child_count @40, child_capacity @48. Returns the node pointer.
+@End Implementation
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     Note: Create AST node with given type
 
@@ -135,6 +184,16 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Null-safe field setter so productions that conditionally attach a value
+(e.g. function names, variable identifiers) don't need to check the node
+pointer themselves before storing.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately if node is 0 (no-op for null nodes). Otherwise
+stores value at offset 8 (value field) via memory_set_int64. Returns 1.
+@End Implementation
 Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
     Note: Set node value
 
@@ -147,6 +206,17 @@ Process called "set_node_value" takes node as Integer, value as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Attaches source coordinates to a node so downstream HIR translation and
+diagnostic emission can point at the originating Bash source position.
+Kept as a separate process from value-setting because not every node has
+useful location data attached (e.g. synthesized nodes).
+@End Reasoning
+
+@Implementation:
+Returns 0 if node is 0. Otherwise writes line to offset 16 and column to
+offset 24 via memory_set_int64. Returns 1.
+@End Implementation
 Process called "set_node_location" takes node as Integer, line as Integer, column as Integer returns Integer:
     Note: Set node source location
 
@@ -160,6 +230,26 @@ Process called "set_node_location" takes node as Integer, line as Integer, colum
     Return 1
 End Process
 
+@Reasoning:
+Implements dynamic-vector growth for ASTNode.children with a doubling
+strategy: amortized O(1) appends across all child additions on a single
+parent node. Lazy initial allocation (only on first append) avoids the
+cost of allocating capacity for the many parser productions that produce
+zero-child nodes (literals, empty bodies).
+@End Reasoning
+
+@Implementation:
+Returns 0 if either node or child is 0 (refuses to attach a null child or
+add to a null parent). Reads child_count @40 and child_capacity @48.
+Growth path:
+- capacity == 0: allocate INITIAL_CHILD_CAPACITY * 8 bytes, store pointer
+  at @32, set capacity to INITIAL_CHILD_CAPACITY.
+- count >= capacity: double the capacity, allocate new array, manually
+  copy each of the count slots from the old array (read at i*8, write at
+  i*8), deallocate the old array, update pointer and capacity.
+Then writes the child pointer at children_array + child_count*8 and
+increments child_count.
+@End Implementation
 Process called "add_child" takes node as Integer, child as Integer returns Integer:
     Note: Add child to AST node
 
@@ -224,6 +314,19 @@ Note: ==========================================================================
 Note: Parser Creation
 Note: ============================================================================
 
+@Reasoning:
+Constructor that establishes the LL(1) invariant by prefetching the first
+token before any production runs. Without prefetch, the first call to
+match() or current_token_type() would observe an uninitialized
+current_token field and read garbage.
+@End Reasoning
+
+@Implementation:
+Allocates PARSER_SIZE (24) bytes. On allocation failure returns 0.
+Stores the lexer pointer at offset 0, zero at offset 16 (has_error
+cleared). Calls next_token on the lexer to grab the first token and
+stores it at offset 8 (current_token). Returns the parser pointer.
+@End Implementation
 Process called "create_parser" takes lexer as Integer returns Integer:
     Note: Create Bash parser
 
@@ -243,6 +346,18 @@ Process called "create_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+Releases the parser record and the token it owns. The lexer's lifetime
+is owned by the caller (it can outlive the parser to drive a second
+pass), so it is not destroyed here.
+@End Reasoning
+
+@Implementation:
+Returns 1 immediately if parser is 0 (idempotent for null). Reads
+current_token at offset 8; if non-zero destroys it via
+Lexer.destroy_token to release the token's string allocation. Then
+deallocates the parser record via Layout.deallocate. Returns 1.
+@End Implementation
 Process called "destroy_parser" takes parser as Integer returns Integer:
     Note: Destroy parser
 
@@ -265,6 +380,18 @@ Note: ==========================================================================
 Note: Token Operations
 Note: ============================================================================
 
+@Reasoning:
+Returns the type of the lookahead token. Returning TOKEN_EOF when the
+current_token slot is empty lets all parser productions treat
+end-of-input as a regular sentinel via the existing match-on-EOF paths
+rather than requiring an extra null check at every call site.
+@End Reasoning
+
+@Implementation:
+Reads current_token at parser offset 8. If 0, returns TOKEN_EOF from the
+Lexer module. Otherwise reads the token's node_type at the token's
+offset 0 and returns it.
+@End Implementation
 Process called "current_token_type" takes parser as Integer returns Integer:
     Note: Get current token type
 
@@ -279,6 +406,16 @@ Process called "current_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Companion of current_token_type that returns the value pointer (typically
+a string) attached to the lookahead token. Returns 0 for a missing token
+so productions like parse_word can skip value capture cleanly at EOF.
+@End Reasoning
+
+@Implementation:
+Reads current_token at parser offset 8. If 0 returns 0; otherwise reads
+the token's value at the token's offset 8 and returns it.
+@End Implementation
 Process called "current_token_value" takes parser as Integer returns Integer:
     Note: Get current token value
 
@@ -293,6 +430,21 @@ Process called "current_token_value" takes parser as Integer returns Integer:
     Return value
 End Process
 
+@Reasoning:
+The single point where token consumption happens: it must destroy the
+prior token before overwriting current_token to avoid leaking the prior
+token's string allocation. Every production that wants to consume the
+lookahead routes through here (directly or via match_and_advance /
+expect) to keep that invariant centralized.
+@End Reasoning
+
+@Implementation:
+Reads lexer (offset 0) and current_token (offset 8). If current_token is
+non-zero calls Lexer.destroy_token on it. Calls Lexer.next_token on the
+lexer to fetch the next token and stores it at offset 8. Returns the
+newly-stored token pointer for callers that want to inspect it without
+a separate current_token read.
+@End Implementation
 Process called "advance" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -309,6 +461,17 @@ Process called "advance" takes parser as Integer returns Integer:
     Return next_token
 End Process
 
+@Reasoning:
+Pure lookahead predicate that never advances. Productions use it for
+optional-token detection (e.g. checking for an `elif` before committing
+to one of two alternatives). Separating non-consuming match from
+consuming advance lets the LL(1) decisions stay clean.
+@End Reasoning
+
+@Implementation:
+Reads current_token_type, compares against the supplied token_type.
+Returns 1 on equality, 0 otherwise.
+@End Implementation
 Process called "match" takes parser as Integer, token_type as Integer returns Integer:
     Note: Check if current token matches type
 
@@ -321,6 +484,17 @@ Process called "match" takes parser as Integer, token_type as Integer returns In
     Return 0
 End Process
 
+@Reasoning:
+Combines lookahead and optional consumption in one call so productions
+that want to consume a token if present (e.g. optional `()` after a
+function name, optional list separators) don't have to write the
+"match then advance" pattern twice in source.
+@End Reasoning
+
+@Implementation:
+Calls match. If it returns 1, calls advance and returns 1. Otherwise
+returns 0 without consuming anything.
+@End Implementation
 Process called "match_and_advance" takes parser as Integer, token_type as Integer returns Integer:
     Note: Match token type and advance if matched
 
@@ -334,6 +508,18 @@ Process called "match_and_advance" takes parser as Integer, token_type as Intege
     Return 0
 End Process
 
+@Reasoning:
+Implements the "this token MUST be present" contract for mandatory
+grammar elements like `then` after the `if` condition, `done` after a
+loop body, etc. On mismatch sets the sticky has_error flag instead of
+throwing or returning a special node so the rest of the parse continues
+producing a partial tree that callers can still inspect.
+@End Reasoning
+
+@Implementation:
+Calls match. On mismatch (0), writes 1 to parser offset 16 (has_error)
+and returns 0. On match advances past the token and returns 1.
+@End Implementation
 Process called "expect" takes parser as Integer, token_type as Integer returns Integer:
     Note: Expect token type, error if not matched
 
@@ -349,6 +535,19 @@ Process called "expect" takes parser as Integer, token_type as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+Bash uses newlines as statement terminators inside list-of-commands
+contexts, but compound constructs (after `then`, `do`, `in`, etc.) accept
+any number of blank lines before their body. Centralizing the newline-
+swallowing here lets every compound production simply call
+skip_newlines after its keywords without writing the loop locally.
+@End Reasoning
+
+@Implementation:
+Infinite loop that calls match against TOKEN_NEWLINE; breaks immediately
+once a non-newline token is current; otherwise calls advance to consume
+the newline and continues. Returns 1 unconditionally.
+@End Implementation
 Process called "skip_newlines" takes parser as Integer returns Integer:
     Note: Skip any newline tokens
 
@@ -374,6 +573,29 @@ Note: ==========================================================================
 Note: Expression Parsing
 Note: ============================================================================
 
+@Reasoning:
+"Word" in Bash grammar collapses several lexical categories (unquoted
+words, single/double-quoted strings, numbers, and expansions) into a
+single parse-level concept because they are all interchangeable in
+command and argument positions. This function dispatches across all of
+those token kinds to a small set of AST node types so the rest of the
+parser only needs to care about the higher-level distinction.
+@End Reasoning
+
+@Implementation:
+Reads current_token_type and tests each accepted token kind in turn:
+- TOKEN_WORD  -> AST_WORD with token value
+- TOKEN_STRING, TOKEN_SINGLE_QUOTED_STRING, TOKEN_DOUBLE_QUOTED_STRING ->
+  AST_STRING
+- TOKEN_NUMBER -> AST_NUMBER
+- TOKEN_COMMAND_SUBSTITUTION -> AST_COMMAND_SUBSTITUTION
+- TOKEN_ARITHMETIC_EXPANSION -> AST_ARITHMETIC_EXPANSION
+- TOKEN_PARAMETER_EXPANSION -> AST_PARAMETER_EXPANSION
+For each match: creates the AST node, calls set_node_value with the
+token's value string, advances past the token, returns the node.
+Returns 0 when no production matches so the caller can probe whether a
+word is available without committing.
+@End Implementation
 Process called "parse_word" takes parser as Integer returns Integer:
     Note: Parse word token
 
@@ -449,6 +671,21 @@ Process called "parse_word" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Command arguments are a superset of words: in addition to all the
+word-accepted forms, they also include `$var` references that come
+through as a TOKEN_DOLLAR followed by a TOKEN_WORD. parse_word handles
+the common cases and this wrapper adds the dollar-variable case so
+parse_simple_command stays simple.
+@End Reasoning
+
+@Implementation:
+First delegates to parse_word; if it returns non-zero, returns that
+result. Otherwise peeks the current token type. On TOKEN_DOLLAR, advances
+past the dollar, reads the following token's value as the variable name,
+creates an AST_VARIABLE node with that name, advances past the name
+token, returns the node. Returns 0 if neither path produces a node.
+@End Implementation
 Process called "parse_argument" takes parser as Integer returns Integer:
     Note: Parse command argument
 
@@ -473,6 +710,24 @@ Process called "parse_argument" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Bash has eight redirection operators (`<`, `>`, `>>`, `<>`, `>&`, `&>`,
+`&>>`, `<&`) that all share the same syntactic shape: operator followed
+by a target word or file descriptor. Recognizing them upfront via a flag
+rather than eight separate branches keeps the target-parsing logic
+single-pathed.
+@End Reasoning
+
+@Implementation:
+Reads the current token type. Sets is_redirect to 1 for any of the eight
+redirection tokens (TOKEN_LESS, TOKEN_GREATER, TOKEN_GREATER_GREATER,
+TOKEN_LESS_GREATER, TOKEN_GREATER_AMP, TOKEN_AMP_GREATER,
+TOKEN_AMP_GREATER_GREATER, TOKEN_LESS_AMP). If 0 returns 0 without
+allocating. Otherwise creates an AST_REDIRECTION node, attaches an empty
+operator string placeholder (operator type currently inferred elsewhere
+from child position), advances past the operator token, parses the
+target via parse_argument, adds it as a child, returns the node.
+@End Implementation
 Process called "parse_redirection" takes parser as Integer returns Integer:
     Note: Parse redirection (>, >>, <, etc.)
 
@@ -535,6 +790,24 @@ Note: ==========================================================================
 Note: Simple Command Parsing
 Note: ============================================================================
 
+@Reasoning:
+A simple command is the command name followed by an arbitrary mix of
+arguments and redirections, terminated by any of the list/pipeline
+separators or end-of-input. Redirections can appear anywhere in the
+argument stream (`cmd >out arg1 arg2 2>&1`), so a single loop pulls
+whichever production matches the lookahead at each iteration.
+@End Reasoning
+
+@Implementation:
+Creates AST_COMMAND node. Parses the leading word via parse_word; if 0,
+returns 0 (no command at this position). Adds it as the first child.
+Then an infinite loop:
+- breaks on any of: TOKEN_NEWLINE, TOKEN_SEMICOLON, TOKEN_PIPE,
+  TOKEN_AMP, TOKEN_AMP_AMP, TOKEN_PIPE_PIPE, TOKEN_EOF
+- tries parse_redirection; if it returns a node adds it and Continue
+- otherwise tries parse_argument; if 0 break, else add it.
+Returns the AST_COMMAND with all collected children.
+@End Implementation
 Process called "parse_simple_command" takes parser as Integer returns Integer:
     Note: Parse simple command (cmd arg1 arg2 ...)
 
@@ -607,6 +880,22 @@ Note: ==========================================================================
 Note: Pipeline Parsing
 Note: ============================================================================
 
+@Reasoning:
+A pipeline is `cmd1 | cmd2 | ...` with optional newlines after each
+pipe. Single-command pipelines are returned as the bare command (not
+wrapped in AST_PIPELINE) so trivial cases stay simple downstream. Only
+when at least one `|` is observed does the wrapping happen.
+@End Reasoning
+
+@Implementation:
+Parses the first command via parse_simple_command. If 0, returns 0. Then
+match-tests for TOKEN_PIPE; if not present, returns the bare first
+command. Otherwise creates AST_PIPELINE, adds first_cmd, and loops:
+- match_and_advance on TOKEN_PIPE; if 0 break
+- skip_newlines after the pipe
+- parse_simple_command; if 0 break, else add child.
+Returns the pipeline node.
+@End Implementation
 Process called "parse_pipeline" takes parser as Integer returns Integer:
     Note: Parse pipeline (cmd1 | cmd2 | cmd3)
 
@@ -650,6 +939,28 @@ Note: ==========================================================================
 Note: List Parsing (&&, ||, ;, &)
 Note: ============================================================================
 
+@Reasoning:
+A "list" is a sequence of pipelines joined by `&&`, `||`, `;`, or `&`.
+Like pipelines, a single-item list is returned as the bare pipeline so
+the AST stays flat in the common case. The four operators are treated
+uniformly at this level - their semantic differences (short-circuit vs
+sequential vs background) are encoded by the operator tokens in the
+ordered child stream, not by separate node types.
+@End Reasoning
+
+@Implementation:
+Parses first pipeline; on 0 returns 0. Sets is_list_operator if the
+current token type is any of TOKEN_AMP_AMP, TOKEN_PIPE_PIPE,
+TOKEN_SEMICOLON, TOKEN_AMP. If 0, returns the bare pipeline. Otherwise
+creates AST_LIST and adds the first item. Loop:
+- re-detect list operator on current token; if not found, break
+- advance past the operator (note: the operator token is currently
+  consumed without being attached to the AST_LIST; downstream consumers
+  infer it positionally for now)
+- skip_newlines
+- parse_pipeline; if 0 break, else add child.
+Returns AST_LIST.
+@End Implementation
 Process called "parse_list" takes parser as Integer returns Integer:
     Note: Parse command list with &&, ||, ;, &
 
@@ -730,6 +1041,28 @@ Note: ==========================================================================
 Note: Control Structure Parsing
 Note: ============================================================================
 
+@Reasoning:
+Bash if statements use `if COND; then BODY [elif COND; then BODY]*
+[else BODY] fi`. The AST flattens elif into pairs of (condition, body)
+children inserted into the AST_IF_STATEMENT after the initial condition
+and then-body so the resulting tree is uniform: children are
+[cond, then_body, elif_cond, elif_body, ..., (optional) else_body].
+This avoids needing a separate AST_ELIF_CLAUSE node kind.
+@End Reasoning
+
+@Implementation:
+expect TOKEN_IF, skip_newlines. Parse condition list, skip newlines,
+expect TOKEN_THEN, skip newlines. Parse then_body list. Create
+AST_IF_STATEMENT, add condition then then_body as the first two
+children. Loop:
+- match TOKEN_ELIF: if 1, advance, skip_newlines, parse elif condition,
+  skip_newlines, expect TOKEN_THEN, skip_newlines, parse elif_body, add
+  both as further children, skip_newlines, Continue.
+- match TOKEN_ELSE: if 1, advance, skip_newlines, parse else_body, add
+  as final child, skip_newlines.
+- Break in all other cases.
+expect TOKEN_FI. Return the if node.
+@End Implementation
 Process called "parse_if_statement" takes parser as Integer returns Integer:
     Note: Parse if-then-else-fi statement
 
@@ -794,6 +1127,20 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
     Return if_node
 End Process
 
+@Reasoning:
+While-loop grammar is `while COND; do BODY; done`. Two-child AST node
+(condition, body) is enough because both pieces are command lists.
+Newlines between the keyword tokens and their attached lists are
+consumed by skip_newlines so multi-line idiomatic Bash works without
+modification.
+@End Reasoning
+
+@Implementation:
+expect TOKEN_WHILE, skip_newlines. Parse condition list. skip_newlines,
+expect TOKEN_DO, skip_newlines. Parse body list. skip_newlines, expect
+TOKEN_DONE. Create AST_WHILE_STATEMENT, add condition and body as
+children. Return the node.
+@End Implementation
 Process called "parse_while_statement" takes parser as Integer returns Integer:
     Note: Parse while-do-done statement
 
@@ -819,6 +1166,19 @@ Process called "parse_while_statement" takes parser as Integer returns Integer:
     Return while_node
 End Process
 
+@Reasoning:
+Until-loop is the negated-condition dual of while: `until COND; do BODY;
+done` runs the body while the condition is false. Same two-child shape
+as while; the only difference is the AST node kind, which downstream
+translation uses to flip the predicate.
+@End Reasoning
+
+@Implementation:
+expect TOKEN_UNTIL, skip_newlines, parse condition, skip_newlines,
+expect TOKEN_DO, skip_newlines, parse body, skip_newlines, expect
+TOKEN_DONE. Create AST_UNTIL_STATEMENT with condition and body as
+children. Return node.
+@End Implementation
 Process called "parse_until_statement" takes parser as Integer returns Integer:
     Note: Parse until-do-done statement
 
@@ -844,6 +1204,25 @@ Process called "parse_until_statement" takes parser as Integer returns Integer:
     Return until_node
 End Process
 
+@Reasoning:
+For-loop is `for VAR in WORD...; do BODY; done`. The iteration variable
+goes into the AST_FOR_STATEMENT.value field while the word list and the
+body are children. This shape lets translation walk the children to
+generate iteration over the value list followed by the body, with the
+loop variable name available without traversing children.
+@End Reasoning
+
+@Implementation:
+expect TOKEN_FOR, skip_newlines. Read current token value as var_name,
+expect TOKEN_WORD. skip_newlines, expect TOKEN_IN, skip_newlines. Create
+AST_FOR_STATEMENT, set its value to var_name. Word-list loop: read
+token type each iteration; break on TOKEN_NEWLINE, TOKEN_SEMICOLON, or
+TOKEN_DO; otherwise parse_word and add as child (break if it returns 0).
+After the loop, skip_newlines, optional match_and_advance on
+TOKEN_SEMICOLON, skip_newlines, expect TOKEN_DO, skip_newlines, parse
+body list, skip_newlines, expect TOKEN_DONE. Add body as final child.
+Return for_node.
+@End Implementation
 Process called "parse_for_statement" takes parser as Integer returns Integer:
     Note: Parse for-do-done statement
 
@@ -905,6 +1284,24 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
     Return for_node
 End Process
 
+@Reasoning:
+A case item is `PATTERN [| PATTERN ...]) COMMANDS [;;|;&|;;&]`. Patterns
+can be alternated with `|`, and the trailing separator selects
+fall-through behavior (`;;` stop, `;&` fall through unconditionally,
+`;;&` continue testing patterns). All patterns plus the commands become
+children of the AST_CASE_ITEM; the fall-through behavior is currently
+discarded after the advance (downstream uses default `;;` semantics).
+@End Reasoning
+
+@Implementation:
+Create AST_CASE_ITEM. Pattern loop: parse_word; break if 0; add as
+child; match_and_advance TOKEN_PIPE; break if no pipe. expect
+TOKEN_RPAREN, skip_newlines. Parse commands list, add as final child.
+skip_newlines. Then test the current token type for any of
+TOKEN_SEMICOLON_SEMICOLON, TOKEN_SEMICOLON_SEMICOLON_AMP, or
+TOKEN_SEMICOLON_AMP and advance past it if matched. Return the item
+node.
+@End Implementation
 Process called "parse_case_item" takes parser as Integer returns Integer:
     Note: Parse case pattern item
 
@@ -955,6 +1352,20 @@ Process called "parse_case_item" takes parser as Integer returns Integer:
     Return item_node
 End Process
 
+@Reasoning:
+Case grammar is `case WORD in ITEM... esac`. The discriminant word is
+the first child; subsequent children are AST_CASE_ITEM nodes, one per
+pattern arm. Newlines are permitted freely between items so multi-line
+case bodies parse without modification.
+@End Reasoning
+
+@Implementation:
+expect TOKEN_CASE, skip_newlines, parse_word as the discriminant.
+skip_newlines, expect TOKEN_IN, skip_newlines. Create AST_CASE_STATEMENT
+and add the discriminant. Item loop: read token type; break on
+TOKEN_ESAC; parse_case_item; break if 0; add as child; skip_newlines.
+After the loop, expect TOKEN_ESAC. Return the case node.
+@End Implementation
 Process called "parse_case_statement" takes parser as Integer returns Integer:
     Note: Parse case-in-esac statement
 
@@ -998,6 +1409,24 @@ Note: ==========================================================================
 Note: Function Definition Parsing
 Note: ============================================================================
 
+@Reasoning:
+Bash function definitions have two surface forms: `function NAME [()]
+BODY` (the `function` keyword path) and `NAME() BODY` (the
+POSIX-compatible form handled by parse_command's lookahead). This
+procedure handles the function-keyword path; the optional parentheses
+after the name are accepted but produce no AST artifact since they have
+no semantic effect.
+@End Reasoning
+
+@Implementation:
+match_and_advance the TOKEN_FUNCTION keyword (is_function_kw is read but
+not subsequently used because both forms reach here with the same shape
+afterward). Read current token value as func_name, expect TOKEN_WORD.
+skip_newlines. match_and_advance TOKEN_LPAREN; if 1, expect TOKEN_RPAREN
+and skip_newlines (consumes the optional `()`). Parse the compound
+command via parse_compound_command. Create AST_FUNCTION_DEFINITION, set
+its value to func_name, add the body as the sole child. Return.
+@End Implementation
 Process called "parse_function_definition" takes parser as Integer returns Integer:
     Note: Parse function definition
 
@@ -1030,6 +1459,22 @@ Note: ==========================================================================
 Note: Compound Command Parsing
 Note: ============================================================================
 
+@Reasoning:
+Bash compound commands come in two forms with different semantics: `(
+commands )` runs in a subshell with isolated environment, while `{
+commands; }` runs in the current shell. The distinction is preserved at
+the AST level by producing AST_SUBSHELL versus AST_COMPOUND_COMMAND so
+downstream translation can emit the correct execution semantics.
+@End Reasoning
+
+@Implementation:
+Reads current token type. On TOKEN_LPAREN: advance, skip_newlines, parse
+list, skip_newlines, expect TOKEN_RPAREN, create AST_SUBSHELL, attach
+commands as child, return. On TOKEN_LBRACE: advance, skip_newlines,
+parse list, skip_newlines, expect TOKEN_RBRACE, create
+AST_COMPOUND_COMMAND, attach commands as child, return. Returns 0 if
+neither bracket is current.
+@End Implementation
 Process called "parse_compound_command" takes parser as Integer returns Integer:
     Note: Parse compound command { commands; } or ( commands )
 
@@ -1074,6 +1519,20 @@ Note: ==========================================================================
 Note: Variable Assignment Parsing
 Note: ============================================================================
 
+@Reasoning:
+Variable assignments take the form `name=value` and are recognized
+upstream in parse_command via character-level lookahead (since the lexer
+emits the name as a TOKEN_WORD). This procedure handles the parsing once
+the lookahead has confirmed the shape: it captures the name, consumes
+the `=`, parses a single argument as the rvalue.
+@End Reasoning
+
+@Implementation:
+Read current token value as var_name, expect TOKEN_WORD. expect
+TOKEN_ASSIGN. Parse the rvalue via parse_argument. Create
+AST_VARIABLE_ASSIGNMENT, set its value to var_name, add the rvalue node
+as the sole child. Return the assignment node.
+@End Implementation
 Process called "parse_variable_assignment" takes parser as Integer returns Integer:
     Note: Parse variable assignment var=value
 
@@ -1095,6 +1554,42 @@ Note: ==========================================================================
 Note: Command Parsing (Main Entry)
 Note: ============================================================================
 
+@Reasoning:
+Central command-dispatch routine that selects the right sub-parser based
+on the lookahead token. The non-trivial case is plain word-leading
+input, which can be either a simple command (`cmd args`) or an
+assignment (`name=value`); these share the same first token, so we
+peek into the lexer's source buffer past the current word to look for
+`=` before any list-separator character. This character-level lookahead
+is a controlled use of lexer internals - the alternative would be a
+multi-token reparseable lookahead protocol on the parser side.
+@End Reasoning
+
+@Implementation:
+skip_newlines. Switch on current token type:
+- TOKEN_IF -> parse_if_statement
+- TOKEN_WHILE -> parse_while_statement
+- TOKEN_UNTIL -> parse_until_statement
+- TOKEN_FOR -> parse_for_statement
+- TOKEN_CASE -> parse_case_statement
+- TOKEN_FUNCTION -> parse_function_definition
+- TOKEN_LBRACE / TOKEN_LPAREN -> parse_compound_command
+- TOKEN_WORD -> reads the lexer pointer at parser offset 0, then the
+  lexer's current peek_pos (offset 16), source (offset 0), and length
+  (offset 8). Walks the source forward from peek_pos: skip space (32)
+  and tab (9); on `=` (61) sets could_be_assignment to 1 and breaks; on
+  any of newline (10), semicolon (59), `&` (38), or pipe (124) breaks
+  without setting the flag; otherwise advances. If
+  could_be_assignment is 1 returns parse_assignment. Falls through to
+  parse_list for everything else.
+@End Implementation
+
+@Security_Scope:
+This is the one place in the parser that directly inspects raw source
+bytes ahead of the token stream. The bounds invariant lookahead_pos <
+length is checked on every iteration so the lookahead cannot read past
+the end of the lexer's source buffer.
+@End Security_Scope
 Process called "parse_command" takes parser as Integer returns Integer:
     Note: Parse any command (control structure, function, simple command, etc.)
 
@@ -1191,6 +1686,19 @@ Note: ==========================================================================
 Note: Script Parsing (Top-Level)
 Note: ============================================================================
 
+@Reasoning:
+The top-level production: a script is a sequence of commands separated
+by newlines, terminated by EOF. AST_SCRIPT becomes the unique tree
+root. Stopping on the first 0 from parse_command lets malformed input
+be partially parsed up to the failure point rather than aborting the
+whole tree.
+@End Reasoning
+
+@Implementation:
+Create AST_SCRIPT root. skip_newlines. Loop: read current_token_type;
+break on TOKEN_EOF; parse_command; break if 0; add command as child;
+skip_newlines. Return the script node when the loop exits.
+@End Implementation
 Process called "parse_script" takes parser as Integer returns Integer:
     Note: Parse complete Bash script
 
@@ -1219,6 +1727,18 @@ Process called "parse_script" takes parser as Integer returns Integer:
     Return script_node
 End Process
 
+@Reasoning:
+Public entry point that lets callers reach the parser via a name
+("parse") that matches the import-side dispatcher convention used by
+other Bash translation modules. Pure delegation to parse_script keeps
+the entry name stable even if internal structure later changes.
+@End Reasoning
+
+@Implementation:
+Returns the result of parse_script(parser) directly. No additional
+setup or teardown - the caller is responsible for parser lifetime
+(create_parser before, destroy_parser after).
+@End Implementation
 Process called "parse" takes parser as Integer returns Integer:
     Note: Main parsing entry point
 

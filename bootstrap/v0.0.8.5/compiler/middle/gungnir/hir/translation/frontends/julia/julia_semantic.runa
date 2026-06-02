@@ -15,6 +15,18 @@ Note: - Abstract types and type unions
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HirNodes
 Import "compiler/middle/gungnir/hir/hir_builder.runa" as HirBuilder
 
+@Reasoning:
+Julia semantic analysis state holds the active module, parent context chain
+for nested scopes, import lists, an error/warning list, plus three lookup
+tables: type_cache for memoized type construction, method_table for the
+multiple-dispatch resolver, and macro_definitions. performance_annotations
+records `@inline`/`@noinline`/`@inbounds` etc. so the codegen layer can
+honor them.
+@End Reasoning
+@Implementation:
+12 fields. All collections are heap-allocated and owned by this context;
+parent_context is borrowed.
+@End Implementation
 Type called "JuliaSemanticContext":
     current_module as JuliaModule
     parent_context as JuliaSemanticContext
@@ -30,6 +42,16 @@ Type called "JuliaSemanticContext":
     performance_annotations as Dictionary[String, List[String]]
 End Type
 
+@Reasoning:
+A Julia module groups functions, types, constants, variables, and
+submodules. exports/imports/using_modules track the visibility surface.
+parent_module enables qualified name resolution upwards through the
+module tree.
+@End Reasoning
+@Implementation:
+10 fields. functions is a dict from name to method LIST because Julia
+permits multiple methods per function name (multiple dispatch).
+@End Implementation
 Type called "JuliaModule":
     name as String
     exports as List[String]
@@ -45,6 +67,16 @@ End Type
 
 Note: Local Julia AST schema used by this semantic analyzer until v0.0.9.x
 Note: replaces the field-rich placeholder with generic HIRNode traversal.
+@Reasoning:
+Wide-record AST node carrying all possible fields used across the various
+Julia node kinds (function defs, calls, parametric types, where clauses,
+type assertions). The wide-record shape lets the analyzer handle different
+node types without per-kind subclasses; the node_type string discriminates.
+@End Reasoning
+@Implementation:
+13 fields. Unused fields per node-kind are zero/null. This is a transitional
+schema; v0.0.9.x will replace with generic HIRNode traversal.
+@End Implementation
 Type called "JuliaSemNode":
     node_type as String
     name as Integer
@@ -61,6 +93,16 @@ Type called "JuliaSemNode":
     asserted_type as Integer
 End Type
 
+@Reasoning:
+A concrete method in Julia's multiple-dispatch system - the specific
+combination of name + parameter types. Julia compiles one machine-code
+specialization per method (per world age) so we track world_age to match
+the Julia runtime model.
+@End Reasoning
+@Implementation:
+10 fields. method_instance is an opaque integer for the JIT layer to
+attach codegen state.
+@End Implementation
 Type called "JuliaMethod":
     name as String
     signature as JuliaMethodSignature
@@ -74,6 +116,14 @@ Type called "JuliaMethod":
     source_location as String
 End Type
 
+@Reasoning:
+The dispatch-relevant subset of a method: function name and parameter
+types. Keyword parameters are tracked separately because Julia keyword
+args are NOT part of dispatch (only positional types are).
+@End Reasoning
+@Implementation:
+6 fields. has_varargs flag indicates the trailing `args...` form.
+@End Implementation
 Type called "JuliaMethodSignature":
     function_name as String
     parameter_names as List[String]
@@ -83,6 +133,17 @@ Type called "JuliaMethodSignature":
     keyword_parameters as Dictionary[String, JuliaType]
 End Type
 
+@Reasoning:
+Julia types form a complex hierarchy: Any at the top, abstract/concrete,
+primitive/composite, union types, and parametric types like Array{T,N}.
+This struct captures the relevant axes for the dispatcher and the
+codegen layout pass.
+@End Reasoning
+@Implementation:
+12 fields. type_params is populated only when is_parametric; union_types
+only when is_union. size_bytes and alignment are populated late (post
+field analysis).
+@End Implementation
 Type called "JuliaType":
     name as String
     type_params as List[JuliaType]
@@ -98,6 +159,15 @@ Type called "JuliaType":
     alignment as Integer
 End Type
 
+@Reasoning:
+A user-defined `struct` or `mutable struct` or `abstract type`. Distinct
+from JuliaType (which represents type values used in dispatch) because
+type definitions also carry constructors and source-level data.
+@End Reasoning
+@Implementation:
+9 fields. constructors are JuliaMethod values; is_mutable flips between
+`struct` and `mutable struct`.
+@End Implementation
 Type called "JuliaTypeDefinition":
     name as String
     type_parameters as List[String]
@@ -110,6 +180,13 @@ Type called "JuliaTypeDefinition":
     size_bytes as Integer
 End Type
 
+@Reasoning:
+A single struct field with its name, type, const-ness, and byte offset
+within the struct. Offset is filled in by the layout pass.
+@End Reasoning
+@Implementation:
+4 fields.
+@End Implementation
 Type called "JuliaField":
     name as String
     type as JuliaType
@@ -117,6 +194,14 @@ Type called "JuliaField":
     offset as Integer
 End Type
 
+@Reasoning:
+A local or global variable. is_type_stable is the critical Julia
+performance property - methods that are type-stable can be specialized
+to monomorphic machine code; type-unstable code forces boxing.
+@End Reasoning
+@Implementation:
+8 fields. first/last assignment lines are used by liveness analysis.
+@End Implementation
 Type called "JuliaVariable":
     name as String
     type as JuliaType
@@ -128,6 +213,14 @@ Type called "JuliaVariable":
     is_type_stable as Boolean
 End Type
 
+@Reasoning:
+A `const` declaration. Value is stored as a textual literal because
+evaluation may depend on imports not yet resolved when the analyzer
+first sees it.
+@End Reasoning
+@Implementation:
+4 fields; value is the source-text form.
+@End Implementation
 Type called "JuliaConstant":
     name as String
     type as JuliaType
@@ -135,6 +228,14 @@ Type called "JuliaConstant":
     is_exported as Boolean
 End Type
 
+@Reasoning:
+A `macro` definition. hygiene_scope tracks the macro's identifier-
+capture context (Julia's hygienic macro system needs explicit scope
+tracking to avoid accidental name capture during expansion).
+@End Reasoning
+@Implementation:
+5 fields. body is kept as source text and re-parsed at each call site.
+@End Implementation
 Type called "JuliaMacro":
     name as String
     parameters as List[String]
@@ -143,6 +244,14 @@ Type called "JuliaMacro":
     hygiene_scope as String
 End Type
 
+@Reasoning:
+A typed diagnostic record with severity ("error"/"warning"/"info") and
+an error_code (e.g. "method-ambiguity", "type-instability") so consumers
+can filter or batch by category.
+@End Reasoning
+@Implementation:
+5 fields.
+@End Implementation
 Type called "JuliaSemanticError":
     message as String
     line as Integer
@@ -155,6 +264,15 @@ Note: ==========================================================================
 Note: MAIN SEMANTIC ANALYSIS ENTRY POINT
 Note: ============================================================================
 
+@Reasoning:
+Top-level pipeline: create main context, load Julia Base, walk the AST,
+run method resolution, run type inference, validate. Each phase reads
+from and updates the shared context.
+@End Reasoning
+@Implementation:
+Create main context; load base; analyze AST recursively; call
+resolve_julia_methods and infer_julia_types; validate; return context.
+@End Implementation
 Process called "analyze_julia_semantics" that takes ast as JuliaSemNode returns JuliaSemanticContext:
     Note: Main entry point for Julia semantic analysis
 
@@ -183,6 +301,14 @@ Process called "analyze_julia_semantics" that takes ast as JuliaSemNode returns 
     Return context
 End Process
 
+@Reasoning:
+Constructs a fresh root-level context with empty Main module and empty
+lookup tables. Used as the seed for the recursive analyzer.
+@End Reasoning
+@Implementation:
+Build a JuliaSemanticContext value with current_module=Main, no parent,
+fresh empty lists and dictionaries for all tracking fields.
+@End Implementation
 Process called "create_main_julia_context" that takes nothing returns JuliaSemanticContext:
     Note: Create the main semantic context with Julia Main module
 
@@ -215,6 +341,17 @@ Process called "create_main_julia_context" that takes nothing returns JuliaSeman
     Return context
 End Process
 
+@Reasoning:
+Populates the context with Julia's Base module: core types, base types,
+core/base/math/array/string/io functions, macros, and performance
+modules. Mirrors Julia's actual Base initialization order so name
+resolution works the same as Julia's REPL on identical source.
+@End Reasoning
+@Implementation:
+Sequentially calls the load_julia_*_types and load_julia_*_functions
+helpers; the order matters because some functions reference types
+defined in earlier load steps.
+@End Implementation
 Process called "load_julia_base" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load Julia Base module and core functions
 
@@ -243,6 +380,14 @@ Process called "load_julia_base" that takes ctx as JuliaSemanticContext returns 
     Call load_julia_performance_modules with ctx
 End Process
 
+@Reasoning:
+Registers Julia's core abstract types: Any (top), Number, Real, Integer,
+AbstractFloat, AbstractString, Function. These are the parents of every
+concrete type and must exist before concrete type registration.
+@End Reasoning
+@Implementation:
+Add each core type to ctx.type_cache by name.
+@End Implementation
 Process called "load_julia_core_types" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load Julia Core module types
 
@@ -262,6 +407,15 @@ Process called "load_julia_core_types" that takes ctx as JuliaSemanticContext re
     End For
 End Process
 
+@Reasoning:
+Registers concrete Julia Base types: Int64, Float64, Bool, String,
+Char, Array, Tuple, Dict, Set, etc. These are the workhorse types and
+must reference the core abstract types loaded by load_julia_core_types.
+@End Reasoning
+@Implementation:
+For each base type, build a JuliaType with proper super_type (e.g.
+Int64's super is Integer) and add to type_cache.
+@End Implementation
 Process called "load_julia_base_types" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load Julia Base module types
 
@@ -302,6 +456,15 @@ Process called "load_julia_base_types" that takes ctx as JuliaSemanticContext re
     End For
 End Process
 
+@Reasoning:
+Registers core Julia Base functions: println, print, error, throw,
+typeof, isa, identity. These are pervasive and resolution against them
+is the most common case in any Julia program.
+@End Reasoning
+@Implementation:
+For each core function, build a JuliaMethod with parameter types and
+add to ctx.method_table.
+@End Implementation
 Process called "load_julia_core_functions" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load Julia Core module functions
 
@@ -324,6 +487,15 @@ Process called "load_julia_core_functions" that takes ctx as JuliaSemanticContex
     End For
 End Process
 
+@Reasoning:
+Loads commonly-used Base functions: length, size, push!, pop!, append!,
+deleteat!, isempty, copy. These are the standard collection-manipulation
+primitives.
+@End Reasoning
+@Implementation:
+Add methods to ctx.method_table; some functions are mutating (suffix `!`)
+which is tracked as part of the name string.
+@End Implementation
 Process called "load_julia_base_functions" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load Julia Base module functions
 
@@ -350,6 +522,14 @@ Process called "load_julia_base_functions" that takes ctx as JuliaSemanticContex
     End For
 End Process
 
+@Reasoning:
+Mathematical functions: sin, cos, exp, log, sqrt, abs, round, floor,
+ceil, +/-/*/etc. as functions, comparison operators. These have multiple
+methods (one per numeric type) which the dispatcher selects between.
+@End Reasoning
+@Implementation:
+Register the math function names and their per-type method signatures.
+@End Implementation
 Process called "load_julia_math_functions" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load Julia mathematical functions
 
@@ -382,6 +562,14 @@ Process called "load_julia_math_functions" that takes ctx as JuliaSemanticContex
     End For
 End Process
 
+@Reasoning:
+Array-specific operations: map, filter, reduce, sort, reverse, broadcast,
+indexing. These are heavily used in numerical Julia code.
+@End Reasoning
+@Implementation:
+Register each array function's methods with parameter types involving
+the parametric Array{T,N} type.
+@End Implementation
 Process called "load_julia_array_functions" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load Julia array manipulation functions
 
@@ -408,6 +596,15 @@ Process called "load_julia_array_functions" that takes ctx as JuliaSemanticConte
     End For
 End Process
 
+@Reasoning:
+String-specific operations: length, replace, split, join, uppercase,
+lowercase, occursin, startswith, endswith. The cost of these in Julia is
+non-trivial because String is internally UTF-8 so byte != char.
+@End Reasoning
+@Implementation:
+Register string-method signatures with String/AbstractString parameter
+types.
+@End Implementation
 Process called "load_julia_string_functions" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load Julia string manipulation functions
 
@@ -429,6 +626,14 @@ Process called "load_julia_string_functions" that takes ctx as JuliaSemanticCont
     End For
 End Process
 
+@Reasoning:
+I/O functions: open, close, read, write, readline, eof, IOBuffer. These
+all return values of IO subtypes whose method dispatch matters for
+proper type inference downstream.
+@End Reasoning
+@Implementation:
+Register each I/O function's methods.
+@End Implementation
 Process called "load_julia_io_functions" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load Julia I/O functions
 
@@ -450,6 +655,15 @@ Process called "load_julia_io_functions" that takes ctx as JuliaSemanticContext 
     End For
 End Process
 
+@Reasoning:
+Built-in macros: @inline, @noinline, @inbounds, @simd, @assert, @show.
+The performance ones must be recognized to enable corresponding codegen
+flags.
+@End Reasoning
+@Implementation:
+Register each macro into ctx.macro_definitions with its parameter list
+and body.
+@End Implementation
 Process called "load_julia_core_macros" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load Julia core macros
 
@@ -472,6 +686,16 @@ Process called "load_julia_core_macros" that takes ctx as JuliaSemanticContext r
     End For
 End Process
 
+@Reasoning:
+Loads Julia's performance-related stdlib modules: LinearAlgebra, SIMD,
+Threads, Distributed. Even if the user code doesn't explicitly `using`
+them, having them registered lets the analyzer resolve qualified
+references like `Threads.@spawn`.
+@End Reasoning
+@Implementation:
+For each performance module, register its name and key exports in
+ctx.using_statements / type cache / method table.
+@End Implementation
 Process called "load_julia_performance_modules" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Load performance-related modules
 
@@ -498,6 +722,16 @@ Note: ==========================================================================
 Note: AST NODE ANALYSIS
 Note: ============================================================================
 
+@Reasoning:
+Central AST walker. Dispatches on node_type string to handlers for
+function definitions, method calls, type definitions, module
+declarations, etc. Generic nodes recurse over their child fields.
+@End Reasoning
+@Implementation:
+Switch on node.node_type comparing to "function_def", "call",
+"type_def", "module_def", "macro_def", etc., dispatching each to its
+analyzer. Default falls through to recursing over child fields.
+@End Implementation
 Process called "analyze_julia_node" that takes node as JuliaSemNode, ctx as JuliaSemanticContext returns Nothing:
     Note: Analyze any Julia AST node based on its type
 
@@ -551,6 +785,17 @@ Process called "analyze_julia_node" that takes node as JuliaSemNode, ctx as Juli
     End Match
 End Process
 
+@Reasoning:
+Function definition handler: build a JuliaMethod from the AST node's
+name, parameters, where clause, return type, and body. The method gets
+added to the dispatch table - multiple methods with the same name but
+different parameter types coexist in the table.
+@End Reasoning
+@Implementation:
+Extract function_name, parameters with their types, where_clause
+constraints, return_type. Build JuliaMethodSignature and JuliaMethod;
+call add_method_to_table.
+@End Implementation
 Process called "analyze_julia_function_def" that takes node as JuliaSemNode, ctx as JuliaSemanticContext returns Nothing:
     Note: Analyze Julia function definition
 
@@ -624,6 +869,16 @@ Process called "analyze_julia_function_def" that takes node as JuliaSemNode, ctx
     End If
 End Process
 
+@Reasoning:
+Resolve a method call by inferring the argument types, then asking the
+dispatcher to find the best-matching method in the method_table. Records
+the resolution result for the codegen layer to use.
+@End Reasoning
+@Implementation:
+For each argument call infer_julia_expression_type; call resolve_julia_method
+with the function name and inferred types; record the chosen method (or
+report ambiguity/no-match error).
+@End Implementation
 Process called "analyze_julia_method_call" that takes node as JuliaSemNode, ctx as JuliaSemanticContext returns Nothing:
     Note: Analyze Julia method call with multiple dispatch
 
@@ -677,6 +932,17 @@ Note: ==========================================================================
 Note: TYPE INFERENCE AND METHOD RESOLUTION
 Note: ============================================================================
 
+@Reasoning:
+Infers the type of a Julia expression: literal -> known concrete type;
+identifier -> variable's recorded type; method call -> return type of
+resolved method; etc. The result feeds back into dispatch decisions.
+@End Reasoning
+@Implementation:
+Switch on expr.node_type. Literals return matching concrete types
+(Int64/Float64/Bool/String). Identifiers look up the variable in the
+current scope. Calls recursively resolve and return the method's
+return_type. Default: Any.
+@End Implementation
 Process called "infer_julia_expression_type" that takes expr as JuliaSemNode, ctx as JuliaSemanticContext returns JuliaType:
     Note: Infer the type of a Julia expression
 
@@ -716,6 +982,18 @@ Process called "infer_julia_expression_type" that takes expr as JuliaSemNode, ct
     End Match
 End Process
 
+@Reasoning:
+The core of Julia's multiple-dispatch: given a function name and the
+concrete argument types, find the most specific method in the method
+table. Tie-breaking follows Julia's specificity rules (more specific
+type parameters beat less specific ones).
+@End Reasoning
+@Implementation:
+Look up the method list for func_name. For each candidate, check
+parameter-type compatibility with arg_types (allowing subtype relations).
+Rank matches by specificity; return the best match or null with an
+appropriate error.
+@End Implementation
 Process called "resolve_julia_method" that takes func_name as String, arg_types as List[JuliaType], type_args as List[JuliaType], ctx as JuliaSemanticContext returns JuliaMethod:
     Note: Resolve method using Julia's multiple dispatch rules
 
@@ -755,6 +1033,16 @@ Process called "resolve_julia_method" that takes func_name as String, arg_types 
     Return most_specific
 End Process
 
+@Reasoning:
+Post-analysis pass that walks every recorded call site and finalizes
+method resolution. Some sites couldn't be resolved during the initial
+walk because forward-referenced methods hadn't been seen yet; this pass
+catches them.
+@End Reasoning
+@Implementation:
+Iterate ctx's recorded method-call sites; for each, re-run
+resolve_julia_method now that the full method_table is populated.
+@End Implementation
 Process called "resolve_julia_methods" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Resolve all method calls in the context
 
@@ -762,6 +1050,16 @@ Process called "resolve_julia_methods" that takes ctx as JuliaSemanticContext re
     Note: Implementation depends on tracking method calls during analysis
 End Process
 
+@Reasoning:
+Fixed-point type inference pass over the analyzed program. Variables
+whose types depend on later-resolved methods can now be settled. Marks
+type-stable vs type-unstable variables for the optimizer.
+@End Reasoning
+@Implementation:
+Iterate over scopes/variables; for each, re-infer type using
+infer_julia_expression_type with the now-complete method_table; update
+ctx with the refined types.
+@End Implementation
 Process called "infer_julia_types" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Perform global type inference
 
@@ -773,6 +1071,14 @@ Note: ==========================================================================
 Note: HELPER FUNCTIONS
 Note: ============================================================================
 
+@Reasoning:
+Appends a method to the method_table for its function name. Multiple
+methods per name are expected (this is multiple dispatch).
+@End Reasoning
+@Implementation:
+Look up the list at method_table[method.name]; create an empty list if
+absent; append the method.
+@End Implementation
 Process called "add_method_to_table" that takes method as JuliaMethod, ctx as JuliaSemanticContext returns Nothing:
     Note: Add method to the global method table
 
@@ -786,6 +1092,15 @@ Process called "add_method_to_table" that takes method as JuliaMethod, ctx as Ju
     Set ctx.method_table at key func_name to method_list
 End Process
 
+@Reasoning:
+Final pass that emits diagnostics for unresolved references, method
+ambiguities, type instabilities, undefined variables. Runs after all
+other passes so it can see the complete picture.
+@End Reasoning
+@Implementation:
+Walk ctx's tracking structures; for each violation append to
+error_list/warning_list with appropriate severity and error_code.
+@End Implementation
 Process called "validate_julia_semantics" that takes ctx as JuliaSemanticContext returns Nothing:
     Note: Perform final semantic validation
 
@@ -806,6 +1121,13 @@ Note: ==========================================================================
 Note: TYPE CREATION HELPERS
 Note: ============================================================================
 
+@Reasoning:
+Convenience factory for the universal Any type. Used as a fallback when
+type inference can't determine a more specific type.
+@End Reasoning
+@Implementation:
+Returns a JuliaType named "Any" with no super (it IS the top).
+@End Implementation
 Process called "create_any_julia_type" that takes nothing returns JuliaType:
     Return a value of type JuliaType with
         name as "Any",
@@ -822,6 +1144,14 @@ Process called "create_any_julia_type" that takes nothing returns JuliaType:
         alignment as 8
 End Process
 
+@Reasoning:
+The 64-bit signed-integer concrete type, the most common Julia
+numerical type and the default for integer literals on 64-bit platforms.
+@End Reasoning
+@Implementation:
+Returns a JuliaType named "Int64", is_primitive=true, size_bytes=8,
+alignment=8, super_type=Signed.
+@End Implementation
 Process called "create_int64_julia_type" that takes nothing returns JuliaType:
     Let parent_type be lookup_julia_type with "Signed"
     Return a value of type JuliaType with
@@ -839,6 +1169,14 @@ Process called "create_int64_julia_type" that takes nothing returns JuliaType:
         alignment as 8
 End Process
 
+@Reasoning:
+IEEE 754 double-precision floating point; default for floating-point
+literals in Julia.
+@End Reasoning
+@Implementation:
+Returns JuliaType named "Float64", is_primitive=true, size_bytes=8,
+alignment=8, super_type=AbstractFloat.
+@End Implementation
 Process called "create_float64_julia_type" that takes nothing returns JuliaType:
     Let parent_type be lookup_julia_type with "AbstractFloat"
     Return a value of type JuliaType with
@@ -856,6 +1194,14 @@ Process called "create_float64_julia_type" that takes nothing returns JuliaType:
         alignment as 8
 End Process
 
+@Reasoning:
+Boolean type for conditionals and comparison results. In Julia, Bool is
+a subtype of Integer (so booleans behave as 0/1 in arithmetic).
+@End Reasoning
+@Implementation:
+Returns JuliaType named "Bool", is_primitive=true, size_bytes=1,
+alignment=1, super_type=Integer.
+@End Implementation
 Process called "create_bool_julia_type" that takes nothing returns JuliaType:
     Let parent_type be lookup_julia_type with "Integer"
     Return a value of type JuliaType with
@@ -873,6 +1219,15 @@ Process called "create_bool_julia_type" that takes nothing returns JuliaType:
         alignment as 1
 End Process
 
+@Reasoning:
+Julia's UTF-8 immutable String type, distinct from AbstractString abstract
+parent. Not primitive (has internal char buffer) so size_bytes=0
+(variable size).
+@End Reasoning
+@Implementation:
+Returns JuliaType named "String", is_primitive=false, is_composite=true,
+super_type=AbstractString.
+@End Implementation
 Process called "create_string_julia_type" that takes nothing returns JuliaType:
     Let parent_type be lookup_julia_type with "AbstractString"
     Return a value of type JuliaType with
@@ -890,6 +1245,14 @@ Process called "create_string_julia_type" that takes nothing returns JuliaType:
         alignment as 8
 End Process
 
+@Reasoning:
+The generic Function type, supertype of every callable. Used when a
+caller passes a function value (first-class function) without
+specifying which specific function.
+@End Reasoning
+@Implementation:
+Returns JuliaType named "Function" with super_type=Any.
+@End Implementation
 Process called "create_function_julia_type" that takes nothing returns JuliaType:
     Return a value of type JuliaType with
         name as "Function",
@@ -907,6 +1270,14 @@ Process called "create_function_julia_type" that takes nothing returns JuliaType
 End Process
 
 Note: Entry point for Julia semantic analysis
+@Reasoning:
+Alternative public entry point that performs the same pipeline as
+analyze_julia_semantics. Kept as a separate name for backward
+compatibility with downstream callers.
+@End Reasoning
+@Implementation:
+Delegates to analyze_julia_semantics with the same AST input.
+@End Implementation
 Process called "analyze_julia_semantic_tree" that takes ast as JuliaSemNode returns JuliaSemanticContext:
     Return analyze_julia_semantics with ast
 End Process

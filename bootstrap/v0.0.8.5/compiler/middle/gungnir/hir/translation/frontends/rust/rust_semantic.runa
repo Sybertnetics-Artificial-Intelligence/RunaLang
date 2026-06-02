@@ -14,6 +14,23 @@ Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
+@Reasoning:
+Rust semantic analysis is a multi-pass operation: declarations must be
+collected before trait resolution can wire up impl blocks, which must
+complete before borrow checking can run with full type info. This
+analyzer struct carries the four substructures (lifetime context,
+borrow checker, trait resolver, type inference engine) that each pass
+needs, plus a scope stack for nested function/block visibility.
+@End Reasoning
+
+@Implementation:
+72-byte record (9 x i64). Offsets: global_scope (0, Dict for top-level
+names), current_scope (8, alias of global at start), scope_stack (16,
+List for push/pop nested scopes), lifetime_context (24), borrow_checker
+(32), trait_resolver (40), type_inference (48), error_message (56,
+owned StringCore copy), has_error (64, sticky flag).
+@End Implementation
+
 Type called "RustSemanticAnalyzer":
     global_scope as Integer
     current_scope as Integer
@@ -26,13 +43,25 @@ Type called "RustSemanticAnalyzer":
     has_error as Integer
 End Type
 
+@Reasoning:
+Initializes the full analyzer with all four substructures eagerly. Eager
+construction (versus lazy per-pass) keeps the per-program overhead in
+one place and means downstream passes never have to check for null
+substructure pointers. global_scope is aliased into current_scope so
+the first scope_push/pop operates correctly without a separate init.
+@End Reasoning
+
+@Implementation:
+72-byte allocation, OOM short-circuit to 0. Builds global_scope (Dict),
+scope_stack (List), and the four substructure objects in independent
+calls. The duplicated set of global_scope into offsets 0 and 8 makes
+current_scope a moving cursor that starts identical to global; later
+scope_push will displace it without affecting the global reference.
+Has_error (offset 64) and error_message (offset 56) initialise to 0.
+@End Implementation
+
 Process called "create_rust_semantic_analyzer" returns Integer:
     Note: Create Rust semantic analyzer with borrow checker
-
-    @Reasoning:
-    Initialize comprehensive semantic analyzer including lifetime tracking,
-    borrow checking, trait resolution, and type inference systems.
-    @End Reasoning
 
     Let analyzer_size be 72
     Let analyzer be proc allocate from Layout with analyzer_size
@@ -61,13 +90,26 @@ Process called "create_rust_semantic_analyzer" returns Integer:
     Return analyzer
 End Process
 
+@Reasoning:
+Three-phase orchestrator: declarations first (for forward references),
+then trait resolution and type inference, then borrow/ownership
+checking. The order is dictated by Rust's semantic model — borrow rules
+need types resolved, types need traits resolved, traits need all impls
+known. Reversing any pair would produce false-negatives where forward
+references look unresolved.
+@End Reasoning
+
+@Implementation:
+Validates analyzer and program_node up-front (returns 0 with sticky
+error on null program). Invokes collect_rust_declarations,
+resolve_rust_traits, and check_rust_ownership in fixed order. After
+all three, checks has_error at offset 64; returns 0 on error or 1 on
+clean analysis. Each phase mutates analyzer substructures rather than
+returning new data — the analyzer itself is the result.
+@End Implementation
+
 Process called "analyze_rust_program" takes analyzer as Integer, program_node as Integer returns Integer:
     Note: Perform complete semantic analysis on Rust program
-
-    @Reasoning:
-    Comprehensive analysis including ownership verification, borrow checking,
-    lifetime parameter validation, trait coherence, and type inference.
-    @End Reasoning
 
     If analyzer is equal to 0:
         Return 0
@@ -95,13 +137,25 @@ Process called "analyze_rust_program" takes analyzer as Integer, program_node as
     Return 1
 End Process
 
+@Reasoning:
+Tree walker that descends into the AST seeking function bodies, where
+the actual borrow-check rules apply. Non-function nodes are recursed
+through (modules, impls) without any per-node ownership state because
+ownership is body-local in Rust; only `fn` introduces a new scope where
+moves and borrows can be tracked.
+@End Reasoning
+
+@Implementation:
+Null-guards the node, reads tag at offset 0. On RUST_FUNCTION delegates
+to check_function_ownership and returns (does not recurse into the
+function body — that's the function checker's job). Otherwise iterates
+children at offset 32 and recurses. The early-return on function nodes
+prevents nested function definitions from being checked in the outer
+function's borrow context.
+@End Implementation
+
 Process called "check_rust_ownership" takes analyzer as Integer, node as Integer:
     Note: Check ownership and borrowing rules
-
-    @Reasoning:
-    Implement Rust's ownership system including move semantics, borrowing
-    rules, lifetime parameter validation, and reference aliasing checks.
-    @End Reasoning
 
     If node is equal to 0:
         Return
@@ -127,6 +181,23 @@ Process called "check_rust_ownership" takes analyzer as Integer, node as Integer
         End While
     End If
 End Process
+
+@Reasoning:
+Per-function ownership scope manager. Establishes a borrow-checker
+scope, processes parameters (which may move or borrow), walks the
+body once, then exits the scope to validate that no outstanding
+borrows escape. Symmetrical enter/exit is required for the borrow
+checker to maintain its invariant that scopes nest cleanly.
+@End Reasoning
+
+@Implementation:
+Reads borrow_checker pointer at analyzer offset 32. Calls
+enter_borrow_scope, then analyze_function_parameters_ownership to
+register parameter ownership patterns, then walks children at offset
+32 calling analyze_ownership_in_block on each. exit_borrow_scope is
+called unconditionally at the end — fail-fast semantics rely on
+set_rust_semantic_error rather than early return for error paths.
+@End Implementation
 
 Process called "check_function_ownership" takes analyzer as Integer, func_node as Integer:
     Note: Check ownership rules within function body
@@ -155,17 +226,27 @@ Process called "check_function_ownership" takes analyzer as Integer, func_node a
     proc exit_borrow_scope from borrow_checker
 End Process
 
+@Reasoning:
+Rust function parameters can have different ownership patterns:
+by value (takes ownership), by immutable reference (&T), by mutable
+reference (&mut T), and the self variants (self/&self/&mut self).
+Each pattern has different implications for the borrow checker: a
+by-value parameter consumes the argument, a borrow tracks the
+argument as live but unconsumed, a mutable borrow excludes any other
+borrows of the same source until this scope exits.
+@End Reasoning
+
+@Implementation:
+Reads func_node children at offset 32. Returns early if children is
+0 (zero-arg function). Iterates the list filtering on
+RUST_PARAMETER tag at child offset 0, dispatching each parameter
+through analyze_parameter_ownership which inspects the type-spec
+string for `&` and `mut` markers. Non-parameter children (return
+type annotation, where clauses) are skipped.
+@End Implementation
+
 Process called "analyze_function_parameters_ownership" takes analyzer as Integer, func_node as Integer:
     Note: Analyze function parameters for ownership transfer patterns
-
-    @Reasoning:
-    Rust function parameters can have different ownership patterns:
-    - By value (takes ownership)
-    - By reference (&T - immutable borrow)
-    - By mutable reference (&mut T - mutable borrow)
-    - Self variants (self, &self, &mut self)
-    Each pattern has different implications for the borrow checker.
-    @End Reasoning
 
     Let borrow_checker be proc memory_get_int64 from Layout with analyzer, 32
     Let children be proc memory_get_int64 from Layout with func_node, 32
@@ -187,6 +268,27 @@ Process called "analyze_function_parameters_ownership" takes analyzer as Integer
         Set i to i plus 1
     End While
 End Process
+
+@Reasoning:
+Per-parameter dispatch based on the type string. The lexical
+distinction between move, immutable borrow, and mutable borrow lives
+entirely in the type-spec prefix — the borrow checker only cares
+about which of three states this parameter induces, not the underlying
+type. Missing type annotations are a hard error because parameter
+ownership cannot be inferred without type info.
+@End Reasoning
+
+@Implementation:
+Pulls param_name from offset 8 and param_type from offset 16 (the
+type AST node, not the type string). If param_type is null, emits a
+"Parameter missing type annotation" error via set_rust_semantic_error
+and returns. Otherwise reads the type's string representation from
+type offset 8 and dispatches: leading `&` plus `mut` substring
+=> register_mutable_borrow; leading `&` alone => register_immutable_borrow;
+no `&` => register_move_semantics. The starts_with/contains pair is
+used because Rust types can be complex (`&mut [u8]`, `&'a Vec<T>`)
+and a simple prefix check would mis-classify them.
+@End Implementation
 
 Process called "analyze_parameter_ownership" takes analyzer as Integer, param as Integer:
     Note: Analyze ownership semantics of individual parameter
@@ -217,14 +319,28 @@ Process called "analyze_parameter_ownership" takes analyzer as Integer, param as
     End If
 End Process
 
+@Reasoning:
+Dispatches each statement kind to its specialised ownership checker.
+Five statement forms have distinct ownership effects: let-binding
+(introduces a new variable, may move from initializer), assignment
+(may overwrite-then-drop), function call (may move arguments), method
+call (may consume self), and return (always moves out). Other
+statement kinds (block, if, while) need no ownership-specific work
+beyond recursing into children.
+@End Reasoning
+
+@Implementation:
+Tag at offset 0 selects the per-kind handler. After per-kind dispatch
+unconditionally recurses through children at offset 32 so nested
+blocks, conditionals, and loops inherit the same checking. Recursion
+is post-dispatch so a let-binding's initializer is checked through
+the let handler first, then its children pick up any nested expressions.
+Block-level scope push/pop is the borrow checker's job — this routine
+only walks structure.
+@End Implementation
+
 Process called "analyze_ownership_in_block" takes analyzer as Integer, block_node as Integer:
     Note: Analyze ownership patterns within code blocks
-
-    @Reasoning:
-    Block analysis must track variable moves, borrows, and lifetimes.
-    Variables can be moved (consumed), borrowed immutably or mutably,
-    and must respect Rust's ownership rules throughout their scope.
-    @End Reasoning
 
     If block_node is equal to 0:
         Return
@@ -258,6 +374,25 @@ Process called "analyze_ownership_in_block" takes analyzer as Integer, block_nod
     End If
 End Process
 
+@Reasoning:
+Let bindings are the primary ownership-introducing form in Rust. Three
+cases matter: `let y = x` moves x into y (or copies if x is Copy);
+`let y = &x` borrows x immutably; `let y = &mut x` borrows mutably.
+Each case must be reflected in the borrow checker so subsequent uses
+of x are checked correctly.
+@End Reasoning
+
+@Implementation:
+Reads var_name (offset 8) and initializer (offset 16). When initializer
+exists, branches on its tag at offset 0: RUST_IDENTIFIER triggers a
+check_move_or_borrow which examines the source variable's type to
+decide move vs copy; RUST_BORROW (a `&expr`) reads the borrowed
+identifier from initializer offset 8 and the mutability flag from
+offset 16, then registers an immutable or mutable borrow. After the
+move/borrow analysis, unconditionally registers var_name as a new
+variable in the current scope.
+@End Implementation
+
 Process called "analyze_let_binding_ownership" takes analyzer as Integer, let_node as Integer:
     Note: Analyze ownership transfer in let bindings
 
@@ -290,6 +425,23 @@ Process called "analyze_let_binding_ownership" takes analyzer as Integer, let_no
     proc register_variable with borrow_checker, var_name
 End Process
 
+@Reasoning:
+Assignment (x = y) is distinct from let-binding in two ways: the target
+already exists (so the borrow checker must verify its current state
+allows writing) and the previous value is dropped before the new one
+lands. The drop semantics matter because the previous value's lifetime
+ends here, freeing any borrows it held.
+@End Reasoning
+
+@Implementation:
+Reads target at offset 8 and value at offset 16. Both must be non-null
+to proceed. Only RUST_IDENTIFIER on the value side triggers a move
+check via check_assignment_move; literal-valued and computed assignments
+don't move anything. The target name is pulled from target offset 8.
+Complex targets (field access, indexing) are not currently treated as
+moves of the parent — that's a known gap for a later patch.
+@End Implementation
+
 Process called "analyze_assignment_ownership" takes analyzer as Integer, assign_node as Integer:
     Note: Analyze ownership in assignment expressions
 
@@ -309,6 +461,23 @@ Process called "analyze_assignment_ownership" takes analyzer as Integer, assign_
     End If
 End Process
 
+@Reasoning:
+A function call may move each argument depending on the corresponding
+parameter's ownership pattern. Per-argument analysis is delegated to
+analyze_argument_ownership; this routine's job is just to iterate the
+argument list. Argument-to-parameter type matching for ownership
+inference relies on the trait_resolver having already resolved the
+called function's signature.
+@End Reasoning
+
+@Implementation:
+Reads args list pointer at call_node offset 16 (offset 8 holds the
+callee). Returns immediately if args is null (zero-arg call). Iterates
+the list calling analyze_argument_ownership on each element. The
+return value of the call is not handled here — that's expression
+context, attended to by the parent expression's analysis.
+@End Implementation
+
 Process called "analyze_function_call_ownership" takes analyzer as Integer, call_node as Integer:
     Note: Analyze ownership transfer in function calls
 
@@ -325,6 +494,25 @@ Process called "analyze_function_call_ownership" takes analyzer as Integer, call
         End While
     End If
 End Process
+
+@Reasoning:
+Per-argument ownership classification: identifier arguments may be
+moved (check_variable_usage decides based on the variable's Copy-ness
+and current borrow state); borrow arguments (&x, &mut x) register
+a borrow for the duration of the call but do not move the source.
+Literal arguments and computed expressions need no borrow-checker
+interaction since they have no prior owner.
+@End Reasoning
+
+@Implementation:
+Reads tag at offset 0. On RUST_IDENTIFIER reads variable name from
+offset 8 and calls check_variable_usage on the borrow checker (which
+verifies the variable is currently usable and may flip it to a moved
+state). On RUST_BORROW reads the inner expression from offset 8 and
+its identifier name from inner offset 8, then calls check_borrow_validity.
+Other expression kinds (literals, calls, blocks) are no-ops here —
+their subexpressions will be visited via the recursive walker.
+@End Implementation
 
 Process called "analyze_argument_ownership" takes analyzer as Integer, arg as Integer:
     Note: Analyze ownership of function call arguments
@@ -344,6 +532,24 @@ Process called "analyze_argument_ownership" takes analyzer as Integer, arg as In
     End If
 End Process
 
+@Reasoning:
+Method calls have an additional ownership consideration beyond regular
+function calls: the receiver (the value the method is called on) may
+be consumed (`self`), borrowed immutably (`&self`), or borrowed mutably
+(`&mut self`). Receiver handling must precede argument handling because
+some receiver patterns invalidate subsequent argument borrows of the
+same root.
+@End Reasoning
+
+@Implementation:
+Reads receiver from offset 8. When receiver is an RUST_IDENTIFIER,
+extracts the variable name from offset 8 and calls
+check_method_receiver_ownership which inspects the method signature
+(via trait_resolver) to decide self vs &self vs &mut self. Then
+delegates to analyze_function_call_ownership to handle the argument
+list, which lives at the same offset layout as regular calls.
+@End Implementation
+
 Process called "analyze_method_call_ownership" takes analyzer as Integer, call_node as Integer:
     Note: Analyze ownership in method calls (including self consumption)
 
@@ -362,6 +568,24 @@ Process called "analyze_method_call_ownership" takes analyzer as Integer, call_n
     proc analyze_function_call_ownership with analyzer, call_node
 End Process
 
+@Reasoning:
+Return statements move their expression value out of the function
+scope. For identifier returns this means the returned variable is
+consumed and can't be used afterward (though in practice nothing
+follows a return in straight-line code). The check is still required
+because lifetime analysis needs to see that any borrows held by the
+returned value escape the function and must outlive the caller.
+@End Reasoning
+
+@Implementation:
+Reads return_expr at offset 8; null-guards. When the expression is
+RUST_IDENTIFIER, extracts var_name from expression offset 8 and calls
+check_return_ownership on the borrow checker, which records the move
+and flags any outstanding borrows that should now be invalidated.
+Other expression kinds (literals, calls) are not analysed here — the
+walker covers them recursively.
+@End Implementation
+
 Process called "analyze_return_ownership" takes analyzer as Integer, return_node as Integer:
     Note: Analyze ownership transfer in return statements
 
@@ -377,15 +601,26 @@ Process called "analyze_return_ownership" takes analyzer as Integer, return_node
     End If
 End Process
 
+@Reasoning:
+Phase 1 of semantic analysis must collect all type definitions, trait
+implementations, function signatures, and module declarations before
+performing detailed analysis. This enables forward references (a
+function calling another defined below it) and proper trait coherence
+checking (which requires knowing all impl blocks before deciding
+overlap).
+@End Reasoning
+
+@Implementation:
+Reads program children at offset 32. Iterates the list dispatching
+each top-level child to its kind-specific collector based on the tag
+at offset 0: RUST_STRUCT, RUST_ENUM, RUST_TRAIT, RUST_IMPL, RUST_FUNCTION.
+Unknown top-level kinds (modules, use statements) are skipped — this
+single-file analysis doesn't model the module graph. global_scope at
+offset 0 is the canonical name table populated by each collector.
+@End Implementation
+
 Process called "collect_rust_declarations" takes analyzer as Integer, program_node as Integer:
     Note: Collect all declarations for trait resolution and type checking
-
-    @Reasoning:
-    Phase 1 of semantic analysis must collect all type definitions,
-    trait implementations, function signatures, and module declarations
-    before performing detailed analysis. This enables forward references
-    and proper trait coherence checking.
-    @End Reasoning
 
     If program_node is equal to 0:
         Return
@@ -418,14 +653,28 @@ Process called "collect_rust_declarations" takes analyzer as Integer, program_no
     End If
 End Process
 
+@Reasoning:
+Phase 2 performs trait resolution, type inference, and coherence
+checking. This must happen after declaration collection to handle
+forward references and complex trait bounds with associated types.
+The three sub-passes are ordered: resolve impls (wires up which type
+implements which trait) -> infer expression types (uses those impls
+to determine call return types) -> check trait bounds (verifies any
+where-clause constraints are satisfiable now that types are known).
+@End Reasoning
+
+@Implementation:
+Reads trait_resolver (offset 40) and type_inference (offset 48) sub-
+structure pointers. Invokes resolve_trait_implementations to walk all
+impl blocks registered in phase 1; then infer_expression_types to
+perform type inference across the AST using the resolved impl table;
+finally check_trait_bounds to validate where-clauses and bounds. No
+return value — errors are recorded via the analyzer's sticky-error
+mechanism rather than returned here.
+@End Implementation
+
 Process called "resolve_rust_traits" takes analyzer as Integer, program_node as Integer:
     Note: Resolve trait bounds and perform type inference
-
-    @Reasoning:
-    Phase 2 performs trait resolution, type inference, and coherence checking.
-    This must happen after declaration collection to handle forward references
-    and complex trait bounds with associated types.
-    @End Reasoning
 
     Let trait_resolver be proc memory_get_int64 from Layout with analyzer, 40
     Let type_inference be proc memory_get_int64 from Layout with analyzer, 48
@@ -440,6 +689,20 @@ Process called "resolve_rust_traits" takes analyzer as Integer, program_node as 
     proc check_trait_bounds with trait_resolver, program_node
 End Process
 
+@Reasoning:
+Indexes a struct declaration into global_scope keyed by name so later
+passes (trait resolution, type inference) can resolve references to
+the struct by name. Struct field information lives on the AST node
+itself; this routine just registers the entry point.
+@End Reasoning
+
+@Implementation:
+Reads global_scope (analyzer offset 0) and struct_name (struct_node
+offset 8). On non-null name calls set on the Dict to register the
+mapping. Null names are skipped silently — the parser may emit them
+for malformed tuples or unit structs the user typed without identifier.
+@End Implementation
+
 Process called "collect_struct_declaration" takes analyzer as Integer, struct_node as Integer:
     Note: Collect struct type information for later resolution
 
@@ -450,6 +713,20 @@ Process called "collect_struct_declaration" takes analyzer as Integer, struct_no
         proc set from Dict with global_scope, struct_name, struct_node
     End If
 End Process
+
+@Reasoning:
+Indexes an enum declaration into global_scope. Enums are referenced
+by name throughout type expressions and match arms, so name->node
+indexing is what enables later resolution of `MyEnum::Variant`
+patterns and trait impls on the enum.
+@End Reasoning
+
+@Implementation:
+Reads global_scope (offset 0) and enum_name (enum_node offset 8).
+Non-null name triggers a Dict set; null name is silently skipped.
+Variant declarations live as children of the enum node and are
+not separately indexed — they're looked up via the parent enum.
+@End Implementation
 
 Process called "collect_enum_declaration" takes analyzer as Integer, enum_node as Integer:
     Note: Collect enum type information for later resolution
@@ -462,6 +739,20 @@ Process called "collect_enum_declaration" takes analyzer as Integer, enum_node a
     End If
 End Process
 
+@Reasoning:
+Traits go into the trait_resolver rather than global_scope because
+trait coherence checking (orphan rule, overlapping impl detection)
+needs a separate index. The trait resolver holds both definitions
+and impl blocks; this routine populates the definitions side.
+@End Reasoning
+
+@Implementation:
+Reads trait_resolver (analyzer offset 40) and trait_name (trait_node
+offset 8). On non-null name calls register_trait passing both the
+name and the node — the resolver wants the full AST for later
+inspection of supertraits, associated types, and default methods.
+@End Implementation
+
 Process called "collect_trait_declaration" takes analyzer as Integer, trait_node as Integer:
     Note: Collect trait information for trait resolution
 
@@ -473,12 +764,43 @@ Process called "collect_trait_declaration" takes analyzer as Integer, trait_node
     End If
 End Process
 
+@Reasoning:
+Impl blocks must be collected so the trait resolver can match calls
+to methods against the right impl. Coherence (orphan rule) and overlap
+checking happen later via check_trait_bounds; this routine just adds
+the impl to the list and lets the resolver index it later. Unlike
+struct/enum/trait, impl blocks have no name — they're identified by
+the trait+type pair.
+@End Reasoning
+
+@Implementation:
+Reads trait_resolver at offset 40 and calls register_impl with the
+impl_node. No name lookup or dict insertion here because impls are
+keyed by (trait_id, self_type) which the resolver computes from the
+node's children — not exposed through a simple name slot.
+@End Implementation
+
 Process called "collect_impl_declaration" takes analyzer as Integer, impl_node as Integer:
     Note: Collect trait implementation for coherence checking
 
     Let trait_resolver be proc memory_get_int64 from Layout with analyzer, 40
     proc register_impl with trait_resolver, impl_node
 End Process
+
+@Reasoning:
+Top-level functions are indexed by name in global_scope. Function
+signatures (parameters and return type) live on the AST node and are
+read by trait resolution when checking calls against trait method
+signatures and by type inference when resolving call return types.
+@End Reasoning
+
+@Implementation:
+Reads global_scope (offset 0) and func_name (func_node offset 8).
+Non-null name triggers a Dict set; null name is silently skipped
+(closures and lambda bodies have anonymous structure). Note this
+only handles top-level/free functions — methods inside impl blocks
+are registered separately via the impl collection path.
+@End Implementation
 
 Process called "collect_function_declaration" takes analyzer as Integer, func_node as Integer:
     Note: Collect function signature for type checking
@@ -490,6 +812,22 @@ Process called "collect_function_declaration" takes analyzer as Integer, func_no
         proc set from Dict with global_scope, func_name, func_node
     End If
 End Process
+
+@Reasoning:
+Lifetime context is a separate substructure because lifetime parameters
+have different scoping rules than ownership: a named lifetime `'a`
+threads through multiple impl blocks and trait bounds, while ownership
+is purely function-local. Splitting them lets each be reset
+independently at scope boundaries.
+@End Reasoning
+
+@Implementation:
+32-byte struct (4 x i64): lifetime_stack at offset 0 (List for nested
+scopes), named_lifetimes at offset 8 (Dict mapping `'a` name -> bound
+info), and two reserved slots at offsets 16 and 24 (currently zero —
+held for future fields like elision rule state or implicit-lifetime
+counters). OOM returns 0.
+@End Implementation
 
 Process called "create_lifetime_context" returns Integer:
     Note: Create lifetime tracking context for borrow checker
@@ -511,6 +849,21 @@ Process called "create_lifetime_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Borrow checker holds three primary data structures: scope_stack for
+nested block lexical scopes, active_borrows for the (source, borrow_kind)
+map, and moved_variables for variables that have been consumed.
+Reserved slots leave headroom for future state without re-allocating
+the struct (loan invalidation queue, two-phase borrow tracking, etc.).
+@End Reasoning
+
+@Implementation:
+48-byte struct (6 x i64). Offsets: scope_stack (0), active_borrows (8),
+moved_variables (16), then three reserved slots at 24/32/40 zero-init.
+OOM returns 0. Three sub-collections created up-front so subsequent
+operations never need to check for null sub-structures.
+@End Implementation
 
 Process called "create_borrow_checker" returns Integer:
     Note: Create borrow checker for ownership analysis
@@ -536,6 +889,21 @@ Process called "create_borrow_checker" returns Integer:
     Return checker
 End Process
 
+@Reasoning:
+Trait resolver indexes trait definitions, impl blocks, and a coherence
+cache. The cache is essential because method-lookup queries during type
+inference would otherwise repeatedly traverse the entire impl list;
+caching (trait, type) -> resolution lets each query be O(1) after the
+first lookup.
+@End Reasoning
+
+@Implementation:
+40-byte struct (5 x i64). Offsets: trait_definitions (0, Dict by trait
+name), impl_blocks (8, List of impl AST nodes), coherence_cache (16,
+Dict keyed on (trait_id, type_id)), then two reserved slots at 24/32
+for future fields like associated-type-binding tables. OOM returns 0.
+@End Implementation
+
 Process called "create_trait_resolver" returns Integer:
     Note: Create trait resolution engine
 
@@ -559,6 +927,22 @@ Process called "create_trait_resolver" returns Integer:
     Return resolver
 End Process
 
+@Reasoning:
+Type inference uses Hindley-Milner-style constraint generation and
+resolution. The engine separates type_variables (the universe of
+introduced unification variables) from constraints (equalities and
+subtype relations to be resolved). Splitting them lets the resolver
+add new constraints during unification without invalidating the
+variable iteration.
+@End Reasoning
+
+@Implementation:
+32-byte struct (4 x i64). Offsets: type_variables (0, Dict keyed by
+type-var id), constraints (8, List of constraint records). Two
+reserved slots at 16/24 for future fields (e.g., inference depth
+counter, unification log). OOM returns 0.
+@End Implementation
+
 Process called "create_type_inference_engine" returns Integer:
     Note: Create type inference system for generic resolution
 
@@ -579,6 +963,25 @@ Process called "create_type_inference_engine" returns Integer:
 
     Return engine
 End Process
+
+@Reasoning:
+Records the first error encountered. First-error-wins semantics avoid
+cascade failures where one borrow-check violation produces a stream of
+follow-on errors that obscure the original cause. The message is copied
+into a buffer the analyzer owns so the caller's transient string can
+be freed independently.
+@End Reasoning
+
+@Implementation:
+Writes 1 to has_error at offset 64 (sticky flag — never cleared by
+this routine). Calls copy_string from StringCore for an owned copy of
+the message, stores the pointer at offset 56 (error_message). No
+previous error message is freed here — first-set-wins, so subsequent
+calls silently overwrite the pointer slot but the underlying buffer
+from the first call leaks until the analyzer is destroyed. The analyzer
+destructor (not present in this file's API but implied by the contract)
+must release whatever is currently at offset 56.
+@End Implementation
 
 Process called "set_rust_semantic_error" takes analyzer as Integer, message as Integer:
     Note: Set semantic analyzer error state

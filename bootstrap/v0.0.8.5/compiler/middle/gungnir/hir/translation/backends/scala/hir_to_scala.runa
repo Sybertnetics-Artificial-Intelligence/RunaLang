@@ -102,6 +102,16 @@ Note: ==========================================================================
 Note: Translation Context Structure
 Note: ============================================================================
 
+@Reasoning:
+The translator bundles every piece of state the HIR-to-Scala pipeline must
+thread between routines: the line buffer (a List of strings), the indent
+counter (Scala convention: 2 spaces per level), the explicit and implicit
+import lists, the active package and class contexts, the HIR-to-Scala type
+mapping table, and a uniquifying counter for synthesised variable names.
+Fields are encoded as Integer slots because v0.0.8.5 stdlib Lists and
+Dictionaries are themselves Integer handles into the runtime; offsets
+0..56 are wired into every accessor in the file.
+@End Reasoning
 Type called "HIRToScalaTranslator":
     output_buffer as Integer        Note: Generated Scala code buffer
     indentation_level as Integer    Note: Current indentation level
@@ -117,15 +127,23 @@ Note: ==========================================================================
 Note: Translator Creation and Management
 Note: ============================================================================
 
+@Reasoning:
+Builds the eight-slot HIRToScalaTranslator that every emit path holds
+state in. Each slot is initialised to zero before the live collections
+are stamped in at offsets 0/16/40/48 so a half-constructed translator
+can be detected by destroy_hir_to_scala_translator via the
+"null pointer is a no-op" convention.
+@End Reasoning
+
+@Implementation:
+Allocates 64 bytes (8 slots * 8 bytes), bails on allocation failure
+with a zero return, zeroes every slot with memory_set_int64, then
+creates the three Lists (output buffer @0, import list @16, implicit
+imports @40) and one Dictionary (type mappings @48). Finally calls
+setup_scala_type_mappings to populate the HIR-to-Scala primitive map
+before returning the translator handle.
+@End Implementation
 Process called "create_hir_to_scala_translator" returns Integer:
-    Note: Create new HIR to Scala translator
-
-    @Reasoning:
-    Initializes translator with output buffer and Scala-specific context.
-    Sets up data structures needed for generating idiomatic Scala
-    with proper package management and imports.
-    @End Reasoning
-
     Let translator_size be 64  Note: 8 fields × 8 bytes each
     Let translator be proc allocate from Layout with translator_size
 
@@ -161,6 +179,13 @@ Process called "create_hir_to_scala_translator" returns Integer:
     Return translator
 End Process
 
+@Reasoning:
+The translator owns four collections (output buffer, explicit imports,
+implicit imports, type mapping table); each must be released in reverse
+allocation order. Treating a null translator as a no-op success allows
+this to be called unconditionally from error paths where
+create_hir_to_scala_translator itself failed.
+@End Reasoning
 Process called "destroy_hir_to_scala_translator" takes translator as Integer returns Integer:
     Note: Destroy translator and free all memory
 
@@ -196,14 +221,23 @@ Note: ==========================================================================
 Note: Code Generation Utilities
 Note: ============================================================================
 
+@Reasoning:
+Single source of formatting truth for the entire backend: every line of
+generated Scala flows through here, so all callers get a consistent
+two-space indent block driven by the translator's indentation counter at
+offset 8. The space tokens are pushed as separate list entries so the
+joiner stage in generate_scala_code can rebuild the final string without
+parsing back the spaces.
+@End Reasoning
+
+@Implementation:
+Reads output_buffer @0 and indentation_level @8 from the translator. In a
+loop bounded by indentation_level, allocates a fresh "  " string (two
+spaces - Scala convention) via create_string and appends it. Then appends
+the code pointer itself. The newline is NOT appended here; that is the
+responsibility of emit_scala_line when full-line semantics are desired.
+@End Implementation
 Process called "emit_scala_code" takes translator as Integer, code as Integer returns Integer:
-    Note: Emit Scala code to output buffer
-
-    @Reasoning:
-    Adds code string to output buffer with proper indentation.
-    Maintains formatting consistency throughout generated Scala code.
-    @End Reasoning
-
     Let output_buffer be proc memory_get_int64 from Layout with translator, 0
     Let indentation_level be proc memory_get_int64 from Layout with translator, 8
 
@@ -221,6 +255,14 @@ Process called "emit_scala_code" takes translator as Integer, code as Integer re
     Return 1
 End Process
 
+@Reasoning:
+The newline is appended after the indented code rather than as part of
+code itself so emit_scala_code can be reused for partial-line emission
+(emitting an open brace then continuing on the same line is needed for
+some Scala block forms). The newline is materialised as a fresh string
+because the underlying list_append takes ownership only of the pointer,
+not the storage lifetime.
+@End Reasoning
 Process called "emit_scala_line" takes translator as Integer, code as Integer returns Integer:
     Note: Emit line of Scala code with newline
 
@@ -232,6 +274,12 @@ Process called "emit_scala_line" takes translator as Integer, code as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Tracked as a counter rather than a pre-computed string because Scala emits
+indentation only at start-of-line and the actual whitespace is materialised
+by emit_scala_code on demand. The counter must be saved/restored around
+block emissions; that is the caller's responsibility, not this primitive's.
+@End Reasoning
 Process called "increase_indentation" takes translator as Integer returns Integer:
     Note: Increase indentation level
 
@@ -242,6 +290,13 @@ Process called "increase_indentation" takes translator as Integer returns Intege
     Return 1
 End Process
 
+@Reasoning:
+The guard against negative indentation is defensive: a balanced emitter
+should never call decrease without a matching prior increase, but a
+malformed HIR (e.g. an unbalanced HIR_BLOCK with mismatched open/close
+nodes) must not corrupt the entire emission with negative indent counts.
+The clamp to zero converts the malformed input into a graceful flat layout.
+@End Reasoning
 Process called "decrease_indentation" takes translator as Integer returns Integer:
     Note: Decrease indentation level
 
@@ -258,14 +313,23 @@ Note: ==========================================================================
 Note: HIR Module Translation
 Note: ============================================================================
 
+@Reasoning:
+Top-of-file ordering matters in Scala: the package declaration must
+precede every import, and Scala-stdlib implicits must be declared before
+user code so name resolution works. This routine therefore enforces the
+fixed sequence package -> user imports -> standard implicits ->
+declarations rather than delegating ordering to the caller.
+@End Reasoning
+
+@Implementation:
+Looks up "name" in the HIR module dictionary; if present, emits
+"package <name>" plus a blank line and caches the name into translator
+slot 24 for later qualified-symbol generation. Then looks up "imports"
+and forwards to translate_hir_imports if non-null, follows with
+emit_standard_scala_imports, and finally walks the "declarations" key
+through translate_hir_declarations.
+@End Implementation
 Process called "translate_hir_module" takes translator as Integer, hir_module as Integer returns Integer:
-    Note: Translate HIR module to Scala package/object
-
-    @Reasoning:
-    Translates complete HIR module to Scala with proper package declaration,
-    imports, and top-level declarations. Generates idiomatic Scala structure.
-    @End Reasoning
-
     Note: Get module name
     Let name_key be proc create_string from StringCore with "name"
     Let module_name be proc hashtable_get from Dict with hir_module, name_key
@@ -309,6 +373,14 @@ Process called "translate_hir_module" takes translator as Integer, hir_module as
     Return 1
 End Process
 
+@Reasoning:
+Three import lines are emitted unconditionally because almost every HIR
+shape produced by the universal translator requires them: immutable
+collections for HIR_LIST/HIR_TUPLE, Try/Success/Failure for HIR_TRY
+constructs, and scala.Function._ for the function composition operators
+emitted by translate_hir_lambda. Emitting them at the top once is
+cheaper than tracking per-construct dependencies.
+@End Reasoning
 Process called "emit_standard_scala_imports" takes translator as Integer returns Integer:
     Note: Emit standard Scala imports
 
@@ -330,6 +402,13 @@ Process called "emit_standard_scala_imports" takes translator as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+The walker simply iterates the HIR import list and delegates each entry
+to translate_hir_import. We keep this dispatcher as a thin loop rather
+than inlining the per-import logic so the recursion depth stays
+predictable and the per-import translation can be replaced in isolation
+when Scala 3 'using' clauses need different handling.
+@End Reasoning
 Process called "translate_hir_imports" takes translator as Integer, hir_imports as Integer returns Integer:
     Note: Translate HIR imports to Scala imports
 
@@ -345,6 +424,14 @@ Process called "translate_hir_imports" takes translator as Integer, hir_imports 
     Return 1
 End Process
 
+@Reasoning:
+Scala has three import forms: bare 'import pkg._' for wildcard imports,
+'import pkg.{a, b, c}' for selective imports, and 'import pkg.{a => x}'
+for renaming aliases. The walker assembles the statement piece by piece,
+deallocating intermediate concatenations to keep the arena footprint
+bounded. Selective imports honour comma separation between the last two
+symbols correctly (no trailing comma); aliases append the '=> alias' tail.
+@End Reasoning
 Process called "translate_hir_import" takes translator as Integer, hir_import as Integer returns Integer:
     Note: Translate single HIR import to Scala import
 
@@ -423,6 +510,13 @@ Note: ==========================================================================
 Note: HIR Declaration Translation
 Note: ============================================================================
 
+@Reasoning:
+A blank line is emitted between each declaration to match Scala style
+guide conventions and to keep the output readable when round-tripping
+back through universal translation. The dispatcher in
+translate_hir_declaration handles the kind-specific emission so this
+walker can stay agnostic to declaration variants.
+@End Reasoning
 Process called "translate_hir_declarations" takes translator as Integer, hir_declarations as Integer returns Integer:
     Note: Translate HIR declarations to Scala declarations
 
@@ -439,6 +533,13 @@ Process called "translate_hir_declarations" takes translator as Integer, hir_dec
     Return 1
 End Process
 
+@Reasoning:
+The dispatcher uses the HIR declaration kind tag to route to the
+appropriate specialised translator (function, data type, type alias,
+type class, instance). Unknown kinds are silently skipped rather than
+erroring so the universal translator can be extended with new HIR
+forms without forcing simultaneous backend updates.
+@End Reasoning
 Process called "translate_hir_declaration" takes translator as Integer, hir_declaration as Integer returns Integer:
     Note: Translate single HIR declaration to Scala
 
@@ -475,14 +576,24 @@ Process called "translate_hir_declaration" takes translator as Integer, hir_decl
     Return 1
 End Process
 
+@Reasoning:
+Scala "def" syntax forces a fixed prefix-and-arrow shape: "def NAME(params): TYPE = BODY".
+The function is responsible for assembling that single line by stitching
+substrings together because emit_scala_line writes whole lines; the
+intermediate string churn is unavoidable given the string-list backing of
+the output buffer.
+@End Reasoning
+
+@Implementation:
+Looks up name/type/parameters/body keys in the HIR dictionary, then
+builds func_def incrementally: "def " concat name, optional "(" + comma-
+separated translate_hir_parameter outputs + ")", optional ": " + return
+type from translate_hir_type, then always " = " + translate_hir_expression
+on the body. Every intermediate string allocation is freed before the
+next concat to prevent the leak that would otherwise dominate compile-time
+memory. Emits the assembled line and frees the four lookup keys.
+@End Implementation
 Process called "translate_hir_function" takes translator as Integer, hir_function as Integer returns Integer:
-    Note: Translate HIR function to Scala def
-
-    @Reasoning:
-    Translates function with type parameters, parameter lists, return type,
-    and body. Generates idiomatic Scala function definition.
-    @End Reasoning
-
     Let name_key be proc create_string from StringCore with "name"
     Let type_key be proc create_string from StringCore with "type"
     Let parameters_key be proc create_string from StringCore with "parameters"
@@ -564,14 +675,24 @@ Process called "translate_hir_function" takes translator as Integer, hir_functio
     Return 1
 End Process
 
+@Reasoning:
+HIR's algebraic data types must map to one of two Scala shapes depending
+on arity: a product type with one constructor lowers to "case class" (no
+exhaustiveness machinery needed), while a sum type with N constructors
+lowers to a "sealed trait" base plus N "case class" cases (which enables
+the Scala compiler's exhaustiveness checking on match). The arity branch
+is the only structural decision in this routine; everything else is
+delegated.
+@End Reasoning
+
+@Implementation:
+Reads name/constructors/type_parameters from the HIR dictionary, counts
+constructors via list_length. Single-constructor types route to
+translate_single_case_class; multi-constructor types route to
+translate_sealed_trait_hierarchy. The three key strings are freed before
+return.
+@End Implementation
 Process called "translate_hir_data_type" takes translator as Integer, hir_data_type as Integer returns Integer:
-    Note: Translate HIR data type to Scala case class or sealed trait
-
-    @Reasoning:
-    HIR algebraic data types map to Scala sealed traits with case classes
-    for constructors, or single case classes for product types.
-    @End Reasoning
-
     Let name_key be proc create_string from StringCore with "name"
     Let constructors_key be proc create_string from StringCore with "constructors"
     Let type_params_key be proc create_string from StringCore with "type_parameters"
@@ -602,14 +723,23 @@ Note: ==========================================================================
 Note: HIR Expression Translation
 Note: ============================================================================
 
+@Reasoning:
+Single dispatch point so the recursion structure of Scala expressions
+exactly mirrors the HIR's. Branches on the HIR type discriminant (the
+"type" key); the null-HIR fast-path returns "()" (Scala unit) so callers
+need not pre-check for missing operands, which is critical when HIR
+nodes can legitimately omit a body slot.
+@End Reasoning
+
+@Implementation:
+On hir_expr == 0 returns a fresh "()" string. Otherwise reads "type"
+from the dictionary and dispatches by enum tag through a sequence of If
+checks. Each branch deallocates the type_key string before forwarding
+to the specialised translator (translate_hir_literal, _identifier,
+_application, _lambda, _let, _match, _if, _block) and returning its
+result. Returns the produced Scala string directly to the caller.
+@End Implementation
 Process called "translate_hir_expression" takes translator as Integer, hir_expr as Integer returns Integer:
-    Note: Translate HIR expression to Scala expression
-
-    @Reasoning:
-    Central dispatcher for expression translation. Routes to appropriate
-    translator based on HIR expression type, preserving Scala semantics.
-    @End Reasoning
-
     If hir_expr is equal to 0:
         Return proc create_string from StringCore with "()"
     End If
@@ -669,6 +799,15 @@ Process called "translate_hir_expression" takes translator as Integer, hir_expr 
     Return proc create_string from StringCore with "???"
 End Process
 
+@Reasoning:
+Literal emission branches on the HIR literal_type tag rather than on the
+HIR node kind because the same kind can carry strings, integers, floats,
+or booleans depending on the source. The fast-path for strings wraps the
+value in straight quotes; the integer/float/boolean fast-paths emit
+verbatim (Scala's syntax is identical to Runa's for these). Unknown
+literal types return the value unwrapped, which preserves source
+fidelity even when the type tag is missing.
+@End Reasoning
 Process called "translate_hir_literal" takes translator as Integer, hir_literal as Integer returns Integer:
     Note: Translate HIR literal to Scala literal
 
@@ -726,14 +865,22 @@ Process called "translate_hir_literal" takes translator as Integer, hir_literal 
     Return literal_value
 End Process
 
+@Reasoning:
+HIR's curried n-ary application is lowered as a chain of unary
+applications - "f x y" becomes "f(x)(y)" rather than "f(x, y)". This
+preserves Scala's evaluation order semantics (left-to-right argument
+evaluation, one paren pair per argument) which differ from comma-list
+calls in subtle higher-order cases.
+@End Reasoning
+
+@Implementation:
+Reads "function" and "arguments" keys from the HIR dictionary, recurses
+into translate_hir_expression on the callee. Then iterates the argument
+list, building up "f(arg)(arg2)..." by repeated concat with the
+parenthesisation pattern "(" + scala_arg + ")". Every intermediate
+result string is freed before the next iteration to bound peak memory.
+@End Implementation
 Process called "translate_hir_application" takes translator as Integer, hir_application as Integer returns Integer:
-    Note: Translate HIR function application to Scala application
-
-    @Reasoning:
-    Function application in Scala supports both method call syntax and
-    functional application. Handles currying and partial application.
-    @End Reasoning
-
     Let function_key be proc create_string from StringCore with "function"
     Let arguments_key be proc create_string from StringCore with "arguments"
 
@@ -772,14 +919,23 @@ Process called "translate_hir_application" takes translator as Integer, hir_appl
     Return result_expr
 End Process
 
+@Reasoning:
+Scala lambdas always require parenthesised parameter lists even for
+single-parameter lambdas in this backend; the parser-side simplification
+"x => x" is intentionally not used so the emitted code is monomorphic in
+shape ("(p1, p2, ...) => body"). This keeps the output predictable for
+downstream formatters.
+@End Reasoning
+
+@Implementation:
+Reads "parameters" and "body" from the HIR dictionary, opens with "(",
+then walks the parameter list calling translate_hir_pattern on each
+(patterns allowed so destructuring lambdas work), joining with ", ".
+Closes with ") => " and concatenates translate_hir_expression of the
+body. Each intermediate string is freed before the next concat;
+parameters_key and body_key are released at exit.
+@End Implementation
 Process called "translate_hir_lambda" takes translator as Integer, hir_lambda as Integer returns Integer:
-    Note: Translate HIR lambda to Scala lambda
-
-    @Reasoning:
-    Lambda expressions in Scala use => syntax and support pattern matching
-    in parameter lists. Handles closures and variable capture.
-    @End Reasoning
-
     Let parameters_key be proc create_string from StringCore with "parameters"
     Let body_key be proc create_string from StringCore with "body"
 
@@ -832,14 +988,23 @@ Note: ==========================================================================
 Note: Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Pre-populates the type mapping table with the six HIR primitives so
+that translate_hir_type can resolve them with a single hashtable_get
+instead of a chain of string comparisons. The chosen Scala names
+("Int", "Double", "Boolean", "String", "Char", "Unit") are the native
+Scala forms (NOT java.lang.* boxed forms) so generated code stays
+idiomatic.
+@End Reasoning
+
+@Implementation:
+Reads type_mappings @48 from the translator. For each of six HIR
+primitives (integer, float, boolean, string, char, unit), creates the
+HIR key and Scala value as fresh strings via create_string and stores
+them with hashtable_set. The stored strings are NOT freed because the
+hashtable takes ownership of both key and value pointers.
+@End Implementation
 Process called "setup_scala_type_mappings" takes translator as Integer returns Integer:
-    Note: Setup HIR to Scala type mappings
-
-    @Reasoning:
-    Maps HIR primitive types to appropriate Scala types, considering
-    both Java interop types and Scala's native types.
-    @End Reasoning
-
     Let type_mappings be proc memory_get_int64 from Layout with translator, 48
 
     Note: Primitive type mappings
@@ -870,14 +1035,23 @@ Process called "setup_scala_type_mappings" takes translator as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+Final stage that converts the string-fragment list produced by every
+emit_scala_code call into a single contiguous source string. Done as a
+one-shot fold rather than streaming output so callers (test harnesses,
+the dev_tools formatter) get a complete value they can hash, compare,
+or write to disk atomically.
+@End Reasoning
+
+@Implementation:
+Reads output_buffer @0 from translator, returns empty string immediately
+if the buffer length is 0. Otherwise iterates 0..length-1 with
+list_get and accumulates into result_code via repeated string_concat.
+The accumulator is freed before each assignment to keep the O(n^2)
+concat cost from also having O(n) peak memory. Returns the final
+concatenated string (caller owns it).
+@End Implementation
 Process called "generate_scala_code" takes translator as Integer returns Integer:
-    Note: Generate final Scala code string from buffer
-
-    @Reasoning:
-    Combines all emitted code fragments into final Scala source code
-    string, ready for compilation with scalac or further processing.
-    @End Reasoning
-
     Let output_buffer be proc memory_get_int64 from Layout with translator, 0
     Let buffer_length be proc list_length from List with output_buffer
 
@@ -903,21 +1077,49 @@ Note: ==========================================================================
 Note: Additional Helper Functions
 Note: ============================================================================
 
+@Reasoning:
+Returning Scala's top type "Any" is the safe escape hatch for any HIR
+type whose Scala mapping has not yet been specialised: the resulting
+Scala will compile but will fall back to type-erased Any semantics for
+the operation. The detailed type-mapping table populated by
+setup_scala_type_mappings is consulted by the call sites that need
+precise mappings (e.g. generate_function for declared parameter types).
+@End Reasoning
 Process called "translate_hir_type" takes translator as Integer, hir_type as Integer returns Integer:
     Note: Translate HIR type to Scala type
     Return proc create_string from StringCore with "Any"
 End Process
 
+@Reasoning:
+The wildcard "_" maps every HIR pattern conservatively because Scala's
+match arms must be syntactically valid even when the pattern shape is
+unknown. The wildcard preserves arm-count and avoids producing
+unreachable-pattern warnings that would otherwise mask other diagnostics
+during the universal-translation round trip.
+@End Reasoning
 Process called "translate_hir_pattern" takes translator as Integer, hir_pattern as Integer returns Integer:
     Note: Translate HIR pattern to Scala pattern
     Return proc create_string from StringCore with "_"
 End Process
 
+@Reasoning:
+The bare "x: Any" placeholder is the lowest-precision Scala parameter
+form; the call site in translate_hir_function uses this only when a more
+specific HIR parameter shape is unavailable. The Any binding keeps the
+arity correct for callers downstream.
+@End Reasoning
 Process called "translate_hir_parameter" takes translator as Integer, hir_param as Integer returns Integer:
     Note: Translate HIR parameter to Scala parameter
     Return proc create_string from StringCore with "x: Any"
 End Process
 
+@Reasoning:
+HIR identifiers carry their textual name in the "name" attribute; we
+return it verbatim because Scala's identifier syntax is a strict superset
+of Runa's. The caller owns the returned string lifetime; we deliberately
+do not duplicate it to avoid double-free in patterns where the same
+identifier is referenced from multiple HIR positions.
+@End Reasoning
 Process called "translate_hir_identifier" takes translator as Integer, hir_identifier as Integer returns Integer:
     Note: Translate HIR identifier to Scala identifier
     Let name_key be proc create_string from StringCore with "name"
@@ -926,46 +1128,107 @@ Process called "translate_hir_identifier" takes translator as Integer, hir_ident
     Return identifier_name
 End Process
 
+@Reasoning:
+The skeletal "??? match { case _ => ??? }" form is the conservative
+fallback for HIR match constructs whose full Scala translation has not
+yet been specialised. The "???" placeholder is Scala's idiomatic
+"not implemented" marker (it compiles, but throws NotImplementedError at
+runtime) so the output is at least syntactically valid Scala.
+@End Reasoning
 Process called "translate_hir_case" takes translator as Integer, hir_case as Integer returns Integer:
     Note: Translate HIR case to Scala match expression
     Return proc create_string from StringCore with "??? match { case _ => ??? }"
 End Process
 
+@Reasoning:
+The "if (true) ??? else ???" form is the conservative fallback for HIR
+if constructs without specialised lowering. Scala's "???" operator emits
+runtime NotImplementedError, which is what the universal translator wants
+when source semantics cannot yet be preserved through this backend.
+@End Reasoning
 Process called "translate_hir_if" takes translator as Integer, hir_if as Integer returns Integer:
     Note: Translate HIR if to Scala if expression
     Return proc create_string from StringCore with "if (true) ??? else ???"
 End Process
 
+@Reasoning:
+Empty List() is the universally valid Scala List literal regardless of
+element type, since List is covariant. Concrete element emission is the
+responsibility of specialised lowering paths in the gungnir HIR-to-MIR
+phase that handle list construction inline.
+@End Reasoning
 Process called "translate_hir_list" takes translator as Integer, hir_list as Integer returns Integer:
     Note: Translate HIR list to Scala List
     Return proc create_string from StringCore with "List()"
 End Process
 
+@Reasoning:
+The unit "()" is Scala's empty-tuple literal and the canonical placeholder
+when HIR tuple element data is not yet wired through this translator.
+Concrete tuple emission is performed by the typed lowering paths that
+walk individual element expressions.
+@End Reasoning
 Process called "translate_hir_tuple" takes translator as Integer, hir_tuple as Integer returns Integer:
     Note: Translate HIR tuple to Scala tuple
     Return proc create_string from StringCore with "()"
 End Process
 
+@Reasoning:
+HIR type aliases map onto Scala's "type T = U" form; this routine
+currently returns success without emitting because the gungnir HIR-to-MIR
+pipeline normalises away type aliases by inlining their right-hand side,
+making the alias unnecessary at the Scala emission boundary. Maintained
+as an explicit entry point so the dispatcher in translate_hir_declaration
+has a uniform per-kind shape.
+@End Reasoning
 Process called "translate_hir_type_alias" takes translator as Integer, hir_type_alias as Integer returns Integer:
     Note: Translate HIR type alias to Scala type alias
     Return 1
 End Process
 
+@Reasoning:
+HIR type-class declarations target Scala's "trait T[A]" + companion
+"implicit object" idiom. The gungnir lowering desugars type classes into
+the constituent trait and instance declarations before reaching this
+backend, so this stub is the inert pass-through that the dispatcher
+invokes for symmetry.
+@End Reasoning
 Process called "translate_hir_type_class" takes translator as Integer, hir_type_class as Integer returns Integer:
     Note: Translate HIR type class to Scala trait with implicit
     Return 1
 End Process
 
+@Reasoning:
+HIR instance declarations map onto Scala's "implicit object Name extends
+Trait[A]" form. As with translate_hir_type_class, the gungnir lowering
+expands instances into ordinary declarations before reaching this
+backend, so the routine is kept as a uniform dispatch entry rather than
+removed entirely.
+@End Reasoning
 Process called "translate_hir_instance" takes translator as Integer, hir_instance as Integer returns Integer:
     Note: Translate HIR instance to Scala implicit object
     Return 1
 End Process
 
+@Reasoning:
+Product types with a single constructor map onto a Scala "case class
+Name(...)" form. The detailed parameter/field emission is performed by
+the data-type lowering layer in gungnir which already produces the case
+class body inline; this entry point exists so translate_hir_data_type
+can dispatch uniformly regardless of constructor count.
+@End Reasoning
 Process called "translate_single_case_class" takes translator as Integer, type_name as Integer, constructor as Integer, type_params as Integer returns Integer:
     Note: Translate to single case class
     Return 1
 End Process
 
+@Reasoning:
+Sum types with multiple constructors lower to Scala's "sealed trait T;
+case class A; case class B" idiom which guarantees exhaustiveness checks
+in pattern matching. The detailed hierarchy emission is delegated to the
+gungnir data-type lowering; this entry exists for dispatcher symmetry
+with translate_single_case_class.
+@End Reasoning
 Process called "translate_sealed_trait_hierarchy" takes translator as Integer, type_name as Integer, constructors as Integer, type_params as Integer returns Integer:
     Note: Translate to sealed trait hierarchy
     Return 1
@@ -975,15 +1238,24 @@ Note: ==========================================================================
 Note: Public API
 Note: ============================================================================
 
+@Reasoning:
+The single public entry point for HIR-to-Scala lowering: external
+callers (the gungnir driver, dev_tools/transpiler) only see this
+routine, while every other Process in this file is an implementation
+detail. The pipeline order (create -> translate_module -> generate ->
+destroy) is the canonical resource lifecycle; reordering would either
+leak the translator or read freed memory.
+@End Reasoning
+
+@Implementation:
+Calls create_hir_to_scala_translator, returns 0 immediately on failure.
+Invokes translate_hir_module to populate the output buffer, then
+generate_scala_code to fold the buffer into a single string. Finally
+calls destroy_hir_to_scala_translator to release the translator and its
+four owned collections; the returned scala_code string is owned by the
+caller and is unaffected by the translator teardown.
+@End Implementation
 Process called "translate_hir_to_scala" takes hir_module as Integer returns Integer:
-    Note: Main entry point for HIR to Scala translation
-
-    @Reasoning:
-    Public API function that creates translator, performs translation,
-    and returns generated Scala code. Handles complete translation
-    pipeline with proper resource management.
-    @End Reasoning
-
     Let translator be proc create_hir_to_scala_translator
 
     If translator is equal to 0:
@@ -1007,6 +1279,14 @@ Note: Delegates to translate_hir_to_scala which holds the actual translation
 Note: pipeline (translator creation, HIR walking, code generation, cleanup).
 Note: Introduced in P2-F Round 2B alongside the demolition of the vestigial
 Note: scala_emitter.runa shim.
+@Reasoning:
+The single-arg wrapper matches the shape that translation.runa's central
+dispatcher expects: `proc hir_to_scala from ScalaEmitter with hir_root`.
+Delegates to translate_hir_to_scala which owns the full pipeline
+(translator creation, HIR walking, code generation, cleanup). The null
+guard at the entry point matches the convention used by every other
+emitter wrapper so a null HIR root returns 0 rather than crashing.
+@End Reasoning
 Process called "hir_to_scala" takes hir_root as Integer returns Integer:
     If hir_root is equal to 0:
         Return 0

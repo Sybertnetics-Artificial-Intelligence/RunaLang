@@ -65,6 +65,14 @@ Fields:
 - attributes (40): Pointer to attributes dictionary
 :End Note
 
+@Reasoning:
+The JSX parser front-loads tokenisation: it eagerly drains the lexer
+into a fixed-size token buffer (1000 slots x 8 bytes) so all
+subsequent parsing operates on a positional array rather than calling
+back into the lexer. This lookahead-friendly design is appropriate
+for JSX because the JSX/JavaScript switch points need arbitrary
+look-back/look-ahead that streaming would prohibit.
+@End Reasoning
 Process called "create_parser" takes source as Integer, length as Integer returns Integer:
     Let parser be proc allocate from Layout with 40
 
@@ -109,6 +117,13 @@ Process called "create_parser" takes source as Integer, length as Integer return
     Return parser
 End Process
 
+@Reasoning:
+Every JSX AST node is 48 bytes: the type tag plus pointers for value
+(string handle), value length, children list (200 slots x 8 bytes),
+child count, and attributes dictionary (100 slots x 8 bytes). The
+fixed allocation sizes are generous enough for typical JSX components
+(rare to exceed 200 children) while keeping malloc churn predictable.
+@End Reasoning
 Process called "create_ast_node" takes type as Integer returns Integer:
     Let node be proc allocate from Layout with 48
 
@@ -126,6 +141,13 @@ Process called "create_ast_node" takes type as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+add_child writes the child pointer into the parent's children array
+at the current count offset, then increments the count. The 8-byte
+stride matches the pointer size; bounds checking against the 200-slot
+allocation is not enforced here because the parser's source-size
+constraints prevent it from exceeding the allocation in practice.
+@End Reasoning
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Let children be proc memory_get_int64 from Layout with parent, 24
     Let child_count be proc memory_get_int64 from Layout with parent, 32
@@ -140,6 +162,12 @@ Process called "add_child" takes parent as Integer, child as Integer returns Int
     Return 1
 End Process
 
+@Reasoning:
+Returns the type tag of the token currently in focus, or 0 if the
+parser has run past the end. Centralising this lookup keeps the
+token-pointer-dereference pattern uniform across every parse_*
+routine.
+@End Reasoning
 Process called "current_token_type" takes parser as Integer returns Integer:
     Let current_token be proc memory_get_int64 from Layout with parser, 8
 
@@ -151,6 +179,12 @@ Process called "current_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+advance_token bumps the cursor and updates the cached current_token
+pointer. Past-end positions set current_token to 0 so subsequent
+current_token_type returns 0 (the EOF sentinel) without requiring
+the caller to recheck position vs count.
+@End Reasoning
 Process called "advance_token" takes parser as Integer returns Integer:
     Let token_index be proc memory_get_int64 from Layout with parser, 32
     Set token_index to token_index plus 1
@@ -174,6 +208,13 @@ Process called "advance_token" takes parser as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+expect_token verifies the current token matches the expected type
+and advances on success. The error_message parameter is reserved
+for future diagnostic surfacing; v0.0.8.5 returns 0 on mismatch
+without recording the message, leaving error reporting to the
+caller via context.
+@End Reasoning
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_message as Integer returns Integer:
     Let token_type be proc current_token_type from parser
 
@@ -185,6 +226,13 @@ Process called "expect_token" takes parser as Integer, expected_type as Integer,
     Return 1
 End Process
 
+@Reasoning:
+The top-level entry creates a JSX_PROGRAM root and walks statements
+until end-of-input. Token 60 is a separator that gets silently
+consumed; other tokens trigger parse_statement. The While loop's
+truthy 'while 1 is equal to 1' is intentional - terminations are
+explicit via Break for EOF (0) or end-of-input sentinel (99).
+@End Reasoning
 Process called "parse_jsx" takes source as Integer, length as Integer returns Integer:
     Let parser be proc create_parser with source, length
 
@@ -214,6 +262,13 @@ Process called "parse_jsx" takes source as Integer, length as Integer returns In
     Return program
 End Process
 
+@Reasoning:
+The statement dispatcher recognises JSX elements (token type 10),
+fragments (17), variable declarations (var/let/const), function
+declarations, and return statements via keyword text matching on
+type 2 (identifier) tokens. Anything else falls through to
+parse_expression which produces an expression-statement node.
+@End Reasoning
 Process called "parse_statement" takes parser as Integer returns Integer:
     Let token_type be proc current_token_type from parser
 
@@ -272,6 +327,13 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Return proc parse_expression from parser
 End Process
 
+@Reasoning:
+check_text performs byte-by-byte comparison of the lexeme against a
+NUL-terminated keyword string. The lexeme length is known from the
+token; the expected string's NUL terminator is detected explicitly.
+This is the canonical way to recognise JavaScript keywords (which
+are not separate token types in this lexer).
+@End Reasoning
 Process called "check_text" takes text as Integer, length as Integer, expected as Integer returns Integer:
     Let index be 0
 
@@ -298,6 +360,15 @@ Process called "check_text" takes text as Integer, length as Integer, expected a
     Return 1
 End Process
 
+@Reasoning:
+JSX elements have three forms: opening tag + children + closing tag,
+self-closing <Tag/>, and fragment <></>. The parser reads the
+element name, parses attributes (including spread {...props}), then
+either consumes the self-closing /> or recurses into the body until
+the matching closing tag. Mismatched tags are a hard error - the
+parser does not attempt recovery, the universal translator surfaces
+the diagnostic instead.
+@End Reasoning
 Process called "parse_jsx_element" takes parser as Integer returns Integer:
     Let element be proc create_ast_node from JSX_ELEMENT
 
@@ -450,6 +521,13 @@ Process called "parse_jsx_element" takes parser as Integer returns Integer:
     Return element
 End Process
 
+@Reasoning:
+JSX element names can be lowercase HTML tags (div, span), uppercase
+React components (MyComponent), namespaced (svg:circle), or
+member-access (My.Component). The parser captures all forms by
+reading the identifier and following any . or : separators to build
+the qualified name.
+@End Reasoning
 Process called "parse_jsx_element_name" takes parser as Integer returns Integer:
     Let token_type be proc current_token_type from parser
 
@@ -504,6 +582,13 @@ Process called "parse_jsx_element_name" takes parser as Integer returns Integer:
     Return identifier
 End Process
 
+@Reasoning:
+JSX attributes have three forms: bare (disabled), string-valued
+(class="foo"), and expression-valued (onClick={handler}). The parser
+identifies the form by what follows the attribute name and routes
+accordingly. Attribute values without an = sign default to true,
+matching HTML's boolean attribute convention.
+@End Reasoning
 Process called "parse_jsx_attribute" takes parser as Integer returns Integer:
     Let attribute be proc create_ast_node from JSX_ATTRIBUTE
 
@@ -568,6 +653,13 @@ Process called "parse_jsx_attribute" takes parser as Integer returns Integer:
     Return attribute
 End Process
 
+@Reasoning:
+The {...expr} spread form copies own enumerable properties of expr
+into the JSX element's props. The parser captures the inner
+expression and tags the node as a spread attribute so the HIR
+lowering can emit the destination-language equivalent (Object.assign,
+spread syntax, etc.).
+@End Reasoning
 Process called "parse_jsx_spread_attribute" takes parser as Integer returns Integer:
     proc expect_token with parser, 22, "Expected '{'"
 
@@ -586,6 +678,12 @@ Process called "parse_jsx_spread_attribute" takes parser as Integer returns Inte
     Return expr
 End Process
 
+@Reasoning:
+JSX text content between tags is captured verbatim into a
+JSX_TEXT node. Leading/trailing whitespace handling (whitespace
+collapsing) is deferred to the HIR lowering since JSX runtime
+behaviour depends on the target framework's rendering rules.
+@End Reasoning
 Process called "parse_jsx_text" takes parser as Integer returns Integer:
     Let current_token be proc memory_get_int64 from Layout with parser, 8
     Let text be proc memory_get_int64 from Layout with current_token, 8
@@ -600,6 +698,12 @@ Process called "parse_jsx_text" takes parser as Integer returns Integer:
     Return text_node
 End Process
 
+@Reasoning:
+JSX expression containers {expr} embed JavaScript expressions inside
+JSX. The parser consumes the opening brace, recurses into
+parse_expression for the JS body, then consumes the closing brace.
+This is how dynamic content (e.g. {user.name}) enters the JSX tree.
+@End Reasoning
 Process called "parse_jsx_expression" takes parser as Integer returns Integer:
     proc expect_token with parser, 15, "Expected '{'"
 
@@ -610,6 +714,13 @@ Process called "parse_jsx_expression" takes parser as Integer returns Integer:
     Return expr
 End Process
 
+@Reasoning:
+JSX fragments <>...</> group children without producing a wrapping
+DOM element. The parser treats them like elements with an empty tag
+name; children are parsed identically to regular element body. The
+distinct JSX_FRAGMENT tag lets the HIR lowering emit framework-
+specific fragment forms (React.Fragment, Vue's <template>, etc.).
+@End Reasoning
 Process called "parse_jsx_fragment" takes parser as Integer returns Integer:
     Let fragment be proc create_ast_node from JSX_FRAGMENT
 
@@ -665,6 +776,13 @@ Process called "parse_jsx_fragment" takes parser as Integer returns Integer:
     Return fragment
 End Process
 
+@Reasoning:
+JavaScript variable declarations (var/let/const) bind one or more
+names to optional initialisers. The parser captures the kind keyword
+(distinguishing scope semantics and mutability) and then parses each
+declarator as a name + optional initialiser pair, separated by commas
+until the statement terminator.
+@End Reasoning
 Process called "parse_variable_declaration" takes parser as Integer returns Integer:
     Let decl be proc create_ast_node from JS_VARIABLE_DECLARATION
 
@@ -745,6 +863,13 @@ Process called "parse_variable_declaration" takes parser as Integer returns Inte
     Return decl
 End Process
 
+@Reasoning:
+JavaScript function declarations have the form function name(params)
+body. The parser reads the name, captures the parenthesised parameter
+list, and recurses into parse_block_statement for the body. Arrow
+functions and function expressions are handled separately by
+parse_arrow_function / parse_primary_expression.
+@End Reasoning
 Process called "parse_function_declaration" takes parser as Integer returns Integer:
     Let func be proc create_ast_node from JS_FUNCTION_DECLARATION
 
@@ -796,6 +921,12 @@ Process called "parse_function_declaration" takes parser as Integer returns Inte
     Return func
 End Process
 
+@Reasoning:
+JavaScript return statements have an optional expression. The parser
+consumes the 'return' keyword, then tries to parse an expression
+unless the next token is a statement terminator (semicolon or
+newline-handled-as-ASI). Bare returns produce a node with no child.
+@End Reasoning
 Process called "parse_return_statement" takes parser as Integer returns Integer:
     Let ret be proc create_ast_node from JS_RETURN_STATEMENT
 
@@ -821,6 +952,13 @@ Process called "parse_return_statement" takes parser as Integer returns Integer:
     Return ret
 End Process
 
+@Reasoning:
+A block statement is a brace-delimited sequence of statements. The
+parser consumes the opening {, recurses into parse_statement
+repeatedly until the closing } is encountered, then consumes the
+closing brace. Each parsed statement becomes a child of the block
+node.
+@End Reasoning
 Process called "parse_block_statement" takes parser as Integer returns Integer:
     Let block be proc create_ast_node from JS_BLOCK_STATEMENT
 
@@ -848,10 +986,23 @@ Process called "parse_block_statement" takes parser as Integer returns Integer:
     Return block
 End Process
 
+@Reasoning:
+The expression grammar's entry point delegates to
+parse_conditional_expression (ternary precedence). Comma-separated
+expressions (the comma operator) are not handled at this level by
+v0.0.8.5; that production lives in the higher-level statement
+parser when needed.
+@End Reasoning
 Process called "parse_expression" takes parser as Integer returns Integer:
     Return proc parse_conditional_expression from parser
 End Process
 
+@Reasoning:
+JavaScript's ternary cond ? then : else expression. Parsed as
+right-associative by recursing into parse_conditional_expression for
+both the then and else branches, matching ECMAScript semantics for
+chained ternaries.
+@End Reasoning
 Process called "parse_conditional_expression" takes parser as Integer returns Integer:
     Let left be proc parse_logical_or_expression from parser
 
@@ -877,6 +1028,11 @@ Process called "parse_conditional_expression" takes parser as Integer returns In
     Return left
 End Process
 
+@Reasoning:
+JavaScript's || operator. Left-associative; standard precedence
+climbing loop. ECMAScript's || has short-circuit semantics that
+the destination emitter is responsible for preserving.
+@End Reasoning
 Process called "parse_logical_or_expression" takes parser as Integer returns Integer:
     Let left be proc parse_logical_and_expression from parser
 
@@ -901,6 +1057,11 @@ Process called "parse_logical_or_expression" takes parser as Integer returns Int
     Return left
 End Process
 
+@Reasoning:
+JavaScript's && operator. Same left-associative precedence-climbing
+pattern as logical-or but binds tighter. Short-circuit semantics
+preserved through to the destination by the HIR lowering.
+@End Reasoning
 Process called "parse_logical_and_expression" takes parser as Integer returns Integer:
     Let left be proc parse_equality_expression from parser
 
@@ -925,6 +1086,12 @@ Process called "parse_logical_and_expression" takes parser as Integer returns In
     Return left
 End Process
 
+@Reasoning:
+JavaScript's equality operators (==, !=, ===, !==). The four
+variants differ in their coercion rules; the parser captures the
+specific operator into the binary-op node so the destination
+emitter can choose between strict and loose equality semantics.
+@End Reasoning
 Process called "parse_equality_expression" takes parser as Integer returns Integer:
     Let left be proc parse_relational_expression from parser
 
@@ -951,6 +1118,12 @@ Process called "parse_equality_expression" takes parser as Integer returns Integ
     Return left
 End Process
 
+@Reasoning:
+JavaScript's relational operators (<, <=, >, >=, instanceof, in).
+Standard precedence-climbing loop. instanceof and in are treated as
+ordinary binary operators at this level even though they have
+distinct runtime semantics; the HIR lowering chooses the right form.
+@End Reasoning
 Process called "parse_relational_expression" takes parser as Integer returns Integer:
     Let left be proc parse_additive_expression from parser
 
@@ -981,6 +1154,12 @@ Process called "parse_relational_expression" takes parser as Integer returns Int
     Return left
 End Process
 
+@Reasoning:
+JavaScript's + and - operators. + is overloaded for numeric addition
+and string concatenation, resolved by ECMAScript's runtime
+coercion rules; the parser captures the operator and lets the
+destination emitter handle the polymorphism.
+@End Reasoning
 Process called "parse_additive_expression" takes parser as Integer returns Integer:
     Let left be proc parse_multiplicative_expression from parser
 
@@ -1007,6 +1186,12 @@ Process called "parse_additive_expression" takes parser as Integer returns Integ
     Return left
 End Process
 
+@Reasoning:
+JavaScript's *, /, %, and ** operators. ** is right-associative;
+all others are left-associative. The parser handles ** specially by
+recursing into parse_unary_expression for the right operand, so
+2**3**2 evaluates as 2**(3**2) per ECMAScript.
+@End Reasoning
 Process called "parse_multiplicative_expression" takes parser as Integer returns Integer:
     Let left be proc parse_unary_expression from parser
 
@@ -1035,6 +1220,12 @@ Process called "parse_multiplicative_expression" takes parser as Integer returns
     Return left
 End Process
 
+@Reasoning:
+JavaScript's unary operators (typeof, void, delete, !, -, +, ++, --,
+~). Each builds a unary-op node with the operator tag and the
+operand sub-tree. typeof/void/delete are keyword-form unary
+operators distinguished from the symbolic ones by the leading token.
+@End Reasoning
 Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Let token_type be proc current_token_type from parser
 
@@ -1074,6 +1265,13 @@ Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Return proc parse_postfix_expression from parser
 End Process
 
+@Reasoning:
+JavaScript's postfix operators include member access (.prop), indexed
+access ([expr]), function call ((args)), optional chaining (?.),
+and template literal tags. The parser layers these left-associatively
+around a primary expression, so chains like obj.foo()[0].bar all
+build correctly without left-recursion.
+@End Reasoning
 Process called "parse_postfix_expression" takes parser as Integer returns Integer:
     Let left be proc parse_primary_expression from parser
 
@@ -1165,6 +1363,14 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
     Return left
 End Process
 
+@Reasoning:
+Primary expressions are the atomic forms: literals (number, string,
+boolean, null, undefined), identifiers, parenthesised expressions,
+array/object literals, JSX elements (when inside JS context),
+function expressions, arrow functions, template literals, and the
+'this'/'super' keywords. The dispatcher classifies by current
+token type and routes to the right constructor.
+@End Reasoning
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
     Let token_type be proc current_token_type from parser
 
@@ -1363,6 +1569,14 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Return 0
 End Process
 
+@Reasoning:
+Arrow functions (param) => body or single-param => body. The parser
+handles three syntactic shapes: bare identifier (x => body),
+parenthesised parameter list ((x, y) => body), and zero-parameter
+form (() => body). The body can be an expression (implicit return)
+or a block-statement (explicit returns required); the parser
+captures which form via a flag on the resulting node.
+@End Reasoning
 Process called "parse_arrow_function" takes parser as Integer returns Integer:
     Let func be proc create_ast_node from JS_ARROW_FUNCTION
 

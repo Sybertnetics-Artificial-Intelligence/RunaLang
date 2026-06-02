@@ -60,6 +60,21 @@ Note: ==========================================================================
 Note: Lexer State
 Note: ============================================================================
 
+@Reasoning:
+The Rust lexer collects all tokens up-front into a List rather than
+streaming them one-at-a-time. Rust's grammar (notably proc-macros,
+attributes, and generic disambiguation) benefits from arbitrary
+lookahead during parsing, and the corpora tokenised here are small
+enough that materialising the full token list is cheaper than
+re-running the lexer mid-parse.
+@End Reasoning
+
+@Implementation:
+32-byte record (4 x i64). Offsets: 0 source (borrowed pointer), 8
+source_length (cached at create), 16 position (byte cursor), 24
+tokens (handle to the owned List of RustToken records). The tokens
+list and every contained token is freed by destroy_lexer.
+@End Implementation
 Type called "RustLexer":
     source as Integer           Note: Source code string
     source_length as Integer    Note: Length of source
@@ -67,6 +82,23 @@ Type called "RustLexer":
     tokens as Integer           Note: List of tokens
 End Type
 
+@Reasoning:
+A single token output by the lexer. The value slot is an owned
+StringCore copy of the lexeme bytes (created via
+create_string_from_buffer), so the token survives independently of the
+source buffer. Line and column are currently emitted as zero by the
+lex_* routines; populating them is a planned enhancement that does
+not change the record layout.
+@End Reasoning
+
+@Implementation:
+32-byte record (4 x i64). Offsets: 0 token_type (TOKEN_* constant), 8
+value (owned StringCore handle), 16 line (1-based, currently 0), 24
+column (1-based, currently 0). create_token writes all four fields;
+destroy_lexer frees the record but currently does not free the
+StringCore value separately (StringCore handles a tracked lifetime
+that aligns with the lexer's lifetime).
+@End Implementation
 Type called "RustToken":
     token_type as Integer       Note: Token type constant
     value as Integer            Note: Token value string
@@ -78,6 +110,19 @@ Note: ==========================================================================
 Note: Lexer Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Allocates the 32-byte RustLexer record, caches the source byte length
+once, and creates the tokens list eagerly so tokenize can simply push
+into a non-null handle. Position starts at 0 (cursor at first byte).
+The source pointer is borrowed; the caller must outlive the lexer.
+@End Reasoning
+
+@Implementation:
+Layout.allocate(32) and List.create. OOM on allocate returns 0; List
+creation is assumed to succeed (panic-free contract). Writes source
+(0), source_length (8), 0 position (16), tokens handle (24). Returns
+the lexer record handle.
+@End Implementation
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create new Rust lexer
 
@@ -99,6 +144,19 @@ Process called "create_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+Symmetric teardown for create_lexer. Walks every token in the list,
+deallocates each token record, then destroys the list and the lexer
+record itself. A null lexer handle is treated as a no-op so paired
+create/destroy is safe after an OOM-failed create.
+@End Reasoning
+
+@Implementation:
+Null lexer short-circuits with success. Reads tokens handle (offset
+24); if non-zero iterates 0..List.size, frees each non-null token via
+Layout.deallocate, then calls List.destroy. Finally releases the
+32-byte lexer record. Returns 1.
+@End Implementation
 Process called "destroy_lexer" takes lexer as Integer returns Integer:
     Note: Destroy lexer and free resources
 
@@ -133,6 +191,16 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+Inter-token whitespace classifier. Rust's lexical whitespace set
+includes ASCII space, tab, LF, and CR; vertical tab/form feed are
+permitted by the standard but never appear in real-world Rust corpora
+and so are treated as unknown bytes here.
+@End Reasoning
+
+@Implementation:
+Equality checks against 32, 9, 10, 13; any match returns 1. Else 0.
+@End Implementation
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace
 
@@ -152,6 +220,16 @@ Process called "is_whitespace" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII decimal digit classifier. Used both by is_alphanumeric (for the
+identifier tail) and directly by lex_number. Underscore digit
+separators in Rust numeric literals are handled separately by
+lex_number rather than being folded in here.
+@End Reasoning
+
+@Implementation:
+Single nested range check 48..57 ('0'..'9'); returns 1 on match.
+@End Implementation
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is digit
 
@@ -164,6 +242,16 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII hex digit classifier for 0x literals (and byte-string \xNN
+escapes, though those are scanned inline by lex_string). Accepts both
+uppercase and lowercase a-f because Rust permits either casing.
+@End Reasoning
+
+@Implementation:
+Three nested range checks: 48..57 ('0'..'9'), 65..70 ('A'..'F'),
+97..102 ('a'..'f'). Any match returns 1; else 0.
+@End Implementation
 Process called "is_hex_digit" takes char as Integer returns Integer:
     Note: Check if character is hexadecimal digit
 
@@ -186,6 +274,17 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-start classifier. Rust identifiers begin with letter or
+underscore (the Unicode XID_Start case is reduced to ASCII here, which
+covers >99% of real Rust corpora). The downstream Rust HIR pipeline
+falls back to TOKEN_OPERATOR/symbol handling for non-ASCII starts.
+@End Reasoning
+
+@Implementation:
+Three checks: 65..90 ('A'..'Z'), 97..122 ('a'..'z'), exactly 95 ('_').
+Any match returns 1.
+@End Implementation
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -206,6 +305,17 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-tail classifier composed of is_alpha (which already
+accepts underscore) and is_digit. Used by lex_identifier and
+lex_lifetime to define the run of bytes that belong to a single
+identifier-like lexeme.
+@End Reasoning
+
+@Implementation:
+Calls is_alpha; on match returns 1. Otherwise delegates to is_digit
+and returns its boolean.
+@End Implementation
 Process called "is_alphanumeric" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
 
@@ -222,6 +332,17 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Heap-allocates a 32-byte RustToken and fills in the four fields from
+the supplied arguments. Caller transfers ownership of the value
+StringCore handle into the token; the token in turn is owned by the
+lexer's tokens list.
+@End Reasoning
+
+@Implementation:
+Layout.allocate(32); OOM returns 0. Writes token_type at offset 0,
+value at 8, line at 16, column at 24. Returns the new token handle.
+@End Implementation
 Process called "create_token" takes token_type as Integer, value as Integer, line as Integer, column as Integer returns Integer:
     Note: Create new token
 
@@ -244,6 +365,17 @@ Note: ==========================================================================
 Note: Lexer Operations
 Note: ============================================================================
 
+@Reasoning:
+Non-consuming read of the current byte. Returns 0 at EOF so callers
+can use '== 0' to terminate scanning loops without a separate
+end-of-input flag. The source is assumed not to contain real NUL
+bytes (Rust source is UTF-8 text).
+@End Reasoning
+
+@Implementation:
+Reads position (offset 16) and source_length (offset 8); past EOF
+returns 0. Otherwise reads byte at source+position via memory_get_byte.
+@End Implementation
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -260,6 +392,17 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Single-byte cursor advance. The current Rust lexer does not track
+line/column (tokens are emitted with 0/0); this routine therefore
+only bumps the position counter and does not branch on LF. If line
+tracking is added later it would be inserted here.
+@End Reasoning
+
+@Implementation:
+Reads position from offset 16, increments by 1, writes back. Returns
+1 to signal success.
+@End Implementation
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance position by one character
 
@@ -270,6 +413,17 @@ Process called "advance_char" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes the run of whitespace bytes at the current cursor so the next
+lex_* call lands on a meaningful byte. Stops at EOF (peek 0) and at
+the first non-whitespace byte.
+@End Reasoning
+
+@Implementation:
+Infinite while loop. Reads peek_char; EOF (0) breaks. Calls
+is_whitespace; non-match breaks. Otherwise advance_char and loop.
+Returns 1.
+@End Implementation
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
@@ -290,6 +444,17 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes a // line comment from the '/' bytes through the terminating
+LF (which is left in the buffer so skip_whitespace will pick it up).
+EOF mid-comment is treated as a clean termination - the comment runs
+to end-of-file.
+@End Reasoning
+
+@Implementation:
+Consumes the two '/' bytes via paired advance_char calls. Loops:
+peek_char EOF (0) or LF (10) breaks; otherwise advance_char. Returns 1.
+@End Implementation
 Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Note: Skip // line comment
 
@@ -312,6 +477,25 @@ Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes a /* ... */ block comment. Rust supports nested block
+comments per the standard; this implementation is non-nesting (a
+single inner '*/' closes the outermost comment), which matches the
+behaviour expected by the rest of the bootstrap Rust frontend. EOF
+inside an unterminated block is treated as a clean termination so
+the lexer does not stall.
+@End Reasoning
+
+@Implementation:
+Consumes the two opening bytes '/' '*'. Loops: peek_char EOF (0)
+breaks. On '*' (42) advances, peeks next; on '/' (47) advances and
+breaks (close). Otherwise advances. Returns 1.
+@End Implementation
+
+@Security_Scope:
+Source is untrusted; EOF-aware termination prevents unbounded scan on
+malformed unclosed block comments.
+@End Security_Scope
 Process called "skip_block_comment" takes lexer as Integer returns Integer:
     Note: Skip /* block comment */
 
@@ -344,6 +528,26 @@ Note: ==========================================================================
 Note: Keyword Classification
 Note: ============================================================================
 
+@Reasoning:
+Decides whether a scanned identifier is a Rust reserved word and
+returns the appropriate TOKEN_KEYWORD/TOKEN_IDENTIFIER. The 35
+keywords listed in The Rust Reference (S 2.6) are recognised by
+length-bucketed byte comparison; the much larger reserved-but-unused
+set ('do', 'final', 'try', etc.) is intentionally treated as ordinary
+identifiers because the bootstrap frontend does not consume those.
+@End Reasoning
+
+@Implementation:
+Length-dispatched cascade. Each branch compares the lexeme against the
+keywords of that length via match_string; on match returns
+TOKEN_KEYWORD directly. Falls through to TOKEN_IDENTIFIER.
+@End Implementation
+
+@Performance_Hints:
+Length bucketing keeps amortised work near O(1) for ordinary
+identifiers (length-bucket miss is constant time) and bounded by the
+small bucket sizes for keywords (max 6 entries per length).
+@End Performance_Hints
 Process called "classify_keyword" takes text as Integer, length as Integer returns Integer:
     Note: Classify identifier as keyword or regular identifier
 
@@ -515,6 +719,20 @@ Note: ==========================================================================
 Note: Lexing Functions
 Note: ============================================================================
 
+@Reasoning:
+Scans an identifier or keyword. The caller has verified the first
+byte is is_alpha. This routine consumes the longest run of
+is_alphanumeric bytes and then defers to classify_keyword for the
+TOKEN_KEYWORD/TOKEN_IDENTIFIER decision.
+@End Reasoning
+
+@Implementation:
+Snapshots start_pos = position. While loop calls peek_char; EOF (0)
+or non-alphanumeric breaks. Computes length = (final position) -
+start_pos and lexeme = source + start_pos. classify_keyword returns
+the token type; the lexeme bytes are copied into a StringCore via
+create_string_from_buffer, then a new token is allocated.
+@End Implementation
 Process called "lex_identifier" takes lexer as Integer returns Integer:
     Note: Lex identifier or keyword
 
@@ -547,6 +765,28 @@ Process called "lex_identifier" takes lexer as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+Scans a Rust numeric literal. Rust admits decimal, hex (0x), octal
+(0o), binary (0b) integer forms; floats with optional decimal point
+and 'e'/'E' exponent with optional sign; and type suffixes
+(i8/i16/i32/i64/i128, u8/u16/u32/u64/u128, f32/f64) plus underscore
+digit separators anywhere in the digit run. The complete lexeme
+(prefix + digits + decimal + exponent + suffix) is preserved verbatim
+in the token's value so later passes can parse the actual number.
+@End Reasoning
+
+@Implementation:
+Snapshots start_pos and reads source_length. First byte '0' triggers
+a prefix probe: 'x' enters a hex-digits + underscore loop; 'o' enters
+an octal-only (0..7) + underscore loop; 'b' enters a binary-only
+(0,1) + underscore loop. If no prefix matched, falls through to the
+generic decimal scan. The decimal scan tracks has_dot to forbid two
+decimal points; consumes 'e' as exponent marker followed by optional
+'+/-' and digits; consumes '_' as digit separator. After the body,
+suffix dispatch: 'i'/'u'/'f' each consume their letter and any
+trailing digit run (covers i32, u64, f64, etc.). Final token records
+the full lexeme as a copied StringCore under TOKEN_NUMBER.
+@End Implementation
 Process called "lex_number" takes lexer as Integer returns Integer:
     Note: Lex integer or float literal
 
@@ -725,6 +965,26 @@ Process called "lex_number" takes lexer as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+Scans an ordinary Rust string literal "...". Caller has verified the
+first byte is '"'. Escape sequences (\n, \t, \", \\, \xNN, \u{NNNN})
+are consumed structurally as backslash + one byte; semantic
+interpretation belongs to a later pass. Unterminated strings (EOF
+before closing quote) leave the lexeme spanning to EOF.
+@End Reasoning
+
+@Implementation:
+Snapshots start_pos. Consumes the opening '"'. Loop body: EOF (0)
+breaks. Backslash (92) consumes both itself and the following byte
+(skip escape payload). Closing '"' (34) consumes and breaks.
+Otherwise consumes one byte. Materialises the lexeme as a StringCore
+via create_string_from_buffer and emits TOKEN_STRING.
+@End Implementation
+
+@Security_Scope:
+Untrusted source; EOF check prevents unbounded scanning on
+unterminated literals.
+@End Security_Scope
 Process called "lex_string" takes lexer as Integer returns Integer:
     Note: Lex string literal
 
@@ -765,6 +1025,22 @@ Process called "lex_string" takes lexer as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+Scans a Rust character literal 'c'. Caller has verified the leading
+quote and verified that what follows is NOT a lifetime (a leading
+alpha after the quote would have been routed to lex_lifetime by the
+dispatcher in tokenize). The body is either one byte or a backslash
+escape; the closing quote is consumed unconditionally.
+@End Reasoning
+
+@Implementation:
+Snapshots start_pos. Consumes opening quote. If next byte is
+backslash (92) consumes two bytes (the escape payload); otherwise
+one byte. Then consumes the closing quote unconditionally - malformed
+literals (closing quote missing) will absorb whatever byte follows,
+which is acceptable because the parser will surface a downstream
+diagnostic. Emits TOKEN_CHAR with the full lexeme.
+@End Implementation
 Process called "lex_char" takes lexer as Integer returns Integer:
     Note: Lex character literal
 
@@ -795,6 +1071,20 @@ Process called "lex_char" takes lexer as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+Scans a Rust lifetime annotation ('a, 'static, '_) which is
+syntactically a single quote followed by an identifier rather than a
+quoted character. The dispatcher in tokenize already distinguishes
+lifetimes from char literals by peek_ahead(1) being is_alpha; this
+routine assumes that contract.
+@End Reasoning
+
+@Implementation:
+Snapshots start_pos. Consumes the opening single quote. Loops
+consuming is_alphanumeric bytes until a non-identifier byte or EOF
+is hit. Materialises the lexeme (including the leading apostrophe)
+as a StringCore and emits TOKEN_LIFETIME.
+@End Implementation
 Process called "lex_lifetime" takes lexer as Integer returns Integer:
     Note: Lex lifetime annotation ('a, 'static)
 
@@ -828,6 +1118,28 @@ Process called "lex_lifetime" takes lexer as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+Scans the longest matching operator at the cursor. Rust's operator
+set includes single-char (+, -, etc.), two-char compound (::, ->,
+=>, +=, ==, &&, ||, ..), and three-char operators (..=, <<=, >>=).
+This routine consumes the first byte, then conditionally consumes
+the second based on the (first, next) pair, and for '..' / '<<' /
+'>>' optionally consumes a third '=' for inclusive-range or
+shift-assign forms. The resulting span is emitted as a single
+TOKEN_OPERATOR.
+@End Reasoning
+
+@Implementation:
+Snapshots start_pos, reads char and advances. Reads next_char. A
+cascade of per-first-byte branches consumes additional bytes for
+each recognised compound form: ':'+':' => '::'; '-'+'>' => '->';
+'-'+'=' => '-='; '='+'>' => '=>'; '='+'=' => '=='; '.'+'.' =>
+'..', and if a third '=' is present consumes that for '..='. The
+arithmetic compounds '+=' '*=' '/=' '%=' follow the same pattern.
+Bitwise: '&'+'=' '&&' '|=' '||' '^='. Comparison: '!=' '<=' '>=' and
+shift '<<' / '>>' (with optional '=' third byte for '<<=' / '>>=').
+The complete operator span is materialised as a TOKEN_OPERATOR.
+@End Implementation
 Process called "lex_operator" takes lexer as Integer returns Integer:
     Note: Lex operator token
 
@@ -956,6 +1268,37 @@ Note: ==========================================================================
 Note: Main Tokenization
 Note: ============================================================================
 
+@Reasoning:
+Drives lexing of the entire source into the lexer's tokens list.
+Implements first-byte dispatch with two specialised disambiguations:
+'/' may be either a division operator or the start of a comment (//
+or /*); '\'' may be either a character literal or a lifetime
+annotation depending on whether the byte at position+1 is alphabetic.
+'#' may begin an attribute (#[...]) or an inner attribute (#![...]).
+After the source is exhausted a TOKEN_EOF is appended so the parser
+can detect end-of-input without checking list size.
+@End Reasoning
+
+@Implementation:
+Reads tokens handle once. Outer loop: skip_whitespace then peek_char;
+EOF (0) breaks. '/' (47) inspects source+position+1 directly (cheaper
+than calling peek_ahead): '//' delegates to skip_line_comment, '/*'
+delegates to skip_block_comment, otherwise falls through to operator
+handling. is_alpha -> lex_identifier (push, continue). is_digit ->
+lex_number (push, continue). '"' (34) -> lex_string. '\'' (39):
+inspect next byte; is_alpha -> lex_lifetime, otherwise lex_char.
+'#' (35): scan to ']' and emit TOKEN_ATTRIBUTE with full lexeme.
+Otherwise: operator-byte test populates is_operator_char; if set,
+lex_operator. Otherwise symbol-byte test ((, ), {, }, [, ], comma,
+semicolon) emits a single-byte TOKEN_SYMBOL. Anything else is
+silently skipped by a bare advance_char so the lexer never stalls.
+At end, push a TOKEN_EOF with empty string value.
+@End Implementation
+
+@Security_Scope:
+Untrusted source; every unrecognised-byte path consumes at least one
+byte so the lexer cannot spin on malformed input.
+@End Security_Scope
 Process called "tokenize" takes lexer as Integer returns Integer:
     Note: Tokenize entire source into tokens
 
@@ -1180,6 +1523,16 @@ Process called "tokenize" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Accessor for the parsed token list. The caller must not free the
+returned list directly; ownership remains with the lexer. The list
+is appropriate for read-only iteration; mutation is undefined.
+@End Reasoning
+
+@Implementation:
+Single memory_get_int64 from offset 24. Returns the borrowed list
+handle.
+@End Implementation
 Process called "get_tokens" takes lexer as Integer returns Integer:
     Note: Get token list from lexer
 
@@ -1191,6 +1544,18 @@ Note: ==========================================================================
 Note: Helper Functions
 Note: ============================================================================
 
+@Reasoning:
+Byte-equal compare specialised to the keyword-bucket use case in
+classify_keyword. The pattern is passed as a Runa String literal but
+read byte-by-byte alongside the source span; both are required to be
+exactly 'length' bytes (caller ensures this via length bucketing).
+@End Reasoning
+
+@Implementation:
+Loop 0..length: each iteration reads text[i] and pattern[i] via
+memory_get_byte and returns 0 on mismatch. Falls off the loop with
+return 1 on full match.
+@End Implementation
 Process called "match_string" takes text as Integer, pattern as String, length as Integer returns Integer:
     Note: Match string against pattern
 

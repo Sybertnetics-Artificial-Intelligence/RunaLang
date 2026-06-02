@@ -67,6 +67,24 @@ Note: ==========================================================================
 Note: LLVM IR AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+Universal LLVM IR AST node carrying enough slots for every node kind
+(module, function, basic block, instruction, type, value, global).
+Some slots are unused per kind — operands is empty on a value node,
+basic_blocks is empty on an instruction — but the uniform layout
+keeps allocation and traversal uniform across kinds. Memory overhead
+(80 bytes per node vs ~24 for a minimal node) is acceptable because
+LLVM IR ASTs are not the dominant memory consumer in the compiler.
+@End Reasoning
+
+@Implementation:
+80-byte record (10 x i64). Offsets: node_type (0), name (8), value (16),
+type_info (24), operands (32, List), basic_blocks (40, List),
+instructions (48, List), attributes (56, Dict), line (64), column (72).
+All pointer fields zero-init in create_llvm_node so consumers can
+null-check before traversal.
+@End Implementation
+
 Type called "LLVMNode":
     node_type as Integer        Note: LLVM_* constant
     name as Integer             Note: Name (function, register, label)
@@ -84,6 +102,20 @@ Note: ==========================================================================
 Note: Parser Structure
 Note: ============================================================================
 
+@Reasoning:
+Parser state: holds the lexer, one-token lookahead (current_token),
+and sticky-error channel. Single-token lookahead is sufficient for
+LLVM IR's grammar — no parser construct needs more than one token
+of context to disambiguate.
+@End Reasoning
+
+@Implementation:
+32-byte struct (4 x i64): lexer pointer at offset 0, current token
+at offset 8, owned error message at offset 16, has_error sticky flag
+at offset 24. The current_token is pre-fetched in create_llvm_parser
+so the parser is ready to use immediately after construction.
+@End Implementation
+
 Type called "LLVMParser":
     lexer as Integer            Note: LLVM IR lexer
     current_token as Integer    Note: Current token
@@ -94,6 +126,22 @@ End Type
 Note: ============================================================================
 Note: Parser Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Builds a parser bound to the provided lexer and pre-fetches the first
+token so the parser is immediately ready for parse_module or similar
+top-level entry. Pre-fetching keeps the rest of the parser's call
+sites simple — they only need to call peek_token_type/lexeme without
+worrying about the empty-state case.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes, OOM short-circuit to 0. Stores lexer pointer at
+offset 0, zero-initialises current_token (8), error_message (16),
+has_error (24). Calls next_token on the lexer for the first token
+and stores it at offset 8, overwriting the zero. Lexer is aliased,
+not copied — the parser does not own it.
+@End Implementation
 
 Process called "create_llvm_parser" takes lexer as Integer returns Integer:
     Note: Create LLVM IR parser
@@ -115,6 +163,19 @@ Process called "create_llvm_parser" takes lexer as Integer returns Integer:
 
     Return parser
 End Process
+
+@Reasoning:
+Releases parser-owned resources without touching the lexer (which is
+owned by the caller). The only owned heap is the error_message buffer
+populated by set_parse_error.
+@End Reasoning
+
+@Implementation:
+Null parser returns success (defensive double-free safety). Reads
+error_message at offset 16 and frees it via Layout deallocate if
+non-null. Then deallocates the 32-byte parser struct. Current_token
+is not freed here — tokens are owned by the lexer's token pool.
+@End Implementation
 
 Process called "destroy_llvm_parser" takes parser as Integer returns Integer:
     Note: Destroy LLVM IR parser
@@ -138,6 +199,19 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Drives the lexer forward and updates the parser's current-token slot
+in one call. The returned token is the new one (now-current), which
+some callers use to inspect immediately without a subsequent peek.
+@End Reasoning
+
+@Implementation:
+Reads lexer at offset 0, calls next_token, stores the result at
+offset 8 (overwriting old current_token), returns the new token.
+No null-check on the lexer because the parser is invalid if
+construction did not assign it.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -148,6 +222,19 @@ Process called "advance_token" takes parser as Integer returns Integer:
 
     Return token
 End Process
+
+@Reasoning:
+Single-token lookahead utility — exposes the type tag of the current
+token without advancing. Returns TOKEN_EOF for missing/null tokens
+so all parser callers can handle "ran past the end" through the same
+control flow that handles legitimate EOF.
+@End Reasoning
+
+@Implementation:
+Reads current_token at offset 8 of the parser; if null returns
+TOKEN_EOF from the Lexer module. Otherwise reads the token_type
+field at offset 0 of the token record.
+@End Implementation
 
 Process called "peek_token_type" takes parser as Integer returns Integer:
     Note: Peek at current token type
@@ -163,6 +250,19 @@ Process called "peek_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Companion to peek_token_type that returns the textual lexeme of the
+current token. Used when the parser needs to match on keyword strings
+(e.g., distinguishing "ret" from "br" inside the parse_instruction
+opcode dispatch) rather than just on token type tags.
+@End Reasoning
+
+@Implementation:
+Reads current_token at offset 8; null returns 0. Otherwise reads the
+lexeme pointer at token offset 8. The returned pointer aliases the
+lexer's buffer — callers must not free it.
+@End Implementation
+
 Process called "peek_token_lexeme" takes parser as Integer returns Integer:
     Note: Get current token lexeme
 
@@ -177,6 +277,18 @@ Process called "peek_token_lexeme" takes parser as Integer returns Integer:
     Return lexeme
 End Process
 
+@Reasoning:
+Boolean predicate for token type matching. Frequently used inside
+parser loops to test the next token without consuming it — for
+example, "is the next token a closing paren?" determines whether
+the parameter list loop should exit.
+@End Reasoning
+
+@Implementation:
+Calls peek_token_type and compares against expected_type. Returns
+1 on match, 0 otherwise. Does not advance the parser.
+@End Implementation
+
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches type
 
@@ -188,6 +300,18 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
 
     Return 0
 End Process
+
+@Reasoning:
+Consumes a token of the expected type or fails with the provided
+error message. Combines the check-and-advance into one call so
+recursive-descent parsing routines stay concise.
+@End Reasoning
+
+@Implementation:
+Calls peek_token_type. On mismatch invokes set_parse_error with the
+caller's error_msg and returns 0 (caller convention is to bail out).
+On match calls advance_token to consume and returns 1.
+@End Implementation
 
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Note: Expect specific token type
@@ -207,6 +331,21 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Records the parse error message. Unlike first-error-wins implementations
+elsewhere in this codebase, this one overwrites previous errors —
+useful here because deep instruction-level errors usually surface
+near the leaf and are more actionable than the outer module-level
+report.
+@End Reasoning
+
+@Implementation:
+Reads existing error pointer at offset 16; frees if non-null to
+prevent leak when overwriting. Allocates msg_length+1 bytes, copies
+the message via memory_copy and NUL-terminates. Stores the new
+pointer at offset 16. Sets has_error to 1 at offset 24 (sticky).
+@End Implementation
 
 Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
     Note: Set parser error message
@@ -231,6 +370,16 @@ Process called "set_parse_error" takes parser as Integer, message as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+Boolean accessor for the sticky-error flag. The parse_module loop
+checks this after each top-level construct to know when to abort.
+@End Reasoning
+
+@Implementation:
+Returns the integer at offset 24. Flag is 0/1 so the caller can
+treat the return as a boolean.
+@End Implementation
+
 Process called "has_parse_error" takes parser as Integer returns Integer:
     Note: Check if parser has error
 
@@ -238,6 +387,16 @@ Process called "has_parse_error" takes parser as Integer returns Integer:
 
     Return has_error
 End Process
+
+@Reasoning:
+Public accessor exposing the (parser-owned) error message pointer
+to callers wanting to format diagnostics.
+@End Reasoning
+
+@Implementation:
+Returns the int64 at offset 16. Caller must not free — the parser
+destructor owns the buffer lifetime.
+@End Implementation
 
 Process called "get_error_message" takes parser as Integer returns Integer:
     Note: Get error message
@@ -250,6 +409,20 @@ End Process
 Note: ============================================================================
 Note: Node Creation
 Note: ============================================================================
+
+@Reasoning:
+Factory for the uniform LLVMNode struct used across all LLVM AST
+node kinds. The node_type tag selects which slots are meaningful;
+unused slots stay zero and are ignored by downstream code.
+@End Reasoning
+
+@Implementation:
+Allocates 80 bytes, OOM short-circuit to 0. Writes node_type at
+offset 0 and zero-initialises all nine other fields explicitly so
+no garbage data leaks into child traversal. The List/Dict slots
+(operands, basic_blocks, instructions, attributes) lazy-create on
+first use via the add_* helpers below.
+@End Implementation
 
 Process called "create_llvm_node" takes node_type as Integer returns Integer:
     Note: Create LLVM AST node
@@ -275,6 +448,21 @@ Process called "create_llvm_node" takes node_type as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Sets the name field on a node by making an owned copy of the source
+string. Copying (not aliasing) is necessary because token lexemes
+get overwritten by subsequent token reads from the lexer's buffer.
+@End Reasoning
+
+@Implementation:
+Computes name_length via string_length. Allocates name_length+1
+bytes. If allocation fails returns 0 without modifying the node.
+On success copies the bytes via memory_copy, NUL-terminates at the
+end byte, and stores the new pointer at node offset 8. Previous
+name pointer (if any) is not freed here — caller must ensure no
+prior name exists, or accept the leak.
+@End Implementation
+
 Process called "set_node_name" takes node as Integer, name as Integer returns Integer:
     Note: Set node name
 
@@ -293,6 +481,18 @@ Process called "set_node_name" takes node as Integer, name as Integer returns In
     Return 1
 End Process
 
+@Reasoning:
+Sets the value field by making an owned copy. Same rationale as
+set_node_name: token lexemes are transient so the node must capture
+its own copy.
+@End Reasoning
+
+@Implementation:
+Length+1 byte allocation, memory_copy, NUL-terminate, store pointer
+at node offset 16. Returns 0 on OOM, 1 on success. Like set_node_name,
+does not free a previously-set value — caller responsibility.
+@End Implementation
+
 Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
     Note: Set node value
 
@@ -310,6 +510,19 @@ Process called "set_node_value" takes node as Integer, value as Integer returns 
 
     Return 1
 End Process
+
+@Reasoning:
+Lazy-initialises the operands list and appends. Lazy creation avoids
+allocating empty List structures for value nodes that never have
+operands, which makes up a large fraction of all nodes.
+@End Reasoning
+
+@Implementation:
+Reads operands at offset 32. If null, creates a fresh List via
+proc create from List and writes it back to offset 32. Then calls
+add from List with the operand pointer. Returns 1 on success, 0 on
+OOM during List creation.
+@End Implementation
 
 Process called "add_operand" takes node as Integer, operand as Integer returns Integer:
     Note: Add operand to node
@@ -332,6 +545,18 @@ Process called "add_operand" takes node as Integer, operand as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+Lazy-initialises the basic_blocks list and appends. Used to attach a
+basic block to its containing function. Same lazy pattern as
+add_operand to avoid empty List structures on non-function nodes.
+@End Reasoning
+
+@Implementation:
+Reads basic_blocks at offset 40, lazy-creates the List if null,
+appends the bb pointer via add from List. Returns 1 on success,
+0 on OOM during List creation.
+@End Implementation
+
 Process called "add_basic_block" takes node as Integer, bb as Integer returns Integer:
     Note: Add basic block to function
 
@@ -352,6 +577,19 @@ Process called "add_basic_block" takes node as Integer, bb as Integer returns In
 
     Return 1
 End Process
+
+@Reasoning:
+Lazy-initialises the instructions list and appends. Used to attach
+parsed instructions to their containing basic block in source order.
+@End Reasoning
+
+@Implementation:
+Reads instructions at offset 48, lazy-creates the List if null,
+appends the inst pointer. Returns 1 on success, 0 on OOM during
+List creation. Order of additions is preserved — important because
+LLVM IR is sequential SSA where instruction order determines
+dominance and use-def relationships.
+@End Implementation
 
 Process called "add_instruction" takes node as Integer, inst as Integer returns Integer:
     Note: Add instruction to basic block
@@ -378,16 +616,25 @@ Note: ==========================================================================
 Note: Type Parsing
 Note: ============================================================================
 
+@Reasoning:
+Parses LLVM IR type expressions. The full LLVM type grammar includes
+primitives (i1/i8/i16/i32/i64/float/double), void, pointer (ptr),
+aggregates ([n x T], {T1, T2}), and vectors (<n x T>). This bootstrap
+implementation handles the primitive-token form (lexer-classified
+TOKEN_TYPE) and the keyword "void" form, which together cover the
+vast majority of real LLVM IR. Other forms route through here too
+but emit "Expected type" — known gap for a later extension.
+@End Reasoning
+
+@Implementation:
+Reads peek token type. On TOKEN_TYPE creates an LLVM_TYPE node with
+the lexeme as its name and advances. On TOKEN_KEYWORD with lexeme
+"void" creates a void-named LLVM_TYPE node similarly. Anything else
+sets parse error "Expected type" and returns 0.
+@End Implementation
+
 Process called "parse_type" takes parser as Integer returns Integer:
     Note: Parse LLVM IR type
-
-    @Reasoning:
-    LLVM IR types include:
-    - Primitives: i1, i8, i32, i64, float, double, void
-    - Pointers: ptr
-    - Aggregates: [n x type], {type1, type2, ...}
-    - Vectors: <n x type>
-    @End Reasoning
 
     Let token_type be proc peek_token_type from parser
 
@@ -419,16 +666,27 @@ Note: ==========================================================================
 Note: Value Parsing
 Note: ============================================================================
 
+@Reasoning:
+LLVM IR values are everything that can appear in an operand slot:
+local registers (%0, %var), global identifiers (@func, @global),
+numeric constants, string constants, and the three keyword constants
+null/true/false. The node kind reflects whether the value is local
+(LLVM_VALUE) or global (LLVM_GLOBAL) so downstream passes can
+distinguish without re-parsing the leading sigil.
+@End Reasoning
+
+@Implementation:
+Switches on peek token type. TOKEN_LOCAL_ID creates an LLVM_VALUE
+node with name. TOKEN_GLOBAL_ID creates an LLVM_GLOBAL node with
+name. TOKEN_NUMBER creates an LLVM_VALUE with value (number string).
+TOKEN_STRING creates an LLVM_VALUE with value (string lexeme).
+TOKEN_KEYWORD dispatches to "null", "true", "false" creating
+LLVM_VALUE nodes with the literal as value. Anything else fires
+"Expected value" via set_parse_error and returns 0.
+@End Implementation
+
 Process called "parse_value" takes parser as Integer returns Integer:
     Note: Parse LLVM IR value (register, global, constant)
-
-    @Reasoning:
-    Values can be:
-    - Local registers: %0, %var
-    - Global identifiers: @global
-    - Constants: 42, 3.14, null, true, false
-    - Strings: "hello"
-    @End Reasoning
 
     Let token_type be proc peek_token_type from parser
 
@@ -500,17 +758,32 @@ Note: ==========================================================================
 Note: Instruction Parsing
 Note: ============================================================================
 
+@Reasoning:
+The instruction parser is the most complex parser routine. LLVM IR
+instructions have heterogeneous shapes: ret/br/call/load/store/alloca
+each take different operand patterns; arithmetic instructions follow
+a uniform "type op1, op2" pattern. Specialised handling for the
+control-flow and memory opcodes produces semantically-correct ASTs;
+the arithmetic fallback covers the regular pattern shared by add,
+sub, mul, sdiv, udiv, icmp, etc.
+@End Reasoning
+
+@Implementation:
+Creates an LLVM_INSTRUCTION node up-front. If current token is
+TOKEN_LOCAL_ID, captures it as the result-assignment register name
+and expects `=`. Then expects TOKEN_KEYWORD for the opcode, stores
+opcode as the node's value, and advances. Six specialised opcode
+branches follow: ret (parses type then optional value, void-typed
+ret has no value), br (parses either unconditional `br label %X` or
+conditional `br i1 %cond, label %T, label %F`), alloca (parses single
+type), load (type, comma, ptr-type, ptr-value), store (type, value,
+comma, ptr-type, ptr-value), call (ret-type, callee, paren-arg list).
+Anything else falls through to the binary-arithmetic pattern:
+type, op1, comma, op2.
+@End Implementation
+
 Process called "parse_instruction" takes parser as Integer returns Integer:
     Note: Parse LLVM IR instruction
-
-    @Reasoning:
-    Instructions include:
-    - Arithmetic: add, sub, mul, sdiv, udiv, etc.
-    - Memory: alloca, load, store
-    - Control flow: br, ret, switch, call
-    - Comparison: icmp, fcmp
-    - Conversions: bitcast, trunc, zext, sext
-    @End Reasoning
 
     Let token_type be proc peek_token_type from parser
     Let inst_node be proc create_llvm_node from LLVM_INSTRUCTION
@@ -737,16 +1010,30 @@ Note: ==========================================================================
 Note: Basic Block Parsing
 Note: ============================================================================
 
+@Reasoning:
+Basic blocks in LLVM IR are sequences of instructions starting with
+a label and ending with a terminator (br/ret/switch/etc). The parser
+treats end-of-block as "next token is another label" (local-id
+followed by colon), end of function `}`, or EOF. Reading instructions
+until that boundary produces the right block structure even without
+parsing terminator types specifically.
+@End Reasoning
+
+@Implementation:
+Creates an LLVM_BASIC_BLOCK node. Parses label: accepts either
+TOKEN_LOCAL_ID (named label %foo) or TOKEN_NUMBER (numbered label %0)
+as the name. Expects `:` after the label. Then loops reading
+instructions. Exit on TOKEN_EOF, TOKEN_RBRACE (end of function), or
+the lookahead pattern "local_id followed by colon" — the lookahead
+saves the lexer cursor at offset 16, advances to peek the next
+token's type, then restores the cursor by writing back the saved
+position and re-fetching the token. Non-instructions or null
+instruction returns also break out. Each successful instruction
+appends to the block via add_instruction.
+@End Implementation
+
 Process called "parse_basic_block" takes parser as Integer returns Integer:
     Note: Parse LLVM IR basic block
-
-    @Reasoning:
-    Basic blocks start with a label and contain instructions.
-    Format: label_name:
-            instruction1
-            instruction2
-            terminator
-    @End Reasoning
 
     Let bb_node be proc create_llvm_node from LLVM_BASIC_BLOCK
 
@@ -822,18 +1109,31 @@ Note: ==========================================================================
 Note: Function Parsing
 Note: ============================================================================
 
+@Reasoning:
+Parses an LLVM function definition starting with `define`. The full
+form is `define RetType @name(ParamType %param, ...) { body }`.
+Return type goes into the type_info slot; basic blocks of the body
+go into the basic_blocks list. Parameters are attached as child
+nodes via add_child so they can be enumerated by traversal passes.
+@End Reasoning
+
+@Implementation:
+Creates an LLVM_FUNCTION node. Verifies the current token is the
+keyword "define" via strings_equal on the lexeme; mismatch sets
+"Expected 'define'" and returns 0. Advances, parses return type into
+type_info (node offset 24). Expects TOKEN_GLOBAL_ID for the function
+name, captures it via set_node_name, advances. Expects `(`. The
+parameter loop reads param_type, then param_name (peek_token_lexeme),
+constructs an AST_PARAMETER node, attaches the type as child and
+sets name. First-iteration flag suppresses the comma check; subsequent
+iterations expect `,` first. After parameters are gathered into
+param_list, iterates and add_child's each onto func_node. Expects
+`)` and `{`. Then loops reading basic_blocks until `}` or EOF.
+Finally expects `}` as the function terminator.
+@End Implementation
+
 Process called "parse_function" takes parser as Integer returns Integer:
     Note: Parse LLVM IR function definition
-
-    @Reasoning:
-    Function format:
-    define return_type @function_name(param1_type %param1, ...) {
-      basic_block1:
-        instructions
-      basic_block2:
-        instructions
-    }
-    @End Reasoning
 
     Let func_node be proc create_llvm_node from LLVM_FUNCTION
 
@@ -955,12 +1255,34 @@ Note: ==========================================================================
 Note: Module Parsing
 Note: ============================================================================
 
+@Reasoning:
+Top-level entry point for parsing a complete LLVM IR module. A module
+mixes function definitions (define), declarations (declare), global
+variables (@name = ...), named type definitions (%name = type ...),
+target triple/datalayout directives, and attributes groups. Dispatch
+is keyword-driven from the current token's lexeme.
+@End Reasoning
+
+@Implementation:
+Creates an LLVM_MODULE node. Loops over module contents until
+TOKEN_EOF. Each iteration peeks the lexeme and dispatches:
+  - "define" -> parse_function, attached via add_basic_block (the
+    function goes into the basic_blocks slot of the module — this
+    is a reuse of the slot since the module itself has no real BBs).
+  - "declare" -> parse_function_declaration for prototype-only
+    declarations.
+  - "@" -> parse_global_variable for module-scoped variables.
+  - "%" -> parse_type_definition for named type aliases.
+  - "target" -> parse_target_info (triple/datalayout).
+  - "attributes" -> parse_attributes for attribute group definitions.
+  - Anything else: skip one token to avoid infinite loop on
+    unrecognised syntax.
+After each iteration checks has_parse_error; non-zero returns 0 to
+abandon the module on first failure.
+@End Implementation
+
 Process called "parse_module" takes parser as Integer returns Integer:
     Note: Parse LLVM IR module (top-level entry point)
-
-    @Reasoning:
-    Modules contain global declarations, function definitions, etc.
-    @End Reasoning
 
     Let module_node be proc create_llvm_node from LLVM_MODULE
 

@@ -49,6 +49,22 @@ Note: ==========================================================================
 Note: Generation Context
 Note: ============================================================================
 
+@Reasoning:
+The Swift generator carries more scope state than the PowerShell one
+because Swift code differs syntactically between top-level, function-body,
+and closure-body positions (e.g. `return` is implicit in single-expression
+closures, capture lists only legal in closures). Two boolean flags
+disambiguate these contexts without re-walking the call stack at every
+expression node.
+@End Reasoning
+
+@Implementation:
+Four pointer-sized fields packed into 32 bytes:
+- emitter (offset 0): backing Swift emitter
+- indent_level (offset 8): integer counter for 4-space indentation
+- in_function (offset 16): 1 when inside a function body, 0 otherwise
+- in_closure (offset 24): 1 when inside a closure literal, 0 otherwise
+@End Implementation
 Type called "HirToSwiftContext":
     emitter as Integer          Note: Swift emitter instance
     indent_level as Integer     Note: Current indentation level
@@ -56,13 +72,17 @@ Type called "HirToSwiftContext":
     in_closure as Integer       Note: Boolean: 1 if inside closure
 End Type
 
+@Reasoning:
+The context is initialised at indent level 0 and outside any function or closure
+scope; the recursive generators flip in_function/in_closure as they descend into
+those constructs so context-sensitive emission (e.g. implicit return in
+single-expression closures, capture list legality) can be decided with a single
+field read rather than re-walking the AST stack. Returning the raw 32-byte
+allocation pointer keeps the cost of context creation to one allocation and four
+stores, which matters because translation passes create one per top-level unit.
+@End Reasoning
 Process called "create_hir_to_swift_context" takes emitter as Integer returns Integer:
     Note: Create generation context
-
-    @Reasoning:
-    Context tracks emitter, indentation state, and scope information
-    needed for proper Swift code generation.
-    @End Reasoning
 
     Let context_size be 32  Note: HirToSwiftContext: 4 fields × 8 bytes
     Let context be proc allocate from Layout with context_size
@@ -79,6 +99,17 @@ Process called "create_hir_to_swift_context" takes emitter as Integer returns In
     Return context
 End Process
 
+@Reasoning:
+Releases the 32-byte HirToSwiftContext struct only; the emitter is owned
+by the caller (generate_swift_from_hir) so callers can extract the output
+buffer after the context is destroyed.
+@End Reasoning
+
+@Implementation:
+Idempotent on null (returns 1 unchanged). Otherwise calls Layout.deallocate
+on the context pointer. No field clearing performed because the memory is
+released in the same call.
+@End Implementation
 Process called "destroy_hir_to_swift_context" takes context as Integer returns Integer:
     Note: Destroy generation context
 
@@ -90,6 +121,16 @@ Process called "destroy_hir_to_swift_context" takes context as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+Swift uses brace-delimited blocks but expects consistent 4-space
+indentation for readability. The counter feeds emit_indent so the
+generator never has to know how many spaces a "level" expands to.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null context. Reads indent_level at offset 8, writes
+`current + 1` back. Returns 1.
+@End Implementation
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -103,6 +144,16 @@ Process called "increase_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Mirror of increase_indent with a positive-only guard so malformed nesting
+in the input HIR cannot underflow indent_level into a giant unsigned
+value, which would otherwise cause emit_indent to loop unboundedly.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null context. Reads indent_level. When strictly positive
+writes `current - 1` back. Always returns 1.
+@End Implementation
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
 
@@ -119,6 +170,18 @@ Process called "decrease_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Centralizes the "compute indent and write spaces" step so every generate_*
+helper writes a single line instead of duplicating the read-level/emit
+pattern. Delegates the actual spaces emission to the emitter so Swift's
+4-space-per-level convention lives in one place.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null context. Reads emitter (offset 0) and level (offset 8),
+forwards both to Emitter.emit_indent which expands the level into the
+appropriate number of spaces.
+@End Implementation
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit current indentation level
 
@@ -138,6 +201,18 @@ Note: ==========================================================================
 Note: HIR Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Domain-named wrapper over HIR.get_dict_value that documents the expected
+shape (string value) at call sites. Null-guards the dict so caller chains
+like `get_dict_string_value(get_dict_hir_value(x, k1), k2)` short-circuit
+cleanly when any intermediate node is missing.
+@End Reasoning
+
+@Implementation:
+Returns 0 if dict_hir is 0. Otherwise reads HIR.get_dict_value(dict, key)
+and returns it (also 0 when the key is absent, which is the expected
+"missing" sentinel).
+@End Implementation
 Process called "get_dict_string_value" takes dict_hir as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary
 
@@ -154,6 +229,17 @@ Process called "get_dict_string_value" takes dict_hir as Integer, key as Integer
     Return value
 End Process
 
+@Reasoning:
+Same shape as get_dict_string_value but named for subtree retrieval to
+keep generate_* code self-documenting when the lookup expects a child
+HIR node rather than a leaf string.
+@End Reasoning
+
+@Implementation:
+Null-guards dict_hir. Returns HIR.get_dict_value(dict, key) unmodified.
+The pointer is borrowed from the dict and must not be deallocated by
+the caller.
+@End Implementation
 Process called "get_dict_hir_value" takes dict_hir as Integer, key as Integer returns Integer:
     Note: Get HIR value (dict/list) from HIR dictionary
 
@@ -165,6 +251,18 @@ Process called "get_dict_hir_value" takes dict_hir as Integer, key as Integer re
     Return value
 End Process
 
+@Reasoning:
+HIR carries boolean fields as wrapped string nodes (e.g. `{ "value": "true" }`)
+so the caller would otherwise have to fetch the child then string-compare.
+This helper collapses both steps and normalizes the result to a clean
+1/0 integer so callers can use it as a plain conditional.
+@End Reasoning
+
+@Implementation:
+Null-guards dict_hir. Reads the keyed sub-node; if non-null reads its
+nested "value" string and returns 1 when that string equals "true" via
+StringCore.strings_equal, else 0. Any missing layer collapses to 0.
+@End Implementation
 Process called "get_dict_bool_value" takes dict_hir as Integer, key as Integer returns Integer:
     Note: Get boolean value from HIR dictionary (1=true, 0=false)
 
@@ -193,13 +291,22 @@ Note: ==========================================================================
 Note: Main Translation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+This is the public entry point: it pairs an emitter (the actual string buffer
+and Swift formatting policy) with a fresh context (scope and indentation state),
+runs the recursive walker once, and lifts the string out before destroying both.
+The two-object split exists because the emitter is reusable across multiple
+translation units (it owns the buffer) but the context is unit-local; if a
+caller wanted to compose several HIR roots into one Swift file it would call
+generate_node directly with a shared emitter.
+@End Reasoning
+@Implementation:
+Returns the string pointer extracted via get_output BEFORE destroying the
+emitter; the emitter's destroy is expected to leave the string allocation
+intact (it lives in its own buffer rather than the emitter's scratch space).
+@End Implementation
 Process called "generate_swift_from_hir" takes hir_root as Integer returns Integer:
     Note: Generate Swift code from HIR
-
-    @Reasoning:
-    Main entry point for HIR→Swift generation. Creates emitter and context,
-    generates code, and returns the Swift source string.
-    @End Reasoning
 
     If hir_root is equal to 0:
         Return 0
@@ -228,13 +335,19 @@ Process called "generate_swift_from_hir" takes hir_root as Integer returns Integ
     Return output
 End Process
 
+@Reasoning:
+This central dispatcher reads the "_type" tag from the HIR dictionary and routes
+to the specialised generator for that construct. Tags are matched via a long
+sequence of strings_equal calls rather than a dictionary lookup because the
+dispatch ordering doubles as priority: declaration forms (function, class,
+struct, enum) are checked before statement forms before expression forms so the
+emitter never confuses, say, a swift_let DECLARATION with a swift_let EXPRESSION
+binding inside a switch case. Unknown tags return 0 silently because the HIR
+pipeline guarantees frontends only emit recognised tag strings; encountering an
+unknown tag at runtime indicates a translator bug rather than malformed source.
+@End Reasoning
 Process called "generate_node" takes context as Integer, node_hir as Integer returns Integer:
     Note: Generate Swift code from HIR node based on type
-
-    @Reasoning:
-    Central dispatcher for node generation. Routes to appropriate
-    generation function based on node type.
-    @End Reasoning
 
     If node_hir is equal to 0:
         Return 0
@@ -409,13 +522,16 @@ Note: ==========================================================================
 Note: Declaration Generation
 Note: ============================================================================
 
+@Reasoning:
+Swift import syntax is "import [kind] <module>" where the optional kind narrows
+the imported symbol set (e.g. "import class UIKit.UIView" imports just the
+class). The HIR carries the kind as the "import_kind" field; the emitter omits
+it entirely when absent to produce the more common bare module import. A
+trailing newline is mandatory because Swift treats imports as statement-position
+declarations that share a line with nothing else.
+@End Reasoning
 Process called "generate_import_decl" takes context as Integer, import_hir as Integer returns Integer:
     Note: Generate Swift import declaration
-
-    @Reasoning:
-    Swift imports can be for entire modules or specific symbols (class, struct, etc.).
-    Example: import Foundation, import class UIKit.UIView
-    @End Reasoning
 
     If import_hir is equal to 0:
         Return 0
@@ -443,13 +559,18 @@ Process called "generate_import_decl" takes context as Integer, import_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Swift's grammar fixes a strict order for the prefix of a function declaration:
+access control, then modifiers, then 'func', then name, then optional generic
+parameter list, then parameter list, then async/throws/rethrows clauses, then
+return type, then body. This emitter walks the HIR dictionary in that exact
+order so reordering the fields in HIR would be invisible to the output, while
+omitting fields cleanly skips the corresponding clause. The body emission flips
+in_function on the context so nested statements know to emit implicit-return
+patterns or 'self' references correctly.
+@End Reasoning
 Process called "generate_function_decl" takes context as Integer, func_hir as Integer returns Integer:
     Note: Generate Swift function declaration
-
-    @Reasoning:
-    Swift functions have: access control, modifiers (static, mutating, etc.),
-    func keyword, name, generic parameters, parameters, throws, return type, body.
-    @End Reasoning
 
     If func_hir is equal to 0:
         Return 0
@@ -538,6 +659,20 @@ Process called "generate_function_decl" takes context as Integer, func_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Swift declaration modifiers (static, final, override, lazy, weak,
+unowned, etc.) appear before the declaration keyword and are
+space-separated. The modifiers_hir is a flat HIR list of strings so the
+generator walks it linearly, emitting each token followed by a single
+space to preserve idiomatic spacing.
+@End Reasoning
+
+@Implementation:
+Null-guards modifiers_hir. Reads the emitter from context. Confirms the
+node is a list via HIR.is_list_hir; if so iterates via ListOps.size /
+get_at, emitting each non-null modifier string followed by a space.
+Non-list inputs are tolerated as a no-op.
+@End Implementation
 Process called "generate_modifiers" takes context as Integer, modifiers_hir as Integer returns Integer:
     Note: Generate Swift modifiers (static, final, override, lazy, etc.)
 
@@ -569,6 +704,19 @@ Process called "generate_modifiers" takes context as Integer, modifiers_hir as I
     Return 1
 End Process
 
+@Reasoning:
+Walks the HIR parameter list (a list node) and emits parameters in
+order with ", " separators. Each parameter is delegated to
+generate_parameter because per-parameter formatting (external+internal
+names, inout, type, variadic, default) is too rich to inline.
+@End Reasoning
+
+@Implementation:
+Null-guards params_hir. Confirms list shape via HIR.is_list_hir; if so,
+iterates ListOps.size / get_at, calling generate_parameter on each
+non-null entry. Between consecutive entries emits ", " through the
+emitter.
+@End Implementation
 Process called "generate_parameter_list" takes context as Integer, params_hir as Integer returns Integer:
     Note: Generate Swift parameter list
 
@@ -609,6 +757,21 @@ Process called "generate_parameter_list" takes context as Integer, params_hir as
     Return 1
 End Process
 
+@Reasoning:
+A Swift parameter is `[external] internal: [inout] Type[...][ = default]`.
+Each piece is optional except internal_name + type. The HIR carries each
+piece as a separate key so the printer never has to parse compound
+strings, and so partial parameters (e.g. type-only requirement signatures)
+still round-trip cleanly.
+@End Reasoning
+
+@Implementation:
+Null-guards param_hir. Optionally emits external_name + space, then
+internal_name. Emits ": ", then "inout " when the inout flag is set,
+then the type via generate_type. Adds "..." when the variadic flag is
+set. If a default_value subtree exists, emits " = " then dispatches it
+through generate_node.
+@End Implementation
 Process called "generate_parameter" takes context as Integer, param_hir as Integer returns Integer:
     Note: Generate single Swift parameter
 
@@ -661,13 +824,18 @@ Process called "generate_parameter" takes context as Integer, param_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Classes in Swift are reference types that combine single-base inheritance with
+multi-protocol conformance, and the colon-separated inheritance list mixes both
+in source order. We do not split the HIR 'inheritance' field into base and
+conformances because Swift's grammar does not require that distinction at the
+declaration site; the type checker disambiguates by symbol kind. Bracketed
+member emission uses increase_indent/decrease_indent to keep nested
+declarations properly aligned even when this class itself is a nested member
+of another type.
+@End Reasoning
 Process called "generate_class_decl" takes context as Integer, class_hir as Integer returns Integer:
     Note: Generate Swift class declaration
-
-    @Reasoning:
-    Swift classes are reference types with inheritance, protocol conformance,
-    and access control. Can be final to prevent inheritance.
-    @End Reasoning
 
     If class_hir is equal to 0:
         Return 0
@@ -732,13 +900,17 @@ Process called "generate_class_decl" takes context as Integer, class_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+The struct emitter differs from the class emitter only in the leading keyword
+and the field name used for the post-colon list ("conformance" vs.
+"inheritance"). The distinction in field naming reflects Swift's grammar -
+structs cannot inherit from another struct, so what looks structurally identical
+to inheritance is purely protocol conformance. Keeping the two emitters
+separate avoids a runtime branch on a "kind" tag and makes future Swift
+features specific to one form (e.g. struct-only attributes) easy to add.
+@End Reasoning
 Process called "generate_struct_decl" takes context as Integer, struct_hir as Integer returns Integer:
     Note: Generate Swift struct declaration
-
-    @Reasoning:
-    Swift structs are value types with protocol conformance.
-    No inheritance (only protocols). Have automatic memberwise initializers.
-    @End Reasoning
 
     If struct_hir is equal to 0:
         Return 0
@@ -797,13 +969,16 @@ Process called "generate_struct_decl" takes context as Integer, struct_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Enum declaration emission diverges from struct/class in two places: the post-
+colon list is a single raw_type rather than a conformance list, and the body
+contains 'case' lines instead of declarations. The raw_type is emitted as a bare
+type name (e.g. ": Int", ": String") because Swift forbids using both a raw
+backing type and a protocol conformance list in the same colon-prefixed clause;
+protocols on raw-valued enums require an extension block elsewhere.
+@End Reasoning
 Process called "generate_enum_decl" takes context as Integer, enum_hir as Integer returns Integer:
     Note: Generate Swift enum declaration
-
-    @Reasoning:
-    Swift enums are algebraic data types with associated values,
-    raw values, methods, and protocol conformance.
-    @End Reasoning
 
     If enum_hir is equal to 0:
         Return 0
@@ -857,6 +1032,19 @@ Process called "generate_enum_decl" takes context as Integer, enum_hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Each enum case is a `case <name>[(types)] [= <raw>]` line at the
+enclosing enum's indent depth. Associated values and raw values are
+mutually exclusive in valid Swift but the printer tolerates the HIR
+carrying either or neither.
+@End Reasoning
+
+@Implementation:
+Null-guards cases_hir. Confirms list shape. For each case node: emits
+indent + "case " + name. If associated_values is present, wraps a
+generate_associated_values call in parentheses. If raw_value string is
+present, emits " = <raw_value>". Ends each case with a newline.
+@End Implementation
 Process called "generate_enum_cases" takes context as Integer, cases_hir as Integer returns Integer:
     Note: Generate Swift enum cases
 
@@ -910,6 +1098,18 @@ Process called "generate_enum_cases" takes context as Integer, cases_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Associated values are emitted as a comma-separated type list inside the
+parentheses opened by the caller. Each entry is dispatched through
+generate_type because associated values can carry full type expressions
+including generic instantiations and tuple types.
+@End Reasoning
+
+@Implementation:
+Null-guards values_hir. Confirms list shape via HIR.is_list_hir. Iterates
+the list, calling generate_type on each non-null entry; between
+consecutive entries emits ", " through the emitter.
+@End Implementation
 Process called "generate_associated_values" takes context as Integer, values_hir as Integer returns Integer:
     Note: Generate associated values for enum case (tuple types)
 
@@ -944,13 +1144,17 @@ Process called "generate_associated_values" takes context as Integer, values_hir
     Return 1
 End Process
 
+@Reasoning:
+Protocol declarations are structurally simpler than classes because they cannot
+carry generic parameter lists at the declaration site (associated types serve
+that role and are emitted as requirements inside the body). The inheritance
+clause refers exclusively to other protocols; the HIR uses the field name
+'inherited_protocols' rather than the class-style 'inheritance' to make this
+explicit. Modifiers are omitted because no source-level modifiers apply to
+protocols other than the access keyword already handled.
+@End Reasoning
 Process called "generate_protocol_decl" takes context as Integer, protocol_hir as Integer returns Integer:
     Note: Generate Swift protocol declaration
-
-    @Reasoning:
-    Protocols define contracts with required methods, properties,
-    and associated types. Central to Swift's protocol-oriented programming.
-    @End Reasoning
 
     If protocol_hir is equal to 0:
         Return 0
@@ -999,6 +1203,19 @@ Process called "generate_protocol_decl" takes context as Integer, protocol_hir a
     Return 1
 End Process
 
+@Reasoning:
+Protocol requirements (method signatures, property requirements,
+associated types) are heterogeneous, so each is dispatched through the
+central generate_node rather than being printed inline here. This means
+new requirement kinds added in the dispatcher are picked up
+automatically.
+@End Reasoning
+
+@Implementation:
+Null-guards requirements_hir. Confirms list shape. Iterates the list
+calling generate_node on each non-null entry, which routes back through
+the central dispatcher to the right per-kind printer.
+@End Implementation
 Process called "generate_protocol_requirements" takes context as Integer, requirements_hir as Integer returns Integer:
     Note: Generate protocol requirements
 
@@ -1027,13 +1244,18 @@ Process called "generate_protocol_requirements" takes context as Integer, requir
     Return 1
 End Process
 
+@Reasoning:
+Extensions in Swift attach new members or conformances to an existing type
+declared elsewhere. Unlike class/struct/enum the head clause is
+"extension <ExtendedType>[: Conformances][ where Constraints]"; the extended
+type itself is a string not a generic node because Swift's grammar requires it
+to be a syntactic type reference resolvable to a single declaration. The
+optional where clause lets us emit constrained extensions (e.g.
+"extension Array where Element: Equatable") which are how generic algorithms
+are added to instantiations.
+@End Reasoning
 Process called "generate_extension_decl" takes context as Integer, ext_hir as Integer returns Integer:
     Note: Generate Swift extension declaration
-
-    @Reasoning:
-    Extensions add functionality to existing types, including protocol
-    conformance and default implementations. Retroactive modeling.
-    @End Reasoning
 
     If ext_hir is equal to 0:
         Return 0
@@ -1082,6 +1304,18 @@ Process called "generate_extension_decl" takes context as Integer, ext_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Typealias declarations are flat: `[access] typealias Name = Type`. No
+generic parameter support in the current shape because typealiases with
+generic parameters are uncommon at the top level and are best modeled
+through the type printer.
+@End Reasoning
+
+@Implementation:
+Null-guards alias_hir. Emits indent. Optionally emits access_control +
+space. Emits "typealias ", then name, " = ", then dispatches the
+underlying_type subtree through generate_type. Trailing newline.
+@End Implementation
 Process called "generate_typealias_decl" takes context as Integer, alias_hir as Integer returns Integer:
     Note: Generate Swift typealias declaration
 
@@ -1118,12 +1352,18 @@ Process called "generate_typealias_decl" takes context as Integer, alias_hir as 
     Return 1
 End Process
 
+@Reasoning:
+'var' declarations carry the same prefix order as functions (access, modifiers,
+keyword, name) but differ in what follows: a colon-typed annotation is optional
+because Swift infers the type from the initializer, and the initializer itself
+is optional inside a class/struct body if the type provides a default (HIR
+guarantees we get one of the two combinations - either a type or an initializer
+or both). Storage modifiers like 'static', 'weak', 'unowned' arrive through the
+modifier list and are emitted before 'var' to match the source-level token
+order.
+@End Reasoning
 Process called "generate_var_decl" takes context as Integer, var_hir as Integer returns Integer:
     Note: Generate Swift var declaration
-
-    @Reasoning:
-    Swift vars are mutable variables with property observers and computed properties.
-    @End Reasoning
 
     If var_hir is equal to 0:
         Return 0
@@ -1170,12 +1410,16 @@ Process called "generate_var_decl" takes context as Integer, var_hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+'let' declarations are structurally identical to 'var' at the emitter level
+because Swift's grammar for the two differs only in the leading keyword - the
+immutability semantic is enforced by the Swift compiler, not by the surface
+syntax. We still keep a separate emitter rather than parameterising the var
+emitter so future divergences (e.g. let-only patterns inside switch arms vs.
+top-level declarations) can be handled without affecting var emission.
+@End Reasoning
 Process called "generate_let_decl" takes context as Integer, let_hir as Integer returns Integer:
     Note: Generate Swift let declaration
-
-    @Reasoning:
-    Swift lets are immutable constants. Must be initialized once.
-    @End Reasoning
 
     If let_hir is equal to 0:
         Return 0
@@ -1220,6 +1464,18 @@ Process called "generate_let_decl" takes context as Integer, let_hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Members of a class/struct/protocol/extension are a heterogeneous list
+(properties, methods, initializers, subscripts, type aliases). Each one
+flows through the central generate_node so the dispatcher's per-kind
+printers stay authoritative.
+@End Reasoning
+
+@Implementation:
+Null-guards members_hir. Confirms list shape via HIR.is_list_hir; if so,
+iterates ListOps.size / get_at and calls generate_node on each non-null
+entry. Caller is responsible for the surrounding indent management.
+@End Implementation
 Process called "generate_member_list" takes context as Integer, members_hir as Integer returns Integer:
     Note: Generate list of class/struct/extension members
 
@@ -1248,6 +1504,19 @@ Process called "generate_member_list" takes context as Integer, members_hir as I
     Return 1
 End Process
 
+@Reasoning:
+Generic parameters between the angle brackets are emitted as already-
+formatted strings (e.g. `T: Equatable`, `U`, `V where ...`). Storing
+each parameter as a single string in the HIR list keeps the
+representation simple for typically-flat generic lists and lets the
+type printer focus on type expressions rather than declaration syntax.
+@End Reasoning
+
+@Implementation:
+Null-guards generic_params_hir. Confirms list shape. Iterates entries,
+emitting each non-null parameter string verbatim through emit_string,
+inserting ", " between consecutive entries.
+@End Implementation
 Process called "generate_generic_parameters" takes context as Integer, generic_params_hir as Integer returns Integer:
     Note: Generate generic parameter list
 
@@ -1282,6 +1551,18 @@ Process called "generate_generic_parameters" takes context as Integer, generic_p
     Return 1
 End Process
 
+@Reasoning:
+Both inheritance (superclass) and conformance (protocol) entries appear
+in the same comma-separated list after the `:` in a class/struct/enum/
+protocol declaration. Swift draws no syntactic distinction between
+them, so the printer treats each entry as a flat name string.
+@End Reasoning
+
+@Implementation:
+Null-guards inheritance_hir. Confirms list shape. Iterates entries
+emitting each non-null name through emit_string. Inserts ", " between
+consecutive entries.
+@End Implementation
 Process called "generate_inheritance_list" takes context as Integer, inheritance_hir as Integer returns Integer:
     Note: Generate inheritance/conformance list
 
@@ -1316,6 +1597,19 @@ Process called "generate_inheritance_list" takes context as Integer, inheritance
     Return 1
 End Process
 
+@Reasoning:
+A where clause is a comma-separated list of constraint expressions
+(e.g. `T: Equatable, U == V.Element`). The HIR carries each constraint
+as a pre-formatted string so the printer can emit them verbatim and
+delegate parsing to the source-level Swift grammar tables on the HIR
+side.
+@End Reasoning
+
+@Implementation:
+Null-guards where_hir. Confirms list shape. Iterates entries emitting
+each non-null constraint string. Inserts ", " between consecutive
+entries.
+@End Implementation
 Process called "generate_where_clause" takes context as Integer, where_hir as Integer returns Integer:
     Note: Generate where clause for generic constraints
 
@@ -1354,6 +1648,19 @@ Note: ==========================================================================
 Note: Statement Generation
 Note: ============================================================================
 
+@Reasoning:
+A statement list is just a heterogeneous flat list dispatched through
+generate_node. Function bodies, conditional bodies, loop bodies, and
+catch bodies all share this shape so they all go through this helper
+to avoid duplicating the iteration loop.
+@End Reasoning
+
+@Implementation:
+Null-guards stmts_hir. Confirms list shape via HIR.is_list_hir. Iterates
+the list calling generate_node on each non-null statement. Each
+statement's own generator is responsible for emitting its own indent
+and newline.
+@End Implementation
 Process called "generate_statement_list" takes context as Integer, stmts_hir as Integer returns Integer:
     Note: Generate list of statements
 
@@ -1382,13 +1689,18 @@ Process called "generate_statement_list" takes context as Integer, stmts_hir as 
     Return 1
 End Process
 
+@Reasoning:
+Swift's if-statement carries condition syntax richer than most C-family
+languages: the condition node may itself be a comma-separated list mixing
+boolean expressions with optional-binding clauses (if let / if var / if case).
+That richness is hidden behind generate_node for the condition, so this emitter
+only owns the keyword, braces, and indentation control. The else-block is
+emitted as 'else {' (not 'else if {' chaining) - HIR pre-flattens else-if
+ladders into nested if statements inside an else block, which matches Swift's
+AST exactly.
+@End Reasoning
 Process called "generate_if_stmt" takes context as Integer, if_hir as Integer returns Integer:
     Note: Generate Swift if statement
-
-    @Reasoning:
-    Swift if statements can have optional binding (if let/var)
-    and compound conditions.
-    @End Reasoning
 
     If if_hir is equal to 0:
         Return 0
@@ -1436,12 +1748,17 @@ Process called "generate_if_stmt" takes context as Integer, if_hir as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Guard inverts the normal if/else semantics: the body runs only when the
+condition is FALSE (the else block), and Swift enforces that the else block
+must transfer control out of scope (return/break/continue/throw/fatalError).
+This emitter does not verify that exit-control invariant; that responsibility
+sits in the upstream semantic analyser. From the emitter's standpoint guard is
+'guard <cond> else { <else_block> }' and is always followed by sequential
+statements that are reached only on the success path.
+@End Reasoning
 Process called "generate_guard_stmt" takes context as Integer, guard_hir as Integer returns Integer:
     Note: Generate Swift guard statement
-
-    @Reasoning:
-    Guard provides early exit. Else block must exit scope.
-    @End Reasoning
 
     If guard_hir is equal to 0:
         Return 0
@@ -1474,13 +1791,17 @@ Process called "generate_guard_stmt" takes context as Integer, guard_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Swift switches are syntactically simple but semantically demanding: the
+compiler verifies exhaustiveness, so this emitter relies on the upstream HIR
+producer to emit a default case or a closed enum match. Cases are NOT
+brace-delimited - each 'case <pattern>:' introduces statements that run until
+the next case or the closing brace, with no implicit fallthrough between
+cases. We delegate case emission to generate_switch_cases so the inner indent
+math is encapsulated there.
+@End Reasoning
 Process called "generate_switch_stmt" takes context as Integer, switch_hir as Integer returns Integer:
     Note: Generate Swift switch statement
-
-    @Reasoning:
-    Swift switches are exhaustive, support pattern matching,
-    where clauses, and no implicit fallthrough.
-    @End Reasoning
 
     If switch_hir is equal to 0:
         Return 0
@@ -1511,6 +1832,20 @@ Process called "generate_switch_stmt" takes context as Integer, switch_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Each switch case has shape `case <pattern> [where <expr>]:` followed by
+an indented body. Patterns are dispatched through generate_node because
+Swift case patterns are full expressions (tuple, value-binding, type
+patterns). The body is indented one level relative to the `case`.
+@End Reasoning
+
+@Implementation:
+Null-guards cases_hir. Confirms list shape. For each case node: emits
+indent + "case ", then dispatches the "pattern" subtree. If
+"where_clause" is present, emits " where " then dispatches it. Emits
+":" and newline. Increments indent, generates "body" via
+generate_statement_list, then decrements indent.
+@End Implementation
 Process called "generate_switch_cases" takes context as Integer, cases_hir as Integer returns Integer:
     Note: Generate Swift switch cases
 
@@ -1563,6 +1898,18 @@ Process called "generate_switch_cases" takes context as Integer, cases_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Swift's only loop with a binding is `for-in`: `for <pattern> in <seq> {
+body }`. The pattern is stored as a flat string (not a HIR subtree)
+because Swift for-in patterns are simple identifiers or tuple binders
+that the parser canonicalizes upstream.
+@End Reasoning
+
+@Implementation:
+Null-guards for_hir. Emits indent + "for ", the pattern string, " in ".
+Dispatches the "sequence" subtree through generate_node. Emits " {",
+newline, indented body via generate_statement_list, dedented "}", newline.
+@End Implementation
 Process called "generate_for_in_stmt" takes context as Integer, for_hir as Integer returns Integer:
     Note: Generate Swift for-in statement
 
@@ -1604,6 +1951,17 @@ Process called "generate_for_in_stmt" takes context as Integer, for_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Swift `while cond { body }` is straightforward. Unlike PowerShell, Swift
+does not parenthesize the condition; the dispatcher emits whatever
+expression the HIR provides directly.
+@End Reasoning
+
+@Implementation:
+Null-guards while_hir. Emits indent + "while ", dispatches the
+"condition" subtree, emits " {", newline, indented "body" via
+generate_statement_list, dedented "}", newline.
+@End Implementation
 Process called "generate_while_stmt" takes context as Integer, while_hir as Integer returns Integer:
     Note: Generate Swift while statement
 
@@ -1638,12 +1996,17 @@ Process called "generate_while_stmt" takes context as Integer, while_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+defer schedules its body to run as the enclosing scope exits, in reverse order
+of registration. The emitter has no responsibility for that ordering - Swift's
+runtime handles it - so we only emit the textual 'defer { ... }' form. defer is
+legal in any block scope (function bodies, if branches, switch cases) and the
+emitter does not specialise on enclosing context; the indent depth carried in
+the context is sufficient to produce correctly nested output everywhere defer
+appears.
+@End Reasoning
 Process called "generate_defer_stmt" takes context as Integer, defer_hir as Integer returns Integer:
     Note: Generate Swift defer statement
-
-    @Reasoning:
-    Defer executes when enclosing scope exits. Swift's RAII-like cleanup.
-    @End Reasoning
 
     If defer_hir is equal to 0:
         Return 0
@@ -1669,12 +2032,17 @@ Process called "generate_defer_stmt" takes context as Integer, defer_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+do-catch is Swift's structured error handling primitive. Inside the do-block any
+'try' expression that throws transfers control to the matching catch clause; the
+catch list is exhaustive against the throwing function's error type. We emit
+'do { ... }' first and append catch clauses without a separating newline so the
+canonical 'do { ... } catch { ... }' layout is preserved. The trailing newline
+is emitted by THIS function, not by generate_catch_clauses, because callers
+expect a single line break after the entire do-catch construct.
+@End Reasoning
 Process called "generate_do_catch_stmt" takes context as Integer, do_catch_hir as Integer returns Integer:
     Note: Generate Swift do-catch statement
-
-    @Reasoning:
-    Swift error handling with typed throws and pattern matching.
-    @End Reasoning
 
     If do_catch_hir is equal to 0:
         Return 0
@@ -1706,6 +2074,20 @@ Process called "generate_do_catch_stmt" takes context as Integer, do_catch_hir a
     Return 1
 End Process
 
+@Reasoning:
+Swift catch clauses follow the closing `}` of the do block; multiple
+catches are space-separated on the same logical line and each may
+carry a pattern, a where clause, and a body. The leading space before
+`catch` is part of this routine because the parent (generate_do_catch_stmt)
+already emitted the prior `}`.
+@End Reasoning
+
+@Implementation:
+Null-guards catches_hir. Confirms list shape. For each catch entry:
+emits " catch ", dispatches the "pattern" subtree if present, emits
+" where " + dispatched where_clause if present, " {" newline, indented
+"body", dedented "}".
+@End Implementation
 Process called "generate_catch_clauses" takes context as Integer, catches_hir as Integer returns Integer:
     Note: Generate Swift catch clauses
 
@@ -1760,6 +2142,17 @@ Process called "generate_catch_clauses" takes context as Integer, catches_hir as
     Return 1
 End Process
 
+@Reasoning:
+Swift `return` may be bare (Void) or carry a value expression. The value
+subtree dispatches through generate_node so any expression kind is
+supported uniformly.
+@End Reasoning
+
+@Implementation:
+Null-guards return_hir. Emits indent + "return". If the "value" subtree
+is present, emits a space then dispatches the value via generate_node.
+Trailing newline.
+@End Implementation
 Process called "generate_return_stmt" takes context as Integer, return_hir as Integer returns Integer:
     Note: Generate Swift return statement
 
@@ -1783,6 +2176,15 @@ Process called "generate_return_stmt" takes context as Integer, return_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Swift `break` supports an optional label to break out of nested labeled
+loops. The label is stored as a flat string on the HIR.
+@End Reasoning
+
+@Implementation:
+Null-guards break_hir. Emits indent + "break". If the "label" string is
+present, emits a space then the label verbatim. Trailing newline.
+@End Implementation
 Process called "generate_break_stmt" takes context as Integer, break_hir as Integer returns Integer:
     Note: Generate Swift break statement
 
@@ -1806,6 +2208,15 @@ Process called "generate_break_stmt" takes context as Integer, break_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Mirror of generate_break_stmt for `continue`. Supports the same optional
+labeled form so labeled loops can be continued precisely.
+@End Reasoning
+
+@Implementation:
+Null-guards continue_hir. Emits indent + "continue". If "label" is
+present, emits a space then the label. Trailing newline.
+@End Implementation
 Process called "generate_continue_stmt" takes context as Integer, continue_hir as Integer returns Integer:
     Note: Generate Swift continue statement
 
@@ -1833,13 +2244,17 @@ Note: ==========================================================================
 Note: Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+Binary expression emission is intentionally non-parenthesising: HIR carries
+operator precedence in tree shape, and the precedence-aware parenthesisation
+happens (when needed) in upstream HIR transformations. Spaces flank the
+operator unconditionally because Swift uses whitespace to disambiguate certain
+operators - e.g. 'a ..< b' is a range whereas 'a..<b' is the same range but
+'a.<b' is a property access on 'a' followed by a less-than. Symmetric padding
+sidesteps every such ambiguity.
+@End Reasoning
 Process called "generate_binary_expr" takes context as Integer, binary_hir as Integer returns Integer:
     Note: Generate Swift binary expression
-
-    @Reasoning:
-    Swift has standard operators + nil-coalescing (??), range operators
-    (..., ..<), and custom operators.
-    @End Reasoning
 
     If binary_hir is equal to 0:
         Return 0
@@ -1869,6 +2284,18 @@ Process called "generate_binary_expr" takes context as Integer, binary_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Swift unary operators can be prefix (e.g. `!x`, `-x`) or postfix (e.g.
+`x?`, `x!`). The HIR carries a boolean "prefix" flag to disambiguate so
+the printer places the operator on the correct side of the operand.
+@End Reasoning
+
+@Implementation:
+Null-guards unary_hir. Reads "prefix" bool and "operator" string. When
+prefix is 1, emits the operator before dispatching the operand; when 0,
+emits the operator after dispatching the operand. Either operator or
+operand may be absent and is then silently skipped.
+@End Implementation
 Process called "generate_unary_expr" takes context as Integer, unary_hir as Integer returns Integer:
     Note: Generate Swift unary expression
 
@@ -1902,13 +2329,17 @@ Process called "generate_unary_expr" takes context as Integer, unary_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Swift call expressions carry effect-marker prefixes (try, await) that must be
+emitted in source order BEFORE the callee. The try and await flags are
+independent: 'try await foo()' is legal, as is 'await try foo()', though we
+emit try-then-await to match the canonical Swift style. Both flags propagate
+from HIR exactly as decided by upstream type checking - we do not synthesize
+them here. Trailing closure syntax (where the last argument is a closure
+written outside the parentheses) is handled by generate_argument_list.
+@End Reasoning
 Process called "generate_call_expr" takes context as Integer, call_hir as Integer returns Integer:
     Note: Generate Swift call expression
-
-    @Reasoning:
-    Swift calls can have labeled arguments, trailing closures,
-    and try/await prefixes.
-    @End Reasoning
 
     If call_hir is equal to 0:
         Return 0
@@ -1946,13 +2377,17 @@ Process called "generate_call_expr" takes context as Integer, call_hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Swift external argument labels are first-class call-site syntax: 'foo(name: x)'
+is distinct from 'foo(x)' and resolves to a different overload. The HIR
+serialises each argument as a dictionary containing an optional 'label' string
+and the value subtree, which lets this emitter handle both labelled and
+unlabelled positional arguments uniformly. Wildcard labels ('_' in the
+declaration) are represented in HIR by a missing label field, which produces
+the correct unlabelled emission here.
+@End Reasoning
 Process called "generate_argument_list" takes context as Integer, args_hir as Integer returns Integer:
     Note: Generate Swift argument list with labels
-
-    @Reasoning:
-    Swift arguments have optional external labels.
-    Example: print(name: "Alice", age: 30)
-    @End Reasoning
 
     If args_hir is equal to 0:
         Return 0
@@ -1994,6 +2429,17 @@ Process called "generate_argument_list" takes context as Integer, args_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Swift `object.member` is the most common access pattern. The member is
+stored as a flat string while the object is a full HIR subtree, since
+the object side may itself be a complex expression (call chain,
+subscript, etc.).
+@End Reasoning
+
+@Implementation:
+Null-guards member_hir. Dispatches the "object" subtree through
+generate_node, emits the literal `.`, then emits the "member" string.
+@End Implementation
 Process called "generate_member_expr" takes context as Integer, member_hir as Integer returns Integer:
     Note: Generate Swift member access expression
 
@@ -2018,6 +2464,17 @@ Process called "generate_member_expr" takes context as Integer, member_hir as In
     Return 1
 End Process
 
+@Reasoning:
+`object[index]` form is identical for arrays, dictionaries, and
+user-defined subscripts. Both sides are full HIR subtrees so any
+expression shape can appear as object or index (including multi-arg
+subscripts the HIR would model as a tuple in the index slot).
+@End Reasoning
+
+@Implementation:
+Null-guards subscript_hir. Dispatches "object" through generate_node,
+emits `[`, dispatches "index" through generate_node, emits `]`.
+@End Implementation
 Process called "generate_subscript_expr" takes context as Integer, subscript_hir as Integer returns Integer:
     Note: Generate Swift subscript expression
 
@@ -2044,12 +2501,16 @@ Process called "generate_subscript_expr" takes context as Integer, subscript_hir
     Return 1
 End Process
 
+@Reasoning:
+Optional chaining ('?.') short-circuits to nil if the base evaluates to nil
+without crashing, propagating the optionality through the rest of the
+expression. We emit only the '?.' suffix here; the member or call following
+the chain is a separate HIR node emitted by its parent (member_expr,
+call_expr, subscript_expr). The chain operator stands alone so the printer
+does not have to know what follows the chain - the AST shape determines that.
+@End Reasoning
 Process called "generate_optional_chain_expr" takes context as Integer, chain_hir as Integer returns Integer:
     Note: Generate Swift optional chaining expression
-
-    @Reasoning:
-    Optional chaining (?.) safely navigates optional values.
-    @End Reasoning
 
     If chain_hir is equal to 0:
         Return 0
@@ -2068,12 +2529,16 @@ Process called "generate_optional_chain_expr" takes context as Integer, chain_hi
     Return 1
 End Process
 
+@Reasoning:
+Force unwrap ('!') is a postfix operator that asserts an optional is non-nil
+and produces the wrapped value. It is the dual of optional chaining: where
+chaining is conservative, force unwrap is aggressive and traps at runtime on
+nil. The emitter only adds the trailing '!' character; the upstream HIR is
+responsible for guaranteeing the operand type IS optional - the Swift compiler
+will reject force-unwrap on non-optionals at compile time.
+@End Reasoning
 Process called "generate_force_unwrap_expr" takes context as Integer, unwrap_hir as Integer returns Integer:
     Note: Generate Swift force unwrap expression
-
-    @Reasoning:
-    Force unwrap (!) extracts value from optional. Runtime error if nil.
-    @End Reasoning
 
     If unwrap_hir is equal to 0:
         Return 0
@@ -2091,13 +2556,18 @@ Process called "generate_force_unwrap_expr" takes context as Integer, unwrap_hir
     Return 1
 End Process
 
+@Reasoning:
+Swift closure expressions are syntactically '{ [captures] (params) -> ReturnType
+in body }' with every clause optional. We always emit the 'in' keyword and a
+following newline because that produces a body indented as a normal block; the
+ultra-compact one-line closure form '{ $0 + 1 }' is something the upstream
+formatter, not the HIR-to-Swift translator, may optionally produce as a
+follow-up rewrite. Flipping context.in_closure during body emission lets
+nested generators emit shorthand argument names ($0, $1, etc.) when
+appropriate, though that decision is made per node, not here.
+@End Reasoning
 Process called "generate_closure_expr" takes context as Integer, closure_hir as Integer returns Integer:
     Note: Generate Swift closure expression
-
-    @Reasoning:
-    Swift closures are anonymous functions with capture semantics.
-    Can have explicit or inferred types.
-    @End Reasoning
 
     If closure_hir is equal to 0:
         Return 0
@@ -2146,6 +2616,18 @@ Process called "generate_closure_expr" takes context as Integer, closure_hir as 
     Return 1
 End Process
 
+@Reasoning:
+Closure capture list entries (e.g. `weak self`, `unowned obj`,
+`x = value`) are emitted verbatim from HIR strings. The square brackets
+themselves are emitted by the caller (generate_closure_expr) because the
+capture list also fits in zero-element form `[]` for empty captures.
+@End Reasoning
+
+@Implementation:
+Null-guards captures_hir. Confirms list shape via HIR.is_list_hir.
+Iterates entries emitting each non-null capture string. Between
+consecutive entries emits ", ".
+@End Implementation
 Process called "generate_capture_list" takes context as Integer, captures_hir as Integer returns Integer:
     Note: Generate Swift closure capture list
 
@@ -2180,6 +2662,16 @@ Process called "generate_capture_list" takes context as Integer, captures_hir as
     Return 1
 End Process
 
+@Reasoning:
+Closure parameter lists are simpler than function parameter lists -
+typically just names or `name: Type` pairs - so the HIR stores each as
+a pre-formatted string and the printer just walks the list.
+@End Reasoning
+
+@Implementation:
+Null-guards params_hir. Confirms list shape. Iterates entries emitting
+each non-null parameter string. Between consecutive entries emits ", ".
+@End Implementation
 Process called "generate_closure_parameters" takes context as Integer, params_hir as Integer returns Integer:
     Note: Generate Swift closure parameters
 
@@ -2214,6 +2706,17 @@ Process called "generate_closure_parameters" takes context as Integer, params_hi
     Return 1
 End Process
 
+@Reasoning:
+Swift literal values (integers, floats, booleans, strings, nil) are
+pre-rendered to their Swift textual form on the HIR node, so the
+printer simply emits the stored "value" string verbatim. String quoting
+and escape handling occur upstream when the HIR is built.
+@End Reasoning
+
+@Implementation:
+Null-guards literal_hir. Reads the "value" string and emits it directly
+via emit_string.
+@End Implementation
 Process called "generate_literal_expr" takes context as Integer, literal_hir as Integer returns Integer:
     Note: Generate Swift literal expression
 
@@ -2231,6 +2734,16 @@ Process called "generate_literal_expr" takes context as Integer, literal_hir as 
     Return 1
 End Process
 
+@Reasoning:
+Swift identifiers are emitted verbatim from the HIR's "name" string.
+Backtick-escaped reserved-word identifiers and operator names are
+pre-quoted upstream so the printer does not need to apply any
+transformation.
+@End Reasoning
+
+@Implementation:
+Null-guards identifier_hir. Reads "name" string and emits it directly.
+@End Implementation
 Process called "generate_identifier_expr" takes context as Integer, identifier_hir as Integer returns Integer:
     Note: Generate Swift identifier expression
 
@@ -2252,13 +2765,18 @@ Note: ==========================================================================
 Note: Type Generation
 Note: ============================================================================
 
+@Reasoning:
+This emitter handles the named-type case: a head name optionally followed by
+generic arguments and an optional optional-suffix '?'. The order matters
+because Swift's grammar binds the optional '?' tighter than the generic
+argument list - 'Array<Int>?' means optional-of-array-of-Int, not
+array-of-optional-Int (the latter is 'Array<Int?>'). Specialised forms like
+'[T]', '[K:V]', and '(A, B) -> C' arrive as named-type nodes here with their
+head set to the sugar form already, so the sugar/desugar choice is made
+upstream and respected verbatim by the emitter.
+@End Reasoning
 Process called "generate_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate Swift type
-
-    @Reasoning:
-    Swift types include primitives, optionals (?), arrays ([T]),
-    dictionaries ([K:V]), tuples, function types, and generic types.
-    @End Reasoning
 
     If type_hir is equal to 0:
         Return 0
@@ -2288,6 +2806,18 @@ Process called "generate_type" takes context as Integer, type_hir as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+Generic argument lists are the `<T, U: P, ...>` forms used at type
+instantiation sites. Each argument is a full type so dispatches back
+through generate_type for proper handling of nested generics and
+optionals.
+@End Reasoning
+
+@Implementation:
+Null-guards args_hir. Confirms list shape. Iterates entries calling
+generate_type on each non-null arg. Between consecutive entries emits
+", ". Caller emits the surrounding angle brackets.
+@End Implementation
 Process called "generate_generic_arguments" takes context as Integer, args_hir as Integer returns Integer:
     Note: Generate generic type arguments
 

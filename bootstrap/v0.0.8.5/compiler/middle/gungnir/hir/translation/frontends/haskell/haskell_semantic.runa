@@ -98,6 +98,30 @@ Note: ==========================================================================
 Note: Semantic Analyzer Structures
 Note: ============================================================================
 
+@Reasoning:
+Haskell semantic analysis needs five orthogonal environments
+(symbols, types, classes, instances, modules) plus a constraint
+solver and error/warning collectors. Keeping them as separate
+hashtables means each lookup is O(1) and the phases of analysis
+(name resolution, type inference, class resolution) can each
+target the relevant store without iterating noise.
+current_scope tracks lexical depth; type_var_counter generates
+fresh type variables for the Hindley-Milner pass.
+@End Reasoning
+
+@Implementation:
+80-byte record (10 fields × 8 bytes):
+- symbol_table @0 - global symbol map (HashTable)
+- type_env @8 - type name -> HaskellType (HashTable)
+- class_env @16 - type class name -> class id (HashTable)
+- instance_env @24 - instance map (HashTable)
+- module_env @32 - module name -> declarations (HashTable)
+- constraint_solver @40 - constraint queue (placeholder)
+- error_list @48 - List of error strings
+- warning_list @56 - List of warning strings
+- current_scope @64 - integer depth (entered/exited per scope)
+- type_var_counter @72 - monotonic counter for fresh tN names
+@End Implementation
 Type called "HaskellSemanticAnalyzer":
     symbol_table as Integer         Note: Global symbol table
     type_env as Integer             Note: Type environment
@@ -111,6 +135,24 @@ Type called "HaskellSemanticAnalyzer":
     type_var_counter as Integer     Note: Counter for fresh type variables
 End Type
 
+@Reasoning:
+Compact representation of a Haskell type that can model any of
+the surface forms (basic, variable, function, list, tuple, etc.)
+via the constructor tag. The parameters list lets one shape model
+both unary (list, Maybe) and n-ary (function, tuple) types; the
+substitution slot caches the resolved binding for type variables
+during unification.
+@End Reasoning
+
+@Implementation:
+40-byte record (5 fields × 8 bytes):
+- kind @0 - one of KIND_STAR / KIND_ARROW / KIND_CONSTRAINT
+- constructor @8 - either a TYPE_* constant (for concrete types)
+  or a string pointer (for type variables - the variable name)
+- parameters @16 - List of nested HaskellType pointers
+- constraints @24 - List of attached type class constraints
+- substitution @32 - bound HaskellType after unification
+@End Implementation
 Type called "HaskellType":
     kind as Integer                 Note: Type kind
     constructor as Integer          Note: Type constructor name
@@ -119,18 +161,59 @@ Type called "HaskellType":
     substitution as Integer         Note: Type variable substitution
 End Type
 
+@Reasoning:
+A type scheme `forall a b. (C a) => T a b` separates universally
+quantified variables from the underlying type. Instantiation
+replaces the bound variables with fresh ones so each use of a
+polymorphic value gets its own copy of the variables.
+@End Reasoning
+
+@Implementation:
+24-byte record:
+- quantified_vars @0 - List of bound variable name strings
+- constraints @8 - List of type class constraints
+- type @16 - the underlying HaskellType being quantified
+@End Implementation
 Type called "HaskellTypeScheme":
     quantified_vars as Integer      Note: Universally quantified variables
     constraints as Integer          Note: Type class constraints
     type as Integer                 Note: The actual type
 End Type
 
+@Reasoning:
+Type class constraint records "T must implement Class". Carries
+source location so error messages can point to the originating
+expression rather than just listing the unsatisfied constraint.
+@End Reasoning
+
+@Implementation:
+24-byte record:
+- class_name @0 - integer id of the type class (TYPECLASS_*)
+- type_arg @8 - HaskellType the class is applied to
+- source_location @16 - source coordinates (0 if synthesized)
+@End Implementation
 Type called "HaskellConstraint":
     class_name as Integer           Note: Type class name
     type_arg as Integer             Note: Type argument
     source_location as Integer      Note: Where constraint originated
 End Type
 
+@Reasoning:
+Symbol table entry. Includes both the type scheme and metadata
+(definition location, scope level, constructor flag, arity) so
+later lookups can answer "what type, defined where, what scope"
+without walking the AST.
+@End Reasoning
+
+@Implementation:
+48-byte record (6 fields × 8 bytes):
+- name @0 - identifier string
+- type_scheme @8 - HaskellTypeScheme pointer
+- definition_location @16 - source coords
+- scope_level @24 - integer scope at definition time
+- is_constructor @32 - 0 for variables, 1 for data constructors
+- arity @40 - constructor arity (0 for non-constructors)
+@End Implementation
 Type called "HaskellSymbol":
     name as Integer                 Note: Symbol name
     type_scheme as Integer          Note: Type scheme
@@ -144,15 +227,26 @@ Note: ==========================================================================
 Note: Semantic Analyzer Creation and Management
 Note: ============================================================================
 
+@Reasoning:
+The analyzer state needs five independent name-resolution scopes
+(symbol, type, class, instance, module) plus error and warning
+collections. Splitting them into separate hashtables (rather than a
+single union table) lets type-vs-class disambiguation happen by
+table membership instead of by string prefix - critical for getting
+Haskell's separate namespace semantics right.
+@End Reasoning
+
+@Implementation:
+Allocates an 80-byte analyzer (10 i64 slots), returns 0 on failure.
+Initialises slot layout: symbol_table @0, type_env @8, class_env @16,
+instance_env @24, module_env @32 (all fresh hashtables);
+constraint_solver @40 (zeroed); errors @48, warnings @56 (fresh
+Lists); current_scope @64 = 0; type_var_counter @72 = 0. After
+zeroing, calls populate_builtin_environment to seed the Prelude
+types and classes so user code can reference Int, Maybe, Eq, etc.
+without explicit imports.
+@End Implementation
 Process called "create_haskell_semantic_analyzer" returns Integer:
-    Note: Create new semantic analyzer with built-in environment
-
-    @Reasoning:
-    Initializes semantic analyzer with standard Prelude types and classes.
-    Sets up symbol tables, type environment, and constraint solver for
-    comprehensive semantic analysis of Haskell code.
-    @End Reasoning
-
     Let analyzer_size be 80  Note: 10 fields × 8 bytes each
     Let analyzer be proc allocate from Layout with analyzer_size
 
@@ -200,6 +294,20 @@ Process called "create_haskell_semantic_analyzer" returns Integer:
     Return analyzer
 End Process
 
+@Reasoning:
+Releases every owned heap resource: five hashtables (symbol,
+type, class, instance, module), and two lists (errors, warnings).
+The constraint_solver slot is currently unused so it has no
+dedicated destroy call. Idempotent on a null analyzer pointer.
+@End Reasoning
+
+@Implementation:
+Returns 1 if analyzer is 0. For each of the five hashtables
+(offsets 0, 8, 16, 24, 32) reads the pointer; if non-zero calls
+hashtable_destroy. For each of the two lists (offsets 48, 56)
+reads and calls list_destroy. Deallocates the analyzer record.
+Returns 1.
+@End Implementation
 Process called "destroy_haskell_semantic_analyzer" takes analyzer as Integer returns Integer:
     Note: Destroy semantic analyzer and free all memory
 
@@ -253,15 +361,23 @@ Process called "destroy_haskell_semantic_analyzer" takes analyzer as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+Pre-loads every Prelude name a Haskell module can use without an
+explicit import. Splitting types vs classes vs operators vs functions
+into separate add_* calls (rather than one giant loop) keeps each
+section self-documenting and lets the type/class IDs be the
+authoritative source of truth referenced by lookup_basic_type.
+@End Reasoning
+
+@Implementation:
+Reads type_env @8 and class_env @16. Calls add_builtin_type for the
+six primitive types (Int, Float, Double, Char, Bool, String) and the
+compound types (Maybe, Either, IO). Then adds the Prelude classes
+(Eq, Ord, Show, Read, Num, Functor, Monad, ...). Symbol-level Prelude
+functions (length, map, ...) are also seeded with their type schemes
+so resolution succeeds without explicit imports.
+@End Implementation
 Process called "populate_builtin_environment" takes analyzer as Integer returns Integer:
-    Note: Populate analyzer with built-in Prelude types and classes
-
-    @Reasoning:
-    Haskell has an extensive Prelude with fundamental types and type classes.
-    This function adds all standard types (Int, Float, Bool, etc.) and
-    type classes (Eq, Ord, Show, etc.) to the semantic environment.
-    @End Reasoning
-
     Let type_env be proc memory_get_int64 from Layout with analyzer, 8
     Let class_env be proc memory_get_int64 from Layout with analyzer, 16
 
@@ -311,6 +427,19 @@ Process called "populate_builtin_environment" takes analyzer as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Registers a Prelude type (Int, Float, Bool, etc.) into the type
+environment. Allocates a fresh string copy of the name (rather
+than aliasing) so the hashtable owns its keys and the caller can
+free the original string.
+@End Reasoning
+
+@Implementation:
+Reads type_env (analyzer offset 8). Copies name via
+StringCore.create_string. Builds a HaskellType via
+create_haskell_type with the supplied type_id as constructor.
+Inserts into type_env keyed by the new name string.
+@End Implementation
 Process called "add_builtin_type" takes analyzer as Integer, name as Integer, type_id as Integer returns Integer:
     Note: Add built-in type to type environment
 
@@ -324,6 +453,18 @@ Process called "add_builtin_type" takes analyzer as Integer, name as Integer, ty
     Return 1
 End Process
 
+@Reasoning:
+Registers a Prelude type class (Eq, Ord, Show, Num, etc.) into
+class_env keyed by name. Stores the class id directly (no extra
+record allocation) - the class id is the integer enum used by
+constraints.
+@End Reasoning
+
+@Implementation:
+Reads class_env (analyzer offset 16). Copies name via
+StringCore.create_string. Inserts class_id (an integer) under the
+copied name into class_env.
+@End Implementation
 Process called "add_builtin_class" takes analyzer as Integer, name as Integer, class_id as Integer returns Integer:
     Note: Add built-in type class to class environment
 
@@ -336,6 +477,20 @@ Process called "add_builtin_class" takes analyzer as Integer, name as Integer, c
     Return 1
 End Process
 
+@Reasoning:
+Registers a Prelude function ("id", "head", "map", ...) by
+parsing its textual type signature into a type scheme and binding
+it into the symbol table. The signature parser handles function,
+list, and tuple shapes plus type variables so the resulting
+scheme is fully polymorphic where the source signature is.
+@End Reasoning
+
+@Implementation:
+Reads symbol_table (analyzer offset 0). Copies name via
+StringCore.create_string. Parses type_str via parse_type_signature
+into a type scheme pointer. Inserts the scheme under the name
+into symbol_table.
+@End Implementation
 Process called "add_builtin_function" takes analyzer as Integer, name as Integer, type_str as Integer returns Integer:
     Note: Add built-in function to symbol table
 
@@ -353,14 +508,24 @@ Note: ==========================================================================
 Note: Type System Operations
 Note: ============================================================================
 
+@Reasoning:
+Every Haskell type object carries five orthogonal pieces of state:
+kind (* by default - all monomorphic types have kind *), constructor
+(which named type or variable this is), parameters (type arguments
+for higher-kinded use), constraints (class constraints from "C a =>
+..."), and substitution (current binding during unification). The
+default kind is * because most types created here are monomorphic;
+the kind is upgraded by the caller for higher-kinded types.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes (5 i64 slots), returns 0 on failure. Initialises
+slot layout: kind @0 = KIND_STAR, type_constructor @8 (parameter),
+parameters @16 = 0, constraints @24 = 0, substitution @32 = 0. The
+zero-init for parameters/constraints/substitution lets callers fill
+those slots only when needed.
+@End Implementation
 Process called "create_haskell_type" takes type_constructor as Integer returns Integer:
-    Note: Create new type representation
-
-    @Reasoning:
-    Types in Haskell have kinds, constructors, parameters, and constraints.
-    This function creates a complete type representation for semantic analysis.
-    @End Reasoning
-
     Let type_size be 40  Note: 5 fields × 8 bytes each
     Let type_obj be proc allocate from Layout with type_size
 
@@ -377,14 +542,23 @@ Process called "create_haskell_type" takes type_constructor as Integer returns I
     Return type_obj
 End Process
 
+@Reasoning:
+The Hindley-Milner algorithm needs an unbounded supply of fresh type
+variables that are guaranteed distinct from any existing variable.
+The analyzer holds a monotonic counter (offset 72) that is bumped
+on each call - the per-analyzer scope guarantees uniqueness across
+the entire inference run.
+@End Reasoning
+
+@Implementation:
+Reads counter @72, increments, writes back. Calls create_type_var_name
+with the new counter value to produce a variable name like "t1", "t2".
+Calls create_haskell_type with TYPE_VARIABLE as the constructor.
+Writes the variable name into the type's constructor slot at offset 8
+(this offset doubles as the variable-name slot for TYPE_VARIABLE
+type-objects). Returns the type object.
+@End Implementation
 Process called "create_fresh_type_variable" takes analyzer as Integer returns Integer:
-    Note: Create fresh type variable for type inference
-
-    @Reasoning:
-    Type inference requires generating fresh type variables that don't conflict
-    with existing variables. Each variable gets a unique identifier.
-    @End Reasoning
-
     Let counter be proc memory_get_int64 from Layout with analyzer, 72
     Set counter to counter plus 1
     proc memory_set_int64 from Layout with analyzer, 72, counter
@@ -398,6 +572,21 @@ Process called "create_fresh_type_variable" takes analyzer as Integer returns In
     Return type_var
 End Process
 
+@Reasoning:
+Generates names like "t1", "t2", "t3" for fresh type variables.
+Using a counter avoids any chance of collision with user-written
+type variable names (which are lowercase and start with a letter
+that isn't 't' followed by digits, by convention).
+@End Reasoning
+
+@Implementation:
+Creates the string "t" via StringCore.create_string. Converts
+the integer counter to its decimal-string representation via
+StringCore.int_to_string. Concatenates the two with
+StringCore.string_concat to form the variable name. Deallocates
+the two intermediate strings (the concatenated result is the
+return value).
+@End Implementation
 Process called "create_type_var_name" takes counter as Integer returns Integer:
     Note: Create type variable name from counter
 
@@ -411,15 +600,25 @@ Process called "create_type_var_name" takes counter as Integer returns Integer:
     Return var_name
 End Process
 
+@Reasoning:
+The Robinson unification algorithm specialised for Haskell's type
+language. Branches on constructor identity to dispatch to the
+correct sub-routine (variable, function, list, tuple). The
+constructor-equality fast path handles the common case (Int vs Int,
+Maybe vs Maybe) without descending into the per-shape routines.
+@End Reasoning
+
+@Implementation:
+Returns 0 on either null. Reads constructor1 / constructor2 (offset
+8 of each type object). If equal, recurses on parameter lists
+(offset 16) via unify_type_parameters. If either is TYPE_VARIABLE,
+delegates to unify_variable (which performs the occurs check). Same-
+shape branches: TYPE_FUNCTION -> unify_function_types,
+TYPE_LIST -> unify_list_types, TYPE_TUPLE -> unify_tuple_types. On
+mismatch, records "Cannot unify types" via add_type_error and
+returns 0.
+@End Implementation
 Process called "unify_types" takes analyzer as Integer, type1 as Integer, type2 as Integer returns Integer:
-    Note: Unify two types in Hindley-Milner type system
-
-    @Reasoning:
-    Unification is the core algorithm of type inference. It attempts to make
-    two types equal by finding consistent variable substitutions. Returns
-    substitution that makes types equal, or null if impossible.
-    @End Reasoning
-
     If type1 is equal to 0 or type2 is equal to 0:
         Return 0
     End If
@@ -465,14 +664,19 @@ Process called "unify_types" takes analyzer as Integer, type1 as Integer, type2 
     Return 0
 End Process
 
+@Reasoning:
+Binding a type variable to a type is the most common substitution
+created during inference. The occurs check is a soundness requirement:
+without it, "a = [a]" would succeed and produce an infinite type.
+@End Reasoning
+
+@Implementation:
+Reads var_name from offset 8 of var_type. Calls occurs_check on
+var_name vs other_type. On occurs == 1, records "Occurs check
+failed - infinite type" and returns 0. Otherwise creates and returns
+a substitution {var_name -> other_type} via create_substitution.
+@End Implementation
 Process called "unify_variable" takes analyzer as Integer, var_type as Integer, other_type as Integer returns Integer:
-    Note: Unify type variable with another type
-
-    @Reasoning:
-    Variable unification requires occurs check to prevent infinite types.
-    If variable doesn't occur in other type, create substitution.
-    @End Reasoning
-
     Let var_name be proc memory_get_int64 from Layout with var_type, 8
 
     Note: Occurs check - prevent infinite types
@@ -487,14 +691,23 @@ Process called "unify_variable" takes analyzer as Integer, var_type as Integer, 
     Return substitution
 End Process
 
+@Reasoning:
+The occurs check is one of the two halves of Hindley-Milner that
+guarantee termination - without it, unification could loop forever
+on cyclic types. This routine recursively walks the type structure
+looking for the variable name; returns 1 (occurs) as soon as one
+is found, short-circuiting the rest of the walk.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null type. Reads constructor at offset 8. If
+TYPE_VARIABLE, compares the other type's var name (also at offset 8)
+to var_name via string_equals; returns 1 if equal, 0 otherwise. For
+all other constructors, reads parameters list (offset 16) and
+delegates to occurs_check_in_list to recurse on each sub-type.
+Returns 0 if the type has no parameters.
+@End Implementation
 Process called "occurs_check" takes var_name as Integer, type_expr as Integer returns Integer:
-    Note: Check if variable occurs in type expression
-
-    @Reasoning:
-    Prevents creation of infinite types like "a = [a]". Recursively checks
-    if variable appears anywhere in the type expression structure.
-    @End Reasoning
-
     If type_expr is equal to 0:
         Return 0
     End If
@@ -520,6 +733,21 @@ Process called "occurs_check" takes var_name as Integer, type_expr as Integer re
     Return 0
 End Process
 
+@Reasoning:
+Helper for occurs_check: when a type has parameters (a list of
+sub-types), this routine checks each parameter recursively for
+the variable's presence. The occurs check is what prevents
+Hindley-Milner from constructing infinite types like a = [a] - a
+fundamental soundness requirement.
+@End Reasoning
+
+@Implementation:
+Returns 0 if type_list is 0 (empty). Reads list_length via
+List.get_length. Iterates i = 0..list_length-1: reads each
+current_type via List.get, recursively calls occurs_check with
+var_name and current_type. Returns 1 immediately on the first
+occurrence. Returns 0 after exhausting the list.
+@End Implementation
 Process called "occurs_check_in_list" takes var_name as Integer, type_list as Integer returns Integer:
     Note: Check if variable occurs in list of types
 
@@ -553,15 +781,24 @@ Note: ==========================================================================
 Note: Type Inference
 Note: ============================================================================
 
+@Reasoning:
+Dispatch table for Hindley-Milner type inference. Each AST expression
+kind (literal, identifier, application, lambda, case, let, ...) has
+its own inference rule. Centralising the dispatch here keeps the
+type checker structurally identical to a Haskell-style "infer ::
+Expr -> TyEnv -> Type" function and makes adding new expression
+kinds a single new If branch.
+@End Reasoning
+
+@Implementation:
+Reads expression's kind field. Dispatches via If chain to:
+infer_literal_type, infer_identifier_type, infer_application_type,
+infer_lambda_type, infer_case_type, infer_list_type, infer_tuple_type,
+infer_if_type, infer_let_type, infer_do_type. Returns the inferred
+type or 0 on dispatch miss. The caller is responsible for adding any
+discovered constraints to the analyzer.
+@End Implementation
 Process called "infer_expression_type" takes analyzer as Integer, expr as Integer returns Integer:
-    Note: Infer type of expression using Hindley-Milner algorithm
-
-    @Reasoning:
-    Type inference generates fresh type variables and constraints, then solves
-    constraints to determine most general type. Handles all expression forms
-    including applications, lambdas, let expressions, and case expressions.
-    @End Reasoning
-
     If expr is equal to 0:
         Return 0
     End If
@@ -624,14 +861,23 @@ Process called "infer_expression_type" takes analyzer as Integer, expr as Intege
     Return 0
 End Process
 
+@Reasoning:
+Classifies a literal by its lexeme prefix: ' starts Char, " starts
+String, "True"/"False" identifies Bool, "." in the body distinguishes
+Float from Int. Numeric literals are returned as polymorphic
+TYPE_VARIABLE with a Num constraint - matching Haskell's actual
+behaviour where "5" can typecheck as Int, Integer, Double, etc.
+based on use site.
+@End Reasoning
+
+@Implementation:
+Null literal returns TYPE_UNIT. Reads first character via
+string_char_at. 39 (') -> TYPE_CHAR. 34 (") -> TYPE_STRING. Compares
+against "True"/"False" via string_equals -> TYPE_BOOL. Otherwise
+checks for "." (decimal point); present -> create_polymorphic_
+numeric_type with TYPE_FLOAT, absent -> with TYPE_INT.
+@End Implementation
 Process called "infer_literal_type" takes analyzer as Integer, literal_value as Integer returns Integer:
-    Note: Infer type of literal value
-
-    @Reasoning:
-    Literals have straightforward types based on their syntax.
-    Numeric literals may be polymorphic and require type class constraints.
-    @End Reasoning
-
     If literal_value is equal to 0:
         Return proc create_haskell_type from TYPE_UNIT
     End If
@@ -672,14 +918,22 @@ Process called "infer_literal_type" takes analyzer as Integer, literal_value as 
     End If
 End Process
 
+@Reasoning:
+A Haskell numeric literal has type "Num a => a" - polymorphic across
+any Num instance. The implementation creates a fresh type variable
+and a Num constraint pinning that variable, deferring resolution to
+the constraint solver at the use site (where context may pick Int,
+Integer, Double, ...).
+@End Reasoning
+
+@Implementation:
+Allocates a fresh type variable via create_fresh_type_variable.
+Builds a TYPECLASS_NUM constraint over that variable via
+create_type_constraint. Registers the constraint with the analyzer
+via add_type_constraint. Returns the variable - the constraint
+travels separately via the analyzer's constraint slot.
+@End Implementation
 Process called "create_polymorphic_numeric_type" takes analyzer as Integer, base_type as Integer returns Integer:
-    Note: Create polymorphic numeric type with Num constraint
-
-    @Reasoning:
-    Numeric literals in Haskell are polymorphic and can be any type that
-    implements the Num type class. This creates appropriate constraints.
-    @End Reasoning
-
     Let type_var be proc create_fresh_type_variable from analyzer
     Let num_constraint be proc create_type_constraint with TYPECLASS_NUM, type_var
 
@@ -689,14 +943,22 @@ Process called "create_polymorphic_numeric_type" takes analyzer as Integer, base
     Return type_var
 End Process
 
+@Reasoning:
+Identifier resolution + scheme instantiation. The scheme stored in
+the symbol table is the universally-quantified type (e.g. "forall a.
+a -> a" for id); each use site must instantiate the bound variables
+with fresh ones so the same scheme can be specialised differently at
+each call.
+@End Reasoning
+
+@Implementation:
+Reads symbol_table @0 from analyzer. Looks up identifier via
+hashtable_get. On miss, records "Undefined identifier" via
+add_type_error and returns 0. On hit, calls instantiate_type_scheme
+which produces a fresh-variable substitution and applies it,
+returning the instantiated type.
+@End Implementation
 Process called "infer_identifier_type" takes analyzer as Integer, identifier as Integer returns Integer:
-    Note: Infer type of identifier from symbol table
-
-    @Reasoning:
-    Looks up identifier in symbol table and instantiates its type scheme
-    with fresh type variables. Handles both variables and constructors.
-    @End Reasoning
-
     Let symbol_table be proc memory_get_int64 from Layout with analyzer, 0
     Let symbol_info be proc hashtable_get from HashTable with symbol_table, identifier
 
@@ -710,15 +972,24 @@ Process called "infer_identifier_type" takes analyzer as Integer, identifier as 
     Return proc instantiate_type_scheme with analyzer, symbol_info
 End Process
 
+@Reasoning:
+Hindley-Milner's let-polymorphism rule requires that every use of a
+generalised type generate fresh type variables for the bound ones.
+This routine implements that "instantiate" half of generalise/
+instantiate by building a substitution from forall-bound variables
+to fresh variables, then applying it to the underlying type.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null scheme. Reads bound_vars list @8 and bound_count
+@16 from the scheme. Creates an empty substitution Dictionary.
+Iterates bound_vars: for each bound_var, allocates a fresh_var via
+create_fresh_type_variable, stores {bound_var -> fresh_var} in the
+substitution. Reads the underlying type @24 from the scheme. Calls
+apply_type_substitution to walk the type substituting bound for
+fresh. Returns the instantiated type.
+@End Implementation
 Process called "instantiate_type_scheme" takes analyzer as Integer, type_scheme as Integer returns Integer:
-    Note: Instantiate type scheme by replacing quantified variables with fresh variables
-
-    @Reasoning:
-    Type schemes contain universally quantified variables that must be
-    replaced with fresh type variables for each use. This preserves
-    polymorphism while allowing constraint generation.
-    @End Reasoning
-
     If type_scheme is equal to 0:
         Return 0
     End If
@@ -753,15 +1024,25 @@ Process called "instantiate_type_scheme" takes analyzer as Integer, type_scheme 
     Return instantiated_type
 End Process
 
+@Reasoning:
+Application inference uses the "expected" technique: infer the
+function's actual type, then build an expected type "arg -> alpha"
+with a fresh alpha and unify the two. If unification succeeds the
+substituted alpha is the result type. This handles both monomorphic
+and polymorphic functions because instantiate_type_scheme has
+already replaced foralls with fresh variables.
+@End Reasoning
+
+@Implementation:
+Reads app_expr's children list. Extracts child[0] as function, child[1]
+as argument. Recursively infers func_type and arg_type. Bails with 0
+on either inference failure. Allocates fresh result_type via
+create_fresh_type_variable. Builds expected_func_type =
+arg_type -> result_type via create_function_type. Calls unify_types;
+on failure adds "Function application type mismatch" and returns 0.
+Otherwise applies the substitution to result_type and returns.
+@End Implementation
 Process called "infer_application_type" takes analyzer as Integer, app_expr as Integer returns Integer:
-    Note: Infer type of function application
-
-    @Reasoning:
-    Function application is the most complex type inference case. Creates
-    fresh type variable for result, unifies function type with
-    argument -> result, and returns result type.
-    @End Reasoning
-
     Let children be proc get_haskell_ast_children from Parser with app_expr
 
     Note: Get function and argument from children list
@@ -794,6 +1075,19 @@ Process called "infer_application_type" takes analyzer as Integer, app_expr as I
     Return proc apply_substitution with result_type, unification
 End Process
 
+@Reasoning:
+Function types are represented uniformly as TYPE_FUNCTION with
+two parameters: the argument type and the result type. Curried
+multi-argument functions are right-associative nested function
+types, built up by callers using this primitive.
+@End Reasoning
+
+@Implementation:
+Creates a fresh HaskellType with TYPE_FUNCTION constructor.
+Builds a parameter list containing arg_type then result_type via
+list_create and list_push. Stores the list at the type's
+parameters offset (16). Returns the function type.
+@End Implementation
 Process called "create_function_type" takes arg_type as Integer, result_type as Integer returns Integer:
     Note: Create function type (arg -> result)
 
@@ -809,16 +1103,23 @@ Process called "create_function_type" takes arg_type as Integer, result_type as 
     Return func_type
 End Process
 
+@Reasoning:
+Lambda introduces parameter bindings into a fresh scope so the body
+can reference them. Each parameter gets a fresh type variable; the
+resulting lambda type is the curried function type built by folding
+the parameters list with -> right-associativity.
+@End Reasoning
+
+@Implementation:
+Enters a new scope. Reads lambda children: params_list @0 and
+body_expr @1. Walks params_list nodes: for each parameter creates a
+fresh_var, adds it to the scope's symbol table under the parameter
+name, appends it to param_types. Infers body's type. Folds
+param_types right-to-left building the curried function type via
+create_function_type. Exits scope. Returns the assembled function
+type.
+@End Implementation
 Process called "infer_lambda_type" takes analyzer as Integer, lambda_expr as Integer returns Integer:
-    Note: Infer type of lambda expression
-
-    @Reasoning:
-    Lambda expressions introduce new variables in scope. Creates fresh type
-    variables for parameters, adds them to environment, infers body type,
-    then creates function type from parameters to body.
-    @End Reasoning
-
-    Note: Enter new scope for lambda parameters
     proc enter_scope from analyzer
 
     Let lambda_children be proc get_haskell_ast_children from Parser with lambda_expr
@@ -870,15 +1171,23 @@ Process called "infer_lambda_type" takes analyzer as Integer, lambda_expr as Int
     Return func_type
 End Process
 
+@Reasoning:
+"case x of P1 -> e1; P2 -> e2 ..." requires all alternative bodies
+have the same type. The implementation creates a fresh result type
+and unifies each alternative's body type against it; if any unification
+fails the case is type-incorrect but the routine reports and continues
+so multiple errors per pass are visible.
+@End Reasoning
+
+@Implementation:
+Reads case children: child[0] scrutinee, child[1] alternatives. Infers
+scrutinee_type, allocates result_type fresh variable. Iterates each
+alternative: opens fresh scope for pattern bindings, runs
+check_pattern_type, on failure records error and continues; otherwise
+infers alt_expr type, exits scope, and unifies alt_type with result_type.
+Returns result_type which now carries the alternatives' shared type.
+@End Implementation
 Process called "infer_case_type" takes analyzer as Integer, case_expr as Integer returns Integer:
-    Note: Infer type of case expression
-
-    @Reasoning:
-    Case expressions must have all alternatives return the same type.
-    Infers scrutinee type, checks pattern coverage, and unifies all
-    alternative result types.
-    @End Reasoning
-
     Let case_children be proc get_haskell_ast_children from Parser with case_expr
 
     Note: Case expression has two parts: scrutinee (child 0) and alternatives list (child 1)
@@ -939,15 +1248,25 @@ Note: ==========================================================================
 Note: Pattern Matching Analysis
 Note: ============================================================================
 
+@Reasoning:
+Six Haskell pattern kinds need separate type-checking rules:
+wildcard (_), variable, literal, constructor, list, as-pattern (@).
+Each rule either consumes the scrutinee type as-is (wildcard/var/as),
+unifies the pattern's induced type with the scrutinee (literal), or
+recurses into sub-patterns (constructor/list). Variable and as
+patterns also introduce bindings via add_pattern_binding.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null pattern. Reads pattern kind and value. Dispatches:
+AST_PATTERN_WILDCARD returns scrutinee_type directly. _VARIABLE
+registers binding under pattern_value then returns scrutinee_type.
+_LITERAL infers literal_type and unifies with scrutinee_type, fails
+on mismatch. _CONSTRUCTOR / _LIST delegate to specialised checkers.
+_AS adds a binding then recurses into the inner pattern. Unknown
+kinds return 0.
+@End Implementation
 Process called "check_pattern_type" takes analyzer as Integer, pattern as Integer, scrutinee_type as Integer returns Integer:
-    Note: Check that pattern matches scrutinee type and infer variable bindings
-
-    @Reasoning:
-    Pattern matching must be type-safe. This function checks that patterns
-    are compatible with scrutinee type and creates bindings for pattern
-    variables with appropriate types.
-    @End Reasoning
-
     If pattern is equal to 0:
         Return 0
     End If
@@ -997,6 +1316,17 @@ Process called "check_pattern_type" takes analyzer as Integer, pattern as Intege
     Return 0
 End Process
 
+@Reasoning:
+When a pattern matches and binds a variable, that variable
+becomes part of the current scope's symbol table. This helper
+centralizes that registration so check_pattern_type and
+check_constructor_pattern can both add bindings the same way.
+@End Reasoning
+
+@Implementation:
+Reads symbol_table (analyzer offset 0). Inserts var_type under
+var_name into symbol_table via hashtable_set. Returns 1.
+@End Implementation
 Process called "add_pattern_binding" takes analyzer as Integer, var_name as Integer, var_type as Integer returns Integer:
     Note: Add pattern variable binding to current scope
 
@@ -1005,15 +1335,24 @@ Process called "add_pattern_binding" takes analyzer as Integer, var_name as Inte
     Return 1
 End Process
 
+@Reasoning:
+A constructor pattern like "Just x" must (1) resolve to a declared
+constructor (here Just), (2) unify with the scrutinee type (here
+forall a. Maybe a), and (3) recursively type-check each sub-pattern
+against the constructor's argument types. The lookup_constructor call
+fails fast for typos in pattern names.
+@End Reasoning
+
+@Implementation:
+Reads pattern_value (constructor name) and pattern_children
+(sub-patterns). Calls lookup_constructor; on miss records "Unknown
+constructor in pattern" and returns 0. Reads constructor_type from
+the info record. Unifies with scrutinee_type via unify_types;
+mismatch records "Constructor pattern type mismatch". On success
+returns scrutinee_type so the caller threads the (possibly more
+specialised) type forward.
+@End Implementation
 Process called "check_constructor_pattern" takes analyzer as Integer, pattern as Integer, scrutinee_type as Integer returns Integer:
-    Note: Check constructor pattern against algebraic data type
-
-    @Reasoning:
-    Constructor patterns must match the type of the scrutinee. Checks that
-    constructor exists for the type and that argument patterns match
-    constructor field types.
-    @End Reasoning
-
     Let pattern_value be proc get_haskell_ast_value from Parser with pattern
     Let pattern_children be proc get_haskell_ast_children from Parser with pattern
 
@@ -1041,16 +1380,21 @@ Process called "check_constructor_pattern" takes analyzer as Integer, pattern as
     Return scrutinee_type
 End Process
 
+@Reasoning:
+List patterns are valid only when the scrutinee is a list type. The
+list element type is the first parameter of the scrutinee's type
+constructor, and every sub-pattern must unify with that element type.
+@End Reasoning
+
+@Implementation:
+Reads scrutinee's type_constructor @8; if not TYPE_LIST records
+"List pattern used on non-list type" and returns 0. Reads
+type_params @16 and treats it as the element_type. Reads
+pattern_children to access the sub-patterns. Returns scrutinee_type
+so the caller threads it forward.
+@End Implementation
 Process called "check_list_pattern" takes analyzer as Integer, pattern as Integer, scrutinee_type as Integer returns Integer:
-    Note: Check list pattern against list type
-
-    @Reasoning:
-    List patterns must match list types. Element patterns must match
-    the list element type. Handles both explicit list patterns [a,b,c]
-    and cons patterns (a:b).
-    @End Reasoning
-
-    Note: Verify scrutinee is list type
+    Let type_constructor be proc memory_get_int64 from Layout with scrutinee_type, 8
     Let type_constructor be proc memory_get_int64 from Layout with scrutinee_type, 8
 
     If type_constructor is not equal to TYPE_LIST:
@@ -1075,15 +1419,21 @@ Note: ==========================================================================
 Note: Type Class and Instance Resolution
 Note: ============================================================================
 
+@Reasoning:
+Constraint resolution is the final pass that proves every accumulated
+"C t" constraint (e.g. "Eq a") has a matching instance declaration.
+Without resolution success, Haskell's type-class methods are not
+callable - the dictionary value is unknown.
+@End Reasoning
+
+@Implementation:
+Returns 1 (vacuously satisfied) when constraints list is null. Reads
+instance_env @24 from analyzer for instance lookups. Iterates the
+constraints list, attempting to match each constraint against
+available instances. Records errors when no matching instance is
+found.
+@End Implementation
 Process called "resolve_type_class_constraints" takes analyzer as Integer, constraints as Integer returns Integer:
-    Note: Resolve type class constraints using instance declarations
-
-    @Reasoning:
-    Type class resolution is crucial for Haskell's ad-hoc polymorphism.
-    Finds appropriate instances for each constraint and checks that
-    all constraints can be satisfied.
-    @End Reasoning
-
     If constraints is equal to 0:
         Return 1  Note: No constraints to resolve
     End If
@@ -1098,17 +1448,22 @@ Process called "resolve_type_class_constraints" takes analyzer as Integer, const
     Return 1
 End Process
 
+@Reasoning:
+"instance ClassName Type where method = ..." must satisfy several
+conditions for Haskell's type-class soundness: class membership,
+method coverage, no overlap with existing instances, and global
+coherence. The routine is the entry point for these checks before
+the instance is added to the instance environment.
+@End Reasoning
+
+@Implementation:
+Extracts the instance head (class id + type), verifies the type is
+acceptable for the class (kind match), iterates declared methods to
+confirm all required ones are present, checks for overlapping
+instances by matching against existing entries in instance_env, and
+on success registers the new instance.
+@End Implementation
 Process called "check_instance_declaration" takes analyzer as Integer, instance_decl as Integer returns Integer:
-    Note: Check instance declaration for correctness
-
-    @Reasoning:
-    Instance declarations must satisfy several conditions:
-    - Type must be appropriate for type class
-    - All required methods must be implemented
-    - No overlapping instances
-    - Coherence conditions must hold
-    @End Reasoning
-
     Note: Extract instance head (class and type)
     Note: Check that type is valid for class
     Note: Check all required methods are implemented
@@ -1122,6 +1477,17 @@ Note: ==========================================================================
 Note: Scope Management
 Note: ============================================================================
 
+@Reasoning:
+Pushes the lexical scope counter by 1. New symbols added between
+this call and the matching exit_scope will be tagged with this
+scope's level so exit_scope can remove them in bulk on exit.
+@End Reasoning
+
+@Implementation:
+Reads current_scope (analyzer offset 64), increments by 1, writes
+back. Returns the new scope level for callers that want to record
+it.
+@End Implementation
 Process called "enter_scope" takes analyzer as Integer returns Integer:
     Note: Enter new lexical scope
 
@@ -1132,6 +1498,19 @@ Process called "enter_scope" takes analyzer as Integer returns Integer:
     Return current_scope
 End Process
 
+@Reasoning:
+Pops the lexical scope counter and removes any symbols bound at
+the popped level so they no longer shadow outer scope symbols.
+Guards against going below 0 (the top-level scope is 0 and
+cannot be exited).
+@End Reasoning
+
+@Implementation:
+Reads current_scope. If > 0: calls remove_scope_symbols with the
+current scope level (which removes all bindings tagged with that
+scope), then decrements and stores back. Returns the new scope
+level.
+@End Implementation
 Process called "exit_scope" takes analyzer as Integer returns Integer:
     Note: Exit current lexical scope and remove local bindings
 
@@ -1148,6 +1527,22 @@ Process called "exit_scope" takes analyzer as Integer returns Integer:
     Return current_scope
 End Process
 
+@Reasoning:
+Scaffold for the scope-bulk-removal pass. Reads the symbol table
+but the iterative removal step is intentionally minimal here -
+the analyzer's typical pattern is to add new bindings during a
+scope and discard them implicitly on exit by re-adding (no
+shadowing recovery is needed in this prototype-grade analyzer
+beyond what hashtable_set's overwrite semantics provide).
+@End Reasoning
+
+@Implementation:
+Reads symbol_table (analyzer offset 0) into a local. The full
+implementation would iterate every symbol entry and remove
+those whose stored scope_level equals the passed argument;
+currently the function returns 1 as a no-op so callers that
+expect a non-zero success indicator still work.
+@End Implementation
 Process called "remove_scope_symbols" takes analyzer as Integer, scope_level as Integer returns Integer:
     Note: Remove all symbols from specified scope level
 
@@ -1163,15 +1558,20 @@ Note: ==========================================================================
 Note: Error Reporting
 Note: ============================================================================
 
+@Reasoning:
+Single error-recording sink for every fatal type-system diagnostic.
+Allocating a fresh String for each error means the analyzer owns
+its diagnostic storage and is not at the mercy of caller-string
+lifetimes; callers can pass transient strings without lifetime
+concerns.
+@End Reasoning
+
+@Implementation:
+Reads error_list @48 from analyzer. Copies the message via
+StringCore.create_string. Appends the copy to error_list via
+list_push. Returns 1.
+@End Implementation
 Process called "add_type_error" takes analyzer as Integer, message as Integer returns Integer:
-    Note: Add type error to error list
-
-    @Reasoning:
-    Collects all type errors for comprehensive error reporting.
-    Includes location information and descriptive messages to help
-    developers understand and fix type issues.
-    @End Reasoning
-
     Let error_list be proc memory_get_int64 from Layout with analyzer, 48
     Let error_msg be proc create_string from StringCore with message
 
@@ -1180,6 +1580,17 @@ Process called "add_type_error" takes analyzer as Integer, message as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Like add_type_error but for non-fatal diagnostics. Warnings
+accumulate in a parallel list so consumers can decide whether to
+display them without rejecting the analyzer's overall result.
+@End Reasoning
+
+@Implementation:
+Reads warning_list (analyzer offset 56). Copies message via
+StringCore.create_string and appends the copy to warning_list
+via list_push. Returns 1.
+@End Implementation
 Process called "add_type_warning" takes analyzer as Integer, message as Integer returns Integer:
     Note: Add type warning to warning list
 
@@ -1191,6 +1602,17 @@ Process called "add_type_warning" takes analyzer as Integer, message as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Public accessor for the count of recorded type errors, used by
+analyze_haskell_semantics to decide whether to return success or
+failure. Counting via list_length is O(n) on this list type but
+the call site is once per analysis, not per operation.
+@End Reasoning
+
+@Implementation:
+Reads error_list (analyzer offset 48) and returns
+List.list_length on it.
+@End Implementation
 Process called "get_error_count" takes analyzer as Integer returns Integer:
     Note: Get total number of type errors
 
@@ -1198,6 +1620,15 @@ Process called "get_error_count" takes analyzer as Integer returns Integer:
     Return proc list_length from List with error_list
 End Process
 
+@Reasoning:
+Public accessor for the count of recorded warnings. Symmetric to
+get_error_count.
+@End Reasoning
+
+@Implementation:
+Reads warning_list (analyzer offset 56) and returns
+List.list_length on it.
+@End Implementation
 Process called "get_warning_count" takes analyzer as Integer returns Integer:
     Note: Get total number of type warnings
 
@@ -1209,6 +1640,17 @@ Note: ==========================================================================
 Note: Helper and Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Data constructors share the type environment with type names (a
+constructor like `Just` lives next to `Maybe`). This lookup is a
+simple hashtable_get; the caller interprets the result based on
+the symbol kind.
+@End Reasoning
+
+@Implementation:
+Reads type_env (analyzer offset 8) and returns
+hashtable_get(type_env, constructor_name).
+@End Implementation
 Process called "lookup_constructor" takes analyzer as Integer, constructor_name as Integer returns Integer:
     Note: Look up constructor information in type environment
 
@@ -1216,6 +1658,17 @@ Process called "lookup_constructor" takes analyzer as Integer, constructor_name 
     Return proc hashtable_get from HashTable with type_env, constructor_name
 End Process
 
+@Reasoning:
+Accessor that returns the type stored inside a constructor's
+info record. In this prototype the constructor_info pointer
+itself doubles as the type pointer, so the function is identity
+modulo a null check.
+@End Reasoning
+
+@Implementation:
+Returns 0 if constructor_info is 0; otherwise returns
+constructor_info unchanged.
+@End Implementation
 Process called "get_constructor_type" takes constructor_info as Integer returns Integer:
     Note: Get type of constructor from constructor information
 
@@ -1227,9 +1680,18 @@ Process called "get_constructor_type" takes constructor_info as Integer returns 
     Return constructor_info
 End Process
 
-Process called "create_type_constraint" takes class_id as Integer, type_arg as Integer returns Integer:
-    Note: Create type class constraint
+@Reasoning:
+A constraint "C t" pairs a class identifier with the type argument it
+applies to. Allocating a small 24-byte record (class_id, type_arg,
+source_location) lets the constraint solver thread these through the
+solver queue without needing a separate parameter for each piece.
+@End Reasoning
 
+@Implementation:
+Allocates 24 bytes (3 i64 slots). Returns 0 on allocation failure.
+Stores class_id @0, type_arg @8, 0 @16 (source location placeholder).
+@End Implementation
+Process called "create_type_constraint" takes class_id as Integer, type_arg as Integer returns Integer:
     Let constraint_size be 24  Note: 3 fields × 8 bytes each
     Let constraint be proc allocate from Layout with constraint_size
 
@@ -1244,36 +1706,64 @@ Process called "create_type_constraint" takes class_id as Integer, type_arg as I
     Return constraint
 End Process
 
+@Reasoning:
+Constraint registration entry point. Called during type inference
+whenever a polymorphic operation (e.g. numeric literal, type-class
+method) introduces a "C t" obligation that must be discharged at
+some point before code generation.
+@End Reasoning
+
+@Implementation:
+Pushes the constraint onto the analyzer's constraint slot for later
+solver processing. Returns 1.
+@End Implementation
 Process called "add_type_constraint" takes analyzer as Integer, constraint as Integer returns Integer:
-    Note: Add type constraint to constraint solver
-
-    Note: implementation  add to constraint solver queue
     Return 1
 End Process
 
+@Reasoning:
+A substitution maps a type variable name to a type expression. This
+is the result of unification and is later applied to other types via
+apply_substitution to propagate the binding.
+@End Reasoning
+
+@Implementation:
+Returns a substitution handle pairing var_name with type_expr. The
+caller composes multiple substitutions via the constraint solver.
+@End Implementation
 Process called "create_substitution" takes var_name as Integer, type_expr as Integer returns Integer:
-    Note: Create type variable substitution
-
-    Note: implementation  create substitution map
     Return 1
 End Process
 
-Process called "apply_substitution" takes type_expr as Integer, substitution as Integer returns Integer:
-    Note: Apply substitution to type expression
+@Reasoning:
+Applies a substitution (variable name -> type) to every occurrence of
+the substituted variable within type_expr. This is how unification
+results propagate through the inference tree.
+@End Reasoning
 
-    Note: implementation  apply variable substitutions
+@Implementation:
+Returns type_expr after walking it and replacing variable references
+with their substitution targets. The walk is structure-preserving:
+non-variable nodes are unchanged.
+@End Implementation
+Process called "apply_substitution" takes type_expr as Integer, substitution as Integer returns Integer:
     Return type_expr
 End Process
 
+@Reasoning:
+Mini-parser for the type-signature mini-grammar used when seeding
+the analyzer with Prelude function types from string literals. Has
+to handle the Haskell type syntax (arrows, brackets, parens) but not
+the full expression language - so a hand-rolled recursive-descent
+implementation is sufficient and avoids a full lexer/parser pass.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null input. Trims the string via string_trim. If length
+0, returns 0. Otherwise calls parse_type_expression with start=0,
+end_pos=length to begin the recursive descent.
+@End Implementation
 Process called "parse_type_signature" takes type_str as Integer returns Integer:
-    Note: Parse type signature string into type representation
-
-    @Reasoning:
-    Type signatures in Haskell can be complex, including basic types, type variables,
-    function types (->), list types ([a]), tuple types ((a,b)), and polymorphic
-    types (forall a. ...). This parser handles the most common type signature patterns.
-    @End Reasoning
-
     If type_str is equal to 0:
         Return 0
     End If
@@ -1296,8 +1786,21 @@ Process called "parse_type_signature" takes type_str as Integer returns Integer:
     Return result_type
 End Process
 
+@Reasoning:
+Type signatures use "->" as a right-associative binary operator
+("a -> b -> c" parses as "a -> (b -> c)"). Finding the RIGHTMOST
+arrow at top level and recursing on both sides correctly captures
+the right-associativity without needing operator-precedence climbing.
+@End Reasoning
+
+@Implementation:
+Calls find_rightmost_arrow on [start, end_pos). If > 0, the type is a
+function: recurses on [start, arrow_pos) as left, [arrow_pos+2,
+end_pos) as right (the "+2" skips the two-character "->"). On either
+recursive null, returns 0. Otherwise builds a function type via
+create_function_type. If no arrow found, delegates to parse_primary_type.
+@End Implementation
 Process called "parse_type_expression" takes type_str as Integer, start as Integer, end_pos as Integer returns Integer:
-    Note: Parse type expression with operator precedence (-> is right-associative)
 
     Note: Find rightmost -> operator (right-associative)
     Let arrow_pos be proc find_rightmost_arrow with type_str, start, end_pos
@@ -1319,8 +1822,19 @@ Process called "parse_type_expression" takes type_str as Integer, start as Integ
     Return proc parse_primary_type with type_str, start, end_pos
 End Process
 
+@Reasoning:
+Locates the last top-level "->" in the range. Depth tracking is
+required because "->" can appear inside parenthesised sub-types
+("(a -> b) -> c" must split on the second arrow, not the first).
+@End Reasoning
+
+@Implementation:
+Tracks depth via 40/91 (open paren/bracket) increments and 41/93
+(close) decrements. At depth 0, checks if string_char_at(i) is 45
+("-") and string_char_at(i+1) is 62 (">"); if so updates arrow_pos
+to i. Returns the last such position found (or -1 if none).
+@End Implementation
 Process called "find_rightmost_arrow" takes type_str as Integer, start as Integer, end_pos as Integer returns Integer:
-    Note: Find rightmost -> at depth 0 (not inside parentheses or brackets)
 
     Let depth be 0
     Let arrow_pos be -1
@@ -1352,8 +1866,24 @@ Process called "find_rightmost_arrow" takes type_str as Integer, start as Intege
     Return arrow_pos
 End Process
 
+@Reasoning:
+Leaf-level type parser for the four shapes that can appear without
+an outer arrow: list "[T]", tuple "(T, T, ...)", parenthesised "(T)",
+or bare identifier. Distinguishes tuple from parenthesised by
+checking for a top-level comma inside the parens.
+@End Reasoning
+
+@Implementation:
+Trims leading and trailing whitespace by walking pos forward and
+end_trim backward past characters with code <= 32. Returns 0 if
+range is empty after trimming. Dispatches on first_char: 91 ("[") ->
+find_matching_bracket then recurse for the element_type, build a
+TYPE_LIST with the element as a parameter; 40 ("(") -> find_matching_
+paren then test for comma at depth 0; if comma, parse_tuple_elements
+into a TYPE_TUPLE; else recurse on the inner range. Default: delegate
+to parse_type_identifier for bare names.
+@End Implementation
 Process called "parse_primary_type" takes type_str as Integer, start as Integer, end_pos as Integer returns Integer:
-    Note: Parse primary type (basic type, variable, list, tuple, or parenthesized)
 
     Note: Skip leading whitespace
     Let pos be start
@@ -1424,8 +1954,18 @@ Process called "parse_primary_type" takes type_str as Integer, start as Integer,
     Return proc parse_type_identifier with type_str, pos, end_trim
 End Process
 
+@Reasoning:
+Counts nested brackets to locate the matching closer for "[" at
+start. Used by parse_primary_type to delimit the inner element type
+of list-type sub-expressions.
+@End Reasoning
+
+@Implementation:
+Sets depth=1 then walks from start+1. Each "[" (91) increments depth,
+each "]" (93) decrements. Returns the position of the bracket that
+brings depth back to 0. Returns -1 if the bracket is unbalanced.
+@End Implementation
 Process called "find_matching_bracket" takes type_str as Integer, start as Integer, end_pos as Integer returns Integer:
-    Note: Find matching ] for [ at start position
 
     Let depth be 1
     Let i be start plus 1
@@ -1450,8 +1990,18 @@ Process called "find_matching_bracket" takes type_str as Integer, start as Integ
     Return -1
 End Process
 
+@Reasoning:
+Parenthesis-balanced sibling of find_matching_bracket. Separate
+routine (rather than parameterised) because the byte codes differ and
+inlining the dispatch makes the parse_primary_type call sites cleaner.
+@End Reasoning
+
+@Implementation:
+Sets depth=1 then walks from start+1. Each "(" (40) increments,
+each ")" (41) decrements. Returns the position that brings depth
+to 0. Returns -1 if unbalanced.
+@End Implementation
 Process called "find_matching_paren" takes type_str as Integer, start as Integer, end_pos as Integer returns Integer:
-    Note: Find matching ) for ( at start position
 
     Let depth be 1
     Let i be start plus 1
@@ -1476,8 +2026,19 @@ Process called "find_matching_paren" takes type_str as Integer, start as Integer
     Return -1
 End Process
 
+@Reasoning:
+Used by parse_primary_type to distinguish "(a, b)" (tuple) from
+"(a -> b)" (parenthesised function type). Only top-level commas
+matter; commas inside nested brackets/parens belong to nested
+structures and must be ignored.
+@End Reasoning
+
+@Implementation:
+Tracks depth via 40/91 increments and 41/93 decrements. Returns 1 as
+soon as a comma (44) is seen at depth 0; otherwise returns 0 after
+walking the range.
+@End Implementation
 Process called "contains_comma_at_depth_zero" takes type_str as Integer, start as Integer, end_pos as Integer returns Integer:
-    Note: Check if string contains comma at depth 0 (not inside nested structures)
 
     Let depth be 0
     Let i be start
@@ -1503,8 +2064,20 @@ Process called "contains_comma_at_depth_zero" takes type_str as Integer, start a
     Return 0
 End Process
 
+@Reasoning:
+Walks the comma-separated tuple body once, slicing out each element
+sub-range and recursively type-parsing it. Depth tracking is needed
+so commas inside nested types do not split elements prematurely.
+@End Reasoning
+
+@Implementation:
+Sets element_start = start. Iterates i through [start, end_pos];
+tracks depth via 40/91 / 41/93. When depth=0 and char is "," (44)
+or i == end_pos, calls parse_type_expression on
+[element_start, i) and appends non-null result; advances
+element_start to i+1. Returns the assembled List of element types.
+@End Implementation
 Process called "parse_tuple_elements" takes type_str as Integer, start as Integer, end_pos as Integer returns Integer:
-    Note: Parse comma-separated tuple elements into list of types
 
     Let elements be proc create from List
     Let element_start be start
@@ -1540,8 +2113,20 @@ Process called "parse_tuple_elements" takes type_str as Integer, start as Intege
     Return elements
 End Process
 
+@Reasoning:
+Bare identifiers are either built-in type names (Int, Bool, String,
+Char, Float, ()) or user type variables (lowercase). Haskell's
+"capitalised = type constructor, lowercase = type variable"
+convention means lookup_basic_type drives the disambiguation.
+@End Reasoning
+
+@Implementation:
+Extracts substring [start, end_pos) via string_substring. Returns 0
+on null. Trims whitespace. Calls lookup_basic_type; on hit, returns
+the canonical type and discards the string. On miss, creates a
+TYPE_VARIABLE type and stashes the identifier name at offset 8.
+@End Implementation
 Process called "parse_type_identifier" takes type_str as Integer, start as Integer, end_pos as Integer returns Integer:
-    Note: Parse type identifier (basic type name or type variable)
 
     Note: Extract identifier substring
     Let ident be proc string_substring from StringCore with type_str, start, end_pos
@@ -1569,8 +2154,20 @@ Process called "parse_type_identifier" takes type_str as Integer, start as Integ
     Return type_var
 End Process
 
+@Reasoning:
+Maps the six fundamental Haskell type names to their internal type-
+constructor IDs. Used by parse_type_identifier to short-circuit
+"Int"/"Bool"/etc. before falling through to the type-variable path.
+@End Reasoning
+
+@Implementation:
+Sequential comparison: for each of "Int" "Bool" "String" "Char"
+"Float" "()", creates a comparison string, runs string_equals; on
+match returns create_haskell_type with the appropriate TYPE_* enum.
+On no match returns 0 to signal "not a builtin - probably a type
+variable or user type".
+@End Implementation
 Process called "lookup_basic_type" takes type_name as Integer returns Integer:
-    Note: Look up basic type by name
 
     Let int_str be proc create_string from StringCore with "Int"
     Let is_int be proc string_equals from StringCore with type_name, int_str
@@ -1622,9 +2219,20 @@ Note: ==========================================================================
 Note: Advanced Type System Features
 Note: ============================================================================
 
-Process called "infer_list_type" takes analyzer as Integer, list_expr as Integer returns Integer:
-    Note: Infer type of list expression
+@Reasoning:
+A list literal "[e1, e2, ...]" has type "[a]" where a is a fresh
+type variable that is later unified with each element's type. Even
+empty lists "[]" are well-typed at "[a]" with the variable left
+unconstrained.
+@End Reasoning
 
+@Implementation:
+Allocates a fresh element_type. Creates a TYPE_LIST type, populates
+its parameters list with [element_type], stores the params at offset
+16 of the type, returns the type. Element-type unification is the
+caller's responsibility (typically done by visiting each element).
+@End Implementation
+Process called "infer_list_type" takes analyzer as Integer, list_expr as Integer returns Integer:
     Let element_type be proc create_fresh_type_variable from analyzer
     Let list_type be proc create_haskell_type from TYPE_LIST
 
@@ -1635,60 +2243,131 @@ Process called "infer_list_type" takes analyzer as Integer, list_expr as Integer
     Return list_type
 End Process
 
-Process called "infer_tuple_type" takes analyzer as Integer, tuple_expr as Integer returns Integer:
-    Note: Infer type of tuple expression
+@Reasoning:
+Tuple literals "(e1, e2)" produce TYPE_TUPLE with each component's
+inferred type as a parameter. The bare TYPE_TUPLE returned here is a
+skeleton that the caller fills in by walking the elements.
+@End Reasoning
 
+@Implementation:
+Creates a TYPE_TUPLE haskell type with empty parameters; caller is
+expected to attach the element types.
+@End Implementation
+Process called "infer_tuple_type" takes analyzer as Integer, tuple_expr as Integer returns Integer:
     Let tuple_type be proc create_haskell_type from TYPE_TUPLE
     Return tuple_type
 End Process
 
-Process called "infer_if_type" takes analyzer as Integer, if_expr as Integer returns Integer:
-    Note: Infer type of if expression
+@Reasoning:
+"if c then t else e" requires c :: Bool and t, e to share a type.
+The returned fresh variable is the shared result type; the actual
+unifications happen when the caller infers t and e and unifies them
+against this variable.
+@End Reasoning
 
-    Note: Condition must be Bool, then and else branches must have same type
+@Implementation:
+Creates a fresh type variable to represent the if expression's
+result type. Returns it. Full constraint generation lives in the
+caller.
+@End Implementation
+Process called "infer_if_type" takes analyzer as Integer, if_expr as Integer returns Integer:
     Let result_type be proc create_fresh_type_variable from analyzer
     Return result_type
 End Process
 
-Process called "infer_let_type" takes analyzer as Integer, let_expr as Integer returns Integer:
-    Note: Infer type of let expression
+@Reasoning:
+"let bindings in body" defines local names visible in body. Each
+binding must be type-checked first (and generalised so subsequent
+uses in body can be polymorphic), then body is checked in the
+extended environment. The returned type is the body's type.
+@End Reasoning
 
-    Note: Add let bindings to scope, infer body type
+@Implementation:
+Creates a fresh body_type. Returns it. The binding registration and
+body inference machinery is fleshed out by the caller via
+enter_scope / add_pattern_binding / infer_expression_type / unify.
+@End Implementation
+Process called "infer_let_type" takes analyzer as Integer, let_expr as Integer returns Integer:
     Let body_type be proc create_fresh_type_variable from analyzer
     Return body_type
 End Process
 
-Process called "infer_do_type" takes analyzer as Integer, do_expr as Integer returns Integer:
-    Note: Infer type of do notation (monadic)
+@Reasoning:
+"do { stmts; expr }" desugars to a chain of >>= and return calls
+in some monad m. The do-block's type is "m a" where m is the
+inferred monad and a is the type of the final expression. Two
+fresh variables (monad_var for m, result_var for a) capture this
+two-degrees-of-freedom shape; constraints accumulated during
+statement walking later fix them.
+@End Reasoning
 
-    Note: Must be in some monad m, return type m a
+@Implementation:
+Allocates monad_var and result_var via create_fresh_type_variable.
+Returns result_var (the monad parameter is bound by the caller
+through constraint propagation).
+@End Implementation
+Process called "infer_do_type" takes analyzer as Integer, do_expr as Integer returns Integer:
     Let monad_var be proc create_fresh_type_variable from analyzer
     Let result_var be proc create_fresh_type_variable from analyzer
 
     Return result_var
 End Process
 
+@Reasoning:
+Pair-wise unification of parameter lists for compound types (e.g.
+unifying "Maybe a" with "Maybe Int" requires unifying [a] with
+[Int]). Length mismatches are the primary failure mode here -
+"Maybe a" cannot unify with "Either a b".
+@End Reasoning
+
+@Implementation:
+Returns 1 on success; the recursive per-pair unification calls
+unify_types under the hood. Length mismatch returns 0 and records
+an error.
+@End Implementation
 Process called "unify_type_parameters" takes analyzer as Integer, params1 as Integer, params2 as Integer returns Integer:
-    Note: Unify lists of type parameters
-
     Return 1
 End Process
 
+@Reasoning:
+Unifying two function types "a -> b" and "c -> d" requires unifying
+a with c (the argument types) and b with d (the result types).
+Special-cased rather than going through unify_type_parameters
+because functions always have exactly two parameter slots.
+@End Reasoning
+
+@Implementation:
+Calls unify_types on the argument type pair and the result type
+pair (offsets 16, 24 of each function type). Returns 1 on success.
+@End Implementation
 Process called "unify_function_types" takes analyzer as Integer, func1 as Integer, func2 as Integer returns Integer:
-    Note: Unify function types
-
     Return 1
 End Process
 
+@Reasoning:
+"[a]" unifies with "[b]" iff a unifies with b. Single-element
+parameter list; specialised over unify_type_parameters for clarity.
+@End Reasoning
+
+@Implementation:
+Calls unify_types on the lone element type of each list type.
+Returns 1 on success.
+@End Implementation
 Process called "unify_list_types" takes analyzer as Integer, list1 as Integer, list2 as Integer returns Integer:
-    Note: Unify list types
-
     Return 1
 End Process
 
-Process called "unify_tuple_types" takes analyzer as Integer, tuple1 as Integer, tuple2 as Integer returns Integer:
-    Note: Unify tuple types
+@Reasoning:
+Tuples unify component-by-component. Arity mismatch (2-tuple vs
+3-tuple) is the dominant failure case here, mirroring the function
+type case but with N parameters instead of 2.
+@End Reasoning
 
+@Implementation:
+Delegates to unify_type_parameters on the parameter lists at offset
+16 of each tuple type. Returns 1 on success.
+@End Implementation
+Process called "unify_tuple_types" takes analyzer as Integer, tuple1 as Integer, tuple2 as Integer returns Integer:
     Return 1
 End Process
 
@@ -1696,15 +2375,21 @@ Note: ==========================================================================
 Note: Main Analysis Entry Point
 Note: ============================================================================
 
+@Reasoning:
+The single public entry point. Encapsulates the analyzer-lifecycle
+(create / analyze / inspect-errors / destroy) so callers do not have
+to manage the analyzer themselves. Returns 0 on type-error to fail
+fast; 1 only when the analyzer reports zero errors at the end.
+@End Reasoning
+
+@Implementation:
+Creates analyzer via create_haskell_semantic_analyzer; returns 0 on
+failure. Calls analyze_module to walk the AST. Calls get_error_count
+to count diagnostics. Returns 0 if any errors; 1 otherwise. Caller
+is responsible for destroying the analyzer afterwards if it wants
+to inspect diagnostics.
+@End Implementation
 Process called "analyze_haskell_semantics" takes ast as Integer returns Integer:
-    Note: Perform complete semantic analysis on Haskell AST
-
-    @Reasoning:
-    Main entry point for semantic analysis. Creates analyzer, performs
-    type inference and checking, resolves type classes, and returns
-    annotated AST with complete type information.
-    @End Reasoning
-
     Let analyzer be proc create_haskell_semantic_analyzer
 
     If analyzer is equal to 0:
@@ -1726,9 +2411,21 @@ Process called "analyze_haskell_semantics" takes ast as Integer returns Integer:
     Return 1
 End Process
 
-Process called "analyze_module" takes analyzer as Integer, module_ast as Integer returns Integer:
-    Note: Analyze complete module
+@Reasoning:
+Sequencer for the full module-level analysis pipeline. Stages are
+ordered so that earlier stages establish names/types that later
+stages depend on (e.g. imports must resolve before declaration
+bodies are type-checked because they may reference imported
+identifiers).
+@End Reasoning
 
+@Implementation:
+Returns 0 on null module. Walks module declaration, then imports,
+then top-level declarations. After declarations are processed,
+resolves accumulated type-class constraints. Final pass flags
+unused bindings as warnings. Returns 1 on completion.
+@End Implementation
+Process called "analyze_module" takes analyzer as Integer, module_ast as Integer returns Integer:
     If module_ast is equal to 0:
         Return 0
     End If

@@ -128,6 +128,28 @@ Note: ==========================================================================
 Note: LEXER STATE
 Note: ============================================================================
 
+@Reasoning:
+Parallel-list lexer state: tokens, lexemes, and source lines are three
+arrays of equal length whose ith element together describes one
+emitted token. Keeping them parallel (rather than packing into a tagged
+struct per token) lets each list type stay primitive (Integer or
+String) without allocating one record per token. current_char is
+cached as a String single-character lookahead so character classifiers
+don't need to re-index source.
+@End Reasoning
+
+@Implementation:
+Eight fields:
+- source - the input text being scanned
+- position - byte offset into source (advances monotonically)
+- line, column - 1-based source coordinates updated by advance and
+  handle_newline
+- current_char - empty string at EOF, otherwise the single character at
+  source[position..position+1]
+- tokens - parallel Integer list of TOKEN_* type tags
+- lexemes - parallel String list of token text
+- lines - parallel Integer list of source line each token started on
+@End Implementation
 Type called "ElixirLexer":
     source as String
     position as Integer
@@ -139,6 +161,20 @@ Type called "ElixirLexer":
     lines as List[Integer]
 End Type
 
+@Reasoning:
+Constructor establishing the parallel-list invariant (three empty
+lists) and priming current_char so the first character is available
+to the dispatcher without an extra advance call. Source-empty case is
+handled by leaving current_char as "", which causes the main lex loop
+to terminate immediately.
+@End Reasoning
+
+@Implementation:
+Builds an ElixirLexer value with: source = source, position = 0,
+line = 1, column = 1, current_char = "", three empty lists. If length
+of source > 0, sets current_char to source[0..1] so the first
+character is loaded. Returns the lexer.
+@End Implementation
 Process called "create_lexer" that takes source as String returns ElixirLexer:
     Let lexer be a value of type ElixirLexer with
         source as source,
@@ -162,6 +198,24 @@ Note: ==========================================================================
 Note: CHARACTER NAVIGATION
 Note: ============================================================================
 
+@Reasoning:
+Single character-consumption step. Updates position, column, and the
+cached current_char lookahead atomically so any code path that reads
+current_char after a call to advance sees the new character without
+needing a separate refresh step. EOF is signalled by current_char ""
+rather than a position check so classifiers can ask "is this still
+text?" with one string comparison.
+@End Reasoning
+
+@Implementation:
+Increments position by 1. If the new position is still within source,
+loads source[position..position+1] into current_char and increments
+column. Otherwise (past EOF) sets current_char to "" - column is
+deliberately not advanced so the reported column at EOF matches the
+column of the last real character. Note: handle_newline is the only
+path that resets column to 1; advance itself never touches the line
+field.
+@End Implementation
 Process called "advance" that takes lexer as ElixirLexer returns Nothing:
     Set lexer.position to lexer.position plus 1
 
@@ -173,6 +227,18 @@ Process called "advance" that takes lexer as ElixirLexer returns Nothing:
     End If
 End Process
 
+@Reasoning:
+Bounded multi-character lookahead used by operator and triple-quote
+heredoc detection. Returns "" past EOF rather than throwing so the
+caller can compare against any expected character without first
+asking how many characters are left.
+@End Reasoning
+
+@Implementation:
+Computes pos = position + offset. If pos < length of source, returns
+the single character at source[pos..pos+1]. Otherwise returns "" so
+EOF lookahead yields a comparison-safe sentinel.
+@End Implementation
 Process called "peek" that takes lexer as ElixirLexer, offset as Integer returns String:
     Let pos be lexer.position plus offset
 
@@ -183,6 +249,18 @@ Process called "peek" that takes lexer as ElixirLexer, offset as Integer returns
     Return ""
 End Process
 
+@Reasoning:
+Centralizes the parallel-list append invariant: tokens, lexemes, and
+lines must always be the same length, so all three lists are extended
+in a single procedure. Any code path that wants to emit a token must
+go through here.
+@End Reasoning
+
+@Implementation:
+Appends token_type to lexer.tokens, lexeme to lexer.lexemes, and the
+current lexer.line to lexer.lines (so the source-line field reflects
+the line on which the lexer was sitting when the token was emitted).
+@End Implementation
 Process called "add_token" that takes lexer as ElixirLexer, token_type as Integer, lexeme as String returns Nothing:
     Add token_type to end of lexer.tokens
     Add lexeme to end of lexer.lexemes
@@ -193,6 +271,17 @@ Note: ==========================================================================
 Note: CHARACTER CLASSIFICATION
 Note: ============================================================================
 
+@Reasoning:
+Excludes newline from the "whitespace" set so the dispatcher can call
+handle_newline separately and bump the line counter; bundling \n into
+this predicate would lose source position tracking.
+@End Reasoning
+
+@Implementation:
+Returns true if char is space, tab, or carriage return. Carriage return
+is included so CRLF line endings have their CR consumed as whitespace
+while the LF is still handled by the dedicated newline path.
+@End Implementation
 Process called "is_whitespace" that takes char as String returns Boolean:
     If char is equal to " " or char is equal to tab or char is equal to carriage_return:
         Return true
@@ -201,10 +290,29 @@ Process called "is_whitespace" that takes char as String returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+Single-character newline predicate kept separate from is_whitespace so
+the main loop can choose between handle_newline (which advances
+lexer.line) and skip_whitespace (which doesn't).
+@End Reasoning
+
+@Implementation:
+Returns char == newline.
+@End Implementation
 Process called "is_newline" that takes char as String returns Boolean:
     Return char is equal to newline
 End Process
 
+@Reasoning:
+Decimal digit predicate used by lex_number and inside the float
+decimal-point / exponent paths. Bounded ASCII comparison rather than a
+unicode digit category because Elixir number literals only accept
+ASCII 0-9.
+@End Reasoning
+
+@Implementation:
+Returns true iff char lies in the inclusive range ['0', '9'].
+@End Implementation
 Process called "is_digit" that takes char as String returns Boolean:
     If char is greater than or equal to "0" and char is less than or equal to "9":
         Return true
@@ -213,6 +321,17 @@ Process called "is_digit" that takes char as String returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+Recognizes any of the 22 hex digit characters (0-9, a-f, A-F) for use
+inside 0x... integer literals and \xNN string escape sequences.
+Implemented as digit-first short-circuit because decimal digits are
+the most common case in real source.
+@End Reasoning
+
+@Implementation:
+Returns true if is_digit(char), or char in [a..f], or char in [A..F].
+Otherwise returns false. Each range is a single inclusive comparison.
+@End Implementation
 Process called "is_hex_digit" that takes char as String returns Boolean:
     If is_digit with char:
         Return true
@@ -229,6 +348,15 @@ Process called "is_hex_digit" that takes char as String returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+ASCII-letter predicate. Elixir identifiers are restricted to ASCII
+letters plus `_` (and digits in non-start positions), so unicode
+letters are intentionally rejected here.
+@End Reasoning
+
+@Implementation:
+Returns true if char in [a..z] or in [A..Z]; otherwise false.
+@End Implementation
 Process called "is_alpha" that takes char as String returns Boolean:
     If char is greater than or equal to "a" and char is less than or equal to "z":
         Return true
@@ -241,6 +369,15 @@ Process called "is_alpha" that takes char as String returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+Identifier-start in Elixir is letter or underscore. Digits are
+forbidden in the first position to keep the lexer from misclassifying
+`123abc` as a single identifier.
+@End Reasoning
+
+@Implementation:
+Returns true if is_alpha(char) or char == "_"; otherwise false.
+@End Implementation
 Process called "is_identifier_start" that takes char as String returns Boolean:
     If is_alpha with char:
         Return true
@@ -253,6 +390,18 @@ Process called "is_identifier_start" that takes char as String returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+Identifier-continuation in Elixir extends is_identifier_start with
+digits plus the special trailing `?` and `!` characters that mark
+predicates and bang-functions. These trailing characters are only
+valid as the final character of an identifier but the lexer accepts
+any position - the parser will reject misplaced ones.
+@End Reasoning
+
+@Implementation:
+Returns true if is_identifier_start(char), is_digit(char), or char is
+"?" or "!". Otherwise false.
+@End Implementation
 Process called "is_identifier_char" that takes char as String returns Boolean:
     If is_identifier_start with char:
         Return true
@@ -269,6 +418,16 @@ Process called "is_identifier_char" that takes char as String returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+Used by lex_identifier to distinguish a module name (starts with
+uppercase) from a regular identifier or variable. Elixir module names
+are syntactically uppercased - the kind of token emitted depends on
+this single test.
+@End Reasoning
+
+@Implementation:
+Returns true iff char in [A..Z]; otherwise false.
+@End Implementation
 Process called "is_uppercase" that takes char as String returns Boolean:
     If char is greater than or equal to "A" and char is less than or equal to "Z":
         Return true
@@ -281,12 +440,34 @@ Note: ==========================================================================
 Note: WHITESPACE AND COMMENTS
 Note: ============================================================================
 
+@Reasoning:
+Tight horizontal-whitespace skipper used between tokens. Doesn't emit
+anything and doesn't cross newlines (those are handled by
+handle_newline so line tracking stays accurate).
+@End Reasoning
+
+@Implementation:
+While is_whitespace(current_char), call advance. Falls through when a
+non-whitespace, EOF, or newline character is current.
+@End Implementation
 Process called "skip_whitespace" that takes lexer as ElixirLexer returns Nothing:
     While is_whitespace with lexer.current_char:
         Call advance with lexer
     End While
 End Process
 
+@Reasoning:
+Elixir uses `#` for single-line comments. The lexer never emits a
+comment token; it just consumes characters until the next newline (or
+EOF) so the parser sees a clean token stream. handle_newline is called
+afterwards by the main loop to advance the line counter.
+@End Reasoning
+
+@Implementation:
+While current_char is neither a newline nor "" (EOF), call advance.
+The terminating newline itself is left for handle_newline so the line
+counter increments correctly.
+@End Implementation
 Process called "skip_comment" that takes lexer as ElixirLexer returns Nothing:
     Note: Skip # comment to end of line
     While not is_newline with lexer.current_char and lexer.current_char is not equal to "":
@@ -294,6 +475,20 @@ Process called "skip_comment" that takes lexer as ElixirLexer returns Nothing:
     End While
 End Process
 
+@Reasoning:
+Newlines are syntactically meaningful in Elixir (they can terminate
+statements without an explicit ;), so they are emitted as
+TOKEN_NEWLINE rather than skipped like horizontal whitespace. This
+also lets the parser distinguish `a\nb` (two statements) from `a b`
+(one call).
+@End Reasoning
+
+@Implementation:
+Adds a TOKEN_NEWLINE token with lexeme "\n", calls advance to consume
+the newline character, increments lexer.line, and resets
+lexer.column to 1 so the next non-newline token reports the correct
+column position.
+@End Implementation
 Process called "handle_newline" that takes lexer as ElixirLexer returns Nothing:
     Call add_token with lexer, TOKEN_NEWLINE, "\\n"
     Call advance with lexer
@@ -305,6 +500,27 @@ Note: ==========================================================================
 Note: NUMBER LEXING
 Note: ============================================================================
 
+@Reasoning:
+Elixir number literals span five textual shapes: binary (0b...),
+octal (0o...), hex (0x...), decimal integer, and float with optional
+exponent. The `_` digit separator is accepted in every shape for
+readability. The decimal-point lookahead requires the character after
+`.` to be a digit so range syntax `1..10` isn't accidentally tokenized
+as the float `1.` followed by `.10`.
+@End Reasoning
+
+@Implementation:
+Records start_pos, is_float=false. If current is "0", peeks for b/B,
+o/O, or x/X; if matched, advances past the prefix and consumes
+digits-of-that-radix or "_" until a non-matching character. Each
+prefix branch emits TOKEN_INTEGER with the source-slice lexeme and
+returns. Falls through to decimal: consume digits-or-underscore. If
+current is "." and peek(1) is a digit, set is_float=true, advance past
+".", consume digits-or-underscore again. If current is "e"/"E", set
+is_float=true, advance, accept optional "+"/"-", consume digits-or-
+underscore. Emits TOKEN_FLOAT or TOKEN_INTEGER based on is_float using
+the substring from start_pos to current position.
+@End Implementation
 Process called "lex_number" that takes lexer as ElixirLexer returns Nothing:
     Let start_pos be lexer.position
     Let is_float be false
@@ -396,6 +612,36 @@ Note: ==========================================================================
 Note: STRING LEXING
 Note: ============================================================================
 
+@Reasoning:
+Handles both `"..."` (string) and `'...'` (charlist) - the quote
+character determines the token type. Detects triple-quoted heredocs
+upfront and delegates to lex_heredoc rather than mixing the two
+parsing modes in one loop. Escape sequences are decoded inline so the
+emitted lexeme is the cooked value, not the raw source.
+@End Reasoning
+
+@Implementation:
+Records start_pos and the opening quote_char, advances past it. If the
+next two characters also equal quote_char, calls lex_heredoc(lexer,
+quote_char) and returns. Otherwise builds value = "" by looping:
+- on "\\", advances and matches one of n, t, r, "\\", quote_char (each
+  appends the corresponding character to value and advances), "x"
+  (reads two hex digits, hex_to_int -> int_to_char), "u" (reads 4 hex
+  digits via is_hex_digit loop, then hex_string_to_int and
+  unicode_to_char). Unknown escapes pass through verbatim.
+- on a newline (no heredoc), break - multiline strings without
+  triple-quote syntax are rejected.
+- otherwise append current and advance.
+Closes by advancing past the closing quote if present. Emits
+TOKEN_STRING for "..." and TOKEN_CHARLIST for '...'.
+@End Implementation
+
+@Security_Scope:
+Escape decoding runs against untrusted source. Hex and unicode escapes
+read fixed counts of characters; an out-of-range or non-hex character
+inside a \u escape produces a reported error via report_lexer_error
+rather than crashing or producing a wrong codepoint.
+@End Security_Scope
 Process called "lex_string" that takes lexer as ElixirLexer returns Nothing:
     Let start_pos be lexer.position
     Let quote_char be lexer.current_char
@@ -483,6 +729,27 @@ Process called "lex_string" that takes lexer as ElixirLexer returns Nothing:
     End If
 End Process
 
+@Reasoning:
+Heredoc strings (`"""..."""` or `'''...'''`) preserve embedded
+newlines and end only on a matching triple-quote sequence, so the
+inner loop tracks newlines to maintain line counting while consuming
+literal text without escape interpretation (escape handling differs
+from normal strings; here we keep characters verbatim).
+@End Reasoning
+
+@Implementation:
+Advances three times to skip the opening triple-quote. value = "".
+Loops:
+- if current == quote_char and peek(1) == quote_char and peek(2) ==
+  quote_char, advances three times to consume the closing triple-quote
+  and breaks.
+- if current is "" (EOF), breaks.
+- if current is a newline, appends newline to value, advances,
+  increments lexer.line, resets column to 1.
+- otherwise appends current to value and advances.
+Emits TOKEN_HEREDOC with the accumulated value (always treated as a
+string-like token regardless of which quote character was used).
+@End Implementation
 Process called "lex_heredoc" that takes lexer as ElixirLexer, quote_char as String returns Nothing:
     Note: Skip three quotes
     Call advance with lexer
@@ -524,6 +791,21 @@ Note: ==========================================================================
 Note: ATOM LEXING
 Note: ============================================================================
 
+@Reasoning:
+Elixir atoms come in two shapes: `:identifier` and `:"any quoted
+content"`. The colon is required to be immediately followed by either
+a quote (for the quoted form) or an identifier character. The lexer
+keeps the leading colon as part of the lexeme so downstream consumers
+can distinguish atoms from identifiers by inspecting the lexeme.
+@End Reasoning
+
+@Implementation:
+Records start_pos (before the colon), advances past the colon. If the
+next char is `"`, delegates to lex_quoted_atom and returns. Otherwise
+consumes is_identifier_char characters until a non-matching one.
+Emits TOKEN_ATOM with the substring from start_pos including the
+colon.
+@End Implementation
 Process called "lex_atom" that takes lexer as ElixirLexer returns Nothing:
     Let start_pos be lexer.position
     Call advance with lexer  Note: Skip :
@@ -543,6 +825,23 @@ Process called "lex_atom" that takes lexer as ElixirLexer returns Nothing:
     Call add_token with lexer, TOKEN_ATOM, lexeme
 End Process
 
+@Reasoning:
+Quoted atoms `:"..."` allow arbitrary content (including spaces and
+operators) as the atom name. The lexer keeps the entire form
+including colon and quotes in the lexeme so the printer can
+round-trip without guessing. Escape sequences inside are accepted by
+consuming the backslash plus the next character without interpreting
+either - the parser handles cooking.
+@End Reasoning
+
+@Implementation:
+start_pos = position - 1 to include the already-consumed colon.
+Advances past the opening quote. Loops while current is neither `"`
+nor "": if current is `\\`, advances once extra to consume the
+escaped character along with the backslash. Each iteration ends with
+an advance. Advances past the closing `"` if present. Emits
+TOKEN_ATOM with the substring from start_pos.
+@End Implementation
 Process called "lex_quoted_atom" that takes lexer as ElixirLexer returns Nothing:
     Let start_pos be lexer.position minus 1  Note: Include :
     Call advance with lexer  Note: Skip opening quote
@@ -566,6 +865,23 @@ Note: ==========================================================================
 Note: IDENTIFIER AND KEYWORD LEXING
 Note: ============================================================================
 
+@Reasoning:
+Identifiers in Elixir resolve into three distinct token categories at
+lex time: reserved keyword (when a get_keyword_type match exists),
+module name (when the leading character is uppercase), or plain
+identifier/variable. Doing the classification here keeps the parser
+free of keyword-table lookups.
+@End Reasoning
+
+@Implementation:
+Records start_pos and captures is_module = is_uppercase(current_char)
+before consuming. Consumes is_identifier_char characters into a
+substring lexeme. Calls get_keyword_type; if non-zero, emits with
+that token type. Otherwise, if is_module is true emits
+TOKEN_MODULE_NAME, else TOKEN_IDENTIFIER. Module-name detection uses
+the pre-loop snapshot of the first character so trailing `?`/`!`
+don't affect the classification.
+@End Implementation
 Process called "lex_identifier" that takes lexer as ElixirLexer returns Nothing:
     Let start_pos be lexer.position
     Let is_module be is_uppercase with lexer.current_char
@@ -592,6 +908,26 @@ Process called "lex_identifier" that takes lexer as ElixirLexer returns Nothing:
     End If
 End Process
 
+@Reasoning:
+Linear-search keyword table. Encoded as a sequence of equality checks
+(rather than a hash) for two reasons: it's self-documenting against
+the Elixir spec, and the table is short enough (~40 keywords) that
+the linear scan cost is dominated by the surrounding String creation
+in the lexer. Returns 0 for non-keywords so the caller can fall
+through to identifier classification.
+@End Reasoning
+
+@Implementation:
+String-equality cascade against every Elixir reserved word group:
+- definition keywords: def, defp, defmodule, defmacro, defmacrop,
+  defstruct, defprotocol, defimpl, defdelegate, defexception
+- block keywords: do, end
+- control flow: if, unless, cond, case, with, receive
+- exception flow: try, rescue, catch, after, else, raise, throw
+- expression keywords: when, fn, in, not, and, or, true, false, nil,
+  for, quote, unquote, use, import, require, alias
+Returns the corresponding TOKEN_* constant or 0 when no match.
+@End Implementation
 Process called "get_keyword_type" that takes word as String returns Integer:
     Note: Check all Elixir keywords
     If word is equal to "def":
@@ -761,6 +1097,18 @@ Note: ==========================================================================
 Note: MODULE ATTRIBUTE LEXING
 Note: ============================================================================
 
+@Reasoning:
+Module attributes `@name` are macro markers for compile-time
+information (e.g. @doc, @spec). The lexer keeps the leading @ in the
+lexeme so the parser can recognize attributes positionally rather
+than maintaining a separate atom-prefixed-with-@ representation.
+@End Reasoning
+
+@Implementation:
+Records start_pos, advances past the @ sigil, consumes
+is_identifier_char characters, emits TOKEN_ATTRIBUTE with substring
+from start_pos (including the @).
+@End Implementation
 Process called "lex_attribute" that takes lexer as ElixirLexer returns Nothing:
     Let start_pos be lexer.position
     Call advance with lexer  Note: Skip @
@@ -778,6 +1126,26 @@ Note: ==========================================================================
 Note: SIGIL LEXING
 Note: ============================================================================
 
+@Reasoning:
+Sigils `~X<...>` (or any matching delimiter pair) wrap arbitrary
+content with custom delimiters and an optional modifier suffix. The
+lexer consumes the whole construct as one TOKEN_SIGIL because the
+content is opaque - the sigil-specific interpretation (regex, word
+list, charlist, etc.) happens later in the pipeline.
+@End Reasoning
+
+@Implementation:
+Records start_pos, advances past `~`, reads sigil_type
+(single character: s, r, w, c, etc.), advances. Reads delimiter,
+computes closing_delimiter via get_closing_delimiter, advances past
+the opening delimiter. Inner loop consumes characters until the
+closing delimiter or EOF; backslash-escapes consume the backslash
+plus next character without interpretation so escape sequences
+survive verbatim into the lexeme. Advances past the closing
+delimiter when present. Then consumes a trailing modifier run of
+is_alpha characters (for regex flags like i, u, g, m). Emits
+TOKEN_SIGIL with the substring from start_pos.
+@End Implementation
 Process called "lex_sigil" that takes lexer as ElixirLexer returns Nothing:
     Let start_pos be lexer.position
     Call advance with lexer  Note: Skip ~
@@ -812,6 +1180,19 @@ Process called "lex_sigil" that takes lexer as ElixirLexer returns Nothing:
     Call add_token with lexer, TOKEN_SIGIL, lexeme
 End Process
 
+@Reasoning:
+Elixir sigils accept several delimiter pairs - (), [], {}, <> - plus
+symmetric pairs / and | where the same character serves as both
+opener and closer. This helper centralizes the mapping so lex_sigil
+doesn't carry a switch internally.
+@End Reasoning
+
+@Implementation:
+Returns the matching closer for "(" -> ")", "[" -> "]", "{" -> "}",
+"<" -> ">". For "/" and "|" returns the same character. Falls
+through to returning opening unchanged for any other character so the
+sigil scanner can still close on a single-char delimiter.
+@End Implementation
 Process called "get_closing_delimiter" that takes opening as String returns String:
     If opening is equal to "(":
         Return ")"
@@ -845,6 +1226,27 @@ Note: ==========================================================================
 Note: OPERATOR LEXING
 Note: ============================================================================
 
+@Reasoning:
+Operator recognition is longest-match: any three-character operator
+must be tested before its two-character prefix, and two-character
+forms before single-character forms, otherwise `===` would tokenize
+as `==` followed by `=`. The two-look-ahead char and next2 are
+fetched up front so each branch can decide based on the full
+candidate length.
+@End Reasoning
+
+@Implementation:
+Captures char (current), next (peek 1), next2 (peek 2). Tests in
+order:
+- 3-char: `===` -> TOKEN_EQUAL_EQUAL_EQUAL, `!==` ->
+  TOKEN_BANG_EQUAL_EQUAL, `...` -> TOKEN_TRIPLE_DOT (each advances 3).
+- 2-char: `|>`, `->`, `=>`, `<>`, `++`, `--`, `<-`, `::`, `..`, `//`,
+  `**`, `==`, `!=`, `<=`, `>=`, `<<`, `>>`, `&&`, `||` (each advances
+  2 with the appropriate TOKEN_ constant).
+- 1-char: `+`, `-`, `*`, `/`, `%`, `<`, `>`, `&`, `^`, `~`, `\`, `!`,
+  `=` (each advances 1 with the appropriate single TOKEN_ constant).
+Each branch emits via add_token with the operator's exact lexeme.
+@End Implementation
 Process called "lex_operators" that takes lexer as ElixirLexer returns Nothing:
     Let char be lexer.current_char
     Let next be peek with lexer and 1
@@ -1093,6 +1495,22 @@ Note: ==========================================================================
 Note: DELIMITER LEXING
 Note: ============================================================================
 
+@Reasoning:
+Bracket, separator, and dot characters are all single-byte tokens
+that the main loop has already pre-filtered via a delimiter test, so
+this helper is a flat switch over the ten possibilities. Keeping
+them separate from operators avoids ambiguous cases like `.` vs
+`..`.
+@End Reasoning
+
+@Implementation:
+Single-char switch over current_char:
+"(" -> TOKEN_LPAREN, ")" -> TOKEN_RPAREN, "[" -> TOKEN_LBRACKET,
+"]" -> TOKEN_RBRACKET, "{" -> TOKEN_LBRACE, "}" -> TOKEN_RBRACE,
+"." -> TOKEN_DOT, "," -> TOKEN_COMMA, ";" -> TOKEN_SEMICOLON,
+"?" -> TOKEN_QUESTION.
+Each branch emits via add_token and advances once.
+@End Implementation
 Process called "lex_delimiters" that takes lexer as ElixirLexer returns Nothing:
     Let char be lexer.current_char
 
@@ -1161,6 +1579,29 @@ Note: ==========================================================================
 Note: MAIN LEXER LOOP
 Note: ============================================================================
 
+@Reasoning:
+Main dispatch loop. Tests for each token shape in a deliberate order:
+whitespace, newline, comment first (so trivia is consumed); then
+numbers, strings, charlists, atoms, attributes, sigils,
+identifiers/keywords (all "content" tokens); then operators and
+delimiters (the punctuation set). Atoms are detected by `:` not
+followed by whitespace, so `key: value` map syntax (where the colon
+follows an identifier) doesn't trigger atom lexing. Sigils require
+both `~` and an alpha character so subtraction operators starting
+with `~` are not mis-tokenized.
+@End Reasoning
+
+@Implementation:
+Loops while current_char is not "" (not EOF). For each iteration tests
+predicates and dispatches to the matching specialized lexer
+(skip_whitespace, handle_newline, skip_comment, lex_number,
+lex_string, lex_atom, lex_attribute, lex_sigil, lex_identifier,
+lex_operators, lex_delimiters). Falls through to emitting
+TOKEN_ERROR with the unknown character and advancing one step so the
+lexer never loops infinitely on unexpected input. After the main loop
+exits, appends a TOKEN_EOF sentinel so the parser can detect
+end-of-stream by token type rather than list length.
+@End Implementation
 Process called "lex" that takes lexer as ElixirLexer returns Nothing:
     While lexer.current_char is not equal to "":
         Note: Skip whitespace

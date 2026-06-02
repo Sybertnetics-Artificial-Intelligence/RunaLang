@@ -14,7 +14,21 @@ Note: ==========================================================================
 Note: ERLANG AST NODE TYPES
 Note: ============================================================================
 
-Note: Module AST node
+@Reasoning:
+Top-level AST node for an Erlang source file. Erlang modules group
+functions, records, and type declarations under a single module name
+that is later used for export/import resolution. Attributes are kept
+as a separate list (rather than folded into module metadata) so the
+later HIR pass can decide which attributes are runtime-visible
+(behaviour, on_load) versus documentation-only.
+@End Reasoning
+
+@Implementation:
+Five-field record: module_name extracted from the -module attribute,
+attributes as the full ordered list of declared attributes (including
+the -module attribute itself for round-trip), functions / records /
+types as the ordered lists of definitions in source-declaration order.
+@End Implementation
 Type called "ErlangModule":
     module_name as String
     attributes as List[ErlangAttribute]
@@ -23,14 +37,38 @@ Type called "ErlangModule":
     types as List[ErlangTypeDecl]
 End Type
 
-Note: Module attribute (-module, -export, -import, etc.)
+@Reasoning:
+Generic attribute record covering every "-keyword(args)" form Erlang
+supports (module, export, import, behaviour, compile, ...). The
+attr_type tag drives downstream interpretation since each attribute
+shape carries a different value structure - keeping attr_values as a
+generic List[Any] avoids needing one Type per attribute kind.
+@End Reasoning
+
+@Implementation:
+Three-field record: attr_type (lowercase keyword name), attr_values
+(parsed payload - for -export this is a List of {Name, Arity} pairs,
+for -module a single string, etc.), line (source line for diagnostics).
+@End Implementation
 Type called "ErlangAttribute":
     attr_type as String           Note: "module", "export", "import", "behaviour", etc.
     attr_values as List[Any]      Note: Attribute-specific values
     line as Integer
 End Type
 
-Note: Function definition (may have multiple clauses)
+@Reasoning:
+Erlang functions are identified by name/arity tuple - the same name
+with different arities is a different function. This record groups all
+clauses (overloaded patterns) of one name/arity into a single unit so
+the HIR can lower each clause as a pattern-match case.
+@End Reasoning
+
+@Implementation:
+Four-field record: name (the function name string), arity (number of
+formal parameters - all clauses must share the same arity), clauses
+(ordered list - clause order matters for pattern matching priority),
+line (declaration line for diagnostics).
+@End Implementation
 Type called "ErlangFunction":
     name as String
     arity as Integer
@@ -38,7 +76,20 @@ Type called "ErlangFunction":
     line as Integer
 End Type
 
-Note: Single function clause with pattern, guards, and body
+@Reasoning:
+A clause is one pattern-match arm of a function. Erlang's guard
+grammar is two-level: top-level "," conjunctions and ";" disjunctions,
+so guards is List[List[expr]] - the outer list is OR-joined, the
+inner lists are AND-joined. Patterns and body are flat lists of
+expressions per the Erlang grammar.
+@End Reasoning
+
+@Implementation:
+Four-field record: patterns (one per formal parameter), guards (OR-of-
+AND structure - each inner list must all evaluate true; any inner list
+succeeding wins), body (expressions evaluated when patterns and guards
+match, the last expression's value is the clause result), line.
+@End Implementation
 Type called "ErlangFunctionClause":
     patterns as List[ErlangExpression]
     guards as List[List[ErlangExpression]]  Note: [[guard1, guard2], [guard3]]
@@ -46,14 +97,37 @@ Type called "ErlangFunctionClause":
     line as Integer
 End Type
 
-Note: Record definition
+@Reasoning:
+Erlang records are syntactic sugar over tagged tuples (the first
+element of the tuple is the record name atom). The HIR keeps records
+as first-class types so the lowering pass can choose between tuple
+encoding (default) and target-language struct types where available.
+@End Reasoning
+
+@Implementation:
+Three-field record: name (the record name - becomes the leading atom
+in the tuple), fields (ordered list of ErlangRecordField; position is
+part of the record contract), line.
+@End Implementation
 Type called "ErlangRecord":
     name as String
     fields as List[ErlangRecordField]
     line as Integer
 End Type
 
-Note: Record field with optional default value and type
+@Reasoning:
+Per-field metadata for record definitions. Both default_value and
+field_type are optional in Erlang source syntax (#name{} works
+without either); when absent they are stored as null/empty
+ErlangExpression and ErlangTypeExpr placeholders so the AST has
+uniform shape across all fields.
+@End Reasoning
+
+@Implementation:
+Four-field record: name (atom token), default_value (expression used
+when the field is omitted at construction time, or null), field_type
+(declared type, or null when the type is implicit any()), line.
+@End Implementation
 Type called "ErlangRecordField":
     name as String
     default_value as ErlangExpression
@@ -61,7 +135,20 @@ Type called "ErlangRecordField":
     line as Integer
 End Type
 
-Note: Type declaration (-type, -opaque, -spec, -callback)
+@Reasoning:
+Unified record for the four Erlang type-system attributes (-type,
+-opaque, -spec, -callback) because they share an identical syntactic
+shape - only their semantic interpretation differs. decl_type holds
+which form was parsed; the HIR lowering selects the right semantic
+treatment by inspecting that tag.
+@End Reasoning
+
+@Implementation:
+Five-field record: decl_type (one of "type" / "opaque" / "spec" /
+"callback"), name, type_vars (parameter type variables for
+parameterised types), type_expr (the right-hand side of the
+declaration), line.
+@End Implementation
 Type called "ErlangTypeDecl":
     decl_type as String          Note: "type", "opaque", "spec", "callback"
     name as String
@@ -70,21 +157,63 @@ Type called "ErlangTypeDecl":
     line as Integer
 End Type
 
-Note: Type expression
+@Reasoning:
+Recursive type-expression node covering every shape Erlang's type
+language emits: atomic types (atom, integer, ...), constructors
+(tuple, list, fun, union), and references to user-defined types.
+type_kind identifies which shape, type_args holds the shape-specific
+payload (e.g. element types for tuple, arg+return for fun, alternatives
+for union).
+@End Reasoning
+
+@Implementation:
+Three-field record: type_kind (string discriminant), type_args
+(List[Any] - polymorphic payload; nested ErlangTypeExpr instances for
+compound types, raw strings for atom literals), line.
+@End Implementation
 Type called "ErlangTypeExpr":
     type_kind as String          Note: "atom", "integer", "tuple", "list", "fun", "union", etc.
     type_args as List[Any]       Note: Type-specific arguments
     line as Integer
 End Type
 
-Note: Erlang expression (unified type for all expressions)
+@Reasoning:
+Unified expression node that covers the entire Erlang expression
+grammar (literals, operators, control constructs, comprehensions,
+record operations, macros). Using a single Type with a string
+discriminant (expr_type) avoids needing ~20 separate types - the
+expr_data Dictionary holds the shape-specific payload keyed by name.
+@End Reasoning
+
+@Implementation:
+Three-field record: expr_type (string tag - one of ~20 documented
+shapes), expr_data (Dictionary[String, Any] with shape-specific keys
+- e.g. atom uses "value", op uses "operator"/"left"/"right", call
+uses "function"/"args"), line.
+@End Implementation
 Type called "ErlangExpression":
     expr_type as String          Note: "atom", "var", "integer", "float", "string", "list", "tuple", "binary", "fun", "call", "op", "case", "if", "receive", "try", "comprehension", "record_create", "record_access", "macro"
     expr_data as Dictionary[String, Any]
     line as Integer
 End Type
 
-Note: Parser state
+@Reasoning:
+Stateful parser context that holds the input token stream plus the
+cursor + cached current-token state. Caching current_token / lexeme /
+line avoids three list-at-index calls on every grammar decision,
+which is the hot path of the parser. Errors are collected (not
+raised) so the parser produces a best-effort AST plus diagnostic
+list even on malformed input.
+@End Reasoning
+
+@Implementation:
+Eight-field record. The three Lists (tokens, lexemes, line_numbers)
+are parallel arrays produced by the lexer and indexed by position.
+position is the cursor into them. The three current_* fields are
+the cached entries at position (rebuilt by advance_parser).
+current_line defaults to 1 for empty input. errors is a List of
+diagnostic strings.
+@End Implementation
 Type called "ErlangParser":
     tokens as List[Integer]      Note: Token types
     lexemes as List[String]      Note: Token text
@@ -100,6 +229,19 @@ Note: ==========================================================================
 Note: PARSER INITIALIZATION
 Note: ============================================================================
 
+@Reasoning:
+Initialises a fresh parser at position 0. Prefetches the first token
+into the cached current_* fields so the top-level parse_erlang_module
+loop can dispatch on the first token without an extra advance call.
+@End Reasoning
+
+@Implementation:
+Allocates an empty errors_list, constructs the ErlangParser with all
+positional defaults, then if the token stream is non-empty seeds
+current_token / current_lexeme / current_line from index 0. Empty
+input leaves the parser pointing at the implicit EOF (handled by
+advance_parser's bounds check).
+@End Implementation
 Process called "create_erlang_parser" that takes tokens as Integer, lexemes as Integer, line_numbers as Integer returns ErlangParser:
     Let errors_list be proc list_create from ListCore
     Let parser be a value of type ErlangParser with
@@ -126,6 +268,21 @@ Note: ==========================================================================
 Note: TOKEN MANAGEMENT
 Note: ============================================================================
 
+@Reasoning:
+Cursor advancement is the hot operation of every recursive-descent
+walker in this file. Updates the three cached current_* fields in
+one place so callers never read past the end of the parallel arrays;
+the EOF synthesis means downstream loops can match TOKEN_EOF
+deterministically.
+@End Reasoning
+
+@Implementation:
+Increments position. If still in bounds, re-reads the three parallel
+arrays at the new index into current_token / current_lexeme /
+current_line. On out-of-bounds, synthesises TOKEN_EOF with an empty
+lexeme; current_line is intentionally left at its prior value so
+EOF diagnostics report the last real source line.
+@End Implementation
 Process called "advance_parser" that takes parser as ErlangParser returns Nothing:
     Set parser.position to parser.position plus 1
 
@@ -139,6 +296,18 @@ Process called "advance_parser" that takes parser as ErlangParser returns Nothin
     End If
 End Process
 
+@Reasoning:
+Read-ahead without advancing the cursor. Used by grammar rules that
+need a second token to disambiguate (e.g. distinguishing tuple from
+function call after seeing an identifier). Returns TOKEN_EOF past
+end-of-input so callers can safely compare against grammar tokens
+without bounds-checking.
+@End Reasoning
+
+@Implementation:
+Computes position + offset. Returns tokens at that index if in bounds,
+TOKEN_EOF otherwise.
+@End Implementation
 Process called "peek_token" that takes parser as ErlangParser, offset as Integer returns Integer:
     Let next_pos be parser.position plus offset
 
@@ -149,6 +318,20 @@ Process called "peek_token" that takes parser as ErlangParser, offset as Integer
     End If
 End Process
 
+@Reasoning:
+Mandatory-token consumer used at every grammar position where a
+specific token is required (commas inside lists, dots ending forms,
+etc.). On mismatch it records a diagnostic but does NOT advance,
+which is the deliberate choice so the caller can attempt recovery
+without skipping potentially-meaningful tokens.
+@End Reasoning
+
+@Implementation:
+If current_token matches expected, advances and returns true.
+Otherwise formats a "Expected <expected> but got <actual> at line N"
+message, appends it to parser.errors, and returns false without
+advancing.
+@End Implementation
 Process called "expect_token" that takes parser as ErlangParser, expected as Integer returns Boolean:
     If parser.current_token is equal to expected:
         Call advance_parser with parser
@@ -160,6 +343,16 @@ Process called "expect_token" that takes parser as ErlangParser, expected as Int
     End If
 End Process
 
+@Reasoning:
+Non-consuming token check used in If/Otherwise dispatch chains where
+the grammar branches on which keyword appears next. Distinct from
+expect_token because no error is recorded on mismatch - this is a
+predicate, not an assertion.
+@End Reasoning
+
+@Implementation:
+Single equality check against current_token. Cursor stays put.
+@End Implementation
 Process called "match_token" that takes parser as ErlangParser, token_type as Integer returns Boolean:
     Return parser.current_token is equal to token_type
 End Process
@@ -168,6 +361,22 @@ Note: ==========================================================================
 Note: TOP-LEVEL MODULE PARSING
 Note: ============================================================================
 
+@Reasoning:
+Top-level driver that walks until EOF, classifying each top-level
+form by its leading token. The -module attribute is special-cased:
+its first value becomes the module's name field while the attribute
+itself is also kept in attributes for round-trip. The four kinds
+(attribute, record, type-decl, function) are mutually exclusive so
+the dispatch is a linear If/Otherwise chain.
+@End Reasoning
+
+@Implementation:
+Initialises an empty module shell, then loops while current_token !=
+TOKEN_EOF. Branches: TOKEN_MINUS -> parse_attribute (and lift -module
+name); TOKEN_RECORD -> parse_record; TOKEN_TYPE/OPAQUE/SPEC/CALLBACK
+-> parse_type_decl; otherwise -> parse_function. Each parsed form is
+appended to its respective list. Returns the assembled ErlangModule.
+@End Implementation
 Process called "parse_erlang_module" that takes parser as ErlangParser returns ErlangModule:
     Let module_name be ""
     Let attributes be a list containing nothing
@@ -222,6 +431,24 @@ Note: ==========================================================================
 Note: ATTRIBUTE PARSING
 Note: ============================================================================
 
+@Reasoning:
+"-keyword(args)." attribute forms have a uniform outer shape but each
+keyword has its own argument grammar (module=atom, export/import=
+function list, behaviour=atom, compile=term, default=generic term).
+The translator branches on attr_type so each shape gets the correct
+parser, keeping the dispatch table inline rather than scattering it
+across one routine per attribute kind.
+@End Reasoning
+
+@Implementation:
+Skips the leading "-", captures the attribute name as attr_type, then
+optionally enters a "(...)" payload. Inside the parens, loops over
+comma-separated values: module/behaviour use the raw lexeme;
+export/import dispatch to parse_function_list; compile uses
+parse_term; everything else falls through to parse_term. The loop
+breaks when no comma follows. Expects closing ")" and the mandatory
+terminating "." that ends every Erlang top-level form.
+@End Implementation
 Process called "parse_attribute" that takes parser as ErlangParser returns ErlangAttribute:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip -
@@ -279,6 +506,20 @@ Process called "parse_attribute" that takes parser as ErlangParser returns Erlan
         line as line
 End Process
 
+@Reasoning:
+Parses the "[name/arity, name/arity, ...]" payload that appears in
+-export and -import. Each entry is a Name/Arity pair encoded as a
+small Dictionary so callers can introspect by key without knowing the
+positional layout.
+@End Reasoning
+
+@Implementation:
+Expects opening "[". If the list is non-empty, loops: captures
+function name as string, expects "/", parses arity as Integer
+(convert from lexeme), constructs {"name": name, "arity": arity}
+Dictionary and appends. Continues while a comma follows; breaks
+otherwise. Expects closing "]".
+@End Implementation
 Process called "parse_function_list" that takes parser as ErlangParser returns List[Dictionary[String, Any]]:
     Let func_list be a list containing nothing
 
@@ -317,6 +558,19 @@ Note: ==========================================================================
 Note: RECORD PARSING
 Note: ============================================================================
 
+@Reasoning:
+"-record(name, { field, field, ... })." is parsed as a fully-bracketed
+attribute. Field parsing is delegated to parse_record_field because
+each field can carry an optional default value and an optional type
+annotation, which is its own sub-grammar.
+@End Reasoning
+
+@Implementation:
+Skips "-record", expects "(", captures record_name from current
+lexeme, expects ",", expects "{". Loops calling parse_record_field
+and appending to fields, breaking when no comma follows. Expects
+the closing "}", ")", and the terminating ".".
+@End Implementation
 Process called "parse_record" that takes parser as ErlangParser returns ErlangRecord:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip -record
@@ -355,6 +609,20 @@ Process called "parse_record" that takes parser as ErlangParser returns ErlangRe
         line as line
 End Process
 
+@Reasoning:
+Each record field can be bare ("name"), default-valued ("name = expr"),
+or fully annotated ("name = expr :: type"). The "=" and "::" markers
+are both optional and independent, so the parser must check for each
+in sequence without requiring the other.
+@End Reasoning
+
+@Implementation:
+Captures the field name from current_lexeme. If TOKEN_ASSIGN follows,
+skips and parses a default_value via parse_expression at precedence 0.
+If TOKEN_DOUBLE_COLON follows, skips and parses field_type via
+parse_type_expr. Both default_value and field_type default to null
+when their markers are absent.
+@End Implementation
 Process called "parse_record_field" that takes parser as ErlangParser returns ErlangRecordField:
     Let line be parser.current_line
     Let field_name be parser.current_lexeme
@@ -386,6 +654,20 @@ Note: ==========================================================================
 Note: TYPE DECLARATION PARSING
 Note: ============================================================================
 
+@Reasoning:
+"-type Name(Vars) :: Expr." is the common shape for type, opaque,
+spec, and callback declarations. This routine reads the kind tag
+(currently in current_lexeme because parse_erlang_module dispatched
+here), then walks the name -> type-variable -> "::" -> body sequence.
+@End Reasoning
+
+@Implementation:
+Captures decl_type from current_lexeme. Advances. Reads name from
+TOKEN_ATOM (if present). If "(" follows, loops collecting
+TOKEN_VARIABLE entries into type_vars until "," fails to match;
+expects ")". Expects "::", parses type_expr via parse_type_expr,
+expects terminating ".".
+@End Implementation
 Process called "parse_type_decl" that takes parser as ErlangParser returns ErlangTypeDecl:
     Let line be parser.current_line
     Let decl_type be parser.current_lexeme
@@ -438,6 +720,25 @@ Process called "parse_type_decl" that takes parser as ErlangParser returns Erlan
         line as line
 End Process
 
+@Reasoning:
+Type expressions form their own recursive grammar with six leading-
+token shapes (atom, variable, list, tuple, fun, binary) plus a
+post-fix union operator. The leaf parser dispatches on the leading
+token to pick the shape, then the union check at the end folds
+multiple types into a single "union" node if "|" continues to appear.
+@End Reasoning
+
+@Implementation:
+Dispatches on current_token. TOKEN_ATOM: type_kind="atom" (or
+"parameterized" if "(" follows with args parsed recursively).
+TOKEN_VARIABLE: type_kind="var". TOKEN_LBRACKET: type_kind="list"
+with one element_type. TOKEN_LBRACE: type_kind="tuple" with comma-
+separated element types. TOKEN_FUN: type_kind="fun" parses arg
+types, expects "->", parses return type. TOKEN_LBIN: type_kind=
+"binary". After the leaf is parsed, if TOKEN_LIST_CONS (|) follows,
+wraps the current type plus subsequent "| type" entries into a
+"union" node with type_args holding the alternatives.
+@End Implementation
 Process called "parse_type_expr" that takes parser as ErlangParser returns ErlangTypeExpr:
     Let line be parser.current_line
     Let type_kind be ""
@@ -563,6 +864,22 @@ Note: ==========================================================================
 Note: FUNCTION PARSING
 Note: ============================================================================
 
+@Reasoning:
+Multi-clause function definitions in Erlang are written as
+"name(pat) -> body; name(pat) -> body. " - each clause separated by
+";" and the entire function terminated by ".". The parser collects
+all clauses with the same leading name; arity is derived once from
+the first clause's pattern count (Erlang requires all clauses share
+arity).
+@End Reasoning
+
+@Implementation:
+Captures func_name. Loops: parse_function_clause -> append; if first
+clause, lock in arity = clauses[0].patterns.length. If TOKEN_SEMICOLON
+follows, advance and verify the next TOKEN_ATOM matches func_name
+(otherwise break - it's a different function). Otherwise break.
+Expects terminating ".".
+@End Implementation
 Process called "parse_function" that takes parser as ErlangParser returns ErlangFunction:
     Let line be parser.current_line
     Let func_name be parser.current_lexeme
@@ -605,6 +922,22 @@ Process called "parse_function" that takes parser as ErlangParser returns Erlang
         line as line
 End Process
 
+@Reasoning:
+Each clause is "(pat, pat) when guards -> body, body, body". The
+patterns, guards (optional), and body are three syntactically
+distinct sections separated by ")", "->", and "." respectively.
+Body expressions are comma-separated and evaluated in order (the
+last one is the clause result).
+@End Reasoning
+
+@Implementation:
+Expects "(". If not immediately ")", loops parse_pattern -> append,
+comma or break; expects ")". If TOKEN_WHEN follows, advance and call
+parse_guards. Expects "->". Loops parse_expression(min_prec=0) ->
+append to body; continues while a comma follows. Returns the
+assembled ErlangFunctionClause - the function-level parser is
+responsible for the trailing "." or ";".
+@End Implementation
 Process called "parse_function_clause" that takes parser as ErlangParser returns ErlangFunctionClause:
     Let line be parser.current_line
     Let patterns be a list containing nothing
@@ -656,6 +989,20 @@ Process called "parse_function_clause" that takes parser as ErlangParser returns
         line as line
 End Process
 
+@Reasoning:
+Erlang guards are a two-level grammar: "G1, G2; G3, G4" means
+"(G1 and G2) or (G3 and G4)". Parsing as two nested loops mirrors
+this structure directly - the outer loop walks over ";"-separated
+disjuncts, the inner loop walks over ","-separated conjuncts.
+@End Reasoning
+
+@Implementation:
+Outer loop builds guard_seqs. Inner loop builds guard_seq: parses
+each guard expression at precedence 0, appends, continues while
+TOKEN_COMMA matches. After inner loop, appends guard_seq to
+guard_seqs. If TOKEN_SEMICOLON follows, advances and continues outer
+loop; otherwise breaks.
+@End Implementation
 Process called "parse_guards" that takes parser as ErlangParser returns List[List[ErlangExpression]]:
     Let guard_seqs be a list containing nothing
 
@@ -691,9 +1038,19 @@ Note: ==========================================================================
 Note: PATTERN PARSING
 Note: ============================================================================
 
+@Reasoning:
+Erlang patterns are a syntactic subset of expressions - the same
+grammar productions apply but with semantic restrictions (no
+function calls, no operators with side effects). This parser
+deliberately reuses parse_expression and defers restriction checking
+to a later semantic pass so the AST shape is identical between
+pattern and expression contexts.
+@End Reasoning
+
+@Implementation:
+Delegates entirely to parse_expression with min_precedence=0.
+@End Implementation
 Process called "parse_pattern" that takes parser as ErlangParser returns ErlangExpression:
-    Note: Patterns are similar to expressions but with restrictions
-    Note: Use expression parser but mark as pattern context
     Return parse_expression with parser and 0
 End Process
 
@@ -701,7 +1058,24 @@ Note: ==========================================================================
 Note: EXPRESSION PARSING (with precedence climbing)
 Note: ============================================================================
 
-Note: Operator precedence table (lower number = higher precedence)
+@Reasoning:
+Lookup table for Erlang's 12-tier operator precedence, encoded as
+lower-is-tighter so the precedence-climbing loop in parse_expression
+can compare with "<" semantics. The values match the Erlang reference
+manual's operator precedence chapter exactly so subtle bugs from
+mismatched precedence (e.g. "++/--" binding tighter than "+/-") are
+ruled out by construction.
+@End Reasoning
+
+@Implementation:
+Sequential If-chain. Returns 1 for ":" (remote call), 2 for "#"
+(record), 3 for "." (field access), 4 for *///div/rem/band
+(multiplicative), 5 for +/-/bor/bxor/bsl/bsr (additive/bitwise),
+6 for ++/-- (list concat), 7 for == ///= < > <= >= =:= =/=
+(comparison), 8 for andalso, 9 for orelse, 10 for "|" (list cons),
+11 for "!" (send), 12 for "=" (match). Returns 999 for any
+non-operator token so the parse_expression loop terminates.
+@End Implementation
 Process called "get_operator_precedence" that takes token as Integer returns Integer:
     Note: Precedence levels for Erlang operators
     If token is equal to TOKEN_COLON:
@@ -755,8 +1129,19 @@ Process called "get_operator_precedence" that takes token as Integer returns Int
     Return 999  Note: Not an operator
 End Process
 
+@Reasoning:
+Three Erlang operators are right-associative: "=" (match), "!" (send),
+and "|" (list cons). The precedence-climbing parser needs this
+distinction to compute the next-iteration min_precedence correctly:
+for right-associative operators the right operand can re-use the same
+precedence, for left-associative ones it must be strictly higher.
+@End Reasoning
+
+@Implementation:
+Single If check against TOKEN_ASSIGN, TOKEN_SEND, or TOKEN_LIST_CONS.
+Returns true only for those three.
+@End Implementation
 Process called "is_right_associative" that takes token as Integer returns Boolean:
-    Note: Right-associative operators
     If token is equal to TOKEN_ASSIGN or token is equal to TOKEN_SEND or token is equal to TOKEN_LIST_CONS:
         Return true
     End If
@@ -764,6 +1149,25 @@ Process called "is_right_associative" that takes token as Integer returns Boolea
     Return false
 End Process
 
+@Reasoning:
+Precedence-climbing implementation (Pratt-style) - parses any
+expression at or tighter than the given min_precedence. The leaf
+operand comes from parse_primary_expression; then the loop greedily
+consumes binary operators whose precedence beats min_precedence,
+re-invoking itself for the right operand with the right
+min_precedence (op_prec or op_prec-1 for right- vs left-associative
+respectively).
+@End Reasoning
+
+@Implementation:
+Calls parse_primary_expression for the left leaf. Loops: looks up
+op_precedence for current_token; breaks if not better than
+min_precedence. Captures op_token / op_lexeme / line, advances past
+the operator, computes next_min_prec (op_precedence for right-assoc,
+op_precedence-1 for left-assoc), recurses to parse right at that
+precedence, builds an ErlangExpression with expr_type="op" carrying
+{"operator", "left", "right"} and stores as the new left.
+@End Implementation
 Process called "parse_expression" that takes parser as ErlangParser, min_precedence as Integer returns ErlangExpression:
     Let left be parse_primary_expression with parser
 
@@ -804,6 +1208,28 @@ Process called "parse_expression" that takes parser as ErlangParser, min_precede
     Return left
 End Process
 
+@Reasoning:
+The leaf parser dispatches on the leading token among ~17 productions
+that can start a primary expression. After the leaf is built, postfix
+operations (function call, record access) are folded in via
+parse_postfix so the same routine handles both "x" and "x(...)" and
+"x#rec.field" uniformly.
+@End Reasoning
+
+@Implementation:
+Linear If/Otherwise If chain on current_token: TOKEN_ATOM -> atom
+literal; TOKEN_VARIABLE -> var; TOKEN_INTEGER/FLOAT/CHAR/STRING ->
+typed literal with value converted from the lexeme; TOKEN_LBRACKET ->
+delegate to parse_list (which also detects list comprehensions);
+TOKEN_LBRACE -> parse_tuple; TOKEN_LBIN -> parse_binary; TOKEN_LPAREN
+-> parenthesised sub-expression; TOKEN_FUN/CASE/IF/RECEIVE/TRY/BEGIN
+-> respective sub-parser; unary +/-/bnot/not -> unary_op with operand
+parsed at primary level (so unary binds tightest); TOKEN_QUESTION ->
+macro reference; TOKEN_HASH -> parse_record_expr. On unrecognised
+token records a diagnostic and produces an "error"-typed expression
+so the AST is still well-formed. Always passes the result through
+parse_postfix to attach trailing calls / record accesses.
+@End Implementation
 Process called "parse_primary_expression" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Let expr_type be ""
@@ -928,6 +1354,21 @@ Process called "parse_primary_expression" that takes parser as ErlangParser retu
     Return result
 End Process
 
+@Reasoning:
+Folds chained postfix operations onto a leaf expression. Only two
+postfix kinds in Erlang: function call "expr(args)" and record field
+access "expr#name". Both can chain (e.g. "module:func()(arg)"), so
+the loop continues until neither marker is present.
+@End Reasoning
+
+@Implementation:
+Loops on current_token. TOKEN_LPAREN: consumes "(", parses comma-
+separated args via parse_expression(min_prec=0), expects ")", wraps
+result in expr_type="call" with {"function": result, "arguments":
+args}. TOKEN_HASH: consumes "#" and the field name lexeme, wraps in
+expr_type="record_access" with {"record", "field"}. Any other token
+breaks the loop. Returns the (possibly-chained) wrapped expression.
+@End Implementation
 Process called "parse_postfix" that takes parser as ErlangParser, expr as ErlangExpression returns ErlangExpression:
     Let result be expr
 
@@ -994,6 +1435,22 @@ Note: ==========================================================================
 Note: COMPOUND EXPRESSION PARSING
 Note: ============================================================================
 
+@Reasoning:
+List literals "[A, B, C]" share syntax with list comprehensions
+"[Expr || Gen, Filt]" and improper lists "[H | T]". The parser tries
+the plain-list path first, then detects the post-fix "||" for
+comprehensions or the "|" tail marker mid-walk. This unified entry
+point keeps the dispatch simple at the caller level.
+@End Reasoning
+
+@Implementation:
+Consumes "[". If non-empty, loops parse_expression -> append. On
+TOKEN_COMMA: continue. On TOKEN_LIST_CONS ("|"): parse the tail
+expression and break. Otherwise break. Expects "]". If exactly one
+element was parsed and TOKEN_DOUBLE_LIST_CONS ("||") follows,
+delegates to parse_list_comprehension with that element as the
+template. Otherwise wraps elements+tail into a "list" ErlangExpression.
+@End Implementation
 Process called "parse_list" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip [
@@ -1038,6 +1495,17 @@ Process called "parse_list" that takes parser as ErlangParser returns ErlangExpr
         line as line
 End Process
 
+@Reasoning:
+Tuples are fixed-size heterogeneous collections in Erlang, written
+with curly braces. Unlike lists, no tail marker exists - all elements
+are positional.
+@End Reasoning
+
+@Implementation:
+Consumes "{". If non-empty, loops parse_expression -> append elements,
+continuing while a comma follows. Expects "}". Wraps elements into a
+"tuple" ErlangExpression.
+@End Implementation
 Process called "parse_tuple" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip {
@@ -1069,6 +1537,24 @@ Process called "parse_tuple" that takes parser as ErlangParser returns ErlangExp
         line as line
 End Process
 
+@Reasoning:
+Erlang's binary literal "<<seg, seg, seg>>" supports per-segment Size
+and Type specifiers (e.g. "Val:8/integer-unsigned"). Each segment is
+a sub-grammar consisting of value, optional ":Size", optional
+"/Type-Type-Type". Like list, binary literal syntax also doubles as
+binary comprehension when "||" follows the closing ">>".
+@End Reasoning
+
+@Implementation:
+Consumes "<<". Loops segments: parses value expression. If ":"
+follows, parses size expression; if "/" follows that, loops over
+TOKEN_ATOM specifiers separated by "-" (binary specifier syntax).
+Each segment is {"value", "size", "specifiers"} appended to segments
+list. Comma continues, otherwise breaks. Expects ">>". If exactly
+one segment and TOKEN_DOUBLE_LIST_CONS follows, dispatches to
+parse_binary_comprehension. Otherwise wraps segments into a "binary"
+ErlangExpression.
+@End Implementation
 Process called "parse_binary" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip <<
@@ -1139,6 +1625,25 @@ Process called "parse_binary" that takes parser as ErlangParser returns ErlangEx
         line as line
 End Process
 
+@Reasoning:
+"fun" in Erlang introduces three distinct forms: (1) remote
+reference "fun Mod:Fun/Arity", (2) local reference "fun Fun/Arity",
+and (3) anonymous function "fun (Args) -> Body end" with optional
+multiple clauses. The parser dispatches on the token after "fun":
+TOKEN_ATOM followed by ":" or "/" picks (1) or (2); TOKEN_LPAREN
+picks (3).
+@End Reasoning
+
+@Implementation:
+After "fun": TOKEN_ATOM branch reads first_name then dispatches on
+":" (remote_ref - reads function name then "/" arity), "/" (local_ref
+- reads arity directly), or records error. TOKEN_LPAREN branch parses
+multi-clause anonymous function: each clause matches the
+parse_function_clause grammar (patterns, optional when-guards, "->",
+body), clauses separated by ";". Expects "end" at the end. The
+final expression carries expr_data["type"] in {"remote_ref",
+"local_ref", "anonymous"} for the lowering pass.
+@End Implementation
 Process called "parse_fun_expression" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip fun
@@ -1254,6 +1759,20 @@ Process called "parse_fun_expression" that takes parser as ErlangParser returns 
         line as line
 End Process
 
+@Reasoning:
+"case X of P1 -> B1; P2 -> B2 end" is Erlang's pattern-match
+expression. The scrutinee X is evaluated once; each clause is
+checked in order until one matches. Reuses parse_case_clause for
+each arm to keep the clause grammar consistent with try-of catch
+arms (which share the same shape).
+@End Reasoning
+
+@Implementation:
+Skips "case". Parses scrutinee via parse_expression. Expects "of".
+Loops until TOKEN_END, parsing each clause via parse_case_clause and
+optionally consuming a separating ";". Expects "end". Wraps into a
+"case" ErlangExpression with {"scrutinee", "clauses"}.
+@End Implementation
 Process called "parse_case_expression" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip case
@@ -1287,6 +1806,21 @@ Process called "parse_case_expression" that takes parser as ErlangParser returns
         line as line
 End Process
 
+@Reasoning:
+A case clause is structurally a single-pattern function clause
+("Pat when Guards -> Body"). Reusing ErlangFunctionClause as the
+return type (rather than introducing a separate ErlangCaseClause)
+keeps the HIR lowering uniform between case arms and function
+clauses, which is the right model since both compile to pattern
+match instructions.
+@End Reasoning
+
+@Implementation:
+Parses a single pattern via parse_pattern, wraps in a one-element
+patterns list. If "when" follows, parses guards via parse_guards.
+Expects "->". Loops parse_expression to collect comma-separated body
+expressions. Returns the ErlangFunctionClause shape.
+@End Implementation
 Process called "parse_case_clause" that takes parser as ErlangParser returns ErlangFunctionClause:
     Let line be parser.current_line
 
@@ -1320,6 +1854,21 @@ Process called "parse_case_clause" that takes parser as ErlangParser returns Erl
         line as line
 End Process
 
+@Reasoning:
+Erlang's "if Guards -> Body; Guards -> Body end" is NOT C-style if -
+there is no expression, only guards. The first clause with all-true
+guards wins; if none match the runtime raises a no_clause error.
+Each "if-clause" reuses the function-clause shape with an empty
+patterns list because all dispatch is guard-only.
+@End Reasoning
+
+@Implementation:
+Skips "if". Loops until TOKEN_END: parses guards via parse_guards,
+expects "->", reads comma-separated body expressions. Builds an
+ErlangFunctionClause with empty patterns, the guards, and the body.
+Optional ";" between clauses. Expects "end". Wraps the clauses list
+into an "if" ErlangExpression.
+@End Implementation
 Process called "parse_if_expression" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip if
@@ -1370,6 +1919,24 @@ Process called "parse_if_expression" that takes parser as ErlangParser returns E
         line as line
 End Process
 
+@Reasoning:
+"receive Pat -> Body; ... after Timeout -> Body end" is the message-
+queue inspection primitive that defines Erlang's actor model. The
+after clause is optional and provides a timeout / default branch.
+Parser uses parse_case_clause for the main arms because the pattern
+syntax matches case clauses exactly; the after branch is parsed
+separately because its guard slot is the timeout expression rather
+than a guard list.
+@End Reasoning
+
+@Implementation:
+Skips "receive". Loops until TOKEN_AFTER or TOKEN_END: parses each
+clause via parse_case_clause and appends. Optional ";" between
+clauses. If TOKEN_AFTER follows, parses after_timeout via
+parse_expression, expects "->", reads comma-separated after_body
+expressions. Expects "end". Wraps {"clauses", "after_timeout",
+"after_body"} into a "receive" ErlangExpression.
+@End Implementation
 Process called "parse_receive_expression" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip receive
@@ -1420,6 +1987,27 @@ Process called "parse_receive_expression" that takes parser as ErlangParser retu
         line as line
 End Process
 
+@Reasoning:
+The full Erlang try expression: "try Body of Pat -> Result catch
+Class:Pat -> Handler after Cleanup end". All four sub-sections (of,
+catch, after) are optional, leading to a four-stage parse where each
+stage looks ahead at the section terminator before deciding whether
+to descend. The catch pattern's "Class:Pat" form (used for
+'exit', 'error', 'throw' qualifiers) is encoded by promoting the
+first pattern to exception_class if a colon follows.
+@End Reasoning
+
+@Implementation:
+Skips "try". Parses comma-separated try_body expressions until of/
+catch/after. If TOKEN_OF: loops until catch/after/end, parsing each
+arm via parse_case_clause -> of_clauses. If TOKEN_CATCH: loops until
+after/end. For each catch arm: parses initial pattern; if ":"
+follows, promotes that pattern into exception_class and parses a new
+exception_pattern; optional when-guards; "->"; comma-separated body.
+Stores {"exception_class", "exception_pattern", "guards", "body"}
+per arm. If TOKEN_AFTER: parses comma-separated after_body until
+end. Expects "end". Wraps the four lists into a "try" ErlangExpression.
+@End Implementation
 Process called "parse_try_expression" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip try
@@ -1537,6 +2125,19 @@ Process called "parse_try_expression" that takes parser as ErlangParser returns 
         line as line
 End Process
 
+@Reasoning:
+"begin ... end" groups multiple expressions into a single
+expression with the value of the last expression. Useful for
+sequencing side effects inside contexts that demand a single
+expression (e.g. inside another expression). HIR represents this
+as a typed "begin" node whose lowering is a direct sequence.
+@End Reasoning
+
+@Implementation:
+Skips "begin". Loops until TOKEN_END collecting comma-separated
+parse_expression results into body. Expects "end". Wraps body
+into a "begin" ErlangExpression.
+@End Implementation
 Process called "parse_begin_expression" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip begin
@@ -1566,6 +2167,23 @@ Process called "parse_begin_expression" that takes parser as ErlangParser return
         line as line
 End Process
 
+@Reasoning:
+"[Template || Qualifier, Qualifier, ...]" - the qualifiers are
+either generators (Pat <- List, Pat <= Binary) or filters
+(boolean expressions). The template is already parsed by parse_list
+when it detected the "||" so this routine focuses only on the
+qualifier list.
+@End Reasoning
+
+@Implementation:
+Skips "||". Loops parsing qualifiers: uses peek_token+1 to look two
+tokens ahead - if it is TOKEN_LARROW, treats as generator (parse
+pattern, expect "<-", parse list expression); TOKEN_LBINARROW
+("<="), treats as binary_generator; otherwise as filter (single
+boolean expression). Each qualifier is appended as a small Dict
+with "type" tag. Comma continues. Expects "]". Wraps {"template",
+"qualifiers"} into a "list_comprehension" ErlangExpression.
+@End Implementation
 Process called "parse_list_comprehension" that takes parser as ErlangParser, template as ErlangExpression returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip ||
@@ -1634,6 +2252,21 @@ Process called "parse_list_comprehension" that takes parser as ErlangParser, tem
         line as line
 End Process
 
+@Reasoning:
+"<<Template || Qualifier, Qualifier, ...>>" - binary comprehension
+produces a new binary. Qualifier grammar is identical to list
+comprehension; only the closing delimiter ("/>" vs "]") and the
+result type differ. The two routines are intentionally kept
+separate (rather than parameterised) because the template parameter
+type differs - binary template is Dict, list template is
+ErlangExpression.
+@End Reasoning
+
+@Implementation:
+Identical to parse_list_comprehension except: takes the template as
+a binary-segment Dict, expects TOKEN_RBIN (">>") instead of "]",
+and wraps result with expr_type="binary_comprehension".
+@End Implementation
 Process called "parse_binary_comprehension" that takes parser as ErlangParser, template as Dictionary[String, Any] returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip ||
@@ -1699,6 +2332,24 @@ Process called "parse_binary_comprehension" that takes parser as ErlangParser, t
         line as line
 End Process
 
+@Reasoning:
+"#name{...}" can mean three things in Erlang: record creation
+"#name{field=value}", record update "#name{Base | field=value}", or
+field index "#name.field". The leading "#" plus record name is shared;
+the disambiguation comes from the token after the record name (either
+"{" with optional update piping, or ".").
+@End Reasoning
+
+@Implementation:
+Skips "#", captures record_name from current_lexeme. If "{" follows:
+detects update form by parsing a leading expression that is NOT an
+atom-followed-by-equals (heuristic: any non-RBRACE non-ATOM token is
+the base of an update); when present, expects "|" before fields.
+Loops field assignments "name = expr". Expects "}". Wraps into
+expr_type="record_create" (or "record_update" if base_record was
+parsed). Implementation captures fields, base_record, and name into
+the expr_data Dict.
+@End Implementation
 Process called "parse_record_expr" that takes parser as ErlangParser returns ErlangExpression:
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip #
@@ -1770,9 +2421,24 @@ Process called "parse_record_expr" that takes parser as ErlangParser returns Erl
     End If
 End Process
 
+@Reasoning:
+Erlang "term" syntax (used in attribute arguments and the IO term
+format) is a restricted grammar that only allows atoms, integers,
+strings, lists, and tuples - no variables, no function calls, no
+operators. This parser stays minimal because terms are static
+data and never need expression-level features.
+@End Reasoning
+
+@Implementation:
+Dispatches on current_token: TOKEN_ATOM/TOKEN_STRING return the raw
+lexeme; TOKEN_INTEGER returns the converted integer; TOKEN_LBRACKET
+recurses into comma-separated parse_term calls building a List;
+TOKEN_LBRACE same but builds a tuple-list (the caller distinguishes
+list vs tuple by context). On any other token returns null. Returns
+Integer because Runa pointers are integers and the function can
+return either a string handle, an integer, or a list pointer.
+@End Implementation
 Process called "parse_term" that takes parser as ErlangParser returns Integer:
-    Note: Parse arbitrary Erlang term (for attributes, etc.)
-    Note: term parsing - returns raw value
 
     If match_token with parser and TOKEN_ATOM:
         Let value be parser.current_lexeme
@@ -1842,6 +2508,22 @@ Note: ==========================================================================
 Note: PARSER ENTRY POINT
 Note: ============================================================================
 
+@Reasoning:
+Single public entry point for the entire Erlang frontend. Encapsulates
+the parser-state-allocation step so callers (the translation driver)
+do not need to know about the ErlangParser type. Parse errors are
+collected on parser.errors and walked at the end for diagnostic
+reporting; the partial module is still returned so the next pass
+can decide whether the diagnostics are recoverable.
+@End Reasoning
+
+@Implementation:
+Calls create_erlang_parser with the three parallel arrays. Calls
+parse_erlang_module to walk the input. After the walk, if
+parser.errors is non-empty, iterates the diagnostic strings. Returns
+the module unconditionally - error recovery is the caller's
+responsibility.
+@End Implementation
 Process called "parse_erlang" that takes tokens as Integer, lexemes as Integer, line_numbers as Integer returns ErlangModule:
     Let parser be create_erlang_parser with tokens, lexemes, line_numbers
     Let module be parse_erlang_module with parser

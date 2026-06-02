@@ -28,6 +28,21 @@ Note: ================================================================
 Note: Translator State
 Note: ================================================================
 
+@Reasoning:
+Five-slot translator state covers what every Verilog AST visit needs:
+the current hir_module being built, current_scope for nested module/
+function scopes, a symbol_table for name resolution within the
+current scope, and parallel lists of errors and warnings so the
+caller can retrieve diagnostics after the walk completes.
+@End Reasoning
+
+@Implementation:
+40-byte struct (5 pointers at offsets 0/8/16/24/32). hir_module
+starts at 0 and is back-filled by translate(); current_scope starts
+at 0 and is mutated when descending into scoped constructs (modules,
+generate blocks). symbol_table holds the current scope's name map;
+error_list and warning_list are append-only diagnostic logs.
+@End Implementation
 Type called "VerilogTranslator":
     hir_module as Integer
     current_scope as Integer
@@ -40,6 +55,20 @@ Note: ================================================================
 Note: Translator Initialization
 Note: ================================================================
 
+@Reasoning:
+Constructor pre-allocates the symbol_table, error_list, and
+warning_list so every later phase finds usable handles in those
+slots. hir_module and current_scope start at 0 and become valid
+only after translate() runs on the source-file root.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes via Memory.allocate. Writes 0 to offsets 0 and 8
+(hir_module, current_scope). Constructs the symbol_table via
+create_symbol_table and writes at offset 16. Constructs error_list
+and warning_list via ListCore.create_list and writes at offsets 24
+and 32. Returns the translator pointer.
+@End Implementation
 Process called "create_translator" that takes nothing returns Integer:
     @Reasoning
     Create and initialize a Verilog→HIR translator.
@@ -62,6 +91,20 @@ Process called "create_translator" that takes nothing returns Integer:
     Return translator_ptr
 End Process
 
+@Reasoning:
+A symbol table is a 16-byte record holding a list of entries (offset
+0) plus a parent-scope pointer (offset 8). Storing the parent
+pointer lets nested scopes chain back to enclosing module-level
+declarations during name resolution, while keeping each scope's
+local entries isolated from siblings.
+@End Reasoning
+
+@Implementation:
+Allocates 16 bytes via Memory.allocate. Creates an empty entries
+list via ListCore.create_list and writes at offset 0. Writes 0 to
+offset 8 (parent scope, populated when this table is pushed as a
+child scope). Returns the table pointer.
+@End Implementation
 Process called "create_symbol_table" that takes nothing returns Integer:
     @Reasoning
     Create a symbol table for tracking declarations.
@@ -80,6 +123,26 @@ Note: ================================================================
 Note: Main Translation Entry Point
 Note: ================================================================
 
+@Reasoning:
+Public entry point. A Verilog source file may contain one or many
+modules; the single-module case is special-cased to return the
+module HIR directly (so callers expecting one module don't have to
+unwrap a list), while the multi-module case returns an HIR list.
+Either result is cached on the translator at offset 0 so subsequent
+diagnostic queries can correlate with the produced HIR.
+@End Reasoning
+
+@Implementation:
+Reads node_type from offset 0 of verilog_ast. If not NODE_SOURCE_FILE,
+records "Expected source file node" via add_error and returns 0.
+Reads the modules list from offset 8 and its size. Returns 0 with
+"No modules found" if the count is 0. If module_count is 1, fetches
+the single module, calls translate_module, caches the result at
+translator offset 0, and returns. Otherwise creates an HIR list,
+iterates every module, translates each via translate_module,
+appends non-null results, caches the list at offset 0, and returns
+it.
+@End Implementation
 Process called "translate" that takes translator_ptr as Integer, verilog_ast as Integer returns Integer:
     @Reasoning
     Translate Verilog AST to HIR module.
@@ -133,6 +196,25 @@ Note: ================================================================
 Note: Module Translation
 Note: ================================================================
 
+@Reasoning:
+A Verilog module is the unit of hardware definition - it has a name,
+parameters (compile-time generics), ports (the external interface),
+and items (the body: declarations, always blocks, instantiations).
+The HIR module node mirrors this fourfold shape so backends can emit
+equivalent module/component/struct declarations in their target HDL
+or simulation language.
+@End Reasoning
+
+@Implementation:
+Allocates a 64-byte HIR module node. Writes HIR_VERILOG_MODULE
+(15000) at offset 0. Copies module_name from offset 8 of module_ast
+to offset 8 of the HIR node. Translates parameters via
+translate_parameters (read from offset 16 of module_ast, written to
+offset 16 of HIR node). Translates ports via translate_ports (read
+from offset 24, written to offset 24). Translates module items via
+translate_module_items (read from offset 32, written to offset 32).
+Returns the HIR module pointer.
+@End Implementation
 Process called "translate_module" that takes translator_ptr as Integer, module_ast as Integer returns Integer:
     @Reasoning
     Translate Verilog module to HIR module structure.
@@ -164,6 +246,21 @@ Process called "translate_module" that takes translator_ptr as Integer, module_a
     Return hir_module_ptr
 End Process
 
+@Reasoning:
+Verilog parameters are compile-time constants used to parameterise
+module instantiation (bit widths, depths, polarities). Each one
+becomes an HIR_CONSTANT node carrying the parameter name and the
+translated value expression.
+@End Reasoning
+
+@Implementation:
+Creates an empty HIR list. Iterates the params_list. For each
+parameter AST: reads its name at offset 16 and its value expression
+at offset 24. Allocates a 32-byte HIR node tagged HIR.HIR_CONSTANT,
+writes name at offset 8, recursively translates the value expression
+via translate_expression and writes the result at offset 16. Appends
+the parameter HIR to hir_params_list. Returns the populated list.
+@End Implementation
 Process called "translate_parameters" that takes translator_ptr as Integer, params_list as Integer returns Integer:
     @Reasoning
     Translate parameter declarations to HIR.
@@ -197,6 +294,21 @@ Process called "translate_parameters" that takes translator_ptr as Integer, para
     Return hir_params_list
 End Process
 
+@Reasoning:
+ANSI-style Verilog separates the port-name list at module header
+from the port-direction/type declarations in the module body. This
+phase preserves the port-list ordering as-is because all the
+substantive port metadata gets attached during
+translate_port_declaration; passing the raw list through is
+sufficient.
+@End Reasoning
+
+@Implementation:
+Returns ports_list verbatim. The parser already provides a list of
+port-name strings in module-header order; the body's port-declaration
+items will be matched against these names during
+translate_port_declaration.
+@End Implementation
 Process called "translate_ports" that takes translator_ptr as Integer, ports_list as Integer returns Integer:
     @Reasoning
     Translate port list (just names in port list, declarations come later).
@@ -207,6 +319,20 @@ Process called "translate_ports" that takes translator_ptr as Integer, ports_lis
     Return ports_list
 End Process
 
+@Reasoning:
+The module body is a flat sequence of declarations and constructs.
+This driver walks each item and delegates kind-specific handling to
+translate_module_item, accumulating non-null results into an HIR
+list. Items that translate to 0 (unrecognised kinds) are silently
+skipped so a single bad item does not abort the whole module.
+@End Reasoning
+
+@Implementation:
+Creates an HIR list. Reads item_count via ListCore.get_list_size.
+Iterates 0..count-1: fetches each item_ast, calls
+translate_module_item, and appends non-null results. Returns the
+populated list.
+@End Implementation
 Process called "translate_module_items" that takes translator_ptr as Integer, items_list as Integer returns Integer:
     @Reasoning
     Translate all module items (declarations and statements).
@@ -232,6 +358,24 @@ Process called "translate_module_items" that takes translator_ptr as Integer, it
     Return hir_items_list
 End Process
 
+@Reasoning:
+Dispatches a single module item to the appropriate per-kind
+translator. Ten Verilog construct families live at module scope
+(port/net/reg declarations, always/initial blocks, continuous
+assign, module instantiation, function/task declarations, generate
+blocks); each gets its own translation routine. Unknown node types
+return 0 so the caller can filter them out without aborting.
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0 of item_ast. Tests against ten
+VerilogParser.NODE_* constants in sequence (PORT_DECLARATION,
+NET_DECLARATION, REG_DECLARATION, ALWAYS_BLOCK, INITIAL_BLOCK,
+ASSIGN, MODULE_INSTANTIATION, FUNCTION_DECLARATION,
+TASK_DECLARATION, GENERATE_BLOCK), Return-dispatching each to its
+matching translator. Falls through to Return 0 for unrecognised
+node types.
+@End Implementation
 Process called "translate_module_item" that takes translator_ptr as Integer, item_ast as Integer returns Integer:
     @Reasoning
     Translate a single module item based on its type.
@@ -283,6 +427,28 @@ Process called "translate_module_item" that takes translator_ptr as Integer, ite
     Return 0
 End Process
 
+@Reasoning:
+Verilog functions are pure value-returning procedures with a fixed
+return type, parameter list, and statement body. They are
+synthesizable subroutines used inside continuous-assign or
+always-block expressions. The translator builds an HIR function
+declaration with the same four parts (name, return type,
+parameters, body) so backends can emit the equivalent function
+shape in their target.
+@End Reasoning
+
+@Implementation:
+Creates an HIR function declaration node via
+HIR.create_hir_function_declaration. Reads func_name at offset 8 of
+func_ast and sets via set_hir_function_name when non-zero. Reads
+return type AST at offset 16; if non-zero, translates via
+translate_type and sets via set_hir_function_return_type. Reads
+params_list at offset 24; if non-zero, iterates and translates each
+parameter via translate_parameter, attaching with
+add_parameter_to_hir_function. Reads body AST at offset 32 and
+translates via translate_statement, setting via
+set_hir_function_body. Returns hir_func.
+@End Implementation
 Process called "translate_function_declaration" that takes translator_ptr as Integer, func_ast as Integer returns Integer:
     Note: Translate Verilog function declaration to HIR function
 
@@ -330,6 +496,26 @@ Process called "translate_function_declaration" that takes translator_ptr as Int
     Return hir_func
 End Process
 
+@Reasoning:
+Verilog tasks are procedural subroutines that can include timing
+controls and may modify their arguments via output/inout
+parameters. They are not pure (unlike functions) and have no return
+value. The HIR represents them as void-returning function
+declarations because most target languages do not have a separate
+"task" form - a void function with output parameters is the
+closest equivalent.
+@End Reasoning
+
+@Implementation:
+Creates an HIR function declaration. Reads task_name at offset 8
+and sets via set_hir_function_name when non-zero. Creates a void
+HIR type via HIR.create_hir_void_type and sets via
+set_hir_function_return_type. Reads params_list at offset 16; if
+non-zero, iterates and translates each parameter via
+translate_parameter, attaching with add_parameter_to_hir_function.
+Reads body AST at offset 24, translates via translate_statement,
+and sets via set_hir_function_body. Returns hir_task.
+@End Implementation
 Process called "translate_task_declaration" that takes translator_ptr as Integer, task_ast as Integer returns Integer:
     Note: Translate Verilog task declaration to HIR function (tasks are like void functions)
 
@@ -374,6 +560,21 @@ Process called "translate_task_declaration" that takes translator_ptr as Integer
     Return hir_task
 End Process
 
+@Reasoning:
+`generate` blocks let Verilog conditionally include items in the
+synthesised design - they are compile-time parameterisation that
+ultimately resolves to ordinary module items. The HIR represents
+them as a block of items so backends that lack compile-time
+generate can either expand them at translation time or emit
+equivalent conditional-compilation directives.
+@End Reasoning
+
+@Implementation:
+Creates an HIR block via HIR.create_hir_block. Reads gen_items at
+offset 16 of gen_ast. If non-zero, iterates the items list and
+calls translate_module_item on each; non-null results are appended
+to hir_block via add_statement_to_hir_block. Returns hir_block.
+@End Implementation
 Process called "translate_generate_block" that takes translator_ptr as Integer, gen_ast as Integer returns Integer:
     Note: Translate Verilog generate block to HIR block or conditional
 
@@ -407,6 +608,23 @@ Note: ================================================================
 Note: Declaration Translation
 Note: ================================================================
 
+@Reasoning:
+A Verilog port declaration carries direction (input/output/inout),
+bit range (the width specification, e.g. `[7:0]`), and the list of
+port names sharing that declaration. The HIR_VERILOG_PORT node
+stores all three so backends can emit appropriate signal types
+(typed args in software languages, signal declarations in other
+HDLs).
+@End Reasoning
+
+@Implementation:
+Allocates a 48-byte HIR node. Writes HIR_VERILOG_PORT (15001) at
+offset 0. Copies the direction integer from offset 8 of port_ast
+to offset 8 of HIR node. Reads range_ptr at offset 16; if non-zero,
+translates via translate_range and stores the result, otherwise
+stores 0. Copies names_list from offset 24 of port_ast to offset 24
+of HIR node. Returns hir_port_ptr.
+@End Implementation
 Process called "translate_port_declaration" that takes translator_ptr as Integer, port_ast as Integer returns Integer:
     @Reasoning
     Translate port declaration to HIR port metadata.
@@ -437,6 +655,22 @@ Process called "translate_port_declaration" that takes translator_ptr as Integer
     Return hir_port_ptr
 End Process
 
+@Reasoning:
+A net (wire) is a Verilog signal that gets continuously driven by
+either an assign statement or a module instance output. The HIR
+preserves net_type (e.g. wire, wand, wor, tri) because each has
+different multi-driver semantics that backends need to honour.
+Range and names follow the same pattern as port declarations.
+@End Reasoning
+
+@Implementation:
+Allocates a 40-byte HIR node. Writes HIR_VERILOG_WIRE (15002) at
+offset 0. Reads net_type at offset 8 of net_ast and writes at
+offset 8 of HIR node. Reads range_ptr at offset 16; if non-zero
+translates via translate_range and stores at offset 16. Reads
+names_list at offset 24 and stores at offset 24 of HIR node.
+Returns hir_net_ptr.
+@End Implementation
 Process called "translate_net_declaration" that takes translator_ptr as Integer, net_ast as Integer returns Integer:
     @Reasoning
     Translate wire/net declaration to HIR variable.
@@ -467,6 +701,20 @@ Process called "translate_net_declaration" that takes translator_ptr as Integer,
     Return hir_net_ptr
 End Process
 
+@Reasoning:
+A reg declaration in Verilog declares a variable that holds its
+value between assignments - the storage element for procedural
+blocks. Unlike wire/net, reg has no net-type variant so the HIR
+form is simpler (no net_type field), just range and names.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node. Writes HIR_VERILOG_REG (15003) at
+offset 0. Reads range_ptr at offset 8 of reg_ast; if non-zero
+translates via translate_range and stores at offset 8 of HIR node.
+Reads names_list at offset 16 and stores at offset 16 of HIR node.
+Returns hir_reg_ptr.
+@End Implementation
 Process called "translate_reg_declaration" that takes translator_ptr as Integer, reg_ast as Integer returns Integer:
     @Reasoning
     Translate reg declaration to HIR variable.
@@ -493,6 +741,21 @@ Process called "translate_reg_declaration" that takes translator_ptr as Integer,
     Return hir_reg_ptr
 End Process
 
+@Reasoning:
+Bit ranges `[msb:lsb]` need both bounds recursively translated
+because Verilog allows expressions in range positions (parameter
+references, arithmetic on parameters, etc.) not just literals.
+Storing the translated expressions lets later passes parameterise
+widths at instantiation time.
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte HIR range node. Reads msb_expr at offset 0 of
+range_ptr, translates via translate_expression, and writes the
+result at offset 0 of the HIR range. Reads lsb_expr at offset 8,
+translates similarly, and writes at offset 8. Returns
+hir_range_ptr.
+@End Implementation
 Process called "translate_range" that takes translator_ptr as Integer, range_ptr as Integer returns Integer:
     @Reasoning
     Translate bit range [msb:lsb] to HIR range structure.
@@ -517,6 +780,22 @@ Note: ================================================================
 Note: Behavioral Block Translation
 Note: ================================================================
 
+@Reasoning:
+An always block executes its body whenever any event in its
+sensitivity list fires - the cornerstone of behavioural Verilog
+modeling. The HIR captures the sensitivity list (which gates
+execution) and the body statement separately so backends can emit
+clocked-process / triggered-process equivalents.
+@End Reasoning
+
+@Implementation:
+Allocates a 40-byte HIR node tagged HIR_VERILOG_ALWAYS (15004) at
+offset 0. Reads sensitivity_ast at offset 8 of always_ast; if
+non-zero translates via translate_sensitivity_list and stores at
+offset 8 of HIR node. Reads body_ast at offset 16, translates via
+translate_statement, and stores at offset 16 of HIR node. Returns
+hir_always_ptr.
+@End Implementation
 Process called "translate_always_block" that takes translator_ptr as Integer, always_ast as Integer returns Integer:
     @Reasoning
     Translate always block to HIR behavioral block.
@@ -544,6 +823,20 @@ Process called "translate_always_block" that takes translator_ptr as Integer, al
     Return hir_always_ptr
 End Process
 
+@Reasoning:
+An initial block runs exactly once at time 0 - typically used for
+simulation setup, testbench drives, and one-time initialization.
+The HIR represents it as a generic initialiser block since the
+"runs once at startup" semantics translate naturally to module/
+constructor initialisation in object-oriented or imperative
+targets.
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte HIR node. Writes HIR.HIR_INITIALIZER at offset
+0 (continued outside the shown excerpt to translate the body
+statement). Returns the initial-block HIR pointer.
+@End Implementation
 Process called "translate_initial_block" that takes translator_ptr as Integer, initial_ast as Integer returns Integer:
     @Reasoning
     Translate initial block to HIR initialization block.
@@ -561,6 +854,20 @@ Process called "translate_initial_block" that takes translator_ptr as Integer, i
     Return hir_initial_ptr
 End Process
 
+@Reasoning:
+The sensitivity list of an always block tells the simulator which
+signal transitions trigger re-execution. The HIR captures the
+signals list as metadata since each backend renders it differently
+(VHDL process triggers, C++ event lists, Rust async wakers).
+@End Reasoning
+
+@Implementation:
+Allocates a 16-byte HIR node tagged HIR_VERILOG_SENSITIVITY at
+offset 0. Reads signals_list at offset 8 of sensitivity_ast and
+copies the list pointer to offset 8 of HIR node (no per-signal
+translation needed - the names are already symbolic). Returns
+hir_sens_ptr.
+@End Implementation
 Process called "translate_sensitivity_list" that takes translator_ptr as Integer, sensitivity_ast as Integer returns Integer:
     @Reasoning
     Translate sensitivity list to HIR metadata.
@@ -576,6 +883,21 @@ Process called "translate_sensitivity_list" that takes translator_ptr as Integer
     Return hir_sens_ptr
 End Process
 
+@Reasoning:
+A continuous assignment `assign lhs = rhs;` drives the LHS net
+permanently with the value of the RHS expression. This is distinct
+from procedural assignment because it is dataflow-driven rather
+than control-flow-driven; the HIR tag HIR_VERILOG_ASSIGN signals
+this to backends.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node. Writes HIR_VERILOG_ASSIGN (15005) at
+offset 0. Reads lhs_ast at offset 8 of assign_ast, translates via
+translate_expression, and stores at offset 8. Reads rhs_ast at
+offset 16, translates similarly, and stores at offset 16. Returns
+hir_assign_ptr.
+@End Implementation
 Process called "translate_assign" that takes translator_ptr as Integer, assign_ast as Integer returns Integer:
     @Reasoning
     Translate continuous assignment to HIR assignment.
@@ -598,6 +920,24 @@ Process called "translate_assign" that takes translator_ptr as Integer, assign_a
     Return hir_assign_ptr
 End Process
 
+@Reasoning:
+Module instantiation creates a hardware sub-block: it carries the
+referenced module's name, an instance-local name, optional
+parameter overrides, and port connections. All four are preserved
+in the HIR so backends emit equivalent instantiations (HDL
+component, OO object construction, struct embedding).
+@End Reasoning
+
+@Implementation:
+Allocates a 48-byte HIR node tagged HIR_VERILOG_INSTANCE (15006).
+Reads module_name string at offset 8 of instance_ast and writes to
+offset 8 of HIR node. Reads instance_name string at offset 24 and
+writes to offset 16. Reads params_list at offset 16 of AST (the
+parameter overrides) and copies to offset 24. Reads ports_list at
+offset 32 of AST, translates the port-connection expressions via
+translate_expression_list, and stores at offset 32. Returns
+hir_inst_ptr.
+@End Implementation
 Process called "translate_module_instance" that takes translator_ptr as Integer, instance_ast as Integer returns Integer:
     @Reasoning
     Translate module instantiation to HIR instance.
@@ -631,6 +971,20 @@ Note: ================================================================
 Note: Statement Translation
 Note: ================================================================
 
+@Reasoning:
+Statement dispatcher for procedural Verilog (inside always/initial/
+function/task). Eight statement kinds dispatched: begin-end blocks,
+if, case, for, while, blocking-assignment (=), nonblocking-assignment
+(<=), and system-task calls. Returns 0 on null or unknown kind so
+callers can skip them safely.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null stmt_ast. Reads node_type at offset 0 and tests
+against eight VerilogParser.NODE_* constants. Each match
+Return-dispatches to the corresponding translate_<kind>_*. Falls
+through to Return 0 for unrecognised kinds.
+@End Implementation
 Process called "translate_statement" that takes translator_ptr as Integer, stmt_ast as Integer returns Integer:
     @Reasoning
     Translate a Verilog statement to HIR.
@@ -677,6 +1031,19 @@ Process called "translate_statement" that takes translator_ptr as Integer, stmt_
     Return 0
 End Process
 
+@Reasoning:
+`begin...end` groups multiple statements into a single compound
+statement (Verilog's equivalent of C's `{ ... }`). The HIR lowers
+this to a generic HIR_BLOCK so target emitters can render any
+appropriate block-scope form.
+@End Reasoning
+
+@Implementation:
+Allocates a 16-byte HIR node tagged HIR.HIR_BLOCK at offset 0.
+Reads stmts_list at offset 8 of block_ast and translates via
+translate_statement_list, storing at offset 8 of HIR node. Returns
+hir_block_ptr.
+@End Implementation
 Process called "translate_begin_end_block" that takes translator_ptr as Integer, block_ast as Integer returns Integer:
     @Reasoning
     Translate begin...end block to HIR block.
@@ -694,6 +1061,21 @@ Process called "translate_begin_end_block" that takes translator_ptr as Integer,
     Return hir_block_ptr
 End Process
 
+@Reasoning:
+Verilog if-statements have a condition expression, a then-branch
+statement, and an optional else-branch. The HIR_IF node mirrors
+this three-slot shape; the else branch slot is left at 0 when
+absent so backends can detect the else-less form.
+@End Reasoning
+
+@Implementation:
+Allocates a 40-byte HIR node tagged HIR.HIR_IF. Reads condition_ast
+at offset 8, translates via translate_expression, stores at offset
+8 of HIR node. Reads then_ast at offset 16, translates via
+translate_statement, stores at offset 16. Reads else_ast at offset
+24; if non-zero translates via translate_statement and stores at
+offset 24, otherwise leaves 0. Returns hir_if_ptr.
+@End Implementation
 Process called "translate_if_statement" that takes translator_ptr as Integer, if_ast as Integer returns Integer:
     @Reasoning
     Translate if statement to HIR conditional.
@@ -726,6 +1108,22 @@ Process called "translate_if_statement" that takes translator_ptr as Integer, if
     Return hir_if_ptr
 End Process
 
+@Reasoning:
+Verilog `case` statements map cleanly onto switch/match constructs
+in other languages. The HIR captures the selector (the value being
+matched against) and the list of case items (each carrying a value
+to match plus a statement body). Default cases get value=0 so
+backends can identify them.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR.HIR_SWITCH. Reads
+selector_ast at offset 16 of case_ast, translates via
+translate_expression, stores at offset 8 of HIR node. Reads
+items_ast at offset 24, translates via translate_case_items
+(produces an HIR list of HIR_CASE_ARM entries), stores at offset
+16. Returns hir_case_ptr.
+@End Implementation
 Process called "translate_case_statement" that takes translator_ptr as Integer, case_ast as Integer returns Integer:
     @Reasoning
     Translate case statement to HIR switch.
@@ -748,6 +1146,23 @@ Process called "translate_case_statement" that takes translator_ptr as Integer, 
     Return hir_case_ptr
 End Process
 
+@Reasoning:
+Each case item is a (value, statement) pair. The value is the
+specific selector value that arm matches; a null/zero value
+indicates the default arm. Storing each arm as an HIR_CASE_ARM
+node with two children gives a uniform shape backends can iterate
+over.
+@End Reasoning
+
+@Implementation:
+Creates an HIR list. Iterates items_list. For each item: reads
+value_ast at offset 0 and stmt_ast at offset 8. Allocates a
+24-byte HIR_CASE_ARM node. If value_ast is non-zero, translates via
+translate_expression; otherwise stores 0 (marker for default). The
+statement is translated via translate_statement and stored at
+offset 16. Each arm is appended to the HIR list. Returns the
+populated list.
+@End Implementation
 Process called "translate_case_items" that takes translator_ptr as Integer, items_list as Integer returns Integer:
     @Reasoning
     Translate case items to HIR case arms.
@@ -788,6 +1203,21 @@ Process called "translate_case_items" that takes translator_ptr as Integer, item
     Return hir_items_list
 End Process
 
+@Reasoning:
+Verilog for loops have the C-style four-part shape: init, condition,
+update, body. The HIR_FOR node stores all four parts at their fixed
+offsets so backends preserve the loop semantics during emission.
+@End Reasoning
+
+@Implementation:
+Allocates a 48-byte HIR node tagged HIR.HIR_FOR. Translates init
+(offset 8 of for_ast, via translate_statement) and stores at offset
+8. Translates condition (offset 16, via translate_expression) and
+stores at offset 16. Translates update (offset 24, via
+translate_statement) and stores at offset 24. Translates body
+(offset 32, via translate_statement) and stores at offset 32.
+Returns hir_for_ptr.
+@End Implementation
 Process called "translate_for_loop" that takes translator_ptr as Integer, for_ast as Integer returns Integer:
     @Reasoning
     Translate for loop to HIR loop.
@@ -820,6 +1250,20 @@ Process called "translate_for_loop" that takes translator_ptr as Integer, for_as
     Return hir_for_ptr
 End Process
 
+@Reasoning:
+While loops have a condition expression and a body statement. The
+HIR_WHILE node stores both at fixed offsets. Verilog also has
+`do-while` (called `forever`) but those use a different parser
+node and translator.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR.HIR_WHILE. Reads
+condition_ast at offset 8 of while_ast, translates via
+translate_expression, stores at offset 8 of HIR node. Reads
+body_ast at offset 16, translates via translate_statement, stores
+at offset 16. Returns hir_while_ptr.
+@End Implementation
 Process called "translate_while_loop" that takes translator_ptr as Integer, while_ast as Integer returns Integer:
     @Reasoning
     Translate while loop to HIR while.
@@ -842,6 +1286,21 @@ Process called "translate_while_loop" that takes translator_ptr as Integer, whil
     Return hir_while_ptr
 End Process
 
+@Reasoning:
+Blocking assignment `lhs = rhs` evaluates RHS and updates LHS
+immediately and synchronously - subsequent statements see the new
+value. The HIR uses a unified HIR_ASSIGNMENT node and distinguishes
+the two assignment kinds via a flag at offset 24 (1 = blocking).
+This preserves Verilog's race-free timing semantics for backends
+that need them.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR.HIR_ASSIGNMENT. Translates
+lhs_ast (offset 8) and rhs_ast (offset 16) via translate_expression,
+storing at offsets 8 and 16 of HIR node. Writes 1 at offset 24 to
+mark the assignment as blocking. Returns hir_assign_ptr.
+@End Implementation
 Process called "translate_blocking_assignment" that takes translator_ptr as Integer, assign_ast as Integer returns Integer:
     @Reasoning
     Translate blocking assignment (=) to HIR assignment.
@@ -867,6 +1326,22 @@ Process called "translate_blocking_assignment" that takes translator_ptr as Inte
     Return hir_assign_ptr
 End Process
 
+@Reasoning:
+Non-blocking assignment `lhs <= rhs` schedules the LHS update for
+the end of the current simulation timestep - subsequent statements
+in the same block see the OLD value. This is the standard form for
+flip-flop modelling and absolutely must be distinguishable from
+blocking assignment, hence the 0/1 flag at offset 24.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR.HIR_ASSIGNMENT (same kind
+tag as blocking assignment - the difference is at the flag).
+Translates lhs_ast (offset 8) and rhs_ast (offset 16) via
+translate_expression and stores at offsets 8 and 16. Writes 0 at
+offset 24 to mark the assignment as non-blocking. Returns
+hir_assign_ptr.
+@End Implementation
 Process called "translate_nonblocking_assignment" that takes translator_ptr as Integer, assign_ast as Integer returns Integer:
     @Reasoning
     Translate non-blocking assignment (<=) to HIR assignment with metadata.
@@ -892,6 +1367,21 @@ Process called "translate_nonblocking_assignment" that takes translator_ptr as I
     Return hir_assign_ptr
 End Process
 
+@Reasoning:
+System tasks like `$display`, `$monitor`, `$finish` are built-in
+simulator-side procedures. Translating them to ordinary HIR_CALL
+nodes lets backends emit equivalent runtime calls (printf, etc.)
+while preserving the task name verbatim so the binding to a
+runtime library is straightforward.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR.HIR_CALL. Reads task_name
+string at offset 8 of call_ast and writes to offset 8 of HIR node
+(name preserved including the $ prefix). Reads args_list at offset
+16, translates via translate_expression_list, and stores at offset
+16. Returns hir_call_ptr.
+@End Implementation
 Process called "translate_system_task_call" that takes translator_ptr as Integer, call_ast as Integer returns Integer:
     @Reasoning
     Translate system task call to HIR function call.
@@ -913,6 +1403,19 @@ Process called "translate_system_task_call" that takes translator_ptr as Integer
     Return hir_call_ptr
 End Process
 
+@Reasoning:
+Driver loop over a statement list, used by every block construct
+(begin-end, function/task body, generate). Translates each
+statement and accumulates non-null results, dropping any that
+return 0 (translation failures or unrecognised kinds).
+@End Reasoning
+
+@Implementation:
+Creates an HIR list. Reads stmt_count from the input list. Iterates
+0..count-1: fetches each stmt_ast, translates via
+translate_statement, and appends non-null results to hir_stmts_list.
+Returns the populated list.
+@End Implementation
 Process called "translate_statement_list" that takes translator_ptr as Integer, stmts_list as Integer returns Integer:
     @Reasoning
     Translate a list of statements.
@@ -942,6 +1445,20 @@ Note: ================================================================
 Note: Expression Translation
 Note: ================================================================
 
+@Reasoning:
+Expression-level dispatcher. Eight expression kinds: number,
+identifier, binary op, unary op, conditional (ternary), bit-select
+(`a[i]`), part-select (`a[hi:lo]`), and concatenation (`{a, b}`).
+Returns 0 on null or unknown kind so the surrounding statement
+walker can decide what to do.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null expr_ast. Reads node_type at offset 0 and tests
+against eight VerilogParser.NODE_* expression constants in order.
+Each match Return-dispatches to the corresponding translate_*.
+Falls through to Return 0 for unrecognised kinds.
+@End Implementation
 Process called "translate_expression" that takes translator_ptr as Integer, expr_ast as Integer returns Integer:
     @Reasoning
     Translate a Verilog expression to HIR.
@@ -988,6 +1505,19 @@ Process called "translate_expression" that takes translator_ptr as Integer, expr
     Return 0
 End Process
 
+@Reasoning:
+Verilog number literals carry width and base information embedded
+in the string form (e.g. `8'hAF`, `4'b1010`, `32'd42`). The HIR
+preserves the source string verbatim so the bit-width-aware
+backends can re-parse the value with full fidelity rather than
+losing information through a generic integer cast.
+@End Reasoning
+
+@Implementation:
+Allocates a 16-byte HIR node tagged HIR.HIR_LITERAL. Reads
+number_value string at offset 8 of number_ast and writes the string
+to offset 8 of HIR node. Returns hir_number_ptr.
+@End Implementation
 Process called "translate_number" that takes translator_ptr as Integer, number_ast as Integer returns Integer:
     @Reasoning
     Translate number literal to HIR constant.
@@ -1003,6 +1533,18 @@ Process called "translate_number" that takes translator_ptr as Integer, number_a
     Return hir_number_ptr
 End Process
 
+@Reasoning:
+Identifier references map directly to HIR_IDENTIFIER with the name
+preserved verbatim. Symbol resolution (binding name to a specific
+declaration) is deferred to a later pass that has access to the
+fully-built module's symbol table.
+@End Reasoning
+
+@Implementation:
+Allocates a 16-byte HIR node tagged HIR.HIR_IDENTIFIER. Reads
+id_name string at offset 8 of id_ast and writes to offset 8 of HIR
+node. Returns hir_id_ptr.
+@End Implementation
 Process called "translate_identifier" that takes translator_ptr as Integer, id_ast as Integer returns Integer:
     @Reasoning
     Translate identifier to HIR variable reference.
@@ -1018,6 +1560,21 @@ Process called "translate_identifier" that takes translator_ptr as Integer, id_a
     Return hir_id_ptr
 End Process
 
+@Reasoning:
+Verilog binary operations span arithmetic (+, -, *, /, %), bitwise
+(&, |, ^, ^~), shifts (<<, >>, <<<, >>>), comparison (==, !=,
+===, !==, <, <=, >, >=), and logical (&&, ||). The HIR encodes
+the operator type as a tag so the wide set of operators can be
+processed uniformly downstream without a string compare.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR.HIR_BINARY_OP. Reads
+op_type at offset 8 of binop_ast and copies to offset 8 of HIR
+node. Translates left_ast (offset 16) and right_ast (offset 24)
+via translate_expression and stores at offsets 16 and 24. Returns
+hir_binop_ptr.
+@End Implementation
 Process called "translate_binary_op" that takes translator_ptr as Integer, binop_ast as Integer returns Integer:
     @Reasoning
     Translate binary operation to HIR binary expression.
@@ -1044,6 +1601,20 @@ Process called "translate_binary_op" that takes translator_ptr as Integer, binop
     Return hir_binop_ptr
 End Process
 
+@Reasoning:
+Unary operators in Verilog include sign (+, -), logical not (!),
+bitwise not (~), and reduction operators (&, |, ^, ~&, ~|, ~^)
+which fold an entire vector into a single bit. Operator type is
+stored as a tag so reduction operators (Verilog-specific) can be
+distinguished from ordinary unaries by downstream passes.
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte HIR node tagged HIR.HIR_UNARY_OP. Reads op_type
+at offset 8 of unop_ast and copies to offset 8 of HIR node.
+Translates operand_ast (offset 16) via translate_expression and
+stores at offset 16. Returns hir_unop_ptr.
+@End Implementation
 Process called "translate_unary_op" that takes translator_ptr as Integer, unop_ast as Integer returns Integer:
     @Reasoning
     Translate unary operation to HIR unary expression.
@@ -1065,6 +1636,20 @@ Process called "translate_unary_op" that takes translator_ptr as Integer, unop_a
     Return hir_unop_ptr
 End Process
 
+@Reasoning:
+Verilog ternary `cond ? a : b` selects between two values based on
+condition - this is a true expression (yields a value) unlike if-
+statements. Every target language has an equivalent (C ternary,
+Python ifexpression, Rust if-let-as-expression), so the HIR keeps
+all three operands as expression children.
+@End Reasoning
+
+@Implementation:
+Allocates a 40-byte HIR node tagged HIR.HIR_CONDITIONAL. Translates
+condition_ast (offset 8), then_ast (offset 16), and else_ast
+(offset 24) via translate_expression, storing each at its matching
+offset on the HIR node. Returns hir_cond_ptr.
+@End Implementation
 Process called "translate_conditional_expr" that takes translator_ptr as Integer, cond_ast as Integer returns Integer:
     @Reasoning
     Translate ternary conditional expr ? true_expr : false_expr to HIR.
@@ -1092,6 +1677,19 @@ Process called "translate_conditional_expr" that takes translator_ptr as Integer
     Return hir_cond_ptr
 End Process
 
+@Reasoning:
+Bit-select `signal[i]` extracts a single bit from a vector. The HIR
+lowers it to a generic indexed-access node so target backends can
+emit array indexing, bit manipulation, or shift-mask sequences as
+appropriate.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR.HIR_INDEX. Reads base_ast
+at offset 8 of bitsel_ast, translates via translate_expression,
+stores at offset 8 of HIR node. Reads index_ast at offset 16,
+translates similarly, stores at offset 16. Returns hir_bitsel_ptr.
+@End Implementation
 Process called "translate_bit_select" that takes translator_ptr as Integer, bitsel_ast as Integer returns Integer:
     @Reasoning
     Translate bit select signal[index] to HIR indexed access.
@@ -1114,6 +1712,19 @@ Process called "translate_bit_select" that takes translator_ptr as Integer, bits
     Return hir_bitsel_ptr
 End Process
 
+@Reasoning:
+Part-select `signal[msb:lsb]` extracts a contiguous range of bits.
+Lowering to HIR_SLICE lets backends decide how to encode the slice
+(direct slice in languages that support it, or shift+mask
+sequences in languages that do not).
+@End Reasoning
+
+@Implementation:
+Allocates a 40-byte HIR node tagged HIR.HIR_SLICE. Translates
+base_ast (offset 8), msb_ast (offset 16), and lsb_ast (offset 24)
+via translate_expression, storing each at its matching offset on
+the HIR node. Returns hir_partsel_ptr.
+@End Implementation
 Process called "translate_part_select" that takes translator_ptr as Integer, partsel_ast as Integer returns Integer:
     @Reasoning
     Translate part select signal[msb:lsb] to HIR slice.
@@ -1141,6 +1752,20 @@ Process called "translate_part_select" that takes translator_ptr as Integer, par
     Return hir_partsel_ptr
 End Process
 
+@Reasoning:
+Concatenation `{a, b, c}` builds a wider vector from a sequence of
+narrower expressions in MSB-first order. The HIR_CONCAT node holds
+the ordered list of components - backends emit bit-shift-and-OR
+patterns or use language-native concatenation depending on the
+target.
+@End Reasoning
+
+@Implementation:
+Allocates a 16-byte HIR node tagged HIR.HIR_CONCAT. Reads
+exprs_list at offset 8 of concat_ast, translates the list via
+translate_expression_list, and stores the resulting HIR list at
+offset 8 of HIR node. Returns hir_concat_ptr.
+@End Implementation
 Process called "translate_concatenation" that takes translator_ptr as Integer, concat_ast as Integer returns Integer:
     @Reasoning
     Translate concatenation {expr, expr, ...} to HIR.
@@ -1158,6 +1783,19 @@ Process called "translate_concatenation" that takes translator_ptr as Integer, c
     Return hir_concat_ptr
 End Process
 
+@Reasoning:
+Driver loop over an expression list, used by concatenation,
+function-call arguments, port connection lists, and system-task
+arguments. Each expression is translated and accumulated, dropping
+any that return 0 to skip failed translations.
+@End Reasoning
+
+@Implementation:
+Creates an HIR list. Reads expr_count from the input list. Iterates
+0..count-1: fetches each expr_ast, translates via
+translate_expression, and appends non-null results. Returns the
+populated list.
+@End Implementation
 Process called "translate_expression_list" that takes translator_ptr as Integer, exprs_list as Integer returns Integer:
     @Reasoning
     Translate a list of expressions.
@@ -1187,6 +1825,17 @@ Note: ================================================================
 Note: Error Handling
 Note: ================================================================
 
+@Reasoning:
+Centralised error registration. Every translation routine that
+detects a malformed AST routes its message through this entry
+point so the caller can retrieve all errors after translation
+completes via get_errors.
+@End Reasoning
+
+@Implementation:
+Reads the error_list handle at offset 24 of the translator.
+Appends the message string via ListCore.add_to_list. Returns 1.
+@End Implementation
 Process called "add_error" that takes translator_ptr as Integer, message as String returns Integer:
     @Reasoning
     Add an error to the error list.
@@ -1199,6 +1848,16 @@ Process called "add_error" that takes translator_ptr as Integer, message as Stri
     Return 1
 End Process
 
+@Reasoning:
+Sibling of add_error. Warnings accumulate in a separate list so
+the caller can distinguish blocking errors from advisory messages
+even when both occur in the same translation run.
+@End Reasoning
+
+@Implementation:
+Reads the warning_list handle at offset 32 of the translator.
+Appends the message string via ListCore.add_to_list. Returns 1.
+@End Implementation
 Process called "add_warning" that takes translator_ptr as Integer, message as String returns Integer:
     @Reasoning
     Add a warning to the warning list.
@@ -1211,18 +1870,27 @@ Process called "add_warning" that takes translator_ptr as Integer, message as St
     Return 1
 End Process
 
+@Reasoning:
+Accessor returning the error_list handle stored at offset 24 of the
+translator block. Callers iterate it with ListCore primitives. Exposed
+separately from get_warnings so a caller can decide policy independently
+(e.g. fail on any error, but only log warnings).
+@End Reasoning
+
 Process called "get_errors" that takes translator_ptr as Integer returns Integer:
-    @Reasoning
-    Get the list of translation errors.
-    @End Reasoning
+    Note: Get the list of translation errors.
 
     Return proc read_integer from Memory with translator_ptr, 24
 End Process
 
+@Reasoning:
+Accessor returning the warning_list handle stored at offset 32 of the
+translator block. Mirrors get_errors but for the advisory channel —
+warnings do not block translation completion.
+@End Reasoning
+
 Process called "get_warnings" that takes translator_ptr as Integer returns Integer:
-    @Reasoning
-    Get the list of translation warnings.
-    @End Reasoning
+    Note: Get the list of translation warnings.
 
     Return proc read_integer from Memory with translator_ptr, 32
 End Process

@@ -257,6 +257,12 @@ Note: ==========================================================================
 Note: F# Lexer State and Structure
 Note: ============================================================================
 
+@Reasoning:
+F# is indentation-sensitive (#light syntax), so the lexer must emit INDENT/
+DEDENT pseudo-tokens. paren/bracket/brace depth counters track grouping
+state so indentation rules can be suppressed inside expressions. in_string/
+in_comment guard against producing tokens inside quoted/commented regions.
+@End Reasoning
 Type called "FSharpLexer":
     source as Integer           Note: Source code string
     position as Integer         Note: Current position in source
@@ -276,13 +282,14 @@ Note: ==========================================================================
 Note: Lexer Creation and Management
 Note: ============================================================================
 
+@Reasoning:
+Allocates a 96-byte (12 fields x 8 bytes) lexer record. Indent stack and
+nesting counters are zero-initialised; they grow during tokenisation as
+F# blocks open. source_len is cached so the inner loops do not call
+string_length per byte.
+@End Reasoning
 Process called "create_fsharp_lexer" takes source_code as Integer returns Integer:
     Note: Create F# lexer instance
-
-    @Reasoning:
-    F# lexer must handle indentation-sensitive syntax, functional operators,
-    pattern matching constructs, and .NET integration features.
-    @End Reasoning
 
     Let lexer_size be 96  Note: FSharpLexer: 12 fields × 8 bytes
     Let lexer be proc allocate from Layout with lexer_size
@@ -310,6 +317,11 @@ Process called "create_fsharp_lexer" takes source_code as Integer returns Intege
     Return lexer
 End Process
 
+@Reasoning:
+Null-safe destructor: frees the indent stack (if allocated) and then the
+lexer record. Stack is allocated lazily so the null-check on the inner
+pointer is required.
+@End Reasoning
 Process called "destroy_fsharp_lexer" takes lexer as Integer returns Integer:
     Note: Destroy F# lexer and free resources
 
@@ -331,6 +343,12 @@ Note: ==========================================================================
 Note: Character Access and Navigation
 Note: ============================================================================
 
+@Reasoning:
+Returns the byte at the current position or 0 sentinel at EOF. Centralising
+EOF handling here means the recognisers don't replicate length checks.
+Returns the ASCII/UTF-8 byte, not a code-point, since F# source is ASCII
+for the lexer's purposes.
+@End Reasoning
 Process called "current_char" takes lexer as Integer returns Integer:
     Note: Get current character
 
@@ -345,6 +363,11 @@ Process called "current_char" takes lexer as Integer returns Integer:
     Return proc string_char_at from StringCore with source, position
 End Process
 
+@Reasoning:
+Lookahead helper that does not advance the cursor. Used when distinguishing
+multi-character operators (e.g., "<-" vs "<-=" vs "<=>"). Returns 0 at EOF
+just like current_char so callers can treat both uniformly.
+@End Reasoning
 Process called "peek_char" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek character at offset from current position
 
@@ -360,6 +383,11 @@ Process called "peek_char" takes lexer as Integer, offset as Integer returns Int
     Return proc string_char_at from StringCore with source, peek_pos
 End Process
 
+@Reasoning:
+Single source-of-truth for cursor advancement and line/column tracking.
+Newline (10) increments the line counter and resets column to 1; other
+characters increment column. EOF returns 0 without advancing.
+@End Reasoning
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character
 
@@ -391,6 +419,11 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII letter or underscore classifier; F# identifiers start with letter or
+underscore. Unicode identifier characters are out of scope - this lexer
+matches the practical subset of F# source we translate from.
+@End Reasoning
 Process called "is_letter" takes ch as Integer returns Integer:
     Note: Check if character is a letter (for identifiers)
 
@@ -413,6 +446,10 @@ Process called "is_letter" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII 0-9 classifier. Used as the leading character predicate for number
+literals and as the second-or-later character predicate for identifiers.
+@End Reasoning
 Process called "is_digit" takes ch as Integer returns Integer:
     Note: Check if character is a digit
 
@@ -425,6 +462,11 @@ Process called "is_digit" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Hex digit classifier: 0-9, A-F, a-f. Accepts both cases per F# syntax;
+delegates digit check to is_digit so a single source-of-truth governs
+the [0-9] range.
+@End Reasoning
 Process called "is_hex_digit" takes ch as Integer returns Integer:
     Note: Check if character is hexadecimal digit
 
@@ -448,6 +490,11 @@ Process called "is_hex_digit" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Horizontal whitespace only (space, tab, CR). Newline is excluded because
+F#'s indentation-sensitive grammar uses newlines as statement boundaries
+that must be tokenised separately for INDENT/DEDENT detection.
+@End Reasoning
 Process called "is_whitespace" takes ch as Integer returns Integer:
     Note: Check if character is whitespace (except newline)
 
@@ -468,14 +515,18 @@ Note: ==========================================================================
 Note: F# Keyword Recognition
 Note: ============================================================================
 
+@Reasoning:
+Linear keyword-lookup against the full F# keyword set (let, match, with,
+type, member, abstract, etc.). Returns 0 for non-keywords so the caller
+treats them as identifiers. The chain is long but each comparison is O(1)
+string-equality.
+@End Reasoning
+@Performance_Hints:
+Linear scan O(K) per identifier; K is around 70 F# keywords. If profiling
+shows this dominates, switch to a perfect hash on the leading character.
+@End Performance_Hints
 Process called "recognize_keyword" takes identifier as Integer returns Integer:
     Note: Recognize F# keywords and return appropriate token type
-
-    @Reasoning:
-    F# has many keywords for functional programming, pattern matching,
-    type system features, and .NET integration. This function maps
-    identifier strings to their corresponding token types.
-    @End Reasoning
 
     Note: Core language keywords
     If proc string_equals from StringCore with identifier, "let":
@@ -716,14 +767,19 @@ Note: ==========================================================================
 Note: F# String and Character Literal Parsing
 Note: ============================================================================
 
+@Reasoning:
+F# has four string-literal forms with different escape rules: regular
+"text", verbatim @"text" (no escapes), triple-quoted """text""" (multiline,
+no escapes inside the inner content), and byte strings "text"B. We probe
+prefixes/suffixes to pick the right termination rule and return the
+matching token kind.
+@End Reasoning
+@Security_Scope:
+Untrusted input. Unterminated strings return TOKEN_ERROR without
+over-reading the source buffer (EOF guard at the loop head).
+@End Security_Scope
 Process called "read_string_literal" takes lexer as Integer returns Integer:
     Note: Parse F# string literal with proper escape sequence handling
-
-    @Reasoning:
-    F# supports multiple string formats: regular strings "text",
-    verbatim strings @"text", triple-quoted strings """text""",
-    and byte strings "text"B. Each has different escape rules.
-    @End Reasoning
 
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
     Let current be proc current_char from lexer
@@ -825,6 +881,11 @@ Process called "read_string_literal" takes lexer as Integer returns Integer:
     Return TOKEN_STRING
 End Process
 
+@Reasoning:
+F# char literal: 'X' or '\X' (single character, possibly escaped, delimited
+by single quotes). We accept any escape sequence by consuming two characters
+after the backslash. Unterminated or malformed char literals return TOKEN_ERROR.
+@End Reasoning
 Process called "read_char_literal" takes lexer as Integer returns Integer:
     Note: Parse F# character literal
 
@@ -866,13 +927,14 @@ Note: ==========================================================================
 Note: F# Numeric Literal Parsing
 Note: ============================================================================
 
+@Reasoning:
+F# numeric literals come in many bases (decimal, hex 0x, octal 0o, binary
+0b) and many type suffixes (y/uy/s/us/L/UL/f/m). We walk digits in the
+appropriate base then peel off type suffixes to choose the precise
+token kind for downstream type inference.
+@End Reasoning
 Process called "read_number_literal" takes lexer as Integer returns Integer:
     Note: Parse F# numeric literals with type suffixes
-
-    @Reasoning:
-    F# supports multiple numeric formats: integers (42, 0x2A, 0b101, 0o52),
-    floats (3.14, 1e-5), with type suffixes (42L, 3.14f, 123I, 42uy).
-    @End Reasoning
 
     Let start_char be proc current_char from lexer
     Let is_hex be 0
@@ -1065,6 +1127,13 @@ Note: ==========================================================================
 Note: F# Identifier and Operator Parsing
 Note: ============================================================================
 
+@Reasoning:
+F# identifier rules: must start with letter or underscore; subsequent
+characters include letters, digits, and apostrophe (for type-variable
+suffixes like 'a). After reading we run keyword recognition and, if it's
+a plain identifier starting with uppercase, upgrade to TOKEN_TYPE_NAME
+since F# treats capitalised identifiers as type/constructor names.
+@End Reasoning
 Process called "read_identifier" takes lexer as Integer returns Integer:
     Note: Parse F# identifier (variables, types, modules)
 
@@ -1115,14 +1184,14 @@ Process called "read_identifier" takes lexer as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+F# operator vocabulary includes pipe (|>, <|), composition (>>, <<),
+arrow (->), cons (::), range (..), and many others. Each multi-character
+form must be tokenised as a single unit; we peek the second character
+before committing to a single-character interpretation.
+@End Reasoning
 Process called "read_operator" takes lexer as Integer returns Integer:
     Note: Parse F# operators (single and multi-character)
-
-    @Reasoning:
-    F# has many functional operators like |>, <|, >>, <<, as well as
-    traditional operators. Multi-character operators must be recognized
-    as single tokens to avoid parsing ambiguity.
-    @End Reasoning
 
     Let current be proc current_char from lexer
     Let next_char be proc peek_char with lexer, 1
@@ -1297,6 +1366,12 @@ Note: ==========================================================================
 Note: F# Comment Parsing
 Note: ============================================================================
 
+@Reasoning:
+"//" begins a line comment, but a third "/" upgrades it to an XML
+documentation comment (///) which is distinct because the documentation
+contents are preserved for tooling. Both forms terminate at newline (10)
+or CR (13) or EOF.
+@End Reasoning
 Process called "read_line_comment" takes lexer as Integer returns Integer:
     Note: Parse F# line comment starting with //
 
@@ -1354,6 +1429,12 @@ Process called "read_line_comment" takes lexer as Integer returns Integer:
     Return TOKEN_LINE_COMMENT
 End Process
 
+@Reasoning:
+F# block comments (* ... *) nest, so we count depth rather than scan for
+a flat closer. Each new (* increments and *) decrements; unterminated
+comments (EOF mid-comment) return TOKEN_ERROR. Nesting is what
+distinguishes this from C-style /* */.
+@End Reasoning
 Process called "read_block_comment" takes lexer as Integer returns Integer:
     Note: Parse F# block comment (* ... *)
 
@@ -1410,14 +1491,14 @@ Note: ==========================================================================
 Note: F# Main Tokenization Process
 Note: ============================================================================
 
+@Reasoning:
+Main tokeniser dispatch. Whitespace and skipped block comments restart
+the loop (Continue); other characters branch by lead-char into the
+matching recogniser. Newline produces TOKEN_NEWLINE because F#'s offside
+rule treats line breaks as statement boundaries.
+@End Reasoning
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from F# source
-
-    @Reasoning:
-    F# tokenization must handle functional operators, pattern matching syntax,
-    indentation-sensitive constructs, and .NET integration features.
-    This is the main tokenization dispatch function.
-    @End Reasoning
 
     While 1:
         Let current be proc current_char from lexer
@@ -1592,14 +1673,14 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Return TOKEN_EOF
 End Process
 
+@Reasoning:
+Public entry point: creates a lexer, walks it to completion accumulating
+tokens, then destroys the lexer. The token list is built incrementally
+via list_push (terminal token at end). Errors break the loop so the
+caller can inspect what was produced before the failure.
+@End Reasoning
 Process called "tokenize_fsharp" takes source_code as Integer returns Integer:
     Note: Main entry point for F# tokenization
-
-    @Reasoning:
-    This function creates a lexer, tokenizes the entire F# source code,
-    and returns a list of tokens for parsing. It handles all F# language
-    constructs including functional programming features.
-    @End Reasoning
 
     Let lexer be proc create_fsharp_lexer from source_code
     If lexer is equal to 0:

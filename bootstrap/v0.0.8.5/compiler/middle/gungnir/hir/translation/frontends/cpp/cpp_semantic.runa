@@ -160,6 +160,22 @@ Note: ==========================================================================
 Note: Analyzer Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Constructs the analyzer and primes every required collection. Failure
+of any sub-allocation must unwind cleanly because partial analyzers
+would crash subsequent passes; each If chain frees previously created
+collections before propagating the 0 return.
+@End Reasoning
+
+@Implementation:
+Allocates 80 bytes (10 slots). Returns 0 on outer allocation failure.
+Creates global_scope (Dict), scope_stack (List), class_hierarchy
+(Dict), template_cache (Dict) - each on failure tears down already-
+created resources and returns 0. Stores pointers at offsets 0/8/16/24/32
+(8 = current_scope = global_scope), zeroes remaining slots (40-72).
+Pushes global_scope onto scope_stack so the analyzer always has at
+least one scope to look up in. Returns the analyzer pointer.
+@End Implementation
 Process called "create_cpp_semantic_analyzer" returns Integer:
     Note: Create C++ semantic analyzer with all necessary contexts
 
@@ -222,6 +238,20 @@ Process called "create_cpp_semantic_analyzer" returns Integer:
     Return analyzer
 End Process
 
+@Reasoning:
+The analyzer owns four heap collections (global_scope, scope_stack,
+class_hierarchy, template_cache) and one optional error string. Each
+must be destroyed via its own destructor to free internal entries
+before the analyzer struct itself is released.
+@End Reasoning
+
+@Implementation:
+Returns 1 if analyzer is 0 (idempotent). Reads each owned pointer
+slot (0/16/24/32/64). Destroys each non-null collection via its
+matching destructor (Dict.destroy / List.destroy). Deallocates the
+error_message string if non-null. Finally deallocates the 80-byte
+analyzer struct.
+@End Implementation
 Process called "destroy_cpp_semantic_analyzer" takes analyzer as Integer returns Integer:
     Note: Destroy C++ semantic analyzer and free all resources
 
@@ -264,6 +294,22 @@ Note: ==========================================================================
 Note: Main Semantic Analysis Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Two-pass analysis is required because C++ allows forward references
+within a translation unit (e.g. a class can reference another class
+defined later in the same file). Pass 1 registers all top-level
+symbols; pass 2 performs full analysis with a complete symbol table.
+@End Reasoning
+
+@Implementation:
+Null-guards both analyzer and program_node; on the latter sets a
+diagnostic and returns 0. Reads the children list at offset 32 of the
+program node. Pass 1: iterates children calling collect_declaration on
+each, which registers names in the appropriate scope. Pass 2: iterates
+again calling analyze_cpp_declaration; after each call checks has_error
+(offset 72) and returns 0 immediately on error so partial AST does not
+leak through. Returns 1 on success.
+@End Implementation
 Process called "analyze_cpp_program" takes analyzer as Integer, program_node as Integer returns Integer:
     Note: Perform complete semantic analysis on C++ program
 
@@ -317,6 +363,23 @@ Process called "analyze_cpp_program" takes analyzer as Integer, program_node as 
     Return 1
 End Process
 
+@Reasoning:
+Pass-1 registration dispatches on AST node type so each declaration
+kind feeds the correct symbol-table population helper. Unknown kinds
+silently no-op so the pre-pass does not fail on unsupported nodes;
+they will be diagnosed in pass 2 if they are truly invalid.
+@End Reasoning
+
+@Implementation:
+Null-guards decl_node. Reads node_type at offset 0. Dispatches on the
+CPP_* constants imported from the parser:
+CPP_CLASS -> collect_class_declaration,
+CPP_NAMESPACE -> collect_namespace_declaration,
+CPP_TEMPLATE -> collect_template_declaration,
+CPP_FUNCTION -> collect_function_declaration,
+CPP_VARIABLE -> collect_variable_declaration. Any other kind is left
+unregistered for the second pass to handle.
+@End Implementation
 Process called "collect_declaration" takes analyzer as Integer, decl_node as Integer:
     Note: Collect declaration for forward reference resolution
 
@@ -367,6 +430,22 @@ Note: ==========================================================================
 Note: Class Analysis
 Note: ============================================================================
 
+@Reasoning:
+A class introduces a new scope for its members, a `this`-relative
+context, and potentially modifies the inheritance hierarchy. Saving
+and restoring the analyzer's current_class slot lets nested local
+classes work without losing the outer class context.
+@End Reasoning
+
+@Implementation:
+Null-guards class_node. Reads the class name (offset 8). Saves the
+current current_class (offset 40) into a local, then writes the new
+class_node pointer to that slot. Pushes a fresh scope via
+push_cpp_scope. Calls analyze_inheritance to validate bases. Iterates
+the class's children (offset 32) calling analyze_class_member on each.
+Calls validate_class_completeness to check constructor/destructor
+rules. Pops the scope. Restores the saved current_class. Returns 1.
+@End Implementation
 Process called "analyze_cpp_class" takes analyzer as Integer, class_node as Integer returns Integer:
     Note: Analyze C++ class including inheritance, members, and access control
 
@@ -418,6 +497,20 @@ Process called "analyze_cpp_class" takes analyzer as Integer, class_node as Inte
     Return 1
 End Process
 
+@Reasoning:
+Inheritance entries appear as CPP_INHERITANCE children in the class's
+child list, interleaved with member declarations. Walking once and
+dispatching per child to analyze_base_class keeps the helpers focused
+on a single inheritance relationship at a time.
+@End Reasoning
+
+@Implementation:
+Reads the class's children list (offset 32). Iterates entries; for
+each child whose node_type at offset 0 equals CPP_INHERITANCE, calls
+analyze_base_class with the derived class and the inheritance node.
+Non-inheritance children are ignored at this stage (they will be
+handled by analyze_class_member later).
+@End Implementation
 Process called "analyze_inheritance" takes analyzer as Integer, class_node as Integer:
     Note: Analyze class inheritance hierarchy and access
 
@@ -448,6 +541,24 @@ Process called "analyze_inheritance" takes analyzer as Integer, class_node as In
     End While
 End Process
 
+@Reasoning:
+Per-base-class validation: the base must exist as a known symbol, the
+inheritance chain must not be circular (which would cause infinite
+recursion during member lookup), and the access level (public,
+protected, private) must be recorded so member lookups can apply
+visibility rules in subclasses.
+@End Reasoning
+
+@Implementation:
+Reads base name (offset 8 of inheritance_node) and access level
+(offset 40). Calls lookup_cpp_symbol; if the base is not found,
+records "Base class not found" and returns. Calls
+check_circular_inheritance with the derived/base pair; on positive
+result records "Circular inheritance detected" and returns. On success
+reads class_hierarchy (offset 24) and the derived class's name
+(offset 8 of derived_class), then registers the relationship via
+add_inheritance_relation with the access level.
+@End Implementation
 Process called "analyze_base_class" takes analyzer as Integer, derived_class as Integer, inheritance_node as Integer:
     Note: Analyze individual base class relationship
 
@@ -486,6 +597,22 @@ Note: ==========================================================================
 Note: Template Analysis
 Note: ============================================================================
 
+@Reasoning:
+Template declarations install template parameters in scope so the
+templated entity (a class, function, or alias) can reference them.
+Saving/restoring template_context lets nested templates work (templates
+defined inside class templates need their outer's parameters visible).
+@End Reasoning
+
+@Implementation:
+Null-guards template_node. Creates a fresh template_context via
+create_template_context. Saves the old template_context (offset 56)
+and writes the new one. Reads template_params (offset 48); if present
+calls analyze_template_parameters to register them. Reads children
+(offset 32) and dispatches each through analyze_cpp_declaration so the
+templated declaration sees the parameter symbols. Restores the saved
+template_context. Returns 1.
+@End Implementation
 Process called "analyze_cpp_template" takes analyzer as Integer, template_node as Integer returns Integer:
     Note: Analyze template declaration and instantiations
 
@@ -533,6 +660,18 @@ Process called "analyze_cpp_template" takes analyzer as Integer, template_node a
     Return 1
 End Process
 
+@Reasoning:
+The parameter list node holds the entries in its children list. Each
+parameter is independently analyzed (type, constraints, default
+arguments) so a loop with per-parameter delegation keeps the code
+isolated and easy to extend (e.g. concepts-style constraints).
+@End Reasoning
+
+@Implementation:
+Reads children (offset 32) of the param_list node; returns when null.
+Iterates the list via List.size / List.get and calls
+analyze_template_parameter on each entry.
+@End Implementation
 Process called "analyze_template_parameters" takes analyzer as Integer, param_list as Integer:
     Note: Analyze template parameter list
 
@@ -557,6 +696,21 @@ Process called "analyze_template_parameters" takes analyzer as Integer, param_li
     End While
 End Process
 
+@Reasoning:
+A template parameter (typename, non-type, or template template) is
+registered in the current scope as a CPP_SYMBOL_TEMPLATE so the
+templated entity can refer to it by name. Storing the original node
+as type_info lets later passes inspect default arguments and
+constraints without re-parsing.
+@End Reasoning
+
+@Implementation:
+Null-guards param_node. Reads its node type (offset 0) and name
+(offset 8). Creates a CppSymbol via create_cpp_symbol with kind
+CPP_SYMBOL_TEMPLATE. Sets the symbol's name and type_info via the
+matching setters. Inserts it into the current scope through
+add_cpp_symbol so subsequent lookups for the parameter name succeed.
+@End Implementation
 Process called "analyze_template_parameter" takes analyzer as Integer, param_node as Integer:
     Note: Analyze individual template parameter
 
@@ -584,6 +738,25 @@ Note: ==========================================================================
 Note: Type Checking and Resolution
 Note: ============================================================================
 
+@Reasoning:
+The expression-type dispatcher routes each special C++ expression form
+(lambda, new, delete, this, auto, call-with-templates) to its own
+analyzer so the base expression handler stays focused on common
+arithmetic/access patterns. The fall-through default keeps the
+dispatcher safe for plain expression shapes.
+@End Reasoning
+
+@Implementation:
+Null-guards expr_node. Reads node_type (offset 0) and dispatches:
+CPP_LAMBDA -> analyze_lambda_expression,
+CPP_NEW_EXPR -> analyze_new_expression,
+CPP_DELETE_EXPR -> analyze_delete_expression,
+CPP_THIS_EXPR -> get_current_class_type,
+CPP_AUTO_TYPE -> deduce_auto_type,
+CPP_CALL_EXPR -> analyze_function_call_with_templates.
+Any other type falls through to analyze_base_expression which handles
+arithmetic, member access, and ordinary calls.
+@End Implementation
 Process called "check_cpp_expression_type" takes analyzer as Integer, expr_node as Integer returns Integer:
     Note: Determine and validate C++ expression type
 
@@ -633,6 +806,23 @@ Process called "check_cpp_expression_type" takes analyzer as Integer, expr_node 
     Return proc analyze_base_expression with analyzer, expr_node
 End Process
 
+@Reasoning:
+A C++ lambda introduces an implicit closure type and a nested scope
+that owns its captures and parameters. Capture analysis must happen
+before body analysis so the body can resolve captured names; return
+type deduction may need to wait until after body analysis so it sees
+the actual return statements.
+@End Reasoning
+
+@Implementation:
+Null-guards lambda_node. Pushes a fresh scope. Calls get_lambda_captures
+and feeds them to analyze_lambda_captures when present. Calls
+get_lambda_parameters and analyzes them via analyze_function_parameters.
+Walks the lambda body via analyze_cpp_statement. Calls
+deduce_lambda_return_type for the return type. Pops the scope. Builds
+a closure type via create_closure_type from the lambda node + return
+type and returns it as the expression's type.
+@End Implementation
 Process called "analyze_lambda_expression" takes analyzer as Integer, lambda_node as Integer returns Integer:
     Note: Analyze lambda expression capture and body
 
@@ -686,6 +876,21 @@ Note: ==========================================================================
 Note: Scope Management
 Note: ============================================================================
 
+@Reasoning:
+Opens a new lexical scope when entering a block, class body, or
+function body. The new scope inherits the parent only by virtue of
+lookup walking the stack on miss - shadowing is automatic. Pushing the
+new Dict onto scope_stack and bumping current_scope keeps the recursive
+descent state-free.
+@End Reasoning
+
+@Implementation:
+Allocates a fresh Dict via Dict.create. Reads scope_stack (offset 16),
+pushes the new scope onto it via List.push. Writes the new scope
+pointer to the current_scope slot (offset 8). The new Dict's ownership
+transfers to the scope_stack list and ultimately to the analyzer
+destructor.
+@End Implementation
 Process called "push_cpp_scope" takes analyzer as Integer:
     Note: Push new scope onto scope stack
 
@@ -726,6 +931,20 @@ Process called "pop_cpp_scope" takes analyzer as Integer:
     End If
 End Process
 
+@Reasoning:
+C++ name lookup walks the scope stack from innermost to outermost so
+inner declarations shadow outer ones - the standard's "ordinary
+lookup" rule. ADL and class scope lookup are handled separately by
+specialized helpers because they require argument or class context the
+generic walk does not have.
+@End Reasoning
+
+@Implementation:
+Reads scope_stack (offset 16). Measures its size. Iterates from index
+stack_size-1 down to 0: reads each scope Dict, calls Dict.get with the
+name; if non-null returns the symbol immediately. Returns 0 when the
+name is absent in every scope.
+@End Implementation
 Process called "lookup_cpp_symbol" takes analyzer as Integer, name as Integer returns Integer:
     Note: Look up symbol in current scope chain
 
@@ -758,6 +977,19 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Errors are sticky: once set, the has_error flag remains until the
+analyzer is destroyed. The string is copied to insulate the analyzer
+from a caller-owned diagnostic buffer that may be freed or reused.
+@End Reasoning
+
+@Implementation:
+Writes 1 to has_error (offset 72). Copies the message string via
+StringCore.copy_string so the analyzer holds an independent allocation
+of it, then stores the copy in the error_message slot (offset 64).
+Previous error_message is overwritten without freeing - the destructor
+is responsible for the last installed string.
+@End Implementation
 Process called "set_cpp_semantic_error" takes analyzer as Integer, message as Integer:
     Note: Set semantic analyzer error state
 

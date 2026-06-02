@@ -2,6 +2,24 @@ Note: HIR to Ruby Translator for Translation Translation System
 Note: Converts High-level Intermediate Representation to Ruby code
 
 
+@Reasoning:
+Encapsulates the entire mutable state of an HIR-to-Ruby emission pass so
+translate_hir_to_ruby and its helpers can append text, track nesting, and
+decide method-vs-block syntax without a global. current_class and
+current_method are explicit (rather than implied by a stack) because Ruby
+generation rarely nests more than one of each and requires the names for
+self-referential constructs like alias_method and super.
+@End Reasoning
+
+@Implementation:
+output_buffer accumulates the emitted Ruby source via emit (string_concat).
+indentation_level is incremented by indent and decremented by dedent;
+emit_indent writes two spaces per level. current_class is set by
+translate_class and cleared on End class; current_method is set by
+translate_function and cleared on its End. requires_newline is a single-shot
+flag set by emit_newline so translate_statement_list can avoid double
+newlines after constructs that already terminated their own line.
+@End Implementation
 Type called "HIRToRubyTranslator":
     output_buffer as String
     indentation_level as Integer
@@ -10,6 +28,19 @@ Type called "HIRToRubyTranslator":
     requires_newline as Integer
 End Type
 
+@Reasoning:
+Factory ensuring every HIRToRubyTranslator starts in a clean state so a
+single backend invocation can never inherit leftover indentation or class
+context from a prior call. Zero-initializing requires_newline avoids the
+first statement emitting a leading blank line.
+@End Reasoning
+
+@Implementation:
+Constructs an HIRToRubyTranslator with output_buffer = "", indentation_level
+= 0, current_class = "", current_method = "", and requires_newline = 0.
+Returns the value directly; callers store it in a local and pass it by
+reference to all translate_* / emit_* helpers.
+@End Implementation
 Process called "create_hir_to_ruby_translator" returns Integer:
     Note: Create new HIR to Ruby translator instance
 
@@ -32,6 +63,21 @@ Note: Constructs a fresh HIRToRubyTranslator and routes through
 Note: translate_hir_to_ruby which holds the actual translation pipeline.
 Note: Introduced in P2-F Round 2B alongside the demolition of the vestigial
 Note: ruby_emitter.runa shim.
+@Reasoning:
+Provides the dispatcher-shaped single-argument entry point so the central
+translation router in translation.runa can invoke the Ruby backend
+uniformly with every other language backend (Lua, Python, etc.) without
+backend-specific argument shapes. Failure to construct a translator
+returns 0 to surface allocation issues to the dispatcher rather than
+producing partial output.
+@End Reasoning
+
+@Implementation:
+Guards against a 0 hir_root by returning 0. Allocates a fresh translator
+via create_hir_to_ruby_translator; if that allocation returns 0, propagates
+the failure. Otherwise calls translate_hir_to_ruby with the new translator
+and the HIR root, returning the resulting Ruby code string.
+@End Implementation
 Process called "hir_to_ruby" takes hir_root as Integer returns Integer:
     If hir_root is equal to 0:
         Return 0
@@ -44,6 +90,25 @@ Process called "hir_to_ruby" takes hir_root as Integer returns Integer:
     Return ruby_code
 End Process
 
+@Reasoning:
+Central HIR-node dispatcher: every Ruby-emitting helper is reached by a
+single match on the "node_type" key set by the HIR builder. Keeping the
+dispatcher in one place means new HIR node kinds need exactly one new arm
+added here plus the dedicated translate_* helper, rather than scattered
+type checks across the file. The Otherwise arm emits a "# Unknown HIR
+node" comment so unsupported nodes degrade visibly rather than silently
+producing wrong code.
+@End Reasoning
+
+@Implementation:
+Reads node_type via get_dict_value and matches on every supported HIR kind
+(module, class, function, block, conditional, loop, assignment, call,
+super_call, yield, return, break, next, identifier, string_literal,
+interpolated_string, number_literal, symbol, array_literal, hash_literal,
+range, binary_operation, unary_operation, include, extend, alias, attr_*).
+Returns translator.output_buffer after all recursive emission completes so
+the caller sees the accumulated Ruby source as the function result.
+@End Implementation
 Process called "translate_hir_to_ruby" takes translator as HIRToRubyTranslator, hir as Integer returns String:
     Note: Translate HIR to Ruby code with complete language feature support
 
@@ -116,6 +181,20 @@ Process called "translate_hir_to_ruby" takes translator as HIRToRubyTranslator, 
     Return translator.output_buffer
 End Process
 
+@Reasoning:
+HIR modules map cleanly to Ruby's `module ... end` construct (not class) so
+namespacing without instantiation is preserved across the round-trip. The
+body is emitted at one indent level deeper than the module header to
+respect Ruby's idiomatic two-space indentation as enforced by emit_indent.
+@End Reasoning
+
+@Implementation:
+Reads the "name" field, emits "module <name>" followed by newline, calls
+indent() to push one level, recursively emits the body via
+translate_statement_list (skipped when body is 0), then dedent() and a
+final "end" via emit_line. No tracking of nested modules is required
+because indent/dedent are scope-symmetric.
+@End Implementation
 Process called "translate_module" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR module to Ruby module
 
@@ -139,6 +218,23 @@ Process called "translate_module" takes translator as HIRToRubyTranslator, hir a
     Return 1
 End Process
 
+@Reasoning:
+Ruby class emission must couple single inheritance (the `<` operator) with
+mixin lists (include/extend) that appear after the class opener but before
+any methods. Updating translator.current_class lets nested constructs
+(method definitions, alias statements) reference the enclosing class by
+name without re-reading the HIR node.
+@End Reasoning
+
+@Implementation:
+Sets translator.current_class to the class name read from HIR, emits
+"class <name>". If a superclass HIR node exists, emits " < " and
+recursively translates it (rather than reading a name string, since the
+superclass can be a constant expression like Foo::Bar). After the header
+newline, indent(), then translate_mixins for include/extend lists, then
+translate_statement_list for the body. Dedent(), emit_line "end", and
+restore current_class to "" so subsequent top-level emission is correct.
+@End Implementation
 Process called "translate_class" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR class to Ruby class with inheritance and mixins
 
@@ -175,6 +271,22 @@ Process called "translate_class" takes translator as HIRToRubyTranslator, hir as
     Return 1
 End Process
 
+@Reasoning:
+HIR "function" emits as Ruby `def ... end` whether at class scope (instance
+method), module scope (module method), or top level (private method on
+Object). Empty bodies become a `# Empty method` comment rather than no
+body so the resulting Ruby remains syntactically valid and the round-trip
+preserves the distinction between absent and empty.
+@End Reasoning
+
+@Implementation:
+Sets translator.current_method to the method name for downstream
+super-call resolution. Emits "def <name>". If parameters is non-zero,
+wraps them in "()" via translate_parameters. After header newline,
+indent(), then translate_statement_list on the body (or emits an empty
+method comment if body is 0). Dedent, emit_line "end", restore
+current_method to "".
+@End Implementation
 Process called "translate_function" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR function to Ruby method
 
@@ -212,6 +324,23 @@ Process called "translate_function" takes translator as HIRToRubyTranslator, hir
     Return 1
 End Process
 
+@Reasoning:
+Ruby parameter lists carry four orthogonal annotations - splat (`*args`),
+double-splat (`**kwargs`), block (`&blk`), and default-valued (`x = expr`)
+- each requiring different sigil placement. Centralizing the per-parameter
+dispatch here keeps callers (translate_function, translate_block) free of
+sigil knowledge and ensures the leading comma is emitted only between
+parameters.
+@End Reasoning
+
+@Implementation:
+Iterates the parameter list by index. Emits ", " between parameters
+(index > 0). For each parameter reads "type" and "name". Matches on type:
+"splat" emits "*name", "double_splat" emits "**name", "block" emits
+"&name", and the default arm emits just "name" plus, if a "default" HIR
+node is attached, " = " followed by a recursive translate_hir_to_ruby on
+that default expression.
+@End Implementation
 Process called "translate_parameters" takes translator as HIRToRubyTranslator, params as Integer returns Integer:
     Note: Translate HIR parameters to Ruby parameter syntax
 
@@ -255,6 +384,21 @@ Process called "translate_parameters" takes translator as HIRToRubyTranslator, p
     Return 1
 End Process
 
+@Reasoning:
+Ruby has two block syntaxes - `{ ... }` (single-line, high precedence) and
+`do ... end` (multi-line, low precedence) - and idiomatic Ruby uses the
+braces form only for trivial bodies. is_simple_block heuristically picks
+between them so the emitter matches conventional Ruby formatting rather
+than always defaulting to one form.
+@End Reasoning
+
+@Implementation:
+Calls is_simple_block to decide. Single-line: emits "{ ", optionally
+"|params| " using translate_block_parameters, then statement list, then
+" }". Multi-line: emits "do", optionally " |params|", newline, indent,
+statement list, dedent, emit_line "end". Parameter pipes are emitted only
+when the parameters HIR node is non-zero.
+@End Implementation
 Process called "translate_block" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR block to Ruby block
 
@@ -296,6 +440,21 @@ Process called "translate_block" takes translator as HIRToRubyTranslator, hir as
     Return 1
 End Process
 
+@Reasoning:
+Ruby `if/elsif/else/end` requires the elsif clauses to be flattened into a
+linear chain at emission - HIR can carry them either as a nested
+conditional or as an explicit elsif_clauses list, and this emitter assumes
+the latter shape produced by the Ruby frontend. Else is always last and
+optional.
+@End Reasoning
+
+@Implementation:
+Reads condition, then_body, else_body, elsif_clauses from the HIR node.
+Emits "if <cond>", newline, indent, then_body via
+translate_statement_list, dedent. For each elsif in elsif_clauses (a
+list), emits "elsif <cond>", newline, indent, body, dedent. If else_body
+is set, emit_line "else", indent, body, dedent. Final emit_line "end".
+@End Implementation
 Process called "translate_conditional" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR conditional to Ruby if statement
 
@@ -351,6 +510,21 @@ Process called "translate_conditional" takes translator as HIRToRubyTranslator, 
     Return 1
 End Process
 
+@Reasoning:
+Ruby method calls have four optional pieces - receiver, method name,
+arguments, and trailing block - and Ruby omits the parentheses around an
+empty argument list. Emitting "()" with zero arguments would still be
+valid Ruby but would change idiomatic round-tripped output, so we only
+emit parens when arg_count > 0.
+@End Reasoning
+
+@Implementation:
+Reads receiver, method (name), arguments, block from HIR. If receiver is
+non-zero, recursively translates it and emits ".". Always emits the
+method name. If arguments is non-zero, computes arg_count via
+get_list_size; only when it is > 0 emits "(", translate_arguments, ")".
+Finally if block is non-zero emits " " followed by translate_block.
+@End Implementation
 Process called "translate_call" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR call to Ruby method call
 
@@ -386,6 +560,20 @@ Process called "translate_call" takes translator as HIRToRubyTranslator, hir as 
     Return 1
 End Process
 
+@Reasoning:
+The HIR assignment node carries its operator as a string so compound forms
+(`+=`, `||=`, `&&=`, `-=`, etc.) round-trip without requiring a separate
+node kind per operator. We emit the target, the spaced operator, then the
+value - matching Ruby's whitespace conventions for both simple `=` and
+compound forms.
+@End Reasoning
+
+@Implementation:
+Reads target, value, operator from HIR. Recursively emits target,
+" <operator> ", then recursively emits value. No special-casing for
+chained assignment (`a = b = c`) because the HIR builder produces nested
+assignment nodes that recurse naturally through this code path.
+@End Implementation
 Process called "translate_assignment" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR assignment to Ruby assignment
 
@@ -402,6 +590,19 @@ Process called "translate_assignment" takes translator as HIRToRubyTranslator, h
     Return 1
 End Process
 
+@Reasoning:
+Ruby array literals use square brackets with comma-separated elements.
+The empty-array case (`[]`) is naturally handled by the same path because
+the inner loop simply doesn't execute when the elements list is absent
+or empty, so no dedicated empty-case branch is needed.
+@End Reasoning
+
+@Implementation:
+Emits "[". Reads "elements" from HIR; if non-zero iterates by index,
+emitting ", " between elements (index > 0) and recursively translating
+each element. Closes with "]". The leading comma is gated by index > 0
+rather than a trailing comma to avoid invalid Ruby like `[1, 2, ]`.
+@End Implementation
 Process called "translate_array_literal" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR array to Ruby array literal
 
@@ -429,6 +630,22 @@ Process called "translate_array_literal" takes translator as HIRToRubyTranslator
     Return 1
 End Process
 
+@Reasoning:
+Ruby hash syntax has two key-style conventions: `:key => value` (legacy,
+required for non-symbol keys) and the modern `key: value` (only valid
+when the key is a symbol). Emitting the modern form for symbol keys
+preserves idiomatic Ruby in the round-trip; falling back to `=>` for any
+other key type keeps the emitter correct for string, integer, and
+expression keys.
+@End Reasoning
+
+@Implementation:
+Emits "{". For each pair, reads key and value; checks key.node_type. If
+"symbol", emits the symbol's "value" field followed by ": " (modern
+syntax). Otherwise recursively translates the key and emits " => "
+(legacy syntax). Then recursively translates value. Pairs are separated
+by ", " (gated by index > 0). Closes with "}".
+@End Implementation
 Process called "translate_hash_literal" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR hash to Ruby hash literal
 
@@ -470,6 +687,20 @@ Process called "translate_hash_literal" takes translator as HIRToRubyTranslator,
     Return 1
 End Process
 
+@Reasoning:
+Ruby symbols are immutable interned strings prefixed with `:` and the HIR
+stores the symbol's textual content (without the colon) under the "value"
+key. The emitter just prepends the sigil. No escaping is required because
+symbol values valid in the HIR are already drawn from the Ruby identifier
+alphabet plus operators.
+@End Reasoning
+
+@Implementation:
+Emits ":" then the symbol "value" via emit. No quoting is attempted -
+even though Ruby supports `:"with spaces"`, the HIR shape coming from
+ruby_parser never produces a quoted symbol so emitting unquoted is the
+correct round-trip.
+@End Implementation
 Process called "translate_symbol" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR symbol to Ruby symbol
 
@@ -480,6 +711,27 @@ Process called "translate_symbol" takes translator as HIRToRubyTranslator, hir a
     Return 1
 End Process
 
+@Reasoning:
+Plain (non-interpolated) string literals always use double quotes for
+emission so a single helper escapes special characters consistently. Using
+double quotes for all literals (rather than mixing with single quotes) is
+a deliberate normalization step - it loses the source's quote-style choice
+but ensures escape_ruby_string is the only escaping path needed.
+@End Reasoning
+
+@Implementation:
+Emits `"`, reads "value" from HIR, runs it through escape_ruby_string to
+backslash-escape `"`, `\`, `\n`, `\t`, `\r`, then emits the closing `"`.
+The escape pass is mandatory because user source may legitimately contain
+unescaped quotes inside single-quoted source literals that have already
+been decoded by the parser.
+@End Implementation
+
+@Security_Scope:
+Inputs may originate from untrusted source code. escape_ruby_string is
+the single point of containment so that no raw quote or backslash escapes
+the emitted literal and corrupts surrounding Ruby code.
+@End Security_Scope
 Process called "translate_string_literal" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR string to Ruby string literal
 
@@ -492,6 +744,29 @@ Process called "translate_string_literal" takes translator as HIRToRubyTranslato
     Return 1
 End Process
 
+@Reasoning:
+Ruby interpolated strings (`"...#{expr}..."`) are stored in HIR as a
+"parts" list interleaving literal text fragments with arbitrary
+expression nodes. Only literal segments are passed through
+escape_ruby_string; expression segments are wrapped in `#{...}` and
+translated recursively, preserving the dynamic-evaluation semantics.
+@End Reasoning
+
+@Implementation:
+Emits opening `"`. For each part: if its node_type is "string_literal",
+escape its value and emit raw. Otherwise wrap with `#{` and `}` around a
+recursive translate_hir_to_ruby call on the expression. Emits closing
+`"`. The all-literal case (no expression parts) still passes through
+because the parts list is just a sequence of string_literal nodes.
+@End Implementation
+
+@Security_Scope:
+Literal segments carry the same untrusted-source risk as plain string
+literals and are escaped via escape_ruby_string. Expression segments are
+translated as HIR and therefore re-emit via the same dispatcher that
+applied to all other code; they are not raw strings inserted into Ruby
+source.
+@End Security_Scope
 Process called "translate_interpolated_string" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR interpolated string to Ruby interpolated string
 
@@ -525,6 +800,19 @@ Process called "translate_interpolated_string" takes translator as HIRToRubyTran
     Return 1
 End Process
 
+@Reasoning:
+Numeric literals are stored as their already-stringified textual
+representation in the HIR (which preserves base prefixes like `0x`, `0o`,
+underscores like `1_000_000`, and scientific notation), so the emitter
+simply writes the stored text without re-parsing. Re-parsing would lose
+formatting like underscore separators on a round-trip.
+@End Reasoning
+
+@Implementation:
+Reads "value" from HIR and emits it verbatim. No type tag is read because
+Ruby does not require integer/float disambiguation at the literal level -
+`1` and `1.0` are distinguished purely by the textual form.
+@End Implementation
 Process called "translate_number_literal" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR number to Ruby number literal
 
@@ -534,6 +822,22 @@ Process called "translate_number_literal" takes translator as HIRToRubyTranslato
     Return 1
 End Process
 
+@Reasoning:
+Operator precedence in Ruby requires explicit parentheses only when a
+child operation has lower precedence than its parent (e.g., `(a + b) * c`
+must keep parens, but `a * (b * c)` need not). needs_parentheses
+encapsulates this lookup so emission is purely structural - no parens
+are emitted otherwise to keep output readable.
+@End Reasoning
+
+@Implementation:
+Reads left, operator, right from HIR. Calls needs_parentheses with the
+HIR node and its operator string. If 1, emits "(". Recursively emits
+left, emits " <operator> ", recursively emits right. If parens were
+opened, closes with ")". Spacing around the operator is unconditional
+because all multi-character Ruby operators (`**`, `<=>`, `<<`) tolerate
+surrounding whitespace.
+@End Implementation
 Process called "translate_binary_operation" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR binary operation to Ruby binary expression
 
@@ -561,6 +865,21 @@ Process called "translate_binary_operation" takes translator as HIRToRubyTransla
     Return 1
 End Process
 
+@Reasoning:
+Ruby ranges distinguish inclusive (`..`) and exclusive (`...`) endpoints,
+and the HIR carries the choice as the "operator" field rather than two
+node kinds. Defaulting to `..` for any non-"..." string keeps the
+emitter robust against frontends that omit the operator.
+@End Reasoning
+
+@Implementation:
+Reads start, end, operator from HIR. Recursively emits the start
+expression, emits "..." iff operator equals "..." otherwise "..", then
+recursively emits the end expression. No whitespace is inserted around
+the range operator because Ruby treats `1..10` and `1 .. 10` differently
+in argument position (the latter can be parsed as a call argument plus
+range).
+@End Implementation
 Process called "translate_range" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR range to Ruby range
 
@@ -582,6 +901,19 @@ Process called "translate_range" takes translator as HIRToRubyTranslator, hir as
     Return 1
 End Process
 
+@Reasoning:
+Identifier emission is intentionally a single emit of the stored name -
+Ruby's sigil-based name classification (`@`, `@@`, `$`) is preserved
+inside the HIR identifier's "name" field by the parser, so no
+classification logic belongs here.
+@End Reasoning
+
+@Implementation:
+Reads "name" from HIR and emits it via emit. Local variable, instance
+variable (`@x`), class variable (`@@x`), and global (`$x`) references all
+flow through this same path because the sigils are kept as part of the
+name string by the Ruby frontend.
+@End Implementation
 Process called "translate_identifier" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR identifier to Ruby variable
 
@@ -591,6 +923,21 @@ Process called "translate_identifier" takes translator as HIRToRubyTranslator, h
     Return 1
 End Process
 
+@Reasoning:
+Ruby methods return the value of their last expression implicitly, so an
+explicit `return` keyword is redundant in that position. The HIR carries
+an "implicit" flag (as a string "true") set by the Ruby frontend for any
+return that appears as the last statement of a method body; this emitter
+elides the keyword in that case to preserve idiomatic Ruby on round-trip.
+@End Reasoning
+
+@Implementation:
+Reads value and implicit from HIR. If implicit equals the string "true",
+recursively emits only the value (no `return` keyword). Otherwise emits
+"return"; if value is non-zero, emits " " followed by a recursive
+translation of the value. A `return` with no value is emitted as bare
+`return` and is valid Ruby (returns nil).
+@End Implementation
 Process called "translate_return" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR return to Ruby return statement
 
@@ -612,6 +959,21 @@ Process called "translate_return" takes translator as HIRToRubyTranslator, hir a
     Return 1
 End Process
 
+@Reasoning:
+Ruby's `yield` invokes the block argument passed to the enclosing method
+and uniquely omits parentheses when bare: `yield`, `yield x`, `yield x, y`
+are all valid without parens. We emit the bare form to remain idiomatic;
+parens are only needed when arguments collide with method-call precedence,
+which translate_arguments handles upstream when those arguments are
+emitted.
+@End Reasoning
+
+@Implementation:
+Emits "yield". If arguments HIR is non-zero, emits " " then defers to
+translate_arguments which writes a comma-separated list. No `()` wrappers
+are added because yield's grammar accepts a bare argument list at
+statement position.
+@End Implementation
 Process called "translate_yield" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR yield to Ruby yield statement
 
@@ -626,6 +988,20 @@ Process called "translate_yield" takes translator as HIRToRubyTranslator, hir as
     Return 1
 End Process
 
+@Reasoning:
+Ruby distinguishes `super` (forwards the caller's arguments verbatim) from
+`super()` (passes no arguments) - these have different semantics. The HIR
+carries arguments as a list whose presence (non-zero) signals the explicit
+form. Bare `super` is therefore emitted only when arguments is 0;
+emit `super()` for explicit empty argument lists too via this same path
+(arguments-list is present but empty).
+@End Reasoning
+
+@Implementation:
+Emits "super". If arguments is non-zero, emits "(", calls
+translate_arguments to fill the parenthesized list, then ")". An absent
+arguments field (0) leaves the bare `super` form.
+@End Implementation
 Process called "translate_super_call" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR super call to Ruby super
 
@@ -641,6 +1017,18 @@ Process called "translate_super_call" takes translator as HIRToRubyTranslator, h
     Return 1
 End Process
 
+@Reasoning:
+Ruby `include` mixes in instance methods from a module into the receiver
+class. translate_mixins emits include directives inside the class body
+before any methods so the resulting Ruby matches conventional ordering;
+this helper only writes the include line itself.
+@End Reasoning
+
+@Implementation:
+Emits "include ", reads the "module" name field from the HIR include
+node, emits it raw (module references in HIR are pre-stringified, e.g.
+"Comparable" or "ActiveSupport::Concern").
+@End Implementation
 Process called "translate_include" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR include to Ruby include statement
 
@@ -651,6 +1039,17 @@ Process called "translate_include" takes translator as HIRToRubyTranslator, hir 
     Return 1
 End Process
 
+@Reasoning:
+Ruby `extend` mixes module methods as class (singleton) methods of the
+receiver, the dual of `include`. Same structural shape as
+translate_include but a different keyword - kept as a separate process
+so the dispatcher can pick the right one without inspecting node fields.
+@End Reasoning
+
+@Implementation:
+Emits "extend ", reads "module" from HIR, emits the module reference
+verbatim.
+@End Implementation
 Process called "translate_extend" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR extend to Ruby extend statement
 
@@ -661,6 +1060,19 @@ Process called "translate_extend" takes translator as HIRToRubyTranslator, hir a
     Return 1
 End Process
 
+@Reasoning:
+Ruby's `attr_accessor` is a class-level macro generating both reader and
+writer methods for the named symbols. The HIR carries a list of attribute
+names that need to be emitted as `:name1, :name2, ...`. Delegated to
+translate_attribute_list so the same emission shape can be reused by the
+reader/writer-only variants if needed.
+@End Reasoning
+
+@Implementation:
+Emits "attr_accessor ", reads "attributes" list from HIR, defers to
+translate_attribute_list (defined in the shared helpers section) to emit
+the comma-separated symbol list.
+@End Implementation
 Process called "translate_attr_accessor" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate HIR attr_accessor to Ruby attr_accessor
 
@@ -673,6 +1085,22 @@ End Process
 
 Note: Helper processes for HIR to Ruby translation
 
+@Reasoning:
+A statement list is emitted as a sequence of indented lines. Some emitted
+constructs (if/end, def/end, do/end) already terminate with their own
+newline; if this helper unconditionally appended one, the output would
+contain blank lines between every multi-line construct. The
+requires_newline flag is the coordination mechanism: emit_newline sets it,
+and this loop consults it before adding another newline.
+@End Reasoning
+
+@Implementation:
+For each statement in the list: emits proper indentation via emit_indent,
+recursively translates the statement, then conditionally adds a newline
+only when requires_newline is still 0 (meaning the statement did not
+self-terminate). Resets requires_newline to 0 after each iteration so the
+next statement starts in a known state.
+@End Implementation
 Process called "translate_statement_list" takes translator as HIRToRubyTranslator, statements as Integer returns Integer:
     Note: Translate list of HIR statements to Ruby statements
 
@@ -697,6 +1125,20 @@ Process called "translate_statement_list" takes translator as HIRToRubyTranslato
     Return 1
 End Process
 
+@Reasoning:
+Argument lists at call sites are just comma-separated expressions. The
+caller (translate_call, translate_yield, translate_super_call) is
+responsible for emitting any surrounding `(...)`; this helper writes only
+the comma-separated payload so it can be reused in paren-less contexts
+like yield.
+@End Reasoning
+
+@Implementation:
+Iterates the args list by index. For each argument, emits ", " between
+items (index > 0) and recursively translates the argument expression via
+translate_hir_to_ruby. The leading comma is gated on index to prevent a
+leading separator before the first argument.
+@End Implementation
 Process called "translate_arguments" takes translator as HIRToRubyTranslator, args as Integer returns Integer:
     Note: Translate HIR arguments to Ruby argument list
 
@@ -717,6 +1159,20 @@ Process called "translate_arguments" takes translator as HIRToRubyTranslator, ar
     Return 1
 End Process
 
+@Reasoning:
+Ruby idiom places `include` and `extend` directives at the top of a class
+body, before constants and methods. translate_class invokes this helper
+immediately after entering the class body (post-indent) so the directives
+appear in the conventional position with one entry per line.
+@End Reasoning
+
+@Implementation:
+Iterates the "includes" list (if present) and, for each include node,
+emits indent, defers to translate_include, then newline. Then does the
+same for the "extends" list using translate_extend. The shared index
+local is intentionally reused (Set index to 0) before the second loop to
+restart counting cleanly.
+@End Implementation
 Process called "translate_mixins" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
     Note: Translate class mixins (includes and extends)
 
@@ -751,12 +1207,37 @@ Process called "translate_mixins" takes translator as HIRToRubyTranslator, hir a
     Return 1
 End Process
 
+@Reasoning:
+Single chokepoint for all text appended to the Ruby output. Centralizing
+buffer mutation here lets every other helper stay free of string_concat
+details and would also be the natural place to add buffer-resize
+optimization later without touching emission sites.
+@End Reasoning
+
+@Implementation:
+Concatenates text onto translator.output_buffer via string_concat and
+stores the new buffer back on the translator. Returns 1 unconditionally
+since the only failure mode (out-of-memory) is handled at the allocator
+level.
+@End Implementation
 Process called "emit" takes translator as HIRToRubyTranslator, text as String returns Integer:
     Note: Emit text to output buffer
     Set translator.output_buffer to proc string_concat with translator.output_buffer, text
     Return 1
 End Process
 
+@Reasoning:
+Convenience for the very common "indent + text + newline" pattern used by
+block terminators (`end`), section markers, and any standalone statement.
+Removing the three-call boilerplate from every caller makes the emission
+sites read more linearly.
+@End Reasoning
+
+@Implementation:
+Sequences emit_indent, emit with the provided text, and emit_newline.
+Returns 1. Note that emit_newline sets requires_newline so
+translate_statement_list will skip the auto-newline after this call.
+@End Implementation
 Process called "emit_line" takes translator as HIRToRubyTranslator, text as String returns Integer:
     Note: Emit line with proper indentation
     proc emit_indent from translator
@@ -765,6 +1246,18 @@ Process called "emit_line" takes translator as HIRToRubyTranslator, text as Stri
     Return 1
 End Process
 
+@Reasoning:
+Wraps the literal newline emission and atomically toggles the
+requires_newline flag so translate_statement_list knows the last write
+already ended a line. Without this flag, a construct like `end\n` followed
+by the loop's auto-newline would produce a blank line after every block.
+@End Reasoning
+
+@Implementation:
+Emits "\n" via emit and sets translator.requires_newline to 1. The flag
+is cleared by translate_statement_list once it has decided whether to
+suppress its own newline.
+@End Implementation
 Process called "emit_newline" takes translator as HIRToRubyTranslator returns Integer:
     Note: Emit newline character
     proc emit with translator, "\n"
@@ -772,6 +1265,21 @@ Process called "emit_newline" takes translator as HIRToRubyTranslator returns In
     Return 1
 End Process
 
+@Reasoning:
+Ruby's idiomatic indent is two spaces per nesting level. Emitting the
+spaces one-by-one (rather than building an indent string and concatenating
+it) is acceptable here because indentation_level is bounded by realistic
+source nesting (typically <10), so the loop is short and avoids managing
+a separate indent buffer.
+@End Reasoning
+
+@Implementation:
+Computes total_spaces = indentation_level * 2, then loops space_count
+from 0 to total_spaces - 1 emitting a single space each iteration. Note
+that translator.indentation_level is the field actually consulted; the
+suite field is called indentation_level (not indent_level) - the type
+declaration matches.
+@End Implementation
 Process called "emit_indent" takes translator as HIRToRubyTranslator returns Integer:
     Note: Emit proper indentation
 
@@ -787,12 +1295,33 @@ Process called "emit_indent" takes translator as HIRToRubyTranslator returns Int
     Return 1
 End Process
 
+@Reasoning:
+Increments indentation level for the duration of a nested block. Paired
+with dedent so every translate_* helper that opens a body must close it,
+guaranteeing balanced indentation on output.
+@End Reasoning
+
+@Implementation:
+Adds 1 to translator.indentation_level. Has no effect on already-emitted
+output; only future emit_indent calls observe the new level.
+@End Implementation
 Process called "indent" takes translator as HIRToRubyTranslator returns Integer:
     Note: Increase indentation level
     Set translator.indentation_level to translator.indentation_level plus 1
     Return 1
 End Process
 
+@Reasoning:
+Decrements indentation level. Guards against going below zero so a buggy
+caller emitting an extra dedent cannot underflow the level to a negative
+value (which would compute a very large total_spaces under integer
+arithmetic and emit a massive indent line).
+@End Reasoning
+
+@Implementation:
+Subtracts 1 from translator.indentation_level only when the current value
+is greater than 0. Otherwise leaves it at 0 silently.
+@End Implementation
 Process called "dedent" takes translator as HIRToRubyTranslator returns Integer:
     Note: Decrease indentation level
     If translator.indentation_level is greater than 0:
@@ -801,6 +1330,36 @@ Process called "dedent" takes translator as HIRToRubyTranslator returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Ruby double-quoted strings interpret backslash sequences, so the literal
+forms of `"`, `\`, newline, tab, and carriage return must each be
+re-escaped before emission. Single-character matching is used rather than
+regex because the surface alphabet is small and a switch is both faster
+and easier to audit for completeness.
+@End Reasoning
+
+@Implementation:
+Builds a result string by iterating text character-by-character. Match
+arms:
+- `"` => `\"`
+- `\` => `\\`
+- newline (LF) => `\n`
+- tab => `\t`
+- carriage return => `\r`
+- any other char => emitted as-is.
+Uses string_concat into result on each step. Returns the assembled
+escaped string.
+@End Implementation
+
+@Security_Scope:
+This is the security boundary for emitted string literals. Any
+unrecognized control character is passed through unchanged - that is safe
+inside a double-quoted Ruby string because Ruby does not have additional
+metacharacters beyond the five handled here. Embedded `#{...}` would still
+be interpolated by Ruby; callers must use translate_interpolated_string
+when interpolation is intended, not pass an already-interpolated string
+through this helper.
+@End Security_Scope
 Process called "escape_ruby_string" takes text as String returns String:
     Note: Escape special characters in Ruby string
 
@@ -832,6 +1391,21 @@ Process called "escape_ruby_string" takes text as String returns String:
     Return result
 End Process
 
+@Reasoning:
+Heuristic gating between `{...}` and `do...end` block syntax. A body is
+"simple" if it has exactly one statement and that statement is one of the
+trivially-shaped kinds that look natural on a single line. Any other shape
+(including control structures, multi-statement bodies, or assignments) is
+classified as non-simple and translate_block uses `do...end`.
+@End Reasoning
+
+@Implementation:
+Returns 1 immediately if body is 0 (empty block) since an empty brace
+form is fine. Otherwise rejects bodies with !=1 statement. Reads the
+node_type of the lone statement and matches: "call", "identifier",
+"string_literal", "number_literal", "binary_operation" map to single-line
+eligible (Return 1); all other types return 0.
+@End Implementation
 Process called "is_simple_block" takes body as Integer returns Integer:
     Note: Determine if block body is simple enough for single-line syntax
 
@@ -864,6 +1438,25 @@ Process called "is_simple_block" takes body as Integer returns Integer:
     End Match
 End Process
 
+@Reasoning:
+Inferring whether a child binary operation needs parentheses in its
+parent context requires knowing both operators' precedence. By comparing
+the child operator's precedence against the parent's, we can drop
+redundant parens that would otherwise clutter idiomatic Ruby output.
+This is conservative: when uncertain (no parent context, unknown parent
+operator), no parens are emitted - Ruby's default precedence handles
+those cases correctly.
+@End Reasoning
+
+@Implementation:
+Returns 0 for null hir. Reads the parent node type via hir_get_node_type.
+HIR_BINARY_OP is constant 25; if the parent is not a binary op, no parens
+needed. Reads parent_op via hir_get_operator; if 0 (missing), no parens.
+Compares get_ruby_operator_precedence(operator) against
+get_ruby_operator_precedence(parent_op): if current < parent, the current
+operation binds looser than its context and requires parens to preserve
+associativity; otherwise no parens.
+@End Implementation
 Process called "needs_parentheses" takes hir as Integer, operator as String returns Integer:
     Note: Determine if binary operation needs parentheses based on Ruby operator precedence
     Note: Ruby precedence (high to low): **, unary +/-, *, /, %, +, -, <<, >>, &, |, ^, <=>, ==, !=, <, >, <=, >=, &&, ||, .., ..., ?:, =, and, or, not
@@ -903,6 +1496,34 @@ Process called "needs_parentheses" takes hir as Integer, operator as String retu
     Return 0
 End Process
 
+@Reasoning:
+Numeric precedence table for Ruby binary operators, returning higher
+values for tighter binding. Encoded as a sequence of string-equality
+checks rather than a hash lookup so the table is self-documenting,
+trivially auditable against the Ruby language spec, and free of
+dictionary overhead in this hot path (called twice per binary
+operation by needs_parentheses).
+@End Reasoning
+
+@Implementation:
+Returns:
+- 14: `**` (exponentiation, highest precedence excluding unary)
+- 12: `*`, `/`, `%`
+- 11: `+`, `-`
+- 10: `<<`, `>>` (shifts)
+-  9: `&` (bitwise AND)
+-  8: `^` (bitwise XOR)
+-  7: `|` (bitwise OR)
+-  6: `<=>`, `..`, `...` (combined comparison / ranges)
+-  5: `==`, `!=`, `<`, `>`, `<=`, `>=` (and unknown default)
+-  4: `&&`
+-  3: `||`
+-  2: `and` (keyword form, low precedence)
+-  1: `or` (keyword form, lowest precedence)
+Default Return 5 covers any operator not explicitly listed so unknown
+inputs sort with the comparison group instead of an extreme value, which
+keeps needs_parentheses safe against new operator strings.
+@End Implementation
 Process called "get_ruby_operator_precedence" takes operator as String returns Integer:
     Note: Return precedence level for Ruby operators (higher number = higher precedence)
 

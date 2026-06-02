@@ -85,6 +85,21 @@ Note: ===================================================================
 Note: AST NODE STRUCTURE
 Note: ===================================================================
 
+@Reasoning:
+Uniform AST node for every Solidity construct. node_type carries the
+SOL_* discriminant; value holds a string lexeme for leaf nodes
+(identifiers, literals, operator symbols on binary expressions); children
+is an ordered ListCore of sub-nodes; metadata is a flat ListCore of
+alternating key, value pairs at even/odd indices respectively. Flat
+encoding avoids per-node dictionary overhead while preserving lookup by
+key.
+@End Reasoning
+
+@Implementation:
+Four 8-byte slots in declaration order:
+node_type@0, value@8, children@16, metadata@24.
+@End Implementation
+
 Type called "ASTNode":
     node_type as Integer
     value as Integer
@@ -96,6 +111,17 @@ Note: ===================================================================
 Note: PARSER STATE
 Note: ===================================================================
 
+@Reasoning:
+Parser state: a ListCore handle of tokens, a 0-based cursor position,
+and the pre-computed token count. Length is cached at construction so
+end-of-stream tests stay O(1) rather than calling list_length on every
+check.
+@End Reasoning
+
+@Implementation:
+Three 8-byte slots: tokens@0, position@8, length@16.
+@End Implementation
+
 Type called "Parser":
     tokens as Integer
     position as Integer
@@ -106,11 +132,24 @@ Note: ===================================================================
 Note: MAIN PARSER ENTRY POINTS
 Note: ===================================================================
 
+@Reasoning:
+Single-call pipeline driver: lex then parse. Exposed as a top-level entry
+point for callers who only have raw source text and do not want to manage
+the lexer or parser separately.
+@End Reasoning
+
 Process called "parse_solidity_source" takes source as Integer returns Integer:
     Let tokens be proc solidity_lex from SolidityLexer with source
     Let parser be proc create_parser from tokens
     Return proc parse_program from parser
 End Process
+
+@Reasoning:
+Parser constructor. Stores the token list, sets position to 0, and caches
+the token-list length. Caching length here ensures every later check
+against parser.length is a struct field read rather than a list_length
+call.
+@End Reasoning
 
 Process called "create_parser" takes tokens as Integer returns Integer:
     Let parser be a value of type Parser with
@@ -125,6 +164,13 @@ Note: ===================================================================
 Note: PROGRAM PARSING
 Note: ===================================================================
 
+@Reasoning:
+Top-level production: builds a SOL_PROGRAM node and accumulates every
+successful top-level declaration as a child. Skipped declarations
+(parse_top_level_declaration returns 0) are not added — they were
+already consumed and discarded as recovery tokens.
+@End Reasoning
+
 Process called "parse_program" takes parser as Integer returns Integer:
     Let program be proc create_node with SOL_PROGRAM, ""
 
@@ -138,6 +184,14 @@ Process called "parse_program" takes parser as Integer returns Integer:
 
     Return program
 End Process
+
+@Reasoning:
+Dispatch table for top-level Solidity constructs. Matches the leading
+token against pragma, import, contract (including the abstract-contract
+shape that prefixes `abstract`), interface, library, using, and error
+definitions. Any other token is consumed silently as a recovery measure
+to keep parsing forward-moving.
+@End Reasoning
 
 Process called "parse_top_level_declaration" takes parser as Integer returns Integer:
     Note: Pragma directive
@@ -188,6 +242,13 @@ Note: ===================================================================
 Note: PRAGMA PARSING
 Note: ===================================================================
 
+@Reasoning:
+Parses `pragma <name> <free-form-value>;` directives — most commonly
+`pragma solidity ^0.8.0`. The value section is free-form (lexer breaks it
+into multiple tokens) so we concatenate token text until the terminating
+semicolon. The reconstructed value is stored as "value" metadata.
+@End Reasoning
+
 Process called "parse_pragma" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_PRAGMA
 
@@ -217,6 +278,14 @@ Note: ===================================================================
 Note: IMPORT PARSING
 Note: ===================================================================
 
+@Reasoning:
+Parses `import "<path>" [as <alias>];`. Records the path string and
+optional alias as metadata. The minimal subset of Solidity import syntax
+is supported (no symbol-list imports or wildcard imports yet — these can
+be added without breaking the AST shape because they ride entirely on
+metadata).
+@End Reasoning
+
 Process called "parse_import" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_IMPORT
 
@@ -242,6 +311,21 @@ End Process
 Note: ===================================================================
 Note: CONTRACT PARSING
 Note: ===================================================================
+
+@Reasoning:
+Parses `[abstract] contract <Name> [is Base1, Base2, ...] { ... }`. The
+abstract prefix is recorded as a metadata flag rather than a separate
+node type so contracts and abstract contracts share AST consumers
+downstream. Inheritance bases come from parse_inheritance_list and are
+attached as a "bases" metadata list.
+@End Reasoning
+
+@Implementation:
+Optionally consumes `abstract`, then `contract`, captures the identifier
+as the node value, optionally consumes an `is`-prefixed inheritance list,
+then loops parse_contract_member between the braces. Each member becomes
+a direct child of the contract node.
+@End Implementation
 
 Process called "parse_contract" takes parser as Integer returns Integer:
     Note: Parse abstract modifier if present
@@ -286,6 +370,14 @@ Process called "parse_contract" takes parser as Integer returns Integer:
     Return contract_node
 End Process
 
+@Reasoning:
+Parses one or more comma-separated identifier base names following an
+`is` keyword. Returns a ListCore of name strings rather than ASTNode
+objects because bases are name-references only and need no further
+structure at this layer. Requires at least one base identifier — callers
+guard with TOKEN_IS.
+@End Reasoning
+
 Process called "parse_inheritance_list" takes parser as Integer returns Integer:
     Let bases be proc list_create from ListCore
 
@@ -300,6 +392,14 @@ Process called "parse_inheritance_list" takes parser as Integer returns Integer:
 
     Return bases
 End Process
+
+@Reasoning:
+Dispatch table for declarations valid inside a contract body. Recognises
+using, struct, enum, event, error, modifier, constructor, fallback,
+receive, function — and falls through to parse_state_variable for
+anything else, since state variables have no leading keyword (they begin
+with a type token).
+@End Reasoning
 
 Process called "parse_contract_member" takes parser as Integer returns Integer:
     Note: Using directive
@@ -360,6 +460,13 @@ Note: ===================================================================
 Note: INTERFACE PARSING
 Note: ===================================================================
 
+@Reasoning:
+Parses `interface <Name> [is Base, ...] { ... }`. Same shape as contract
+but uses parse_interface_member which restricts permitted declarations to
+function/event/error signatures (interfaces cannot have state variables
+or implementations).
+@End Reasoning
+
 Process called "parse_interface" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_INTERFACE
 
@@ -391,6 +498,12 @@ Process called "parse_interface" takes parser as Integer returns Integer:
     Return interface_node
 End Process
 
+@Reasoning:
+Restricted dispatch table for interface members: only events, functions
+(without bodies — parse_function_body returns 0 on semicolon), and error
+declarations. Unknown leading tokens are advanced past and yield 0.
+@End Reasoning
+
 Process called "parse_interface_member" takes parser as Integer returns Integer:
     Note: Interfaces only have function declarations and events
     If proc check with parser, SolidityLexer.TOKEN_EVENT:
@@ -412,6 +525,13 @@ End Process
 Note: ===================================================================
 Note: LIBRARY PARSING
 Note: ===================================================================
+
+@Reasoning:
+Parses `library <Name> { ... }`. Libraries are stateless code-bearing
+containers — they reuse parse_contract_member because the set of valid
+declarations matches contracts (minus state variables semantically; but
+the parser does not enforce that here — later HIR validation does).
+@End Reasoning
 
 Process called "parse_library" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_LIBRARY
@@ -441,6 +561,14 @@ Note: ===================================================================
 Note: USING DIRECTIVE PARSING
 Note: ===================================================================
 
+@Reasoning:
+Parses `using <Library> for <Type|*>;`. The library name lives as the
+node value and the target type lives as "target" metadata. `*` is
+accepted as the wildcard target (binds the library's methods to all
+types). The keyword `for` is matched by lexeme rather than by token type
+because the lexer treats it as a generic identifier in this context.
+@End Reasoning
+
 Process called "parse_using" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_USING
 
@@ -462,6 +590,13 @@ End Process
 Note: ===================================================================
 Note: STRUCT PARSING
 Note: ===================================================================
+
+@Reasoning:
+Parses `struct <Name> { type field1; type field2; ... }`. Fields are
+parsed by parse_struct_field and attached as ordered children. Struct
+fields share the SOL_PARAMETER node type with function parameters and
+event parameters because they carry the same `type name` shape.
+@End Reasoning
 
 Process called "parse_struct" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_STRUCT
@@ -487,6 +622,12 @@ Process called "parse_struct" takes parser as Integer returns Integer:
     Return struct_node
 End Process
 
+@Reasoning:
+Parses `<type> <name>;` for a single struct field. The type node lives
+in "type" metadata rather than as a child because consumers want
+type/name separation at lookup time. Trailing semicolon is required.
+@End Reasoning
+
 Process called "parse_struct_field" takes parser as Integer returns Integer:
     Let type_node be proc parse_type from parser
     Let field_name be proc expect with parser, SolidityLexer.TOKEN_IDENTIFIER
@@ -501,6 +642,13 @@ End Process
 Note: ===================================================================
 Note: ENUM PARSING
 Note: ===================================================================
+
+@Reasoning:
+Parses `enum <Name> { Value1, Value2, ... }`. Enum values are bare
+identifiers (no associated data), stored as a "values" metadata list of
+strings. Trailing commas are tolerated because the loop consumes a comma
+opportunistically after each value without requiring one.
+@End Reasoning
 
 Process called "parse_enum" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_ENUM
@@ -536,6 +684,14 @@ End Process
 Note: ===================================================================
 Note: EVENT PARSING
 Note: ===================================================================
+
+@Reasoning:
+Parses `event <Name>(parameters) [anonymous];`. Event parameters can
+have an `indexed` modifier between the type and the optional name (see
+parse_event_parameter) — events use up to 3 indexed parameters for log
+topics in the EVM. Anonymous events skip the first topic and are flagged
+in metadata.
+@End Reasoning
 
 Process called "parse_event" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_EVENT
@@ -573,6 +729,13 @@ Process called "parse_event" takes parser as Integer returns Integer:
     Return event_node
 End Process
 
+@Reasoning:
+Parses one event parameter: `<type> [indexed] [<name>]`. Unlike function
+parameters, the name is optional (event logs don't need it). The
+`indexed` flag is stored as "indexed" metadata so HIR translation can
+emit the parameter into the appropriate EVM log topic slot.
+@End Reasoning
+
 Process called "parse_event_parameter" takes parser as Integer returns Integer:
     Let type_node be proc parse_type from parser
 
@@ -602,6 +765,13 @@ End Process
 Note: ===================================================================
 Note: ERROR DEFINITION PARSING
 Note: ===================================================================
+
+@Reasoning:
+Parses `error <Name>(parameters);` — a Solidity 0.8.4+ custom error
+declaration. Errors are like events but throw rather than log. Parameters
+use the regular parse_parameter routine (no `indexed` modifier permitted)
+so structure matches function parameter lists.
+@End Reasoning
 
 Process called "parse_error_definition" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_ERROR
@@ -635,6 +805,14 @@ End Process
 Note: ===================================================================
 Note: MODIFIER PARSING
 Note: ===================================================================
+
+@Reasoning:
+Parses `modifier <Name>[(parameters)] [virtual|override] { body }`.
+Modifiers are decorators applied to functions and run with access to the
+function arguments and the magic `_;` placeholder. Parameter list is
+optional (zero-arg modifiers can omit the parens entirely); virtual /
+override come from parse_function_modifiers.
+@End Reasoning
 
 Process called "parse_modifier" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_MODIFIER
@@ -677,6 +855,14 @@ Note: ===================================================================
 Note: FUNCTION PARSING
 Note: ===================================================================
 
+@Reasoning:
+Parses `function [<name>](parameters) [modifiers...] [returns (...)] {
+body }` or a signature ending in `;` for interfaces. Function name is
+optional because anonymous functions appear as type expressions in
+Solidity 0.6+. Visibility, mutability, virtual/override, and return-type
+parsing are delegated to parse_function_tail.
+@End Reasoning
+
 Process called "parse_function" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_FUNCTION
 
@@ -711,6 +897,22 @@ Process called "parse_function" takes parser as Integer returns Integer:
     Return function_node
 End Process
 
+@Reasoning:
+Shared tail logic for function-like declarations after the parameter
+list: visibility/mutability/virtual/override modifiers, optional
+`returns (...)` clause, then either a body block or a semicolon. Split
+out from parse_function because constructor/fallback/receive reuse parts
+of it.
+@End Reasoning
+
+@Implementation:
+Calls parse_function_modifiers to gobble modifier keywords. If `returns`
+follows, parses a comma-separated return parameter list into a fresh
+ListCore and stores it as "returns" metadata, then dispatches to
+parse_function_body. If no `returns`, falls through directly to
+parse_function_body.
+@End Implementation
+
 Process called "parse_function_tail" takes parser as Integer, function_node as Integer:
     Note: Parse visibility, mutability, modifiers
     proc parse_function_modifiers with parser, function_node
@@ -744,6 +946,21 @@ Process called "parse_function_tail" takes parser as Integer, function_node as I
     Note: Parse function body
     proc parse_function_body with parser, function_node
 End Process
+
+@Reasoning:
+Collects any number of leading modifier keywords (visibility, mutability,
+inheritance flags) in any order. Solidity's grammar is intentionally
+permissive here — `function foo() public view virtual returns ...` and
+`function foo() view public ...` are both valid. We loop until we see a
+non-modifier token, then stop without consuming it.
+@End Reasoning
+
+@Implementation:
+Loops checking for each of public/private/internal/external/pure/view/
+payable/virtual/override; on hit, consumes the token and appends the
+modifier name string to the modifiers list. First non-matching token
+breaks the loop and finalises modifiers metadata.
+@End Implementation
 
 Process called "parse_function_modifiers" takes parser as Integer, function_node as Integer:
     Let modifiers be proc list_create from ListCore
@@ -805,6 +1022,14 @@ Process called "parse_function_modifiers" takes parser as Integer, function_node
     proc set_metadata with function_node, "modifiers", modifiers
 End Process
 
+@Reasoning:
+Dispatches on what follows the modifier/returns clause: a `;` means
+this is an abstract or interface declaration (return 0, no body
+attached); anything else is parsed as a brace block and attached as a
+child. Return value indicates body presence so callers can record
+abstractness if useful.
+@End Reasoning
+
 Process called "parse_function_body" takes parser as Integer, function_node as Integer returns Integer:
     Note: Function can end with semicolon (interface) or have a body
     If proc check with parser, SolidityLexer.TOKEN_SEMICOLON:
@@ -820,6 +1045,14 @@ End Process
 Note: ===================================================================
 Note: CONSTRUCTOR PARSING
 Note: ===================================================================
+
+@Reasoning:
+Parses `constructor(parameters) [modifiers...] { body }`. Constructors
+have a fixed name ("constructor") rather than a user-supplied
+identifier. They share parameter parsing with regular functions but
+always require a body — Solidity does not allow a semicolon-only
+constructor declaration.
+@End Reasoning
 
 Process called "parse_constructor" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_CONSTRUCTOR
@@ -854,6 +1087,14 @@ End Process
 Note: ===================================================================
 Note: FALLBACK AND RECEIVE PARSING
 Note: ===================================================================
+
+@Reasoning:
+Parses `fallback() [modifiers] [returns (...)] { body }`. The fallback
+function fires when a contract call matches no selector. As of Solidity
+0.6, fallback takes no parameters but may return bytes. We still pre-
+allocate the parameter list parsing to keep code shape consistent with
+parse_function — the parentheses are always empty here.
+@End Reasoning
 
 Process called "parse_fallback" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_FALLBACK
@@ -897,6 +1138,14 @@ Process called "parse_fallback" takes parser as Integer returns Integer:
     Return fallback_node
 End Process
 
+@Reasoning:
+Parses `receive() external payable { body }`. The receive function
+fires on plain ether transfers (no calldata). Solidity requires receive
+to be `external payable` and to take no parameters or returns — the
+parser does not enforce these constraints here; parse_function_modifiers
+captures whatever the source provides for later validation.
+@End Reasoning
+
 Process called "parse_receive" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_RECEIVE
 
@@ -915,6 +1164,23 @@ End Process
 Note: ===================================================================
 Note: STATE VARIABLE PARSING
 Note: ===================================================================
+
+@Reasoning:
+Parses `<type> [visibility] [constant|immutable] <name> [= initializer];`.
+State variables have no leading keyword in Solidity, so this is the
+fallback in parse_contract_member. Visibility and storage qualifiers may
+appear in any order before the name and are stored as a "modifiers"
+metadata list. The initializer is parsed as an expression and held in
+"initializer" metadata.
+@End Reasoning
+
+@Implementation:
+Parses the type via parse_type, then loops over visibility/constant/
+immutable tokens (each appears at most once but accepted in any order
+via separate While loops to keep grammar permissive). Captures the
+identifier as the node value, attaches type and modifiers metadata,
+parses an optional `= expression`, and consumes the terminating `;`.
+@End Implementation
 
 Process called "parse_state_variable" takes parser as Integer returns Integer:
     Let type_node be proc parse_type from parser
@@ -968,6 +1234,15 @@ Note: ===================================================================
 Note: PARAMETER PARSING
 Note: ===================================================================
 
+@Reasoning:
+Parses one function/error/struct parameter: `<type> [memory|storage|
+calldata] [<name>]`. Data-location qualifiers (memory/storage/calldata)
+are mandatory for reference types in external/public functions but the
+parser doesn't enforce that here — it just captures whatever was given as
+"storage" metadata. Name is optional (anonymous parameters are legal in
+abstract function signatures).
+@End Reasoning
+
 Process called "parse_parameter" takes parser as Integer returns Integer:
     Let type_node be proc parse_type from parser
 
@@ -1008,6 +1283,24 @@ End Process
 Note: ===================================================================
 Note: TYPE PARSING
 Note: ===================================================================
+
+@Reasoning:
+Recognises every Solidity type expression at this layer: elementary
+types (bool/uintN/intN/address[ payable]/bytesN/string), mapping types
+(delegated to parse_mapping_type), and user-defined types with optional
+array brackets. Array brackets nest left-to-right so `T[][3]` parses as
+"fixed-size 3 of dynamic T" — matching Solidity's right-most-is-outer
+convention.
+@End Reasoning
+
+@Implementation:
+Sequential keyword checks dispatched on token type. For sized integer/
+bytes variants (uint8, uint16, ..., uintN) the token's value field
+carries the precise width, so we copy it verbatim into the node value.
+Array bracket handling wraps the current type_node in a new
+SOL_ARRAY_TYPE on each `[size]` suffix, with size captured as a string
+("" for dynamic arrays).
+@End Implementation
 
 Process called "parse_type" takes parser as Integer returns Integer:
     Note: Elementary types
@@ -1089,6 +1382,14 @@ Process called "parse_type" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Parses `mapping(<KeyType> => <ValueType>)`. Mappings are Solidity's
+storage-only associative arrays. The `=>` arrow is lexed as a keyword
+token rather than a punctuation symbol, so consume_keyword is used to
+advance past it. Key and value types are stored as metadata rather than
+children so HIR translation can look them up by role.
+@End Reasoning
+
 Process called "parse_mapping_type" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_MAPPING
     proc consume with parser, SolidityLexer.TOKEN_LEFT_PAREN
@@ -1111,6 +1412,14 @@ End Process
 Note: ===================================================================
 Note: STATEMENT PARSING
 Note: ===================================================================
+
+@Reasoning:
+Dispatch table for Solidity statements: if, while, for, do-while, return,
+break, continue, emit, revert, try, brace blocks, and expression
+statements. break/continue are handled inline because they are single-
+keyword statements; everything else delegates. Expression statements are
+the catch-all when no keyword matches.
+@End Reasoning
 
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: If statement
@@ -1176,6 +1485,14 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Return proc parse_expression_statement from parser
 End Process
 
+@Reasoning:
+Parses `{ statement* }` as a SOL_BLOCK_STMT. Statements are appended as
+ordered children. Empty blocks are legal and produce a child-less
+SOL_BLOCK_STMT. Loop exits when the closing brace is seen or the parser
+runs out of tokens (unclosed block defensively returns whatever was
+collected).
+@End Reasoning
+
 Process called "parse_block" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_LEFT_BRACE
 
@@ -1195,6 +1512,14 @@ Process called "parse_block" takes parser as Integer returns Integer:
 
     Return block
 End Process
+
+@Reasoning:
+Parses `if (cond) then_stmt [else else_stmt]`. The condition is stored
+as "condition" metadata so it can be looked up by role; the two branches
+are children (then at index 0, else at index 1 if present). The
+ambiguous-else problem is resolved C-style by binding `else` to the
+nearest `if` because parse_statement is greedy on the next statement.
+@End Reasoning
 
 Process called "parse_if_statement" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_IF
@@ -1219,6 +1544,12 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
     Return if_node
 End Process
 
+@Reasoning:
+Parses `while (cond) body`. Condition lives in "condition" metadata,
+body is the sole child. Body may be either a single statement or a brace
+block — parse_statement handles both via its own dispatch.
+@End Reasoning
+
 Process called "parse_while_statement" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_WHILE
 
@@ -1234,6 +1565,13 @@ Process called "parse_while_statement" takes parser as Integer returns Integer:
 
     Return while_node
 End Process
+
+@Reasoning:
+Parses `do body while (cond);`. The trailing semicolon after the closing
+paren distinguishes do-while from a misplaced `while` after a standalone
+do — Solidity requires it. Body runs at least once; condition is checked
+after each iteration.
+@End Reasoning
 
 Process called "parse_do_while_statement" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_DO
@@ -1252,6 +1590,21 @@ Process called "parse_do_while_statement" takes parser as Integer returns Intege
 
     Return do_while_node
 End Process
+
+@Reasoning:
+Parses C-style `for (init; cond; update) body`. All three header
+clauses are optional — an empty clause is recorded as 0 in the
+corresponding metadata slot. Init is parsed as an expression statement
+(so it can be a declaration with `=`), condition as a plain expression,
+update as a plain expression.
+@End Reasoning
+
+@Implementation:
+For each header slot, peeks for the immediate `;` or `)`; if present,
+consumes it and leaves the slot at 0, otherwise calls the appropriate
+sub-parser and consumes the trailing separator. The body comes from
+parse_statement after the closing paren.
+@End Implementation
 
 Process called "parse_for_statement" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_FOR
@@ -1294,6 +1647,14 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
     Return for_node
 End Process
 
+@Reasoning:
+Parses `return [expression];`. The value is optional — `return;` is
+valid for void-returning functions and is encoded as a return node with
+no "value" metadata. Any value expression goes into "value" metadata
+rather than as a child for symmetry with break/continue (which are also
+SOL_*_STMT nodes with no children).
+@End Reasoning
+
 Process called "parse_return_statement" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_RETURN
 
@@ -1312,6 +1673,13 @@ Process called "parse_return_statement" takes parser as Integer returns Integer:
     Return return_node
 End Process
 
+@Reasoning:
+Parses `emit <EventCall(args)>;`. The call expression is the sole child
+of the emit statement. This isolates the event invocation under a
+discriminator that HIR translation can use to lower into EVM LOG opcodes
+rather than the regular CALL machinery.
+@End Reasoning
+
 Process called "parse_emit_statement" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_EMIT
 
@@ -1323,6 +1691,14 @@ Process called "parse_emit_statement" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_SEMICOLON
     Return emit_node
 End Process
+
+@Reasoning:
+Parses `revert [ErrorName(args)];` — either bare (revert with no
+information) or with a custom error call attached. The call form is
+detected by an immediately following identifier; otherwise the revert is
+recorded child-less and HIR translation emits an empty-data revert
+instruction.
+@End Reasoning
 
 Process called "parse_revert_statement" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_REVERT
@@ -1338,6 +1714,22 @@ Process called "parse_revert_statement" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_SEMICOLON
     Return revert_node
 End Process
+
+@Reasoning:
+Parses `try <ExternalCall>(args) [returns (params)] { body } catch [Name]
+(params) { body } ...`. The try expression is stored as "expression"
+metadata. Return-binding params (if `returns` present) and the try body
+become children, followed by one or more catch clauses appended by
+parse_catch_clauses.
+@End Reasoning
+
+@Implementation:
+Consumes `try`, parses the call as an expression. If `returns` follows,
+consumes parameter list and stores each parsed parameter as a child. The
+try body is parsed via parse_block and added as a child. Catch clauses
+are delegated to parse_catch_clauses which keeps appending until no
+TOKEN_CATCH remains.
+@End Implementation
 
 Process called "parse_try_statement" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_TRY
@@ -1383,6 +1775,14 @@ Process called "parse_try_statement" takes parser as Integer returns Integer:
     Return try_node
 End Process
 
+@Reasoning:
+Accumulator for one or more catch clauses on a try statement. Each catch
+becomes a SOL_CATCH_CLAUSE child appended to try_node. Solidity permits
+multiple catches per try (typed catches: `catch Error(string memory r)`
+and the unnamed catch-all). The error name is captured as an optional
+parameter inside the catch parenthesised list.
+@End Reasoning
+
 Process called "parse_catch_clauses" takes parser as Integer, try_node as Integer:
     While proc check with parser, SolidityLexer.TOKEN_CATCH:
         proc consume with parser, SolidityLexer.TOKEN_CATCH
@@ -1409,6 +1809,13 @@ Process called "parse_catch_clauses" takes parser as Integer, try_node as Intege
     End While
 End Process
 
+@Reasoning:
+Wraps an expression in a SOL_EXPRESSION_STMT and requires a trailing
+semicolon. This thin wrapper distinguishes expressions used for side
+effects (function calls, assignments) from expressions used as values
+inside other constructs.
+@End Reasoning
+
 Process called "parse_expression_statement" takes parser as Integer returns Integer:
     Let expr be proc parse_expression from parser
 
@@ -1424,9 +1831,25 @@ Note: ===================================================================
 Note: EXPRESSION PARSING
 Note: ===================================================================
 
+@Reasoning:
+Entry point for the operator-precedence chain. Solidity expression
+precedence (low to high) is: ternary → logical-or → logical-and →
+equality → comparison → additive → multiplicative → unary → postfix →
+primary. This single-call indirection exists so all callers route into
+the chain through one fixed name even if intermediate levels are
+reordered.
+@End Reasoning
+
 Process called "parse_expression" takes parser as Integer returns Integer:
     Return proc parse_ternary from parser
 End Process
+
+@Reasoning:
+Ternary `cond ? then : else`. Lowest-precedence expression layer below
+explicit assignment. Right-associative — `a ? b : c ? d : e` parses as
+`a ? b : (c ? d : e)` because the else branch recurses through
+parse_expression rather than parse_logical_or.
+@End Reasoning
 
 Process called "parse_ternary" takes parser as Integer returns Integer:
     Let expr be proc parse_logical_or from parser
@@ -1451,6 +1874,13 @@ Process called "parse_ternary" takes parser as Integer returns Integer:
     Return expr
 End Process
 
+@Reasoning:
+Left-associative `||`. Each iteration folds the running `left` and a
+freshly-parsed RHS into a new SOL_BINARY_EXPR with operator "||". Solidity
+short-circuits || at runtime; the AST records both operands and HIR
+translation emits the SC branch.
+@End Reasoning
+
 Process called "parse_logical_or" takes parser as Integer returns Integer:
     Let left be proc parse_logical_and from parser
 
@@ -1467,6 +1897,12 @@ Process called "parse_logical_or" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Left-associative `&&`. Same fold pattern as parse_logical_or but binds
+tighter, so `a || b && c` parses as `a || (b && c)`. Short-circuit
+semantics preserved by HIR translation, not by the parser.
+@End Reasoning
+
 Process called "parse_logical_and" takes parser as Integer returns Integer:
     Let left be proc parse_equality from parser
 
@@ -1482,6 +1918,12 @@ Process called "parse_logical_and" takes parser as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Left-associative `==` and `!=`. Both have identical precedence so the
+loop accepts either inside the same iteration. Loop terminates by
+returning left when neither equality token appears next.
+@End Reasoning
 
 Process called "parse_equality" takes parser as Integer returns Integer:
     Let left be proc parse_comparison from parser
@@ -1512,6 +1954,13 @@ Process called "parse_equality" takes parser as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Left-associative `<`, `<=`, `>`, `>=`. All four occupy the same
+precedence class. Operator-token-to-operator-string mapping captured in
+local `op` then used uniformly to build the SOL_BINARY_EXPR — keeps the
+node-build code identical across the four cases.
+@End Reasoning
 
 Process called "parse_comparison" takes parser as Integer returns Integer:
     Let left be proc parse_additive from parser
@@ -1552,6 +2001,12 @@ Process called "parse_comparison" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Left-associative `+` and `-`. Multiplicative recursion happens through
+parse_multiplicative so `a + b * c` correctly groups as `a + (b * c)`
+even though both are left-associative at their own precedence level.
+@End Reasoning
+
 Process called "parse_additive" takes parser as Integer returns Integer:
     Let left be proc parse_multiplicative from parser
 
@@ -1580,6 +2035,14 @@ Process called "parse_additive" takes parser as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Left-associative `*`, `/`, `%`, `**`. Solidity treats `**` at the same
+multiplicative precedence as `*` rather than putting it higher — this
+matches the official grammar even though most languages give exponentiation
+higher precedence. Loop builds SOL_BINARY_EXPR nodes for each operator
+found.
+@End Reasoning
 
 Process called "parse_multiplicative" takes parser as Integer returns Integer:
     Let left be proc parse_unary from parser
@@ -1619,6 +2082,22 @@ Process called "parse_multiplicative" takes parser as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Prefix unary operators (`!`, `-`, `++`, `--`, `delete`) and the `new`
+expression. Right-associative — each operator recursively calls
+parse_unary so `--!x` correctly groups as `--(!x)`. Increment and
+decrement record a "prefix"="true" metadata flag so HIR translation can
+distinguish prefix vs postfix forms (postfix lives in parse_postfix).
+@End Reasoning
+
+@Implementation:
+If first token is `new`, delegates immediately to parse_new_expression.
+Otherwise matches each unary token and wraps the recursive result in a
+SOL_UNARY_EXPR. The recursive parse_unary call rather than parse_postfix
+is what gives right-associativity. If no unary leads, falls through to
+parse_postfix.
+@End Implementation
 
 Process called "parse_unary" takes parser as Integer returns Integer:
     Note: Unary operators
@@ -1677,6 +2156,22 @@ Process called "parse_unary" takes parser as Integer returns Integer:
 
     Return proc parse_postfix from parser
 End Process
+
+@Reasoning:
+Postfix operations layered onto a primary expression: `.member` member
+access, `[index]` array/mapping indexing, `(args)` function call, and
+trailing `++`/`--` (recorded with "prefix"="false" metadata). All four
+forms can chain: `obj.field[i](x)++` is one continuous postfix chain that
+ends only when no further postfix token is seen.
+@End Reasoning
+
+@Implementation:
+Loop wraps the running `expr` in successive SOL_MEMBER_EXPR /
+SOL_INDEX_EXPR / SOL_CALL_EXPR / SOL_UNARY_EXPR nodes as long as the
+next token is `.`, `[`, `(`, `++`, or `--`. Object/index/function are
+stored as metadata on the new node and the call-argument list is built
+as ordered children of the SOL_CALL_EXPR.
+@End Implementation
 
 Process called "parse_postfix" takes parser as Integer returns Integer:
     Let expr be proc parse_primary from parser
@@ -1764,6 +2259,14 @@ Process called "parse_postfix" takes parser as Integer returns Integer:
     Return expr
 End Process
 
+@Reasoning:
+Standalone call parser used by emit and revert statements where the
+caller must always be an identifier (event or error name). Differs from
+the call form in parse_postfix because the name itself becomes the node
+value rather than a separate "function" metadata pointer — these
+statements need to inspect the named target directly.
+@End Reasoning
+
 Process called "parse_call_expression" takes parser as Integer returns Integer:
     Let name be proc expect with parser, SolidityLexer.TOKEN_IDENTIFIER
 
@@ -1788,6 +2291,14 @@ Process called "parse_call_expression" takes parser as Integer returns Integer:
 
     Return call
 End Process
+
+@Reasoning:
+Parses `new <TypeName>[(args)]` — creates a fresh contract instance or
+dynamic array. The constructor argument list is optional (some types
+need none). Type name lives in the node value; arguments are ordered
+children. Contract `new` deploys a child contract; array `new` allocates
+storage.
+@End Reasoning
 
 Process called "parse_new_expression" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_NEW
@@ -1817,6 +2328,22 @@ Process called "parse_new_expression" takes parser as Integer returns Integer:
 
     Return new_expr
 End Process
+
+@Reasoning:
+Bottom layer of the expression-precedence chain. Produces a leaf node
+for every kind of atomic expression: number/string/hex/boolean literals,
+plain identifiers, parenthesised sub-expressions, array literals, and
+`payable(addr)` casts. Anything not matched returns 0 to allow callers to
+detect a parse-failure cheaply.
+@End Reasoning
+
+@Implementation:
+Token-driven if-cascade matching the literal/identifier/paren/bracket/
+payable token kinds. Parenthesised expressions re-enter parse_expression
+to give the inside its own precedence climb. The `payable(...)` form
+wraps its argument in a SOL_PAYABLE_EXPR distinct from a regular call so
+HIR translation can lower it to an address-conversion cast.
+@End Implementation
 
 Process called "parse_primary" takes parser as Integer returns Integer:
     Note: Number literal
@@ -1883,6 +2410,13 @@ Process called "parse_primary" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Parses `[expr, expr, ...]` as a SOL_ARRAY_LITERAL with elements as
+ordered children. Empty array literals (`[]`) are legal and produce a
+child-less node. Trailing commas are tolerated because the loop accepts
+either a closing bracket or a comma after each element.
+@End Reasoning
+
 Process called "parse_array_literal" takes parser as Integer returns Integer:
     proc consume with parser, SolidityLexer.TOKEN_LEFT_BRACKET
 
@@ -1909,6 +2443,13 @@ Note: ===================================================================
 Note: AST NODE UTILITIES
 Note: ===================================================================
 
+@Reasoning:
+Single allocation site for ASTNode. Children and metadata lists are
+created upfront (not lazily) because nearly every Solidity AST node
+accumulates at least one child or one metadata entry, so the optimisation
+of deferring list creation does not pay off here.
+@End Reasoning
+
 Process called "create_node" takes node_type as Integer, value as Integer returns Integer:
     Let node be a value of type ASTNode with
         node_type as node_type,
@@ -1919,9 +2460,29 @@ Process called "create_node" takes node_type as Integer, value as Integer return
     Return node
 End Process
 
+@Reasoning:
+Order-preserving append onto the children list. Source order is
+significant for statements inside blocks, parameters in lists, and array
+literal elements — list_append maintains insertion order.
+@End Reasoning
+
 Process called "add_child" takes node as ASTNode, child as Integer:
     proc list_append from ListCore with node.children, child
 End Process
+
+@Reasoning:
+Flat encoding of metadata: append key then value as two consecutive list
+entries. Lookup by key is a linear scan over even indices, which is fine
+because per-node metadata count is small (rarely more than 4-5 entries).
+Avoids the per-node overhead of a dictionary while preserving key/value
+semantics.
+@End Reasoning
+
+@Implementation:
+Two list_append calls in sequence — first key, then value. Even-indexed
+entries are keys, odd-indexed entries are the matching values. This is
+the storage convention; consumers iterate in pairs.
+@End Implementation
 
 Process called "set_metadata" takes node as ASTNode, key as Integer, value as Integer:
     Note: Store metadata as key-value pairs using flat list encoding
@@ -1935,9 +2496,22 @@ Note: ===================================================================
 Note: PARSER UTILITIES
 Note: ===================================================================
 
+@Reasoning:
+Position-indexed access to the current token. Wraps list_get so the
+storage representation can later change (e.g. cached pointer array) by
+editing this single function rather than every call site.
+@End Reasoning
+
 Process called "current_token" takes parser as Integer returns Integer:
     Return proc list_get from ListCore with parser.tokens, parser.position
 End Process
+
+@Reasoning:
+Non-consuming type predicate with explicit bounds guard. The
+position-vs-length check happens FIRST so that solidity_token_type cannot
+be called on an out-of-bounds index (which would dereference invalid
+memory in ListCore). Returns 0 cleanly at or past end-of-stream.
+@End Reasoning
 
 Process called "check" takes parser as Integer, token_type as Integer returns Integer:
     If parser.position is greater than or equal to parser.length:
@@ -1954,6 +2528,13 @@ Process called "check" takes parser as Integer, token_type as Integer returns In
     Return 0
 End Process
 
+@Reasoning:
+Increments the cursor by 1 unless already at end-of-stream, then returns
+the new current token. Returns-the-new-token semantics let callers
+chain `let next be proc advance ...` without a follow-up
+current_token call.
+@End Reasoning
+
 Process called "advance" takes parser as Integer returns Integer:
     If parser.position is less than parser.length:
         Set parser.position to parser.position plus 1
@@ -1962,12 +2543,25 @@ Process called "advance" takes parser as Integer returns Integer:
     Return proc current_token from parser
 End Process
 
+@Reasoning:
+Soft consume — if the current token matches, advance; otherwise leave
+position untouched without raising an error. Used at sites where the
+token presence is already known (called right after a successful check).
+@End Reasoning
+
 Process called "consume" takes parser as Integer, token_type as Integer:
     Let matches be proc check with parser, token_type
     If matches is equal to 1:
         proc advance from parser
     End If
 End Process
+
+@Reasoning:
+Like consume but matches by lexeme equality instead of by token type.
+Used for Solidity tokens the lexer emits generically (e.g. `for` in using
+directives or `=>` in mapping types) where the keyword identity must be
+verified.
+@End Reasoning
 
 Process called "consume_keyword" takes parser as Integer, keyword as Integer:
     Let current be proc current_token from parser
@@ -1979,6 +2573,13 @@ Process called "consume_keyword" takes parser as Integer, keyword as Integer:
     End If
 End Process
 
+@Reasoning:
+Captures the current token's lexeme value AND consumes the token. Used
+when the parser needs both the lexeme (to store as a node value/name)
+and the advance — combining them into one call removes a class of bugs
+where one was forgotten.
+@End Reasoning
+
 Process called "expect" takes parser as Integer, token_type as Integer returns Integer:
     Let current be proc current_token from parser
     Let value be proc solidity_token_value from SolidityLexer with current
@@ -1987,6 +2588,13 @@ Process called "expect" takes parser as Integer, token_type as Integer returns I
 
     Return value
 End Process
+
+@Reasoning:
+End-of-stream test with two exit conditions: position has reached the
+cached length OR the current token's type is TOKEN_EOF. Both checks are
+required because a well-formed token stream ends with an EOF sentinel
+while a malformed truncated stream may not.
+@End Reasoning
 
 Process called "not_at_end" takes parser as Integer returns Integer:
     If parser.position is greater than or equal to parser.length:
@@ -2007,21 +2615,52 @@ Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
 
+@Reasoning:
+Public top-level alias matching the naming convention shared by sibling
+frontends. Lets external callers stay decoupled from the internal
+parse_solidity_source name.
+@End Reasoning
+
 Process called "solidity_parse" takes source as Integer returns Integer:
     Return proc parse_solidity_source from source
 End Process
+
+@Reasoning:
+Accessor exposing the SOL_* discriminant to HIR translation passes that
+cannot see ASTNode layout directly. Encapsulation here is important
+because the struct's field order may change for cache locality without
+breaking external consumers.
+@End Reasoning
 
 Process called "solidity_ast_type" takes node as ASTNode returns Integer:
     Return node.node_type
 End Process
 
+@Reasoning:
+Accessor for the leaf-node lexeme (identifier text, operator symbol,
+literal value text, type name, etc.). Returns "" for interior nodes
+whose payload lives in children/metadata instead.
+@End Reasoning
+
 Process called "solidity_ast_value" takes node as ASTNode returns Integer:
     Return node.value
 End Process
 
+@Reasoning:
+Accessor returning the ListCore handle of the node's ordered children.
+Caller walks it with list_get/list_length; the handle remains owned by
+the ASTNode for lifetime purposes.
+@End Reasoning
+
 Process called "solidity_ast_children" takes node as ASTNode returns Integer:
     Return node.children
 End Process
+
+@Reasoning:
+Accessor returning the ListCore handle of the node's flat key/value
+metadata list. Callers iterate in pairs (index i = key, index i+1 = value)
+or use a helper that linearly searches by key.
+@End Reasoning
 
 Process called "solidity_ast_metadata" takes node as ASTNode returns Integer:
     Return node.metadata

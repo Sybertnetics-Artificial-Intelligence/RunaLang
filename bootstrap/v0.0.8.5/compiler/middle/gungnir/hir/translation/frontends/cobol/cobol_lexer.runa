@@ -257,15 +257,32 @@ Note: ==========================================================================
 Note: Lexer Creation and Initialization
 Note: ============================================================================
 
+@Reasoning:
+COBOL uniquely supports two source layouts: fixed-format (the historical
+mainframe layout with cols 1-6 = sequence number, col 7 = indicator,
+cols 8-72 = code area A/B, cols 73-80 = identification) and free-format
+(modern, column-irrelevant). The lexer must know the mode at construction
+because tokenisation differs at the column-7 indicator (`*` = comment
+line, `-` = continuation, `D` = debug, space = normal). We auto-detect by
+sampling indicator columns from the first ten lines - heuristic, but
+robust because any modern free-format file lacks the column-7 dense
+indicator pattern that fixed-format ALWAYS exhibits. The arena handle
+is stored once so every token's lexeme allocation comes out of the same
+pool, freeing in O(1) at end-of-compilation.
+@End Reasoning
+
+@Implementation:
+Allocates a 64-byte lexer record (8 slots * 8 bytes) via Layout.allocate;
+returns 0 on failure. Reads source_len via StringCore.string_length.
+Writes: 0=source ptr, 8=position=0, 16=source_len, 24=line=1, 32=column=1,
+48=arena. Calls detect_fixed_format(source, source_len) and stores the
+0/1 result at offset 56. If source_len > 0, reads the first byte via
+string_char_at(source, 0) and writes it at offset 40 (current_char);
+empty sources write 0 at offset 40 (immediate-EOF state).
+@End Implementation
+
 Process called "create_cobol_lexer" takes source as Integer, arena as Integer returns Integer:
     Note: Create COBOL lexer from source code
-
-    @Reasoning:
-    Initialize COBOL lexer with source code and arena for token allocation.
-    Detect fixed-format vs free-format based on source structure.
-    Fixed-format COBOL uses columns 1-6 for sequence numbers, column 7 for
-    indicator (comment, continuation), columns 8-72 for code.
-    @End Reasoning
 
     Let lexer_size be 64  Note: 8 fields × 8 bytes
     Let lexer be proc allocate from Layout with lexer_size
@@ -298,16 +315,32 @@ Process called "create_cobol_lexer" takes source as Integer, arena as Integer re
     Return lexer
 End Process
 
+@Reasoning:
+Format detection is heuristic-based because fixed and free formats share
+the same lexical alphabet - we can only distinguish by COLUMN PATTERNS,
+specifically the column-7 indicator zone. A fixed-format source almost
+always has at least a few `*` (comment) lines in the first dozen lines.
+We sample up to 10 lines and require 3+ column-7 indicators (`*` or `-`)
+to declare fixed format. Sources shorter than 72 characters cannot
+possibly be fixed-format (cols 73-80 are mandatory in that layout)
+so we early-out to free-format. False negatives (treating fixed as free)
+break tokenisation; false positives (treating free as fixed) just enforce
+unused column constraints, which is safe.
+@End Reasoning
+
+@Implementation:
+Returns 0 if length < 72 (too short to be fixed). Initialises
+lines_checked=0, fixed_indicators=0, pos=0. Outer loop: if
+lines_checked >= 10, returns 1 when indicators > 3 else 0. Reads
+col7_pos = pos + 6 (0-indexed column 7); if in-range, reads the byte;
+if it equals 42 ('*') or 45 ('-'), bumps fixed_indicators. Inner loop
+walks forward until newline (10) is consumed, bumping lines_checked.
+After the outer loop falls through (EOF before 10 lines), returns 1
+when indicators > 2, else 0 (looser threshold for short files).
+@End Implementation
+
 Process called "detect_fixed_format" takes source as Integer, length as Integer returns Integer:
     Note: Detect if COBOL source is fixed-format
-
-    @Reasoning:
-    Fixed-format COBOL has specific column structure. Look for indicators:
-    - Column 7 has '*' or '-' (comment or continuation)
-    - Column 1-6 contains sequence numbers
-    - Most code starts at column 8 or later
-    Check first few lines to determine format.
-    @End Reasoning
 
     If length is less than 72:
         Return 0  Note: Too short for fixed-format
@@ -360,13 +393,25 @@ Process called "detect_fixed_format" takes source as Integer, length as Integer 
     Return 0
 End Process
 
+@Reasoning:
+The lexer record itself is the only thing this function frees. Token
+lexemes (the variable-length identifier/literal text) all live in the
+arena that the caller passed at construction - freeing the arena (which
+the CALLER does at end-of-translation-unit) frees every lexeme in O(1).
+Idempotent on null lexer so callers can free unconditionally without
+needing a flag to track whether construction succeeded.
+@End Reasoning
+
+@Implementation:
+If lexer is non-zero, calls Layout.deallocate to release the 64-byte
+record. Always returns 1. No iteration over tokens - they're not stored
+in the lexer (it produces them on demand via next_token); each token
+the caller still holds is the caller's responsibility, or lives in
+the arena.
+@End Implementation
+
 Process called "destroy_cobol_lexer" takes lexer as Integer returns Integer:
     Note: Destroy COBOL lexer
-
-    @Reasoning:
-    Free lexer structure. Token lexemes are arena-allocated and will be
-    freed when arena is destroyed.
-    @End Reasoning
 
     If lexer is not equal to 0:
         proc deallocate from Layout with lexer
@@ -379,14 +424,28 @@ Note: ==========================================================================
 Note: Character Navigation
 Note: ============================================================================
 
+@Reasoning:
+The lexer's per-character workhorse. Maintains 1-based line/column
+tracking so any token created downstream carries the source coordinates
+used in error messages. Newlines reset column to 1 and bump line - we
+intentionally process the newline AFTER reading it (newline IS column 1
+of the next line in our model), which matches how most editors number
+positions. Column tracking is critical for fixed-format mode where
+indicator-column detection needs the running column to know when we're
+in cols 1-6 (sequence), col 7 (indicator), or cols 8-72 (code).
+@End Reasoning
+
+@Implementation:
+Reads position (offset 8), length (offset 16), current_char (offset 40).
+If current_char equals 10 (newline): reads line at offset 24, writes
+line+1, and resets column at offset 32 to 1. Otherwise reads column and
+writes column+1. Bumps position by 1 and persists at offset 8. If new
+position < length, reads next_char via string_char_at and writes it at
+offset 40; otherwise writes 0 (EOF sentinel) at offset 40. Returns 1.
+@End Implementation
+
 Process called "advance" takes lexer as Integer returns Integer:
     Note: Move to next character
-
-    @Reasoning:
-    Advance position and update line/column tracking. Handle newline
-    characters for proper line counting. In fixed-format mode, track
-    column position for indicator area detection.
-    @End Reasoning
 
     Let position be proc memory_get_int64 from Layout with lexer, 8
     Let length be proc memory_get_int64 from Layout with lexer, 16
@@ -417,13 +476,25 @@ Process called "advance" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Constant-time lookahead without mutating the lexer state. The parameter
+is an OFFSET (0 = current, 1 = next, 2 = the one after, ...) rather than
+absolute position - this matches how the COBOL token scanners want to
+ask "what's the character after this one?" Out-of-range peeks return 0
+(the EOF sentinel), letting callers treat peek-past-EOF uniformly with
+peek-at-EOF without special-casing.
+@End Reasoning
+
+@Implementation:
+Reads position (offset 8) and length (offset 16). Computes
+peek_pos = position + offset. If peek_pos >= length returns 0 (EOF).
+Otherwise reads source pointer (offset 0) and returns
+string_char_at(source, peek_pos). Pure read - the lexer state is
+untouched.
+@End Implementation
+
 Process called "peek" takes lexer as Integer, offset as Integer returns Integer:
     Note: Look ahead at character at offset
-
-    @Reasoning:
-    Peek ahead without advancing position. Used for multi-character
-    operators and keyword lookahead.
-    @End Reasoning
 
     Let position be proc memory_get_int64 from Layout with lexer, 8
     Let length be proc memory_get_int64 from Layout with lexer, 16
@@ -443,6 +514,21 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+Inlined ASCII range test rather than a stdlib call so the scanner's tight
+character-dispatch loop stays branch-predictable and free of cross-module
+indirection. COBOL number literals (PIC 9, level numbers, picture counts)
+hit this on every column, so it must remain a leaf function with no
+allocation.
+@End Reasoning
+
+@Implementation:
+Two nested range comparisons against the ASCII codepoints 48 ('0') and 57
+('9'). Returns 1 only when both bounds are satisfied; falls through to 0
+otherwise. The nested form (rather than a single boolean and) matches the
+shape required by Runa's emitted code path which compiles each comparison
+independently.
+@End Implementation
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is digit (0-9)
 
@@ -455,13 +541,25 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+COBOL-85's identifier alphabet is strict: A-Z, a-z, digits (in non-leading
+position), and hyphen. Underscore is NOT in standard COBOL - some
+extensions allow it but bootstrap COBOL targets the standard. We separate
+is_alpha from is_alphanumeric so the leading-character test (which forbids
+digits and hyphens) can reuse just is_alpha while the body test (which
+allows both) uses is_alphanumeric. The two ASCII ranges (uppercase 65-90,
+lowercase 97-122) are tested independently rather than combined into a
+single boolean to match Runa's nested-If codegen idiom.
+@End Reasoning
+
+@Implementation:
+Two nested range tests. First: if char >= 65 and char <= 90 (A..Z),
+returns 1. Second: if char >= 97 and char <= 122 (a..z), returns 1.
+Falls through to Return 0. Pure function - no lexer state touched.
+@End Implementation
+
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
-
-    @Reasoning:
-    COBOL identifiers can contain letters (A-Z, a-z) and hyphens (-).
-    Underscores are not standard in COBOL-85.
-    @End Reasoning
 
     If char is greater than or equal to 65:
         If char is less than or equal to 90:
@@ -478,13 +576,26 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+The continuation-character test for COBOL identifier scanning. After a
+leading is_alpha character, any subsequent character that's alphanumeric
+OR a hyphen continues the identifier. Hyphen-in-identifier is one of
+COBOL's most distinctive features (e.g., `MAIN-PROGRAM`, `EMPLOYEE-NUMBER`)
+and forces a token-scanner design that cannot use simple is_alnum tests
+- we explicitly include codepoint 45. We do NOT include underscore here
+because COBOL-85 forbids it.
+@End Reasoning
+
+@Implementation:
+First tests via is_digit; on match returns 1. Then tests via is_alpha;
+on match returns 1. Final test: if char == 45 (hyphen), returns 1.
+Otherwise returns 0. The ordering (digit/alpha/hyphen) is mildly
+optimized for hot identifier scanning - digits and alphas dominate the
+character mix; hyphens are rarer.
+@End Implementation
+
 Process called "is_alphanumeric" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric or hyphen
-
-    @Reasoning:
-    COBOL identifiers: letters, digits, and hyphens. Cannot start with
-    hyphen or digit.
-    @End Reasoning
 
     Let is_digit_result be proc is_digit from char
     If is_digit_result is equal to 1:
@@ -503,6 +614,21 @@ Process called "is_alphanumeric" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Only the three whitespace codepoints the COBOL fixed-format lexer actually
+consumes are tested here. Form-feed and vertical tab are excluded
+deliberately because COBOL-85 column layout (cols 1-6 sequence, 7 indicator,
+8-72 area A/B) treats them as data, not separators, so accepting them here
+would corrupt continuation-line handling.
+@End Reasoning
+
+@Implementation:
+Three independent equality tests against ASCII 32 (space), 9 (tab), and 10
+(newline). Each match returns 1 immediately; falls through to 0 (CR is
+checked in the calling site of the line-end logic, not here, to keep this
+helper aligned with what the column tracker considers a horizontal
+separator).
+@End Implementation
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace
 
@@ -529,13 +655,27 @@ Note: ==========================================================================
 Note: Whitespace and Comment Handling
 Note: ============================================================================
 
+@Reasoning:
+COBOL is whitespace-tolerant - any number of spaces, tabs, newlines, or
+carriage returns can appear between tokens (in both fixed and free
+formats). Fixed-format does have column-specific rules but those are
+applied by the higher-level next_token dispatcher when it encounters
+the start of a new line; once we know we're scanning whitespace WITHIN
+a line, all four whitespace codepoints are skippable. EOF (current_char
+== 0) breaks the loop immediately so we don't advance past end of
+source.
+@End Reasoning
+
+@Implementation:
+Reads current_char (offset 40). Loop: when current_char == 0 (EOF) exit.
+Calls is_whitespace(current_char); if returns 0 (non-whitespace), the
+function returns 1 immediately. Otherwise calls advance(lexer) and
+refreshes current_char from offset 40. Each iteration consumes exactly
+one whitespace byte and re-tests. Always returns 1.
+@End Implementation
+
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
-
-    @Reasoning:
-    In fixed-format COBOL, respect column boundaries. In free-format,
-    skip all whitespace normally.
-    @End Reasoning
 
     Let current_char be proc memory_get_int64 from Layout with lexer, 40
 
@@ -552,13 +692,26 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+COBOL comments are line-rest comments in both formats but with different
+introducers: fixed-format uses `*` in col 7 (the whole line is a
+comment), free-format and inline use `*>`. From this procedure's
+viewpoint the introducer has already been consumed by the caller; our
+job is simply "advance past everything up to and including the next
+newline". This makes the procedure symmetric for both comment styles
+and reduces dispatcher complexity in next_token.
+@End Reasoning
+
+@Implementation:
+Reads current_char from offset 40. Loop while current_char != 0 (EOF):
+if it equals 10 (newline), calls advance to consume the newline and
+returns 1. Otherwise calls advance and refreshes current_char. EOF
+without a trailing newline still returns 1 - end of source ends the
+comment.
+@End Implementation
+
 Process called "skip_comment" takes lexer as Integer returns Integer:
     Note: Skip COBOL comment (asterisk in column 7 or inline)
-
-    @Reasoning:
-    Fixed-format COBOL: '*' in column 7 makes entire line a comment.
-    Free-format and inline: '*>' starts comment to end of line.
-    @End Reasoning
 
     Let current_char be proc memory_get_int64 from Layout with lexer, 40
 
@@ -580,13 +733,31 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Token construction is the lexer's commitment point - every successful
+token call corresponds to one parse-tree leaf. The lexeme (the actual
+source text the token covers) is copied OUT of the source string into
+a freshly allocated buffer so that the original source can be freed
+or modified without affecting tokens already produced. Allocation
+failure mid-construction must free the partial token; otherwise we leak
+the 32-byte token record. Zero-length tokens (start_pos == end_pos)
+take the no-lexeme path, identical to create_simple_token's record.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte token record. Returns 0 on failure. Writes type at
+offset 0, line (lexer offset 24) at token offset 16, column (lexer
+offset 32) at token offset 24. Computes lexeme_len = end_pos - start_pos.
+If lexeme_len > 0: allocates lexeme_len+1 bytes; on failure frees the
+token and returns 0. Loops i in 0..lexeme_len-1 copying byte-by-byte
+via string_char_at(source, start_pos+i) and memory_set_byte(lexeme, i,
+char). Writes null terminator at lexeme[lexeme_len], stores the lexeme
+pointer at token offset 8. Otherwise (zero-length): writes 0 at offset
+8. Returns the token handle.
+@End Implementation
+
 Process called "create_token" takes lexer as Integer, type as Integer, start_pos as Integer, end_pos as Integer returns Integer:
     Note: Create token with lexeme from source range
-
-    @Reasoning:
-    Allocate token structure and copy lexeme from source to arena.
-    Store line and column for error reporting.
-    @End Reasoning
 
     Let token_size be 32  Note: 4 fields × 8 bytes
     Let token be proc allocate from Layout with token_size
@@ -634,13 +805,25 @@ Process called "create_token" takes lexer as Integer, type as Integer, start_pos
     Return token
 End Process
 
+@Reasoning:
+Optimised constructor for fixed-shape tokens whose meaning is fully
+determined by their type constant: punctuation (period, comma,
+parentheses), structural markers, and operator tokens. Skipping the
+lexeme allocation reduces both heap churn and downstream lookup cost
+- parsers that see lexeme==0 know to use the type constant directly
+for matching rather than string-comparing the lexeme. Source position
+is still recorded so error messages can point at the correct column.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte token record. Returns 0 on failure. Writes type
+at offset 0, 0 at offset 8 (no lexeme). Reads line (lexer offset 24)
+and column (lexer offset 32), writing them at token offsets 16 and 24.
+Returns the token handle.
+@End Implementation
+
 Process called "create_simple_token" takes lexer as Integer, type as Integer returns Integer:
     Note: Create token without lexeme (for single-character tokens)
-
-    @Reasoning:
-    Single-character tokens like period, comma, parentheses don't need
-    lexeme storage.
-    @End Reasoning
 
     Let token_size be 32
     Let token be proc allocate from Layout with token_size
@@ -665,13 +848,31 @@ Note: ==========================================================================
 Note: Number Tokenization
 Note: ============================================================================
 
+@Reasoning:
+COBOL-85 numeric literals are pleasantly simple: an optional sign
+(`+` or `-`), an integer part, an optional decimal point and fractional
+part. There is NO scientific notation in standard COBOL (extensions
+add it but bootstrap COBOL targets the standard), no hex/octal/binary
+prefixes, no underscore digit separators. The lexer eats the longest
+matching sequence and produces a TOKEN_NUMBER whose lexeme is the
+verbatim source text - downstream typing (PIC clause) determines how
+to interpret it (integer vs decimal vs binary-coded-decimal).
+@End Reasoning
+
+@Implementation:
+Captures position (offset 8) as start_pos and current_char (offset 40).
+If current_char equals 43 ('+') or 45 ('-'), advances and refreshes
+current_char (only one sign allowed). Enters digit loop: while
+current_char != 0, calls is_digit; if returns 0 control falls through
+the inner If (the Note: comments mark the break path used by Runa's
+codegen). Advances on each digit. If current_char equals 46 ('.'),
+advances and repeats the digit loop for the fractional part. Captures
+end_pos (offset 8 again) and calls create_token(lexer, TOKEN_NUMBER,
+start_pos, end_pos).
+@End Implementation
+
 Process called "tokenize_number" takes lexer as Integer returns Integer:
     Note: Tokenize numeric literal
-
-    @Reasoning:
-    COBOL numbers: integer (123), decimal (123.45), signed (+123, -45).
-    No scientific notation in standard COBOL-85.
-    @End Reasoning
 
     Let position be proc memory_get_int64 from Layout with lexer, 8
     Let start_pos be position
@@ -732,13 +933,32 @@ Note: ==========================================================================
 Note: String Tokenization
 Note: ============================================================================
 
+@Reasoning:
+COBOL string literals accept either single quotes (`'TEXT'`) or double
+quotes (`"TEXT"`); the opening quote determines the closing-quote
+character for this literal (you cannot mix). The standard escape for
+an embedded quote is the doubled-quote convention (`'It''s'` =
+`It's`), no backslash escapes - that's a deliberate design choice
+from COBOL's punched-card heritage where backslash wasn't widely
+available. Unterminated strings (EOF before close quote) produce
+TOKEN_ERROR_TOKEN rather than failing silently, letting the parser
+report a precise diagnostic.
+@End Reasoning
+
+@Implementation:
+Captures start_pos and current_char (the opening quote, stored as
+quote_char so the doubled-escape test can use it). Calls advance to
+skip the opening quote. Loop until EOF: if current_char equals
+quote_char, advances and peeks the next character; if next_char equals
+quote_char too (doubled escape), advances and continues the loop; else
+emits TOKEN_STRING with create_token(lexer, TOKEN_STRING, start_pos,
+end_pos) where end_pos is the post-close-quote position. Non-quote
+characters are simply advanced over. EOF exit produces
+TOKEN_ERROR_TOKEN at the partial range.
+@End Implementation
+
 Process called "tokenize_string" takes lexer as Integer returns Integer:
     Note: Tokenize string literal
-
-    @Reasoning:
-    COBOL strings use either single quotes ('STRING') or double quotes ("STRING").
-    Handle escaped quotes ('' or "").
-    @End Reasoning
 
     Let position be proc memory_get_int64 from Layout with lexer, 8
     Let start_pos be position
@@ -782,13 +1002,28 @@ Note: ==========================================================================
 Note: Identifier and Keyword Tokenization
 Note: ============================================================================
 
+@Reasoning:
+Two-stage tokenisation: first scan the longest is_alphanumeric run
+starting from current position (caller has already verified the first
+character is is_alpha), then test the resulting text against the
+keyword table. If it matches a keyword, emit that specific TOKEN_*;
+otherwise emit TOKEN_IDENTIFIER. Doing the keyword lookup HERE rather
+than in the parser means the parser sees structurally pre-classified
+tokens, which simplifies the grammar dramatically (no "is this token
+the IDENTIFIER 'DATA' or the keyword DATA?" ambiguity).
+@End Reasoning
+
+@Implementation:
+Captures start_pos (offset 8) and current_char (offset 40). Loops:
+calls is_alphanumeric on current_char; advances on match, breaks
+otherwise. Captures end_pos. Calls match_keyword(lexer, start_pos,
+end_pos); if returns non-zero (a keyword TOKEN_* constant), creates
+and returns a keyword token via create_token. Otherwise creates and
+returns TOKEN_IDENTIFIER via create_token.
+@End Implementation
+
 Process called "tokenize_identifier" takes lexer as Integer returns Integer:
     Note: Tokenize identifier or keyword
-
-    @Reasoning:
-    COBOL identifiers: letters, digits, hyphens. Cannot start with digit or hyphen.
-    Convert to uppercase for keyword matching (COBOL is case-insensitive).
-    @End Reasoning
 
     Let position be proc memory_get_int64 from Layout with lexer, 8
     Let start_pos be position
@@ -820,14 +1055,33 @@ Process called "tokenize_identifier" takes lexer as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+COBOL-85 has 400+ reserved words; checking each one with a naive linear
+loop would do ~400 string comparisons per identifier. We first-letter-
+bucket: compute the upper-case form of the identifier's first byte
+once, then only test keywords starting with that letter. This reduces
+the average comparison count by ~25x for English keyword frequency.
+Case-insensitivity is intrinsic to COBOL - `Data`, `DATA`, `data`, `DaTa`
+all reference the same keyword - so we upper-case the first char (and
+the per-keyword matcher upper-cases the rest) before comparing.
+Returning 0 (not a keyword) lets tokenize_identifier fall through to
+TOKEN_IDENTIFIER without an explicit error path.
+@End Reasoning
+
+@Implementation:
+Reads source pointer (lexer offset 0). Computes len = end_pos -
+start_pos. Reads first_char at source+start_pos, calls
+to_upper(first_char) -> first_upper. Branches on first_upper against
+ASCII codepoints: 68 ('D') -> tests DATA, DIVISION, DISPLAY, DIVIDE,
+DELETE via match_keyword_exact(source, start_pos, len, "DATA"); each
+match returns the corresponding TOKEN_* constant. Similar branches
+for 73 ('I'), 80 ('P'), 77 ('M'), ... covering all keyword
+introducer letters. Falls through to Return 0 for unknown first
+letters or no matches.
+@End Implementation
+
 Process called "match_keyword" takes lexer as Integer, start_pos as Integer, end_pos as Integer returns Integer:
     Note: Match identifier against COBOL keywords
-
-    @Reasoning:
-    COBOL has 100+ keywords. Perform case-insensitive matching.
-    Return token type constant if keyword, 0 if not a keyword.
-    This is a comprehensive keyword matcher for production COBOL support.
-    @End Reasoning
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let len be end_pos minus start_pos
@@ -1356,6 +1610,22 @@ Process called "match_keyword" takes lexer as Integer, start_pos as Integer, end
     Return 0  Note: Not a keyword
 End Process
 
+@Reasoning:
+COBOL keyword identification needs to honour two invariants: exact length
+match (no prefix matches, since FILE and FILES are distinct reserved words)
+and case-insensitive comparison (PERFORM/perform/Perform must all hit). This
+helper enforces both via a length gate before the per-character fold loop,
+avoiding an out-of-bounds read past the candidate token's recorded length.
+@End Reasoning
+
+@Implementation:
+Length gate: return 0 immediately if the candidate token length differs from
+the keyword literal length. Otherwise loop i in [0, len), folding both bytes
+to uppercase via to_upper and comparing them. The source slice is addressed
+by (start + i) so the caller can pass the original source buffer without
+copying, while the keyword string is its own buffer indexed from 0. Returns
+1 only when all len byte pairs agree post-fold.
+@End Implementation
 Process called "match_keyword_exact" takes source as Integer, start as Integer, len as Integer, keyword as Integer returns Integer:
     Note: Case-insensitive exact keyword match
 
@@ -1417,13 +1687,36 @@ Note: ==========================================================================
 Note: Main Tokenization Function
 Note: ============================================================================
 
+@Reasoning:
+The top-level token dispatcher. Order of testing matters because the
+character classes overlap: a digit can start a number OR be part of an
+identifier (only if NOT the first character - but the parser handles
+that), a `+` or `-` can be a sign on a number OR a standalone operator
+(distinguished by what follows: digit -> sign, non-digit -> operator),
+and `*>` opens an inline comment that requires two-character lookahead.
+We dispatch on current_char with explicit lookahead via peek() rather
+than maintaining a separate FSM, because the COBOL grammar's first-
+character / second-character disambiguation is shallow (1 or 2
+characters of lookahead always suffices).
+@End Reasoning
+
+@Implementation:
+Calls skip_whitespace. Reads current_char (offset 40). If 0 (EOF),
+returns create_simple_token(lexer, TOKEN_EOF). If 42 ('*'), peeks
+offset 1; if peek == 62 ('>'), advances past `*>`, calls skip_comment,
+then RECURSES into next_token for the next non-comment token. Tests
+is_digit(current_char) -> tokenize_number. Tests current_char == 43
+('+') or 45 ('-') with one-byte lookahead for digit-start -> sign
+prefix; if peek is digit, falls through to tokenize_number. Tests
+current_char == 39 or 34 (quotes) -> tokenize_string. Tests
+is_alpha(current_char) -> tokenize_identifier. Then a sequence of
+exact-codepoint tests for single-character tokens (46=`.`, 44=`,`,
+40=`(`, 41=`)`, 43=`+`, ...) each creating a TOKEN_* via
+create_simple_token and advancing.
+@End Implementation
+
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
-
-    @Reasoning:
-    Main tokenization dispatcher. Handles all COBOL token types including
-    keywords, identifiers, numbers, strings, operators, and comments.
-    @End Reasoning
 
     proc skip_whitespace from lexer
 

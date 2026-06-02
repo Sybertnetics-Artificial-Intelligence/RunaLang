@@ -187,6 +187,21 @@ Note: ==========================================================================
 Note: Lexer Structure
 Note: ============================================================================
 
+@Reasoning:
+Minimal scanner state for a stream-based lexer: just enough to know where
+we are (position, line, column), what we're looking at (current_char),
+and the bounds (length) of the source buffer. No layout stack is needed
+because TypeScript is brace-based, not indentation-sensitive like
+Haskell/Python.
+@End Reasoning
+
+@Implementation:
+6 x i64 record (48 bytes). offsets: 0 = source string handle, 8 = byte
+position, 16 = source length cache, 24 = current_char (0 marks EOF in
+this scanner), 32 = 1-based line, 40 = 1-based column. Layout matches
+create_lexer's 48-byte allocation exactly.
+@End Implementation
+
 Type called "TypeScriptLexer":
     source as Integer          Note: Source code string
     position as Integer        Note: Current position in source
@@ -200,6 +215,20 @@ Note: ==========================================================================
 Note: Token Structure
 Note: ============================================================================
 
+@Reasoning:
+Tokens carry the discriminant plus source span info; lexeme is a
+substring handle pointing into the source buffer so we don't copy bytes
+on the hot path. This is the universal token shape consumed by the
+TypeScript parser stage.
+@End Reasoning
+
+@Implementation:
+4 x i64 record (32 bytes). offsets: 0 = type constant (TOKEN_* above),
+8 = lexeme string handle (may be a freshly-allocated substring), 16 =
+1-based line, 24 = 1-based column. Layout matches create_token's 32-byte
+allocation exactly.
+@End Implementation
+
 Type called "Token":
     type as Integer      Note: Token type constant
     lexeme as Integer    Note: Token text (string pointer)
@@ -210,6 +239,21 @@ End Type
 Note: ============================================================================
 Note: Lexer Creation and Management
 Note: ============================================================================
+
+@Reasoning:
+Allocates the lexer record and primes the cursor at the first character.
+Line and column start at 1 (the conventional 1-based reporting used by
+TypeScript tooling). The current_char field is preloaded so the first
+call to next_token doesn't need an explicit advance.
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes via Layout. Returns 0 on allocation failure. Writes
+source handle (0), position=0 (8), source_length (16), line=1 (32),
+column=1 (40), and the first character (24) — read via memory_get_byte
+because source is treated as raw bytes here. An empty source leaves
+current_char=0 (EOF sentinel).
+@End Implementation
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create TypeScript lexer with source code
@@ -240,6 +284,17 @@ Process called "create_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+The lexer record holds no owned heap allocations (the source string is
+borrowed), so destruction is a single deallocate of the record itself.
+Tokens emitted by the lexer are independently owned by the parser.
+@End Reasoning
+
+@Implementation:
+Null guard then Layout.deallocate. Returns 1 unconditionally; callers
+that need to detect double-free should track liveness themselves.
+@End Implementation
+
 Process called "destroy_lexer" takes lexer as Integer returns Integer:
     Note: Destroy TypeScript lexer
 
@@ -253,6 +308,23 @@ End Process
 Note: ============================================================================
 Note: Character Navigation
 Note: ============================================================================
+
+@Reasoning:
+Single-step cursor advance: increments position, reloads current_char,
+bumps column. EOF detection sets current_char to 0 so callers can compare
+against the same sentinel as the initial empty-source case in
+create_lexer. Line tracking is handled by skip_whitespace/skip_comment
+when they consume newlines, not here.
+@End Reasoning
+
+@Implementation:
+Loads position (8) and length (16), increments position and writes it
+back. If past end, writes current_char=0 and returns 0. Otherwise reads
+the next byte via memory_get_byte and stores it at offset 24. Bumps
+column at offset 40 by 1 — column resets are NOT done here because this
+function doesn't see whether the character it stepped over was a newline
+(skip_whitespace handles that).
+@End Implementation
 
 Process called "advance" takes lexer as Integer returns Integer:
     Note: Move to next character and return it
@@ -279,6 +351,18 @@ Process called "advance" takes lexer as Integer returns Integer:
     Return next_char
 End Process
 
+@Reasoning:
+Multi-character operators (=== , !== , >>>=, ...) require k-character
+lookahead so the scanner can disambiguate before committing. peek is
+non-consuming and bounds-safe.
+@End Reasoning
+
+@Implementation:
+Computes peek_pos = position + offset (no negative-offset support;
+callers pass 1..3). Returns 0 past EOF (matching current_char's EOF
+sentinel); otherwise reads the byte at peek_pos via memory_get_byte.
+@End Implementation
+
 Process called "peek" takes lexer as Integer, offset as Integer returns Integer:
     Note: Look ahead at character without consuming it
 
@@ -300,6 +384,18 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII '0'..'9' predicate used by scan_number. Kept separate from
+is_alphanumeric so identifier scanning and numeric scanning can call
+into one shared digit definition.
+@End Reasoning
+
+@Implementation:
+Nested range test against ASCII 48..57. Returns 1 only when both
+inequalities hold, 0 otherwise. Does not handle hex/oct digits — number
+prefix dispatch happens in scan_number.
+@End Implementation
+
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is a digit (0-9)
 
@@ -311,6 +407,19 @@ Process called "is_digit" takes char as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+JavaScript/TypeScript identifier-start predicate. Critically includes
+`$` (36) and `_` (95) per ECMAScript spec — both are legal first
+characters in identifiers like `$jquery` or `_private`.
+@End Reasoning
+
+@Implementation:
+Four explicit cases: ASCII 65..90 (A-Z), 97..122 (a-z), equality with 95
+(underscore), and equality with 36 (dollar). Returns 1 on first match,
+0 otherwise. Unicode identifier characters are NOT handled by the
+bootstrap lexer.
+@End Implementation
 
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
@@ -338,6 +447,17 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-continuation predicate. After the first character (handled by
+is_alpha), subsequent characters may be digits as well. Composing the two
+primitive predicates keeps a single source of truth for both.
+@End Reasoning
+
+@Implementation:
+Calls is_alpha; on match returns 1 immediately. Otherwise returns the
+result of is_digit directly (short-circuit OR via early-return).
+@End Implementation
+
 Process called "is_alphanumeric" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
 
@@ -349,6 +469,18 @@ Process called "is_alphanumeric" takes char as Integer returns Integer:
     Let digit be proc is_digit from char
     Return digit
 End Process
+
+@Reasoning:
+"Whitespace" here intentionally excludes the line-feed character (10):
+skip_whitespace handles LF separately because it also needs to bump the
+line counter. Treating LF as whitespace here would lose the line break.
+@End Reasoning
+
+@Implementation:
+Three equality checks: 32 (space), 9 (tab), 13 (CR). Returns 1 on first
+match, 0 otherwise. Form-feed and vertical-tab are not recognised even
+though ECMAScript allows them — they do not appear in practical TS.
+@End Implementation
 
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace
@@ -372,6 +504,19 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Single allocation point for every token the scanner emits, keeping the
+record layout consistent with the Token type and making any future
+re-layout a one-place change.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes via Layout; returns 0 on allocation failure. Writes
+type at offset 0, lexeme handle at 8, line at 16, column at 24. Lexeme
+is borrowed — caller (typically a scan_* function) owns it and is
+responsible for ensuring it lives at least as long as the token does.
+@End Implementation
+
 Process called "create_token" takes type as Integer, lexeme as Integer, line as Integer, column as Integer returns Integer:
     Note: Create token with given properties
 
@@ -393,6 +538,30 @@ End Process
 Note: ============================================================================
 Note: Keyword Recognition
 Note: ============================================================================
+
+@Reasoning:
+After scan_identifier produces a lexeme, the lexer must decide whether
+it is one of TypeScript's ~70 reserved words (matching the spec plus
+TypeScript-only keywords like `interface`, `namespace`, `type`,
+`readonly`). A flat sequence of equality checks is used rather than a
+hash because string_equal is cheap and the cache locality of the linear
+form outperforms a hash table at this size.
+@End Reasoning
+
+@Implementation:
+Sequential strings_equal calls covering reserved words in alphabetical
+order: abstract, any, as, async, await, boolean, ..., yield. Each match
+returns its dedicated TOKEN_* constant. Falls through to TOKEN_IDENTIFIER
+when none match. Returning early on first match keeps the average path
+short — common identifiers fall through the whole table only once.
+@End Implementation
+
+@Performance_Hints:
+For pathological inputs (many identifier tokens), this is the hottest
+function in the lexer. A perfect-hash dispatch on the first character
+would cut comparisons by ~10x; the current implementation is kept linear
+for clarity and to avoid a separate codegen step.
+@End Performance_Hints
 
 Process called "check_keyword" takes lexeme as Integer returns Integer:
     Note: Check if identifier is a keyword, return token type or TOKEN_IDENTIFIER
@@ -714,6 +883,21 @@ Note: ==========================================================================
 Note: Token Scanning
 Note: ============================================================================
 
+@Reasoning:
+Identifiers begin with is_alpha (already verified by next_token) and
+continue with is_alphanumeric. The scan grabs the byte range from the
+recorded start position to the current position, then asks check_keyword
+whether the lexeme is in fact a reserved word.
+@End Reasoning
+
+@Implementation:
+Captures the start position before the loop. Loops calling advance until
+current_char fails is_alphanumeric. Computes end - start, extracts the
+substring from the source via StringCore.substring, dispatches the
+keyword check, and emits a token (TOKEN_IDENTIFIER if not a keyword)
+with the current line/column.
+@End Implementation
+
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Note: Scan identifier or keyword
 
@@ -742,6 +926,22 @@ Process called "scan_identifier" takes lexer as Integer returns Integer:
 
     Return token
 End Process
+
+@Reasoning:
+Recognises integer, decimal-fraction, and exponent forms. The float flag
+flips when either a fraction (`.digit`) or exponent (`e[+-]?digits`) is
+consumed, so the emitted token type can be TOKEN_INTEGER vs TOKEN_FLOAT.
+A dot followed by a non-digit is intentionally left unconsumed so it can
+be re-tokenised as a member-access operator.
+@End Reasoning
+
+@Implementation:
+Three loops: (1) integer part — digits only. (2) optional fraction —
+only entered when `.` is followed by a digit (peek+1 check), then digits
+consumed greedily; sets is_float=1. (3) optional exponent — `e`, then
+optional `+`/`-`, then digits; also sets is_float=1. Lexeme is sliced
+from source[start..end], token_type chosen between INTEGER and FLOAT.
+@End Implementation
 
 Process called "scan_number" takes lexer as Integer returns Integer:
     Note: Scan numeric literal (integer or float)
@@ -821,6 +1021,29 @@ Process called "scan_number" takes lexer as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+String literals are either '...' or "..." — the caller passes the
+expected closing quote so one implementation handles both. Escape
+sequences are NOT processed semantically here; the scanner just skips
+the byte after a backslash so the closing quote is detected correctly.
+The parser/HIR-builder is responsible for decoding escapes.
+@End Reasoning
+
+@Implementation:
+Records start+1 (skipping opening quote), advances into the string,
+then loops: break on EOF (current_char==0, unterminated), break on the
+quote byte, skip an additional byte after backslash 92, advance. After
+the loop, computes the lexeme via substring and consumes the closing
+quote with a final advance. Emits TOKEN_STRING_LITERAL with current
+line/column.
+@End Implementation
+
+@Security_Scope:
+Input is untrusted source text. Unterminated strings are handled
+gracefully via EOF detection, preventing infinite loops on malformed
+input. No buffer overflow risk because peek/advance are bounds-checked.
+@End Security_Scope
+
 Process called "scan_string" takes lexer as Integer, quote as Integer returns Integer:
     Note: Scan string literal
 
@@ -858,6 +1081,27 @@ Process called "scan_string" takes lexer as Integer, quote as Integer returns In
 
     Return token
 End Process
+
+@Reasoning:
+Template literals use backticks and support `${expr}` interpolation.
+The bootstrap scanner emits them as a single TOKEN_TEMPLATE_STRING and
+leaves interpolation parsing to a later pass; this avoids state-machine
+complexity in the lexer while preserving the full source text in the
+lexeme for the parser to re-process.
+@End Reasoning
+
+@Implementation:
+Mirrors scan_string but uses 96 (backtick) as the terminator. Unbounded
+on `${...}` expressions — the loop just walks to the closing backtick
+since interior `}` is not a terminator. Backslash escapes are skipped
+the same way as in scan_string. Emits TOKEN_TEMPLATE_STRING with the
+raw lexeme between the backticks.
+@End Implementation
+
+@Security_Scope:
+Untrusted input; unterminated templates (no closing backtick) are
+handled via EOF detection (current_char==0) to prevent runaway loops.
+@End Security_Scope
 
 Process called "scan_template_string" takes lexer as Integer returns Integer:
     Note: Scan template string literal (backtick strings)
@@ -897,6 +1141,20 @@ Process called "scan_template_string" takes lexer as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+Consumes both inline whitespace (handled by is_whitespace) and newlines
+(handled here so we can bump the line counter and reset column). Kept
+as a single function so callers don't need two phases between tokens.
+@End Reasoning
+
+@Implementation:
+Loop: if current_char passes is_whitespace, advance and continue. If
+current_char is 10 (LF), increment line at offset 32 and reset column
+at offset 40 to 1, then advance. Otherwise break. CR is treated as
+whitespace (so CR-LF and lone CR both skip without bumping the line
+counter twice).
+@End Implementation
+
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace and newlines
 
@@ -923,6 +1181,23 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Handles both `//` line comments and `/* */` block comments. Block
+comments must continue to update line/column state across newlines so
+the next real token gets accurate position info. Returning 1 signals
+the caller (next_token) to re-enter the dispatch loop because the
+comment was skipped.
+@End Reasoning
+
+@Implementation:
+First checks current_char is `/` (47); returns 0 immediately if not.
+Peek at next char: 47 = line comment (advance until LF or EOF, leaving
+LF for skip_whitespace), 42 = block comment (advance past `/*`, walk
+forward; on LF update line/column; on `*` followed by `/`, advance
+past `*/` and break). Returns 1 if a comment was consumed, 0 if the
+leading `/` was a division operator instead.
+@End Implementation
 
 Process called "skip_comment" takes lexer as Integer returns Integer:
     Note: Skip single-line or multi-line comment
@@ -984,6 +1259,23 @@ Process called "skip_comment" takes lexer as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Main dispatch function called by the parser. Each invocation: skip
+whitespace, then comments (with tail recursion to handle a run of
+adjacent comments/whitespace), then dispatch by the leading character
+to identifier/number/string/template/operator scanners.
+@End Reasoning
+
+@Implementation:
+Order matters: skip_whitespace -> sample current_char/line/column ->
+skip_comment (re-enter via recursion if a comment was consumed) ->
+EOF check -> identifier (is_alpha) -> number (is_digit) -> string
+quotes (34/39) -> template literal (96) -> multi-character operators
+(handled in the long Match below the section shown above). The
+recursive tail call after a comment skip is the simplest way to make
+"// comment\n// comment" produce no spurious tokens.
+@End Implementation
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source

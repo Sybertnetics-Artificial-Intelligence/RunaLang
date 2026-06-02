@@ -61,20 +61,27 @@ Note: ===================================================================
 Note: ANALYZER CREATION
 Note: ===================================================================
 
+@Reasoning:
+Builds an analyzer with twelve eagerly-allocated registries plus the
+two name-cursor slots (current_namespace, current_class). Eager
+construction avoids per-pass null checks at the cost of upfront
+allocation of empty containers — acceptable because the analyzer is
+constructed once per file.
+@End Reasoning
+
+@Implementation:
+Allocates 136-byte struct, OOM short-circuit. Builds twelve sub-
+containers (Dicts for the registries and use_statements, Lists for
+the scope stack and validation channels). Stores them at offsets
+0/8/16/24/32/40/48/56/64/72/80/104/112. global_scope is aliased into
+both offset 0 and offset 8 so current_scope can move independently
+via push_function_scope without affecting the global anchor. The
+remaining slots (current_namespace 88, current_class 96, error_message
+120, has_error 128, strict_types 136) zero-init.
+@End Implementation
+
 Process called "create_php_semantic_analyzer" returns Integer:
     Note: Create PHP semantic analyzer for type checking and validation
-
-    @Reasoning:
-    Initialize comprehensive semantic analyzer for PHP including type checking,
-    class hierarchy validation, namespace resolution, variable scoping, and
-    PHP-specific semantic rules following modern PHP 7+ standards.
-    @End Reasoning
-
-    @Implementation:
-    Allocate analyzer structure with registries for classes, interfaces, traits,
-    functions, namespaces, variables, constants, and use statements. Initialize
-    scope stack and type tracking for comprehensive PHP semantic analysis.
-    @End Implementation
 
     Let analyzer_size be 136
     Let analyzer be proc allocate from Layout with analyzer_size
@@ -122,20 +129,27 @@ Note: ===================================================================
 Note: MAIN ANALYSIS ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+Five-phase orchestrator: declarations -> namespace resolution -> class
+hierarchy validation -> function body analysis -> variable usage
+validation. The phase order is dictated by PHP's name-resolution rules:
+namespaces must be resolved before class hierarchies, and class
+hierarchies must be intact before method/function bodies are typed,
+because method calls and inheritance require name resolution to
+succeed first.
+@End Reasoning
+
+@Implementation:
+Null analyzer returns 0; null program triggers "Null program node"
+error and returns 0. Calls collect_php_declarations,
+resolve_php_namespaces, validate_php_class_hierarchies,
+analyze_php_functions, validate_php_variable_usage in order. After
+all five, reads has_error at offset 128; non-zero short-circuits to
+0. Returns 1 on clean analysis.
+@End Implementation
+
 Process called "analyze_php_program" takes analyzer as Integer, program_node as Integer returns Integer:
     Note: Perform complete semantic analysis on PHP program
-
-    @Reasoning:
-    Comprehensive analysis including namespace resolution, class hierarchy
-    validation, type checking with PHP 7+ type hints, variable scoping,
-    interface implementation verification, and PHP-specific validation.
-    @End Reasoning
-
-    @Implementation:
-    Multi-phase analysis: collect declarations, resolve types and namespaces,
-    validate class hierarchies, check type compatibility, and analyze function
-    bodies with proper scoping and type inference.
-    @End Implementation
 
     If analyzer is equal to 0:
         Return 0
@@ -173,14 +187,27 @@ Note: ===================================================================
 Note: DECLARATION COLLECTION
 Note: ===================================================================
 
+@Reasoning:
+First phase: build the registries (class, interface, trait, function,
+constant, namespace, use_statement) by scanning every top-level
+statement. Without this pre-pass, forward references (a class
+extending another class declared later in the file) would fail in
+phase 2.
+@End Reasoning
+
+@Implementation:
+Reads statements list via get_php_statements. Iterates each, querying
+get_php_statement_type and dispatching through Match on the string
+kind: "namespace" -> collect_php_namespace, "use" -> collect_php_use_statement,
+"class"/"interface"/"trait"/"function"/"const"/"declare" -> their
+respective collectors. Other statement kinds are skipped (they are
+analyzed in later phases). No early termination — all collection runs
+even if individual collectors set errors; resolution decides whether
+to bail out.
+@End Implementation
+
 Process called "collect_php_declarations" takes analyzer as Integer, program_node as Integer:
     Note: Collect all PHP declarations for reference resolution
-
-    @Reasoning:
-    First phase collects all class, interface, trait, function, constant,
-    namespace, and use statement declarations to build comprehensive registries
-    for cross-reference validation and type checking.
-    @End Reasoning
 
     Let statements be proc get_php_statements from program_node
     Let stmt_count be proc size from List with statements
@@ -215,14 +242,24 @@ Process called "collect_php_declarations" takes analyzer as Integer, program_nod
     End While
 End Process
 
+@Reasoning:
+Registers a namespace declaration and updates the current_namespace
+cursor. Subsequent class/function/constant collectors use the cursor
+to build qualified names. PHP allows multiple namespace declarations
+per file (especially with bracketed namespaces); the cursor reflects
+the most recent declaration only.
+@End Reasoning
+
+@Implementation:
+Reads namespace_name via get_php_namespace_name. Inserts into
+namespace_registry (analyzer offset 56) keyed by name. Updates
+current_namespace (offset 88) to the new name string. The new
+qualified-name cursor takes effect immediately for any subsequent
+collectors invoked in this collect_php_declarations pass.
+@End Implementation
+
 Process called "collect_php_namespace" takes analyzer as Integer, namespace_stmt as Integer:
     Note: Collect namespace declaration
-
-    @Reasoning:
-    Register namespace for proper name resolution and scoping. PHP supports
-    both bracketed and non-bracketed namespace syntax. Track current namespace
-    context for subsequent declarations.
-    @End Reasoning
 
     Let namespace_name be proc get_php_namespace_name from namespace_stmt
     Let registry be proc memory_get_int64 from Layout with analyzer, 56
@@ -231,14 +268,27 @@ Process called "collect_php_namespace" takes analyzer as Integer, namespace_stmt
     proc memory_set_int64 from Layout with analyzer, 88, namespace_name
 End Process
 
+@Reasoning:
+Use statements bind a fully-qualified name to a shorter alias in the
+current file. PHP supports three flavours of use (class/function/
+const), each with potentially many items in one use declaration
+(group syntax). The registry key combines type and alias so the
+three namespaces (class/function/const) don't collide.
+@End Reasoning
+
+@Implementation:
+Reads use_type ("class", "function", or "const") and items list.
+Iterates items, extracting original (fully-qualified) name and alias.
+When no explicit alias is provided (use_alias_name returns 0), the
+alias defaults to the simple-name suffix of the original via
+get_simple_name_from_fqn (e.g., `use Foo\Bar` aliases to `Bar`).
+The registry key is built as `"<type>:<alias>"` (e.g., "class:Bar")
+to give each use namespace its own keyspace inside the single
+use_statements Dict.
+@End Implementation
+
 Process called "collect_php_use_statement" takes analyzer as Integer, use_stmt as Integer:
     Note: Collect use statement for alias resolution
-
-    @Reasoning:
-    Register use statements for proper class/function/constant aliasing.
-    PHP supports aliasing classes, functions, and constants with different
-    syntax forms including group use statements.
-    @End Reasoning
 
     Let use_type be proc get_php_use_type from use_stmt
     Let use_items be proc get_php_use_items from use_stmt
@@ -263,14 +313,24 @@ Process called "collect_php_use_statement" takes analyzer as Integer, use_stmt a
     End While
 End Process
 
+@Reasoning:
+Indexes a class declaration in class_registry under its qualified
+name. Duplicate definitions in the same namespace are a hard error
+(PHP allows redeclaration only via class_alias which is a runtime
+function, not a declaration). The qualified name is built from the
+current namespace plus the unqualified class name.
+@End Reasoning
+
+@Implementation:
+Reads class_name and current_namespace (offset 88). build_qualified_name
+combines them. Reads class_registry at offset 24, checks for duplicate
+via Dict.contains; on collision sets a "Duplicate class: <name>"
+error and returns. Otherwise inserts the class_stmt AST node into the
+registry keyed by qualified_name.
+@End Implementation
+
 Process called "collect_php_class" takes analyzer as Integer, class_stmt as Integer:
     Note: Collect class declaration for registry
-
-    @Reasoning:
-    Register class with full qualified name, parent class, implemented
-    interfaces, and visibility modifiers for hierarchy validation and
-    method resolution. Check for duplicate class definitions.
-    @End Reasoning
 
     Let class_name be proc get_php_class_name from class_stmt
     Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
@@ -288,14 +348,23 @@ Process called "collect_php_class" takes analyzer as Integer, class_stmt as Inte
     proc set from Dict with registry, qualified_name, class_stmt
 End Process
 
+@Reasoning:
+Indexes an interface declaration in interface_registry. Like classes,
+duplicate interface definitions in the same namespace are a hard
+error. Interfaces have their own registry (offset 32) separate from
+classes because PHP allows a class and interface to share a name
+even within the same namespace.
+@End Reasoning
+
+@Implementation:
+Identical pattern to collect_php_class: reads interface_name and
+current_namespace, builds qualified_name, checks for duplicate in
+interface_registry (offset 32), emits "Duplicate interface:" error
+on collision, otherwise inserts the AST node.
+@End Implementation
+
 Process called "collect_php_interface" takes analyzer as Integer, interface_stmt as Integer:
     Note: Collect interface declaration for registry
-
-    @Reasoning:
-    Register interface with full qualified name and extended interfaces
-    for inheritance validation and method signature checking. Interfaces
-    define contracts that classes must implement.
-    @End Reasoning
 
     Let interface_name be proc get_php_interface_name from interface_stmt
     Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
@@ -313,14 +382,23 @@ Process called "collect_php_interface" takes analyzer as Integer, interface_stmt
     proc set from Dict with registry, qualified_name, interface_stmt
 End Process
 
+@Reasoning:
+Indexes a trait declaration in trait_registry (offset 40). Traits
+provide horizontal code reuse — methods that can be mixed into multiple
+classes — and must be uniquely named within their namespace. Trait
+conflict resolution during composition is a class-level concern
+handled later, not here.
+@End Reasoning
+
+@Implementation:
+Same duplicate-detection pattern as class/interface collectors. Reads
+trait_name, builds qualified_name with current_namespace, checks for
+existing entry in trait_registry, emits "Duplicate trait:" error on
+collision, otherwise inserts the AST node.
+@End Implementation
+
 Process called "collect_php_trait" takes analyzer as Integer, trait_stmt as Integer:
     Note: Collect trait declaration for registry
-
-    @Reasoning:
-    Register trait for code reuse validation and conflict resolution.
-    Traits provide horizontal code reuse and can be composed into classes
-    with conflict resolution mechanisms.
-    @End Reasoning
 
     Let trait_name be proc get_php_trait_name from trait_stmt
     Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
@@ -338,14 +416,22 @@ Process called "collect_php_trait" takes analyzer as Integer, trait_stmt as Inte
     proc set from Dict with registry, qualified_name, trait_stmt
 End Process
 
+@Reasoning:
+Indexes a top-level (namespace-scoped) function in function_registry.
+Class methods are NOT collected here — they live on their parent class
+node and are reached via the class_registry. PHP namespaces can host
+free functions distinct from class methods of the same name.
+@End Reasoning
+
+@Implementation:
+Same pattern as the other collectors: reads function_name, builds
+qualified_name with current_namespace, checks for duplicate in
+function_registry (offset 48), emits "Duplicate function:" on
+collision, otherwise inserts the AST node.
+@End Implementation
+
 Process called "collect_php_function" takes analyzer as Integer, function_stmt as Integer:
     Note: Collect function declaration for registry
-
-    @Reasoning:
-    Register function with parameter types, return type, and full qualified
-    name for call validation and type checking. PHP supports type hints
-    and return type declarations in modern versions.
-    @End Reasoning
 
     Let function_name be proc get_php_function_name from function_stmt
     Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
@@ -363,14 +449,21 @@ Process called "collect_php_function" takes analyzer as Integer, function_stmt a
     proc set from Dict with registry, qualified_name, function_stmt
 End Process
 
+@Reasoning:
+Indexes a top-level constant in constant_registry. Class constants
+are tracked on their parent class node, not here — this registry
+holds only namespace-level/global `const NAME = value;` declarations
+(not class constants).
+@End Reasoning
+
+@Implementation:
+Identical pattern to other collectors: reads name, qualifies via
+current_namespace, checks duplicate in constant_registry (offset 72),
+emits "Duplicate constant:" on collision, otherwise inserts.
+@End Implementation
+
 Process called "collect_php_constant" takes analyzer as Integer, const_stmt as Integer:
     Note: Collect constant declaration for registry
-
-    @Reasoning:
-    Register constant with value and visibility for reference validation.
-    PHP supports class constants, global constants, and namespaced constants
-    with different visibility modifiers in modern PHP versions.
-    @End Reasoning
 
     Let const_name be proc get_php_constant_name from const_stmt
     Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
@@ -388,14 +481,24 @@ Process called "collect_php_constant" takes analyzer as Integer, const_stmt as I
     proc set from Dict with registry, qualified_name, const_stmt
 End Process
 
+@Reasoning:
+The `declare(...)` directive primarily affects strict_types and
+ticks. Of these, strict_types=1 is the most significant because it
+changes type-coercion behavior throughout the file (no implicit
+int->string, no implicit string->int, etc.). We track strict_types
+on the analyzer so check_php_type_compatibility can branch on it.
+@End Reasoning
+
+@Implementation:
+Reads the directives list. Iterates each directive comparing its
+name against "strict_types". On match, if the value is 1, sets
+strict_types at analyzer offset 136 to 1. Other directives are
+currently ignored (ticks, encoding are runtime concerns not semantic
+ones).
+@End Implementation
+
 Process called "collect_php_declare" takes analyzer as Integer, declare_stmt as Integer:
     Note: Collect declare statement for strict typing
-
-    @Reasoning:
-    Handle declare(strict_types=1) directives which affect type checking
-    behavior throughout the file. Track strict typing mode for proper
-    type coercion and validation rules.
-    @End Reasoning
 
     Let directives be proc get_php_declare_directives from declare_stmt
     Let directive_count be proc size from List with directives
@@ -421,14 +524,24 @@ Note: ===================================================================
 Note: NAMESPACE RESOLUTION
 Note: ===================================================================
 
+@Reasoning:
+Phase 2 of the analyzer pipeline. Drives the four reference-resolution
+sub-passes covering classes, interfaces, traits, and functions. After
+this phase, every name used in the program either points to a known
+declaration in one of the registries or is recorded as an undefined-
+name error.
+@End Reasoning
+
+@Implementation:
+Four sequential calls: resolve_class_references, resolve_interface_references,
+resolve_trait_references, resolve_function_references. Each scans the
+corresponding registry and resolves cross-references (extends, implements,
+use traits, function call targets). Errors from each sub-pass
+accumulate via add_php_validation_error.
+@End Implementation
+
 Process called "resolve_php_namespaces" takes analyzer as Integer, program_node as Integer:
     Note: Resolve namespace and use statement references
-
-    @Reasoning:
-    Second phase resolves all namespace references, use statement aliases,
-    and qualified names to ensure proper name resolution throughout the
-    PHP program following PSR-4 and namespace conventions.
-    @End Reasoning
 
     proc resolve_class_references from analyzer
     proc resolve_interface_references from analyzer
@@ -459,14 +572,24 @@ Process called "resolve_class_references" takes analyzer as Integer:
     End While
 End Process
 
+@Reasoning:
+Validates the `extends` clause: resolves the parent class name
+through namespace/use-statement rules and reports an error if the
+parent doesn't exist. Circular inheritance detection runs separately
+in detect_circular_inheritance after all parent references are
+resolved.
+@End Reasoning
+
+@Implementation:
+Reads parent_class via get_php_class_extends. If null (no extends),
+returns early. Calls resolve_class_name which applies PHP's
+namespace-resolution rules; on null result (unresolvable), constructs
+a contextual error string "Undefined parent class for <child>: <parent>"
+and adds to validation_errors via add_php_validation_error.
+@End Implementation
+
 Process called "resolve_class_inheritance" takes analyzer as Integer, class_stmt as Integer:
     Note: Resolve parent class reference
-
-    @Reasoning:
-    Validate parent class exists and is accessible. Check for circular
-    inheritance and ensure proper visibility inheritance rules are followed
-    according to PHP object-oriented semantics.
-    @End Reasoning
 
     Let parent_class be proc get_php_class_extends from class_stmt
     If parent_class is equal to 0:
@@ -483,14 +606,24 @@ Process called "resolve_class_inheritance" takes analyzer as Integer, class_stmt
     End If
 End Process
 
+@Reasoning:
+Validates the `implements` clause. PHP allows multiple-interface
+implementation so this scans the full list and reports each
+unresolvable interface separately. Method-implementation completeness
+is checked later by validate_interface_implementations.
+@End Reasoning
+
+@Implementation:
+Reads interfaces list via get_php_class_implements; null returns early
+(no implements clause). Iterates each interface name, calls
+resolve_interface_name. On null result, constructs an "Undefined
+interface for <class>: <interface>" error message and adds via
+add_php_validation_error. Continues iterating after errors so all
+undefined interfaces are reported in one pass.
+@End Implementation
+
 Process called "resolve_class_interfaces" takes analyzer as Integer, class_stmt as Integer:
     Note: Resolve implemented interface references
-
-    @Reasoning:
-    Validate all implemented interfaces exist and are accessible. Check
-    interface method implementation requirements and ensure no interface
-    conflicts according to PHP interface semantics.
-    @End Reasoning
 
     Let interfaces be proc get_php_class_implements from class_stmt
     If interfaces is equal to 0:
@@ -516,14 +649,24 @@ Process called "resolve_class_interfaces" takes analyzer as Integer, class_stmt 
     End While
 End Process
 
+@Reasoning:
+Validates the `use TraitName` declarations inside a class body. PHP
+allows trait composition with method-conflict resolution syntax
+(precedence and alias); the conflict-resolution checks are deferred
+to a later pass — this routine just verifies that every named trait
+actually exists.
+@End Reasoning
+
+@Implementation:
+Reads the use_traits list via get_php_class_use_traits; null returns
+early. Iterates each trait reference, extracts the trait_name via
+get_php_trait_use_name (the reference structure may include
+precedence/alias info we don't validate here), calls resolve_trait_name.
+On unresolvable, emits "Undefined trait for <class>: <trait>" error.
+@End Implementation
+
 Process called "resolve_class_traits" takes analyzer as Integer, class_stmt as Integer:
     Note: Resolve used trait references
-
-    @Reasoning:
-    Validate all used traits exist and are accessible. Check trait method
-    conflicts and resolution rules according to PHP trait composition
-    semantics including precedence and alias declarations.
-    @End Reasoning
 
     Let use_traits be proc get_php_class_use_traits from class_stmt
     If use_traits is equal to 0:
@@ -554,14 +697,23 @@ Note: ===================================================================
 Note: CLASS HIERARCHY VALIDATION
 Note: ===================================================================
 
+@Reasoning:
+Phase 3 driver: runs four validators against the registered class
+graph: cycle detection, interface implementation completeness, trait
+composition rules, and method signature compatibility (LSP, etc.).
+Each is a separate sub-pass to keep the per-validator logic focused.
+@End Reasoning
+
+@Implementation:
+Four sequential calls: detect_circular_inheritance,
+validate_interface_implementations, validate_trait_compositions,
+validate_method_signatures. Each reports errors through
+add_php_validation_error; no early termination so the developer gets
+all hierarchy errors in one pass.
+@End Implementation
+
 Process called "validate_php_class_hierarchies" takes analyzer as Integer:
     Note: Validate class inheritance hierarchies
-
-    @Reasoning:
-    Third phase validates class hierarchies for circular inheritance,
-    interface implementation completeness, trait conflict resolution,
-    and method signature compatibility following PHP OOP rules.
-    @End Reasoning
 
     proc detect_circular_inheritance from analyzer
     proc validate_interface_implementations from analyzer
@@ -569,14 +721,24 @@ Process called "validate_php_class_hierarchies" takes analyzer as Integer:
     proc validate_method_signatures from analyzer
 End Process
 
+@Reasoning:
+Detects inheritance cycles using classic three-color DFS: a class
+being visited is gray, a fully-explored class is black, an unvisited
+class is white. A gray->gray transition (a back-edge) is a cycle.
+Cycles are fatal at the language level because PHP cannot resolve
+method dispatch through them.
+@End Reasoning
+
+@Implementation:
+Reads class_registry, builds two Dicts: visited (black) and visiting
+(gray). Iterates each class name; if not yet visited, calls
+detect_inheritance_cycle_from_class which performs the recursive DFS
+and emits errors for any cycles found. Classes already explored
+through a previous DFS root are skipped via the visited check.
+@End Implementation
+
 Process called "detect_circular_inheritance" takes analyzer as Integer:
     Note: Detect circular inheritance in class hierarchy
-
-    @Reasoning:
-    Use depth-first search to detect circular inheritance patterns which
-    are forbidden in PHP. Track visited classes and currently visiting
-    classes to identify cycles in the inheritance graph.
-    @End Reasoning
 
     Let class_registry be proc memory_get_int64 from Layout with analyzer, 24
     Let visited be proc create from Dict
@@ -634,14 +796,22 @@ Process called "detect_inheritance_cycle_from_class" takes analyzer as Integer, 
     proc set from Dict with visited, class_name, 1
 End Process
 
+@Reasoning:
+Iterates every class to check that each implements its declared
+interfaces' required methods. PHP requires that an implementing class
+declare a method with compatible signature for every interface method
+(or be declared abstract to defer it).
+@End Reasoning
+
+@Implementation:
+Reads class_registry, gets all class statements as a list. Iterates
+calling validate_class_interface_implementation on each. That helper
+walks the class's `implements` list and checks each interface against
+the class's method set.
+@End Implementation
+
 Process called "validate_interface_implementations" takes analyzer as Integer:
     Note: Validate that classes implement all interface methods
-
-    @Reasoning:
-    Check that classes implementing interfaces provide implementations for
-    all required interface methods with compatible signatures including
-    parameter types, return types, and visibility modifiers.
-    @End Reasoning
 
     Let class_registry be proc memory_get_int64 from Layout with analyzer, 24
     Let classes be proc values from Dict with class_registry
@@ -684,14 +854,23 @@ Note: ===================================================================
 Note: FUNCTION ANALYSIS
 Note: ===================================================================
 
+@Reasoning:
+Phase 4 driver: type-checks and validates function bodies. Three
+sub-passes: global functions (free functions registered in
+function_registry), class methods (accessed via class_registry), and
+function calls (validating that callees exist and arguments match
+parameters).
+@End Reasoning
+
+@Implementation:
+Three sequential calls: analyze_global_functions (no program arg —
+uses function_registry), analyze_class_methods (uses class_registry),
+analyze_function_calls (walks the entire program AST to validate
+call sites). Errors accumulate via add_php_validation_error.
+@End Implementation
+
 Process called "analyze_php_functions" takes analyzer as Integer, program_node as Integer:
     Note: Analyze function bodies and method implementations
-
-    @Reasoning:
-    Fourth phase analyzes function and method bodies for type checking,
-    variable usage, parameter validation, return type compatibility,
-    and PHP-specific semantic rules with proper scoping.
-    @End Reasoning
 
     proc analyze_global_functions from analyzer
     proc analyze_class_methods from analyzer
@@ -719,14 +898,27 @@ Process called "analyze_global_functions" takes analyzer as Integer:
     End While
 End Process
 
+@Reasoning:
+Per-function analyzer: opens a fresh function-local scope, validates
+parameters (registers them as local variables with their types),
+walks the body statement-by-statement, then validates that return
+statements match the declared return type. The scope push/pop pair
+ensures parameter bindings don't leak into the enclosing scope.
+@End Reasoning
+
+@Implementation:
+Four sequential steps: push_function_scope (creates a new
+function-local scope on the scope_stack and stores function metadata
+for later access by validate_function_returns),
+validate_function_parameters (typechecks param defaults, registers
+param symbols), analyze_statement_block on the body (type-checks
+expressions and statement-level constructs), validate_function_returns
+(verifies each return statement against the declared return type),
+pop_function_scope (tears down the scope).
+@End Implementation
+
 Process called "analyze_function_body" takes analyzer as Integer, function_stmt as Integer:
     Note: Analyze individual function body
-
-    @Reasoning:
-    Analyze function parameters, local variables, return statements,
-    and type compatibility. Check parameter type hints, return type
-    declarations, and variable scoping within function scope.
-    @End Reasoning
 
     Note: Enter function scope
     proc push_function_scope with analyzer, function_stmt
@@ -749,14 +941,25 @@ Note: ===================================================================
 Note: VARIABLE VALIDATION
 Note: ===================================================================
 
+@Reasoning:
+Phase 5 driver: catches three classes of variable-usage error.
+Declaration validation ensures `$var` is bound before being read.
+Reference validation catches type mismatches at use sites against
+the inferred type. Undefined-variable detection emits warnings (not
+errors) since PHP allows undefined variables (they evaluate to null
+with a notice).
+@End Reasoning
+
+@Implementation:
+Three sequential validators on the same program_node:
+validate_variable_declarations, validate_variable_references, and
+check_undefined_variables. Each walks the program AST recursively
+and emits findings via add_php_validation_error or
+add_php_validation_warning.
+@End Implementation
+
 Process called "validate_php_variable_usage" takes analyzer as Integer, program_node as Integer:
     Note: Validate variable scoping and usage patterns
-
-    @Reasoning:
-    Fifth phase validates variable declarations, usage, scoping rules,
-    and type consistency throughout the PHP program following PHP's
-    variable scoping semantics and type juggling rules.
-    @End Reasoning
 
     proc validate_variable_declarations with analyzer, program_node
     proc validate_variable_references with analyzer, program_node
@@ -767,14 +970,25 @@ Note: ===================================================================
 Note: TYPE CHECKING
 Note: ===================================================================
 
+@Reasoning:
+PHP type compatibility decisions hinge on the strict_types flag.
+Strict mode forbids type juggling: int->string is rejected. Loose
+mode allows the juggling matrix defined by PHP's type-coercion
+rules. Nullable types (?int) are handled specially: they accept the
+base type OR null. Both modes accept exact-name matches.
+@End Reasoning
+
+@Implementation:
+Null on either side returns 1 (no constraint). Reads strict_mode at
+offset 136. Tests exact-name match via strings_equal; on match returns
+1. Tests nullable prefix `?`: if expected starts with `?`, strips
+prefix and re-tests against actual; also returns 1 if actual is
+"null". Falls through to type-juggling check (check_php_type_juggling)
+in loose mode, returns 0 in strict mode.
+@End Implementation
+
 Process called "check_php_type_compatibility" takes analyzer as Integer, expected_type as Integer, actual_type as Integer returns Integer:
     Note: Check if actual type is compatible with expected type
-
-    @Reasoning:
-    PHP type checking with consideration for type juggling, scalar type
-    hints, nullable types, union types (PHP 8+), and strict typing mode.
-    Handle both loose and strict type checking modes appropriately.
-    @End Reasoning
 
     If expected_type is equal to 0 or actual_type is equal to 0:
         Return 1  Note: No type constraint
@@ -857,14 +1071,22 @@ Note: ===================================================================
 Note: UTILITY FUNCTIONS
 Note: ===================================================================
 
+@Reasoning:
+PHP qualified-name construction: `Namespace\SimpleName`. When the
+namespace is null or empty (global scope), returns the simple name
+unchanged. The backslash is the PHP namespace separator (escaped as
+\\ in source code).
+@End Reasoning
+
+@Implementation:
+Null namespace -> return simple_name. Length-0 namespace -> also
+return simple_name (global scope shortcut). Otherwise concatenates
+namespace + "\" + simple_name using string_concat. Two concatenations
+because Runa lacks a 3-arg concat at this layer.
+@End Implementation
+
 Process called "build_qualified_name" takes namespace as Integer, simple_name as Integer returns Integer:
     Note: Build fully qualified name from namespace and simple name
-
-    @Reasoning:
-    Construct fully qualified name following PHP namespace conventions.
-    Handle global namespace (empty namespace) and proper separator usage
-    for consistent name resolution throughout the analyzer.
-    @End Reasoning
 
     If namespace is equal to 0:
         Return simple_name
@@ -879,14 +1101,27 @@ Process called "build_qualified_name" takes namespace as Integer, simple_name as
     Return proc string_concat from StringCore with qualified, simple_name
 End Process
 
+@Reasoning:
+PHP's class-name resolution algorithm. Checks (in order): use-statement
+aliases (e.g., `use Foo\Bar as Baz` resolves Baz to Foo\Bar);
+fully-qualified names (leading `\`); current-namespace qualification;
+global namespace. Returns the resolved qualified name or 0 (not found).
+Matches the standard PHP resolution rules.
+@End Reasoning
+
+@Implementation:
+Step 1: Construct use_key as "class:<name>" and probe use_statements
+(offset 80); on hit return the aliased target. Step 2: Check the
+first character for ASCII 92 ('\\') indicating a fully-qualified
+name; if so return as-is. Step 3: Build current-namespace qualified
+form via build_qualified_name and probe class_registry (offset 24);
+on hit return qualified_name. Step 4: Probe class_registry for the
+bare class_name (global namespace); on hit return class_name itself.
+Step 5: Return 0 (unresolvable).
+@End Implementation
+
 Process called "resolve_class_name" takes analyzer as Integer, class_name as Integer returns Integer:
     Note: Resolve class name using use statements and namespaces
-
-    @Reasoning:
-    Resolve class reference considering current namespace, use statements,
-    and fully qualified names. Handle relative and absolute name resolution
-    according to PHP namespace resolution rules.
-    @End Reasoning
 
     Note: Check if it's a use statement alias
     Let use_registry be proc memory_get_int64 from Layout with analyzer, 80

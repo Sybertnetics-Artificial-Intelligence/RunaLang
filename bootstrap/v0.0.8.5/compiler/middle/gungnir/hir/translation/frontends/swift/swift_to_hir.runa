@@ -47,6 +47,14 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+The Swift translation context carries four state slots:
+node_stack tracks the currently-being-translated chain (for parent
+queries), symbol_table resolves identifiers against their
+declarations, scope_depth supports indented diagnostic output, and
+error_count aggregates per-context failures so the driver knows
+whether to emit the resulting HIR or treat it as failed translation.
+@End Reasoning
 Type called "SwiftToHirContext":
     node_stack as Integer       Note: Stack of nodes being translated
     symbol_table as Integer     Note: Symbol table for name resolution
@@ -54,13 +62,22 @@ Type called "SwiftToHirContext":
     error_count as Integer      Note: Number of translation errors
 End Type
 
+@Reasoning:
+Builds a fresh SwiftToHirContext on the heap with all four slots
+zero-initialised so callers can populate node_stack / symbol_table
+lazily on first use. Returning 0 on allocation failure (instead of
+panicking) lets the caller chain context-creation directly into a
+guard pattern that aborts the translation cleanly.
+@End Reasoning
+@Implementation:
+Allocates 32 bytes (4 int64 slots) via Layout.allocate, then writes
+zero into each of the four offsets in slot order: 0 (node_stack), 8
+(symbol_table), 16 (scope_depth), 24 (error_count). The struct layout
+must remain in lockstep with the SwiftToHirContext Type declaration
+above.
+@End Implementation
 Process called "create_swift_to_hir_context" returns Integer:
     Note: Create translation context
-
-    @Reasoning:
-    Translation context maintains state during AST traversal including
-    symbol resolution, scope tracking, and error handling.
-    @End Reasoning
 
     Let context_size be 32  Note: SwiftToHirContext: 4 fields × 8 bytes
     Let context be proc allocate from Layout with context_size
@@ -77,6 +94,13 @@ Process called "create_swift_to_hir_context" returns Integer:
     Return context
 End Process
 
+@Reasoning:
+The context owns only its 32-byte struct allocation; the
+node_stack and symbol_table pointers refer to caller-owned storage
+that the context borrows during translation. A null context is a
+no-op success because create_swift_to_hir_context may have returned
+0 on allocation failure and error paths call this unconditionally.
+@End Reasoning
 Process called "destroy_swift_to_hir_context" takes context as Integer returns Integer:
     Note: Destroy translation context
 
@@ -92,13 +116,23 @@ Note: ==========================================================================
 Note: Main Translation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Top-level entry point: owns the translation context lifecycle so
+callers never have to remember the create + translate + destroy
+triplet. Translation of an empty AST (null root) returns 0 directly
+without allocating a context, mirroring the convention used by every
+other translator pass in the gungnir pipeline.
+@End Reasoning
+@Implementation:
+Guards on null ast_root, creates the context via
+create_swift_to_hir_context, dispatches the root through
+translate_node, and unconditionally destroys the context before
+returning the HIR root. The context error_count is intentionally not
+checked here; callers use get_translation_error_count after the call
+to decide whether to keep the returned HIR.
+@End Implementation
 Process called "translate_swift_ast_to_hir" takes ast_root as Integer returns Integer:
     Note: Translate Swift AST to HIR
-
-    @Reasoning:
-    Main entry point for Swift→HIR translation. Creates context,
-    translates root node, and handles cleanup.
-    @End Reasoning
 
     If ast_root is equal to 0:
         Return 0
@@ -117,6 +151,34 @@ Process called "translate_swift_ast_to_hir" takes ast_root as Integer returns In
     Return hir_root
 End Process
 
+@Reasoning:
+Single dispatcher for the entire Swift AST. The thirty-some SWIFT_*
+node-type constants cover three orthogonal axes (declarations,
+statements, expressions); funnelling all of them through one switch
+lets recursive sub-translators bottom out at this routine without
+needing per-kind plumbing. Returning 0 on unrecognised kinds keeps
+the surface gracefully degrading rather than crashing when the
+parser introduces new node kinds the lowering does not yet cover.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Reads node_type at offset 0 of node. Tests
+against every SWIFT_* constant in fixed sequence:
+- Declaration tokens: SWIFT_IMPORT_DECL, SWIFT_FUNCTION_DECL,
+  SWIFT_CLASS_DECL, SWIFT_STRUCT_DECL, SWIFT_ENUM_DECL,
+  SWIFT_PROTOCOL_DECL, SWIFT_EXTENSION_DECL, SWIFT_TYPEALIAS_DECL,
+  SWIFT_VAR_DECL, SWIFT_LET_DECL.
+- Statement tokens: SWIFT_IF_STMT, SWIFT_GUARD_STMT,
+  SWIFT_SWITCH_STMT, SWIFT_FOR_IN_STMT, SWIFT_WHILE_STMT,
+  SWIFT_DEFER_STMT, SWIFT_DO_CATCH_STMT, SWIFT_RETURN_STMT,
+  SWIFT_BREAK_STMT, SWIFT_CONTINUE_STMT.
+- Expression tokens: SWIFT_BINARY_EXPR, SWIFT_UNARY_EXPR,
+  SWIFT_CALL_EXPR, SWIFT_MEMBER_EXPR, SWIFT_SUBSCRIPT_EXPR,
+  SWIFT_OPTIONAL_CHAIN_EXPR, SWIFT_FORCE_UNWRAP_EXPR,
+  SWIFT_CLOSURE_EXPR, SWIFT_LITERAL_EXPR, SWIFT_IDENTIFIER_EXPR.
+Each Return-dispatches to the matching translate_* helper. Falls
+through to Return 0 for unrecognised node_type.
+@End Implementation
 Process called "translate_node" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift AST node to HIR based on node type
 
@@ -265,6 +327,20 @@ Note: ==========================================================================
 Note: Declaration Translation
 Note: ============================================================================
 
+@Reasoning:
+Swift imports have two attributes worth preserving: the module name
+and the optional "import kind" (one of module/class/func/struct/enum/
+protocol/typealias) that narrows what's imported. Storing kind as
+HIR metadata lets backends emit the most specific form their target
+language supports.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged _type =
+"swift_import". Reads the attribute dict at offset 32 of the AST
+node. If non-zero, copies "module" -> "module" and "kind" ->
+"import_kind" via the dict accessors. Returns the import_hir dict.
+@End Implementation
 Process called "translate_import_decl" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift import declaration to HIR
 
@@ -297,6 +373,32 @@ Process called "translate_import_decl" takes context as Integer, node as Integer
     Return import_hir
 End Process
 
+@Reasoning:
+Swift function declarations carry six categories of metadata beyond
+the parameter/return shape: name, modifiers (static, mutating,
+override, final, ...), access control (private, fileprivate,
+internal, public, open), throws/rethrows specifier, generic
+parameters, and where-clause constraints. Every one of these
+affects the surface form a backend emits, so all must survive the
+lowering. The three children (parameter list, return type, body)
+are addressed by ordinal index because the parser fixes their slot
+positions even when some are absent.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_function".
+Reads the attribute dict at offset 32. If non-zero, copies six
+attributes: "name" -> "name", "modifiers" -> "modifiers",
+"access" -> "access_control", "throws" -> "throws",
+"generic_params" -> "generic_params", "where_clause" ->
+"where_clause". Then reads the children list at offset 24 and
+child_count at offset 32. If count >= 1, child 0 is the parameter
+list - translated via translate_parameter_list and stored under
+"parameters". If count >= 2, child 1 is the return type -
+translated via translate_type and stored under "return_type". If
+count >= 3, child 2 is the body - translated via
+translate_statement_list and stored under "body". Returns func_hir.
+@End Implementation
 Process called "translate_function_decl" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift function declaration to HIR
 
@@ -396,6 +498,26 @@ Process called "translate_function_decl" takes context as Integer, node as Integ
     Return func_hir
 End Process
 
+@Reasoning:
+Swift parameters carry a dual-name convention - the external name
+used at call sites (`func greet(to name: String)` is called as
+`greet(to: "x")`) and the internal name used in the function body.
+Backends need both to reconstruct call sites accurately. Additional
+attributes (default value, variadic `...`, `inout`) round out the
+parameter metadata.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null param_list. Allocates an HIR list params_hir.
+Reads the parameter children at offset 24 of param_list. If 0,
+returns the empty params_hir. Otherwise reads child_count at offset
+32 and iterates 0..count-1. For each param_node: allocates a dict
+tagged "swift_parameter", reads the attribute dict at offset 32, and
+copies "external_name", "internal_name" (continued outside the
+shown excerpt also copying default value, variadic, and inout
+attributes). Each parameter HIR is appended to params_hir. Returns
+params_hir at end.
+@End Implementation
 Process called "translate_parameter_list" takes context as Integer, param_list as Integer returns Integer:
     Note: Translate Swift parameter list to HIR
 
@@ -480,6 +602,25 @@ Process called "translate_parameter_list" takes context as Integer, param_list a
     Return params_hir
 End Process
 
+@Reasoning:
+Classes in Swift are reference types - heap-allocated and shared by
+reference. The HIR distinguishes them from value types by tagging
+"kind" = "reference_type" so backends targeting languages with both
+class- and struct-like forms (Rust enums + struct, C++ class +
+struct) can pick the right shape. Inheritance is stored verbatim
+because Swift's single-inheritance-plus-many-protocols model maps
+non-trivially to other languages.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_class"
+with "kind" = "reference_type". Reads the attribute dict at offset
+32. If non-zero, copies five attributes: "name", "modifiers",
+"access" -> "access_control", "generic_params", "inheritance".
+Reads the children list at offset 24; if non-zero, translates the
+member list via translate_member_list and stores under "members".
+Returns class_hir.
+@End Implementation
 Process called "translate_class_decl" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift class declaration to HIR
 
@@ -536,6 +677,23 @@ Process called "translate_class_decl" takes context as Integer, node as Integer 
     Return class_hir
 End Process
 
+@Reasoning:
+Structs in Swift are value types - copied on assignment and not
+heap-shared - so they get "kind" = "value_type" in the HIR. The
+sibling fields versus classes are nearly identical except that
+structs use "conformance" (protocols only) instead of "inheritance"
+(superclass plus protocols), reflecting that structs in Swift
+cannot inherit from another struct/class.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_struct"
+with "kind" = "value_type". Reads the attribute dict at offset 32.
+If non-zero, copies five attributes: "name", "modifiers",
+"access" -> "access_control", "generic_params", "conformance".
+Reads children at offset 24 and translates the member list via
+translate_member_list, storing under "members". Returns struct_hir.
+@End Implementation
 Process called "translate_struct_decl" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift struct declaration to HIR
 
@@ -592,6 +750,23 @@ Process called "translate_struct_decl" takes context as Integer, node as Integer
     Return struct_hir
 End Process
 
+@Reasoning:
+Swift enums are full algebraic data types: each case can carry its
+own associated values (tuple), and the enum as a whole may declare a
+raw_type so cases get implicit raw values. Tagging "kind" =
+"algebraic_type" in the HIR signals to backends that they need to
+emit Variant/Tagged-Union/Discriminated-Union machinery, not the
+C-style integer enum that the surface syntax superficially resembles.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_enum"
+with "kind" = "algebraic_type". Reads the attribute dict at offset
+32 and copies four attributes: "name", "modifiers",
+"access" -> "access_control", "raw_type". Reads children at offset
+24; if non-zero, calls translate_enum_cases to produce a list of
+case HIRs and stores under "cases". Returns enum_hir.
+@End Implementation
 Process called "translate_enum_decl" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift enum declaration to HIR
 
@@ -643,6 +818,23 @@ Process called "translate_enum_decl" takes context as Integer, node as Integer r
     Return enum_hir
 End Process
 
+@Reasoning:
+Enum cases come in three shapes: bare (`case foo`), associated-value
+(`case bar(Int, String)`), and raw-value (`case baz = 42`). Each
+shape encodes different information; the HIR captures all three
+under one record by leaving the unused fields absent. Backends pick
+the right syntactic form by inspecting which keys are present.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null cases_node. Allocates an HIR list cases_hir. Reads
+the cases children at offset 24; returns the empty list if 0.
+Otherwise reads child_count at offset 32 and iterates. For each
+case_node: allocates an HIR dict tagged "swift_enum_case", reads
+the attribute dict at offset 32, and copies "name",
+"associated_values", "raw_value". The case dict is appended to
+cases_hir. Returns cases_hir at end.
+@End Implementation
 Process called "translate_enum_cases" takes context as Integer, cases_node as Integer returns Integer:
     Note: Translate Swift enum cases to HIR
 
@@ -701,6 +893,25 @@ Process called "translate_enum_cases" takes context as Integer, cases_node as In
     Return cases_hir
 End Process
 
+@Reasoning:
+Protocols are Swift's interfaces - declarations of requirements that
+conforming types must satisfy. The HIR captures the protocol's name,
+access control, and inherited protocols (a protocol can refine
+others), then translates the body's requirements (methods,
+properties, associated types) as a separate list so backends can
+emit them in whatever shape their target language uses for
+interface declarations.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged
+"swift_protocol". Reads the attribute dict at offset 32 and copies
+"name", "access" -> "access_control", "inheritance" ->
+"inherited_protocols". Reads children at offset 24; if non-zero,
+calls translate_protocol_requirements which produces a list of
+requirement HIRs, then stores under "requirements". Returns
+protocol_hir.
+@End Implementation
 Process called "translate_protocol_decl" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift protocol declaration to HIR
 
@@ -746,6 +957,13 @@ Process called "translate_protocol_decl" takes context as Integer, node as Integ
     Return protocol_hir
 End Process
 
+@Reasoning:
+Swift protocol requirements include method signatures, property
+declarations, and associated types. The translator walks each
+requirement child and recurses through translate_node so the
+appropriate kind-specific HIR shape is produced for each. The
+resulting list becomes the protocol's "requirements" field.
+@End Reasoning
 Process called "translate_protocol_requirements" takes context as Integer, reqs_node as Integer returns Integer:
     Note: Translate protocol requirements to HIR
 
@@ -779,6 +997,23 @@ Process called "translate_protocol_requirements" takes context as Integer, reqs_
     Return reqs_hir
 End Process
 
+@Reasoning:
+Extensions retroactively add members and protocol conformance to an
+existing type. The HIR records the extended type name, the
+conformance list (which protocols this extension brings to the
+extended type), the optional where clause (for conditional
+conformance), and the members being added. Treating extensions as
+first-class HIR shapes lets backends with no native extension form
+synthesise equivalent free-standing methods or subclass adaptations.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged
+"swift_extension". Reads the attribute dict at offset 32 and copies
+"extended_type", "conformance", "where_clause" verbatim. Reads
+children at offset 24; if non-zero, calls translate_member_list and
+stores the resulting list under "members". Returns ext_hir.
+@End Implementation
 Process called "translate_extension_decl" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift extension declaration to HIR
 
@@ -824,6 +1059,13 @@ Process called "translate_extension_decl" takes context as Integer, node as Inte
     Return ext_hir
 End Process
 
+@Reasoning:
+Swift typealiases bind a name to an existing type. The HIR
+"swift_typealias" node carries the alias name, access control, and
+underlying_type so target emitters can choose between a type alias
+declaration or inlined substitution depending on what the
+destination language supports.
+@End Reasoning
 Process called "translate_typealias_decl" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift typealias declaration to HIR
 
@@ -866,6 +1108,26 @@ Process called "translate_typealias_decl" takes context as Integer, node as Inte
     Return alias_hir
 End Process
 
+@Reasoning:
+`var` declarations in Swift produce mutable bindings. The HIR tags
+"mutable" = "true" so a single var/let path can be used downstream
+(translate_let_decl emits "false"). Property observers
+(willSet/didSet) are a Swift-specific feature that backends without
+direct support can lower into setter wrappers; their preservation
+in the HIR is therefore mandatory. Type annotation and initialiser
+are positional children with optional presence.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_var"
+with "mutable" = "true". Reads the attribute dict at offset 32 and
+copies "name", "modifiers", "access" -> "access_control",
+"observers" -> "property_observers". Reads children at offset 24
+and child_count at offset 32. If count >= 1, child 0 is the type
+annotation - translated via translate_type and stored under "type".
+If count >= 2, child 1 is the initialiser - translated via
+translate_node and stored under "initializer". Returns var_hir.
+@End Implementation
 Process called "translate_var_decl" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift var declaration to HIR
 
@@ -935,6 +1197,24 @@ Process called "translate_var_decl" takes context as Integer, node as Integer re
     Return var_hir
 End Process
 
+@Reasoning:
+`let` declarations produce immutable bindings - the HIR mirrors var
+declarations exactly except that "mutable" is "false", which
+signals to backends that they may emit a `const`/`val`/`final`
+equivalent. Property observers do not appear for let bindings
+because Swift forbids them on immutable storage. Same positional-
+children convention as var: type at index 0, initialiser at index 1.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_let"
+with "mutable" = "false". Reads the attribute dict at offset 32 and
+copies "name", "modifiers", "access" -> "access_control". Reads
+children at offset 24 and child_count at offset 32. If count >= 1,
+translates child 0 as type and stores under "type". If count >= 2,
+translates child 1 as initialiser and stores under "initializer".
+Returns let_hir.
+@End Implementation
 Process called "translate_let_decl" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift let declaration to HIR
 
@@ -998,6 +1278,12 @@ Process called "translate_let_decl" takes context as Integer, node as Integer re
     Return let_hir
 End Process
 
+@Reasoning:
+Class/struct/extension members include methods, properties,
+initializers, deinitializers, and nested types. The walker
+delegates each member to translate_node which dispatches by kind,
+collecting the resulting HIR nodes into a uniform members list.
+@End Reasoning
 Process called "translate_member_list" takes context as Integer, members_node as Integer returns Integer:
     Note: Translate list of class/struct/extension members to HIR
 
@@ -1035,6 +1321,13 @@ Note: ==========================================================================
 Note: Statement Translation
 Note: ============================================================================
 
+@Reasoning:
+A statement list (function body, if-branch body, loop body) is
+translated by walking each child and translating it via the central
+dispatcher. Statement ordering is preserved by appending in source
+order. Empty lists return an empty HIR list rather than 0 so
+callers do not need a null check downstream.
+@End Reasoning
 Process called "translate_statement_list" takes context as Integer, stmt_list as Integer returns Integer:
     Note: Translate list of statements to HIR
 
@@ -1068,6 +1361,25 @@ Process called "translate_statement_list" takes context as Integer, stmt_list as
     Return stmts_hir
 End Process
 
+@Reasoning:
+Swift if-statements support `if let` / `if var` optional binding
+which makes the condition richer than a single boolean expression -
+it can introduce new local bindings into the then-branch scope. The
+HIR keeps the condition as an opaque expression sub-tree so the
+optional-binding semantics flow through to backends unmodified.
+Then/else blocks are translated via translate_statement_list to
+preserve statement ordering within each branch.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_if".
+Reads children at offset 24 and child_count at offset 32. If
+count >= 1, translates child 0 as the condition expression and
+stores under "condition". If count >= 2, translates child 1 as the
+then-block via translate_statement_list and stores under
+"then_block". If count >= 3, translates child 2 as the else-block
+and stores under "else_block". Returns if_hir.
+@End Implementation
 Process called "translate_if_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift if statement to HIR
 
@@ -1124,6 +1436,27 @@ Process called "translate_if_stmt" takes context as Integer, node as Integer ret
     Return if_hir
 End Process
 
+@Reasoning:
+`guard` is Swift's inverted-if: the body runs when the condition
+fails and is required to exit the enclosing scope. The HIR tags
+"control_flow" = "early_exit" so backends without a native guard
+form can synthesise the equivalent (if (!cond) { else_block } where
+else_block contains a return/throw/break/continue). Any optional
+bindings in the condition apply to the rest of the scope after the
+guard, not just the else branch.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_guard"
+with "control_flow" = "early_exit". Reads children at offset 24 and
+child_count at offset 32. If count >= 1, translates child 0 as the
+condition (must succeed to continue) and stores under "condition".
+If count >= 2, translates child 1 as the else-block via
+translate_statement_list and stores under "else_block". Returns
+guard_hir. The early-exit invariant is documented but not statically
+enforced here - the parser is responsible for rejecting else-blocks
+that do not exit scope.
+@End Implementation
 Process called "translate_guard_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift guard statement to HIR
 
@@ -1170,6 +1503,24 @@ Process called "translate_guard_stmt" takes context as Integer, node as Integer 
     Return guard_hir
 End Process
 
+@Reasoning:
+Swift switches are exhaustive: every possible value of the scrutinee
+must be matched by some case (or a default). Tagging "exhaustive" =
+"true" tells backends that emit C-style switches that they need to
+either keep the exhaustiveness check (where the target language
+supports it) or add a default arm to silence compile warnings.
+Unlike C, Swift has no implicit fallthrough; cases are walls.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_switch"
+with "exhaustive" = "true". Reads children at offset 24 and
+child_count at offset 32. If count >= 1, translates child 0 as the
+scrutinee expression and stores under "expression". If count >= 2,
+translates child 1 (the cases list node) via
+translate_switch_cases and stores the resulting list under "cases".
+Returns switch_hir.
+@End Implementation
 Process called "translate_switch_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift switch statement to HIR
 
@@ -1216,6 +1567,14 @@ Process called "translate_switch_stmt" takes context as Integer, node as Integer
     Return switch_hir
 End Process
 
+@Reasoning:
+Swift switch cases have three sub-elements: pattern (required),
+where clause (optional value-guard), and body (required statement
+list). Each case is captured as a "swift_case" dict with these
+fields. Pattern translation is delegated to the central translator
+because Swift patterns can themselves contain expressions (enum
+case payload binding, tuple destructuring).
+@End Reasoning
 Process called "translate_switch_cases" takes context as Integer, cases_node as Integer returns Integer:
     Note: Translate Swift switch cases to HIR
 
@@ -1287,6 +1646,24 @@ Process called "translate_switch_cases" takes context as Integer, cases_node as 
     Return cases_hir
 End Process
 
+@Reasoning:
+Swift `for x in sequence { ... }` is the canonical iteration form -
+there is no C-style `for(i=0;i<n;i++)`. The HIR records the pattern
+(which can be a simple identifier or a destructuring tuple like
+`(key, value)`), the sequence expression (any expression yielding a
+Sequence), and the body. Backends without a sequence-based for-each
+form lower this to manual iterator construction.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_for_in".
+Reads attribute dict at offset 32; if present, copies "pattern".
+Reads children at offset 24 and child_count at offset 32. If
+count >= 1, translates child 0 as the sequence expression and
+stores under "sequence". If count >= 2, translates child 1 as the
+body via translate_statement_list and stores under "body". Returns
+for_hir.
+@End Implementation
 Process called "translate_for_in_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift for-in statement to HIR
 
@@ -1340,6 +1717,12 @@ Process called "translate_for_in_stmt" takes context as Integer, node as Integer
     Return for_hir
 End Process
 
+@Reasoning:
+Swift while loops have a single condition expression (which may be
+a boolean or, in Swift, a 'while let' binding) plus a body. Both
+flow through translate_node so the right HIR shape is produced;
+the resulting "swift_while" node carries condition and body fields.
+@End Reasoning
 Process called "translate_while_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift while statement to HIR
 
@@ -1380,6 +1763,24 @@ Process called "translate_while_stmt" takes context as Integer, node as Integer 
     Return while_hir
 End Process
 
+@Reasoning:
+`defer` schedules its body to run when the enclosing scope exits,
+regardless of how the exit happens (normal return, thrown error,
+early break). The HIR tags "execution" = "scope_exit" so backends
+without a native defer can synthesise the same behaviour via
+try/finally (Java) or RAII destructors (C++) or scope guards (D).
+Multiple defers in the same scope execute in reverse declaration
+order; the ordering is preserved by the surrounding statement list.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_defer"
+with "execution" = "scope_exit". Reads children at offset 24 and
+child_count at offset 32. If count >= 1, translates child 0 as the
+body via translate_statement_list and stores under "body". Returns
+defer_hir. The reverse-order execution rule is a backend obligation,
+not encoded here.
+@End Implementation
 Process called "translate_defer_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift defer statement to HIR
 
@@ -1414,6 +1815,25 @@ Process called "translate_defer_stmt" takes context as Integer, node as Integer 
     Return defer_hir
 End Process
 
+@Reasoning:
+Swift's `do { ... } catch ... { }` blocks scope thrown errors and
+pattern-match them across catch clauses. Unlike Java/C++ exception
+handling, the catch clauses pattern-match on error values (any type
+conforming to Error) rather than testing class hierarchy, so the
+HIR keeps each catch clause as a pattern+body record instead of an
+exception-class binding.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged
+"swift_do_catch". Reads children at offset 24 and child_count at
+offset 32. If count >= 1, translates child 0 (the do-block) via
+translate_statement_list and stores under "do_block". If
+count >= 2, translates child 1 (the catch-clauses node) via
+translate_catch_clauses, which produces a list of catch HIRs
+patterned the same way as switch cases. Stores under
+"catch_clauses". Returns do_catch_hir.
+@End Implementation
 Process called "translate_do_catch_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift do-catch statement to HIR
 
@@ -1459,6 +1879,12 @@ Process called "translate_do_catch_stmt" takes context as Integer, node as Integ
     Return do_catch_hir
 End Process
 
+@Reasoning:
+Swift catch clauses pattern-match on the thrown error. Each clause
+has a pattern (required), optional where-clause guard, and a body.
+The structural layout mirrors switch cases (pattern/where/body) so
+the HIR has a uniform shape for both constructs.
+@End Reasoning
 Process called "translate_catch_clauses" takes context as Integer, catches_node as Integer returns Integer:
     Note: Translate Swift catch clauses to HIR
 
@@ -1530,6 +1956,13 @@ Process called "translate_catch_clauses" takes context as Integer, catches_node 
     Return catches_hir
 End Process
 
+@Reasoning:
+Swift return statements have an optional value expression. The HIR
+captures the optional value as a "value" field; bare returns
+produce a "swift_return" with no value field. Target emitters can
+distinguish Void-returning from value-returning functions via the
+field's presence.
+@End Reasoning
 Process called "translate_return_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift return statement to HIR
 
@@ -1558,6 +1991,12 @@ Process called "translate_return_stmt" takes context as Integer, node as Integer
     Return return_hir
 End Process
 
+@Reasoning:
+Swift break supports optional labels to break out of an outer
+loop/switch (break outerLoop). The label is captured from the
+attrs dictionary if present; otherwise the HIR carries only the
+"swift_break" type tag.
+@End Reasoning
 Process called "translate_break_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift break statement to HIR
 
@@ -1580,6 +2019,11 @@ Process called "translate_break_stmt" takes context as Integer, node as Integer 
     Return break_hir
 End Process
 
+@Reasoning:
+Swift continue, like break, supports optional labels for explicit
+control over which loop to continue. Same translation pattern as
+translate_break_stmt.
+@End Reasoning
 Process called "translate_continue_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift continue statement to HIR
 
@@ -1606,6 +2050,24 @@ Note: ==========================================================================
 Note: Expression Translation
 Note: ============================================================================
 
+@Reasoning:
+Swift's operator set extends beyond the C family: nil-coalescing
+(`??`), the two range operators (`...` closed and `..<` half-open),
+and user-declared custom operators with precedence groups. Storing
+the operator as a string token (rather than a numeric tag) is the
+cheapest way to preserve operator identity across the universal
+translation pipeline because the operator string is a verbatim
+copy of the source spelling.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged
+"swift_binary_op". Reads the attribute dict at offset 32 and copies
+"operator". Reads children at offset 24 and child_count at offset
+32. If count >= 1, translates child 0 as the left operand and
+stores under "left". If count >= 2, translates child 1 as the right
+operand and stores under "right". Returns binary_hir.
+@End Implementation
 Process called "translate_binary_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift binary expression to HIR
 
@@ -1659,6 +2121,14 @@ Process called "translate_binary_expr" takes context as Integer, node as Integer
     Return binary_hir
 End Process
 
+@Reasoning:
+Swift unary operators (-, !, ~) bind tighter than binary operators
+and include the postfix optional unwrapping operator (!) and
+prefix optional-chaining operator (?). The HIR captures the
+operator tag and the operand subtree; the kind (prefix/postfix)
+is included via the attrs dictionary because Swift distinguishes
+them syntactically.
+@End Reasoning
 Process called "translate_unary_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift unary expression to HIR
 
@@ -1700,6 +2170,25 @@ Process called "translate_unary_expr" takes context as Integer, node as Integer 
     Return unary_hir
 End Process
 
+@Reasoning:
+Swift call expressions can carry two effectful prefixes - `try` for
+calls that can throw and `await` for calls that can suspend - both
+of which alter how the call site is encoded. The HIR records both
+as boolean-style flags ("try" and "await") so backends can emit
+their language-specific equivalents (Java exception declarations,
+Kotlin/Rust async-await). The callee and arguments are the standard
+two positional children.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_call".
+Reads the attribute dict at offset 32 and copies "try" and "await".
+Reads children at offset 24 and child_count at offset 32. If
+count >= 1, translates child 0 as the callee expression and stores
+under "callee". If count >= 2, translates child 1 (the argument
+list) via translate_argument_list and stores under "arguments".
+Returns call_hir.
+@End Implementation
 Process called "translate_call_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift call expression to HIR
 
@@ -1758,6 +2247,25 @@ Process called "translate_call_expr" takes context as Integer, node as Integer r
     Return call_hir
 End Process
 
+@Reasoning:
+Swift arguments at call sites use the parameter's external label
+(matching the receiver function's declared external_name). A
+labelless argument is a positional one that matches a parameter
+declared with `_` as its external name. The HIR records each
+argument as a label+value pair so the caller-side spelling can be
+reconstructed exactly.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null args_node. Allocates an HIR list args_hir. Reads
+the arguments children at offset 24; returns the empty list if 0.
+Otherwise reads child_count at offset 32 and iterates. For each
+arg_node: allocates an HIR dict tagged "swift_argument", reads the
+attribute dict at offset 32 and copies "label". Reads the
+argument's children at offset 24; if non-zero and count >= 1,
+translates child 0 (the argument expression) and stores under
+"value". Each argument HIR is appended to args_hir. Returns args_hir.
+@End Implementation
 Process called "translate_argument_list" takes context as Integer, args_node as Integer returns Integer:
     Note: Translate Swift argument list to HIR (with labels)
 
@@ -1820,6 +2328,12 @@ Process called "translate_argument_list" takes context as Integer, args_node as 
     Return args_hir
 End Process
 
+@Reasoning:
+Swift member access (object.property) preserves the receiver and
+member name. The HIR distinguishes static dot from optional-chain
+(object?.property) via an attrs flag so target emitters can render
+the right null-safety form.
+@End Reasoning
 Process called "translate_member_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift member access expression to HIR
 
@@ -1856,6 +2370,13 @@ Process called "translate_member_expr" takes context as Integer, node as Integer
     Return member_hir
 End Process
 
+@Reasoning:
+Swift subscripts (arr[i], dict["key"]) are syntactic sugar over
+user-definable subscript operators. The HIR captures the receiver
+plus the index list (Swift subscripts can take multiple arguments).
+Target emitters render this as indexed access, method call, or
+operator overload depending on destination language semantics.
+@End Reasoning
 Process called "translate_subscript_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift subscript expression to HIR
 
@@ -1896,6 +2417,24 @@ Process called "translate_subscript_expr" takes context as Integer, node as Inte
     Return subscript_hir
 End Process
 
+@Reasoning:
+Optional chaining `base?.member` is Swift's safe-navigation
+operator: if any link in the chain is nil, the whole expression
+short-circuits to nil instead of crashing. The HIR captures the
+base operand and tags the operator explicitly so backends can lower
+to their target's equivalent (Kotlin's `?.`, Rust's `?` propagation,
+C# null-conditional `?.`).
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged
+"swift_optional_chain" with "operator" = "?.". Reads children at
+offset 24 and child_count at offset 32. If count >= 1, translates
+child 0 as the base operand and stores under "base". Returns
+chain_hir. The member component following the `?.` is captured by
+the surrounding member-access node, not here, because optional
+chaining wraps any subsequent access.
+@End Implementation
 Process called "translate_optional_chain_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift optional chaining expression to HIR
 
@@ -1930,6 +2469,23 @@ Process called "translate_optional_chain_expr" takes context as Integer, node as
     Return chain_hir
 End Process
 
+@Reasoning:
+Force unwrap `operand!` asserts at runtime that operand is non-nil
+and yields the unwrapped value. The crashes-if-nil behaviour is
+semantically distinct from optional chaining (which short-circuits)
+so the HIR uses a separate node kind. Backends lower this to
+Kotlin's `!!`, Rust's `unwrap()`, C#'s null-forgiving suffix `!`, or
+explicit panic-on-null checks for languages without a built-in
+shape.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged
+"swift_force_unwrap" with "operator" = "!". Reads children at
+offset 24 and child_count at offset 32. If count >= 1, translates
+child 0 as the operand and stores under "operand". Returns
+unwrap_hir.
+@End Implementation
 Process called "translate_force_unwrap_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift force unwrap expression to HIR
 
@@ -1964,6 +2520,27 @@ Process called "translate_force_unwrap_expr" takes context as Integer, node as I
     Return unwrap_hir
 End Process
 
+@Reasoning:
+Swift closures combine four interesting features that the HIR must
+preserve: explicit capture lists (`[weak self]`, `[unowned x]`),
+shorthand syntax flags (the `$0, $1` form vs the explicit parameter
+form), parameter list (which may have inferred types), and an
+optional explicit return type. Targets without capture-list syntax
+synthesize equivalent reference-counting decorations from this
+metadata.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_closure".
+Reads the attribute dict at offset 32 and copies "captures" and
+"shorthand". Reads children at offset 24 and child_count at offset
+32. If count >= 1, translates child 0 (parameter list) via
+translate_parameter_list and stores under "parameters". If
+count >= 2, translates child 1 as explicit return type via
+translate_type and stores under "return_type". If count >= 3,
+translates child 2 (body) via translate_statement_list and stores
+under "body". Returns closure_hir.
+@End Implementation
 Process called "translate_closure_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift closure expression to HIR
 
@@ -2035,6 +2612,13 @@ Process called "translate_closure_expr" takes context as Integer, node as Intege
     Return closure_hir
 End Process
 
+@Reasoning:
+Swift literal expressions cover integers, floats, strings,
+booleans, nil, and the rarer regex literal. The HIR captures the
+literal value and its kind tag so the target emitter can choose
+the right literal form for the destination language (e.g., Swift's
+nil maps to null/None/nil/Nothing depending on target).
+@End Reasoning
 Process called "translate_literal_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift literal expression to HIR
 
@@ -2061,6 +2645,13 @@ Process called "translate_literal_expr" takes context as Integer, node as Intege
     Return literal_hir
 End Process
 
+@Reasoning:
+Identifier expressions are unqualified name references. The HIR
+preserves the name verbatim; symbol resolution happens later in
+the semantic phase using the symbol table threaded through the
+context. We do not attempt resolution here because the resolver
+needs full module context.
+@End Reasoning
 Process called "translate_identifier_expr" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift identifier expression to HIR
 
@@ -2086,6 +2677,28 @@ Note: ==========================================================================
 Note: Type Translation
 Note: ============================================================================
 
+@Reasoning:
+Swift type expressions can be primitives, optionals (`T?`), arrays
+(`[T]`), dictionaries (`[K:V]`), tuples, function types, or generic
+parameterised forms. Flattening all of them into a single
+"swift_type" record with optional fields (name, optional flag,
+element_type, key_type, value_type, generic_args) lets backends
+inspect the type via the same accessor pattern regardless of which
+shape was originally written - a much simpler walker contract than
+maintaining a separate HIR shape per type kind.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Allocates an HIR dict tagged "swift_type".
+Reads the attribute dict at offset 32 and copies six fields:
+"type_name" -> "name", "optional" -> "optional",
+"element_type" -> "element_type" (for array types),
+"key_type" -> "key_type" (for dictionary types),
+"value_type" -> "value_type" (for dictionary types),
+"generic_args" -> "generic_args" (for parameterised types). Returns
+type_hir. Tuple types and function types follow the same pattern
+with additional fields populated by the upstream parser.
+@End Implementation
 Process called "translate_type" takes context as Integer, node as Integer returns Integer:
     Note: Translate Swift type to HIR
 
@@ -2145,6 +2758,12 @@ Note: ==========================================================================
 Note: Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Returns the context's error_count field (offset 24). Callers
+inspect this after translation to decide whether to use the
+produced HIR or treat the translation as failed. Null contexts
+return 0 so the call is safe in error paths.
+@End Reasoning
 Process called "get_translation_error_count" takes context as Integer returns Integer:
     Note: Get number of translation errors encountered
 

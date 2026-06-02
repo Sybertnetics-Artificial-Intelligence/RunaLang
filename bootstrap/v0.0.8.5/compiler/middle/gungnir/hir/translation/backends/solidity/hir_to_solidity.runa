@@ -16,6 +16,22 @@ Note: ===================================================================
 Note: GENERATION CONTEXT
 Note: ===================================================================
 
+@Reasoning:
+Per-translation context for Solidity emission. output accumulates the
+generated source; indent_level controls per-line spacing;
+current_contract is a back-pointer to the enclosing HIR class node so
+state-variable and function generation can consult contract-level
+metadata (e.g. base list, abstract flag) without re-locating the
+contract.
+@End Reasoning
+
+@Implementation:
+Runa struct of three fields: output (String, running source), indent_level
+(Integer), current_contract (Integer handle to enclosing contract HIR node
+or 0 at file scope). Constructed via create_generation_context with
+empty/zero values; current_contract is set/cleared on entry/exit of
+generate_contract.
+@End Implementation
 Type called "GenerationContext":
     output as Integer
     indent_level as Integer
@@ -26,6 +42,16 @@ Note: ===================================================================
 Note: MAIN GENERATION ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+Top-level driver. Creates a fresh GenerationContext and dispatches to
+generate_module which emits the SPDX comment, pragma, imports, types,
+and contracts in that order. Returns the accumulated output string.
+@End Reasoning
+
+@Implementation:
+Calls create_generation_context, then generate_module(ctx, hir_module),
+then returns ctx.output.
+@End Implementation
 Process called "generate_solidity_from_hir" takes hir_module as Integer returns Integer:
     Let ctx be proc create_generation_context
 
@@ -34,6 +60,15 @@ Process called "generate_solidity_from_hir" takes hir_module as Integer returns 
     Return ctx.output
 End Process
 
+@Reasoning:
+Factory for GenerationContext. Initialises output to empty string,
+indent_level to 0, and current_contract to 0 (file-scope marker).
+@End Reasoning
+
+@Implementation:
+Constructs a GenerationContext value with output="", indent_level=0,
+current_contract=0. Returns the new value.
+@End Implementation
 Process called "create_generation_context" returns Integer:
     Let ctx be a value of type GenerationContext with
         output as "",
@@ -47,6 +82,24 @@ Note: ===================================================================
 Note: MODULE GENERATION
 Note: ===================================================================
 
+@Reasoning:
+Emits the full module preamble (SPDX license, pragma directive) and
+then walks the top-level lists - imports, types (structs/enums/errors),
+and contracts (contract/interface/library). Solidity files must lead
+with an SPDX comment and pragma; this driver enforces that
+unconditionally. If the HIR module supplies pragma metadata it is
+used verbatim, otherwise a default 'pragma solidity ^0.8.0;' is
+emitted.
+@End Reasoning
+
+@Implementation:
+Emits the SPDX comment. Reads solidity_pragma_type and _pragma_value
+metadata; if pragma_type is non-empty emits 'pragma TYPE VALUE;'
+otherwise the default. Iterates hir_module_get_imports, then
+_get_types, then _get_classes (which holds contracts/interfaces/
+libraries). Each call delegates to the corresponding generate_*.
+Blank lines separate non-empty sections.
+@End Implementation
 Process called "generate_module" takes ctx as Integer, hir_module as Integer:
     Note: Generate SPDX license identifier
     proc emit with ctx, "// SPDX-License-Identifier: MIT\n"
@@ -111,6 +164,18 @@ Note: ===================================================================
 Note: IMPORT GENERATION
 Note: ===================================================================
 
+@Reasoning:
+Emits 'import "path";' or 'import "path" as Alias;'. Solidity's import
+target is always quoted (a path or URI) unlike most languages'
+identifier-based imports; the alias clause is optional and recorded
+in metadata.
+@End Reasoning
+
+@Implementation:
+Reads import name. Emits 'import "', name, '"'. Reads
+'solidity_alias' metadata; if non-empty emits ' as ALIAS'. Terminates
+with ';\n'.
+@End Implementation
 Process called "generate_import" takes ctx as Integer, import_node as Integer:
     Let import_name be proc hir_import_get_name from HIR with import_node
 
@@ -134,6 +199,20 @@ Note: ===================================================================
 Note: TYPE GENERATION (STRUCTS, ENUMS, ERRORS)
 Note: ===================================================================
 
+@Reasoning:
+Top-level type-declaration dispatcher. Solidity's type-level
+declarations split into three distinct keywords (struct, enum, error
+- each introduced in different language versions). The
+'solidity_type' metadata key selects which generator to invoke; an
+unrecognised value silently produces no output, which is the right
+behaviour for forward-compatible HIR extensions.
+@End Reasoning
+
+@Implementation:
+Reads 'solidity_type' metadata. Branches on string_equals match:
+"struct" -> generate_struct; "enum" -> generate_enum; "error" ->
+generate_error. Other values fall through with no emission.
+@End Implementation
 Process called "generate_type" takes ctx as Integer, type_node as Integer:
     Let solidity_type be proc hir_get_metadata from HIR with type_node, "solidity_type"
 
@@ -154,6 +233,19 @@ Process called "generate_type" takes ctx as Integer, type_node as Integer:
     End If
 End Process
 
+@Reasoning:
+Emits 'struct Name { type1 field1; type2 field2; ... }' for a
+Solidity value-type aggregate. Each field is emitted with its
+Solidity type (from 'solidity_field_type' metadata) followed by the
+field name.
+@End Reasoning
+
+@Implementation:
+Reads struct name. Emits 'struct NAME {\n'. increase_indent. Loops
+hir_type_get_fields: each field becomes
+'<indent>TYPE NAME;\n'. The TYPE comes from 'solidity_field_type'
+metadata via generate_type_expression. decrease_indent. Emits '}\n'.
+@End Implementation
 Process called "generate_struct" takes ctx as Integer, struct_node as Integer:
     Let struct_name be proc hir_type_get_name from HIR with struct_node
 
@@ -186,6 +278,20 @@ Process called "generate_struct" takes ctx as Integer, struct_node as Integer:
     proc emit with ctx, "}\n"
 End Process
 
+@Reasoning:
+Emits 'enum Name { V1, V2, ... }' for a Solidity enum. Variant names
+are stored in the enum node's metadata under the 'solidity_enum_value'
+key (potentially multiple occurrences); get_all_metadata_values
+collects them in declared order.
+@End Reasoning
+
+@Implementation:
+Reads enum name. Emits 'enum NAME {\n'. increase_indent. Pulls the
+metadata map via hir_type_get_metadata, collects values under
+"solidity_enum_value" via get_all_metadata_values. Iterates the
+returned list: each variant is emitted on its own indented line with
+a trailing comma except the last. decrease_indent + '}\n'.
+@End Implementation
 Process called "generate_enum" takes ctx as Integer, enum_node as Integer:
     Let enum_name be proc hir_type_get_name from HIR with enum_node
 
@@ -220,6 +326,20 @@ Process called "generate_enum" takes ctx as Integer, enum_node as Integer:
     proc emit with ctx, "}\n"
 End Process
 
+@Reasoning:
+Emits a Solidity 0.8.4+ custom error declaration:
+'error Name(type1 field1, type2 field2);'. Errors are file-scope
+constructs (unlike struct/enum which can also live inside contracts)
+and form the typed counterpart to require/revert messages, enabling
+gas-efficient diagnostics.
+@End Reasoning
+
+@Implementation:
+Reads error name. Emits 'error NAME('. Iterates hir_type_get_fields:
+each field becomes 'TYPE NAME' separated by ', '. The TYPE comes
+from the field's 'type' metadata via generate_type_expression.
+Terminates with ');\n'.
+@End Implementation
 Process called "generate_error" takes ctx as Integer, error_node as Integer:
     Let error_name be proc hir_type_get_name from HIR with error_node
 
@@ -255,6 +375,31 @@ Note: ===================================================================
 Note: CONTRACT GENERATION
 Note: ===================================================================
 
+@Reasoning:
+Emits a Solidity contract, interface, or library declaration with
+all members. Solidity distinguishes three top-level container forms:
+'contract' (default), 'interface' (no state, no implementations),
+and 'library' (no state, no inheritance, stateless utilities). The
+'solidity_type' metadata key selects the keyword; the 'solidity_abstract'
+metadata flag adds the 'abstract' prefix (Solidity 0.6+). Inheritance
+is expressed via 'is Base1, Base2'. The proc saves and restores
+ctx.current_contract so member generators (state vars, modifiers,
+functions) can consult enclosing-contract metadata.
+@End Reasoning
+
+@Implementation:
+Reads contract name and 'solidity_type'/'solidity_abstract' metadata.
+Emits 'abstract ' if applicable, then the keyword ('contract' /
+'interface' / 'library'), then the name. Reads
+'solidity_inherits' metadata via get_all_metadata_values; if non-
+empty emits ' is B1, B2, ...'. Emits ' {\n'. Increases indent, sets
+ctx.current_contract = contract_node. Calls generate_using_directives
+then walks fields (-> generate_state_variable) and methods (each
+method's 'solidity_type' metadata routes to generate_event /
+_modifier / _function). Blank lines separate non-empty groups and
+adjacent methods. Decreases indent, clears current_contract, emits
+'}\n'.
+@End Implementation
 Process called "generate_contract" takes ctx as GenerationContext, contract_node as Integer:
     Let contract_name be proc hir_class_get_name from HIR with contract_node
 
@@ -362,6 +507,23 @@ Process called "generate_contract" takes ctx as GenerationContext, contract_node
     proc emit with ctx, "}\n"
 End Process
 
+@Reasoning:
+Emits 'using LIB for TYPE;' directives inside a contract. The
+directive attaches a library's free functions as methods on instances
+of the target type (e.g. 'using SafeMath for uint256' makes
+'a.add(b)' resolve to 'SafeMath.add(a, b)'). A missing target_type
+metadata is interpreted as the global form 'using LIB for *' (file
+scope only in Solidity 0.8.13+, but emitted here unconditionally for
+backward-compat HIR shapes).
+@End Reasoning
+
+@Implementation:
+Reads 'solidity_using' metadata. Returns early if absent. Pulls the
+list of directives via get_metadata_list; returns early if empty.
+Iterates: each directive carries 'library' and 'for_type' fields.
+If library is non-null: emit_indent, 'using LIB for '; emit either
+target_type or '*'; ';\n'. Returns 1 to signal completion.
+@End Implementation
 Process called "generate_using_directives" takes ctx as Integer, contract_node as Integer:
     Note: Generate Solidity using directives (e.g., using SafeMath for uint256)
     Note: Using directives attach library functions to types
@@ -416,6 +578,23 @@ Note: ===================================================================
 Note: STATE VARIABLE GENERATION
 Note: ===================================================================
 
+@Reasoning:
+Emits a contract state-variable declaration:
+'TYPE [modifier...] NAME [= INIT];'. Solidity modifiers for state
+variables include visibility (public/internal/private) and storage
+classifiers (constant/immutable). They can appear in either order
+between the type and the name. The modifier list is collected from
+'solidity_modifier' metadata which may have multiple values.
+@End Reasoning
+
+@Implementation:
+emit_indent. Reads modifier list via get_all_metadata_values keyed by
+'solidity_modifier'. Emits 'TYPE ' from 'solidity_type' metadata via
+generate_type_expression. Then emits each modifier followed by a
+space. Emits the field_name. If 'solidity_initializer' metadata is
+non-null emits ' = INIT' via generate_expression. Terminates with
+';\n'.
+@End Implementation
 Process called "generate_state_variable" takes ctx as Integer, field_node as Integer:
     Let field_name be proc hir_field_get_name from HIR with field_node
 
@@ -456,6 +635,22 @@ Note: ===================================================================
 Note: EVENT GENERATION
 Note: ===================================================================
 
+@Reasoning:
+Emits 'event Name(type1 indexed? name1, ...);'. Each event parameter
+may carry the 'indexed' modifier (up to 3 per event in Solidity)
+which causes the parameter to be stored in a log topic for efficient
+indexed access. The 'anonymous' event-level modifier removes the
+event's identifier topic - emitted via the 'solidity_anonymous'
+metadata flag.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'event NAME('. Loops parameters; each yields
+'TYPE [indexed] [NAME]'. The 'indexed' keyword is emitted when
+'solidity_indexed' metadata is non-empty. Parameters separated by
+', '. After ')', emits ' anonymous' when 'solidity_anonymous'
+metadata is non-empty. Terminates with ';\n'.
+@End Implementation
 Process called "generate_event" takes ctx as Integer, event_node as Integer:
     Let event_name be proc hir_function_get_name from HIR with event_node
 
@@ -512,6 +707,23 @@ Note: ===================================================================
 Note: MODIFIER GENERATION
 Note: ===================================================================
 
+@Reasoning:
+Emits a Solidity modifier definition:
+'modifier NAME(params) [virtual/override] { body... }'. Modifiers are
+re-usable pre/post-condition fragments composed onto functions. The
+'_;' placeholder represents the wrapped function's body and must be
+present somewhere in the modifier; when no body is provided this
+generator emits a minimal '{ _; }' so the output is syntactically
+valid.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'modifier NAME(' + comma-separated 'TYPE NAME'
+parameters + ')'. Calls generate_function_modifiers to append
+virtual/override and other tag modifiers. Emits ' '. If body is
+non-null, delegates to generate_statement. Otherwise emits a default
+empty body '{\n    _;\n}\n'.
+@End Implementation
 Process called "generate_modifier" takes ctx as Integer, modifier_node as Integer:
     Let modifier_name be proc hir_function_get_name from HIR with modifier_node
 
@@ -566,6 +778,29 @@ Note: ===================================================================
 Note: FUNCTION GENERATION
 Note: ===================================================================
 
+@Reasoning:
+Emits a Solidity function declaration. Covers the four function
+forms: regular 'function NAME', the unnamed 'constructor', the
+unnamed 'fallback', and the unnamed 'receive'. Parameters carry an
+optional storage location (memory/calldata/storage) emitted between
+type and name. Returns clause uses the 'solidity_returns' metadata
+which holds a parameter list (each entry can name its return slot).
+@End Reasoning
+
+@Implementation:
+emit_indent. Reads 'solidity_type' metadata. Branches:
+  "constructor" -> 'constructor'
+  "fallback"    -> 'fallback'
+  "receive"     -> 'receive'
+  else          -> 'function NAME'
+Emits '('. Loops params: emits TYPE via generate_type_expression;
+emits ' STORAGE' if 'solidity_storage' metadata is non-empty; emits
+' NAME' if name is non-empty. Parameters separated by ', '. Emits
+')'. Calls generate_function_modifiers (visibility/mutability/etc).
+If 'solidity_returns' metadata is non-null emits ' returns (' +
+comma-separated parameter list via generate_parameter + ')'. If
+body is non-null emits ' ' + generate_statement; otherwise ';\n'.
+@End Implementation
 Process called "generate_function" takes ctx as Integer, function_node as Integer:
     Let function_name be proc hir_function_get_name from HIR with function_node
     Let solidity_type be proc hir_get_metadata from HIR with function_node, "solidity_type"
@@ -664,6 +899,20 @@ Process called "generate_function" takes ctx as Integer, function_node as Intege
     End If
 End Process
 
+@Reasoning:
+Emits the modifier-list tail of a function or modifier declaration:
+the space-separated tags visibility (public/private/internal/external),
+mutability (view/pure/payable), virtual, override, and any custom
+modifiers like 'onlyOwner'. The order follows the HIR-supplied
+sequence verbatim because Solidity is lenient about modifier ordering.
+@End Reasoning
+
+@Implementation:
+Collects modifier list from 'solidity_modifier' metadata via
+get_all_metadata_values. Iterates; each entry is emitted as ' TAG'
+(leading space). No trailing semicolon or newline - the caller
+controls termination.
+@End Implementation
 Process called "generate_function_modifiers" takes ctx as Integer, function_node as Integer:
     Let modifiers_meta_func be proc hir_get_metadata from HIR with function_node, "solidity_modifier"
     Let modifiers be proc get_all_metadata_values with modifiers_meta_func
@@ -678,6 +927,18 @@ Process called "generate_function_modifiers" takes ctx as Integer, function_node
     End While
 End Process
 
+@Reasoning:
+Single-parameter emitter used for return-list parameters (the
+function-argument list inlines parameter emission for tighter
+control over the comma-separator logic). Emits 'TYPE [STORAGE] [NAME]'.
+@End Reasoning
+
+@Implementation:
+Reads param_name and param_type. Emits TYPE via
+generate_type_expression. Reads 'solidity_storage' metadata; if non-
+empty appends ' STORAGE'. Emits ' NAME' if name is non-empty (named
+returns are an optional Solidity feature).
+@End Implementation
 Process called "generate_parameter" takes ctx as Integer, param_node as Integer:
     Let param_name be proc hir_parameter_get_name from HIR with param_node
     Let param_type be proc hir_parameter_get_type from HIR with param_node
@@ -703,6 +964,22 @@ Note: ===================================================================
 Note: STATEMENT GENERATION
 Note: ===================================================================
 
+@Reasoning:
+Statement-level dispatcher. Unlike PHP's backend which uses a single
+type-tag read, the Solidity backend uses per-kind predicate helpers
+(hir_is_block / hir_is_if_statement / etc.) - this keeps the
+predicate logic centralised in HIR but costs an extra call per
+candidate kind. Each predicate match short-circuits via Return.
+@End Reasoning
+
+@Implementation:
+Reads the node's type via hir_node_get_type (used only for the
+default-case fallthrough; predicates do their own type-tag inspection
+internally). Cascade: hir_is_block -> generate_block; _is_if -> _if;
+_is_while -> _while; _is_return -> _return; _is_break -> 'break;\n';
+_is_continue -> 'continue;\n'; _is_expression_statement ->
+_expression_statement. Unrecognised statement kinds produce no output.
+@End Implementation
 Process called "generate_statement" takes ctx as Integer, stmt_node as Integer:
     Let stmt_type be proc hir_node_get_type from HIR with stmt_node
 
@@ -758,6 +1035,17 @@ Process called "generate_statement" takes ctx as Integer, stmt_node as Integer:
     End If
 End Process
 
+@Reasoning:
+Emits a Solidity brace-delimited block. The opening brace lands on
+the current cursor position (no fresh emit_indent) so 'if (...) {'
+and similar can attach the brace to the previous line.
+@End Reasoning
+
+@Implementation:
+Emits '{\n'. increase_indent. Loops hir_block_get_statements,
+recursing generate_statement for each. decrease_indent. emit_indent
++ '}\n'.
+@End Implementation
 Process called "generate_block" takes ctx as Integer, block_node as Integer:
     proc emit with ctx, "{\n"
 
@@ -778,6 +1066,19 @@ Process called "generate_block" takes ctx as Integer, block_node as Integer:
     proc emit with ctx, "}\n"
 End Process
 
+@Reasoning:
+Emits 'if (cond) thenStmt' with optional 'else elseStmt'. Unlike the
+PHP backend, this generator passes the branch through
+generate_statement without wrapping bare statements in synthesised
+braces - the HIR is expected to wrap such cases in a block node
+already.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'if (' + generate_expression(condition) + ') '. Then
+generate_statement(then_branch). If else_branch is non-null:
+emit_indent + 'else ' + generate_statement(else_branch).
+@End Implementation
 Process called "generate_if_statement" takes ctx as Integer, if_node as Integer:
     Let condition be proc hir_if_get_condition from HIR with if_node
     Let then_stmt be proc hir_if_get_then_branch from HIR with if_node
@@ -797,6 +1098,16 @@ Process called "generate_if_statement" takes ctx as Integer, if_node as Integer:
     End If
 End Process
 
+@Reasoning:
+Emits 'while (cond) body'. As in generate_if_statement, the body is
+passed straight to generate_statement on the assumption that the HIR
+already wraps multi-statement bodies in a block.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'while (' + generate_expression(condition) + ') ' +
+generate_statement(body).
+@End Implementation
 Process called "generate_while_statement" takes ctx as Integer, while_node as Integer:
     Let condition be proc hir_while_get_condition from HIR with while_node
     Let body be proc hir_while_get_body from HIR with while_node
@@ -809,6 +1120,15 @@ Process called "generate_while_statement" takes ctx as Integer, while_node as In
     proc generate_statement with ctx, body
 End Process
 
+@Reasoning:
+Emits 'return [expr];'. The value is optional - bare 'return;' is
+the typeless or void-returning form.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'return'. If hir_return_get_value is non-null appends
+' ' + generate_expression(value). Terminates with ';\n'.
+@End Implementation
 Process called "generate_return_statement" takes ctx as Integer, return_node as Integer:
     proc emit_indent from ctx
     proc emit with ctx, "return"
@@ -822,6 +1142,18 @@ Process called "generate_return_statement" takes ctx as Integer, return_node as 
     proc emit with ctx, ";\n"
 End Process
 
+@Reasoning:
+Emits an expression evaluated for its side effect: 'expr;'. The
+emit_indent / trailing ';\n' separation here (rather than inside
+generate_expression) keeps expression generation reusable both as a
+statement and as a sub-expression of another expression without
+emitting stray semicolons.
+@End Reasoning
+
+@Implementation:
+emit_indent + generate_expression(hir_expression_statement_get_expression)
++ ';\n'.
+@End Implementation
 Process called "generate_expression_statement" takes ctx as Integer, expr_stmt as Integer:
     Let expr be proc hir_expression_statement_get_expression from HIR with expr_stmt
 
@@ -834,6 +1166,22 @@ Note: ===================================================================
 Note: EXPRESSION GENERATION
 Note: ===================================================================
 
+@Reasoning:
+Expression-level dispatcher. Tests each expression kind via the
+corresponding hir_is_* predicate and routes to the dedicated
+generator. Literal kinds (integer/string/boolean/identifier) are
+inlined here because they reduce to a single emit pair.
+@End Reasoning
+
+@Implementation:
+Cascade of predicate calls: _is_binary -> generate_binary_expression;
+_is_unary -> generate_unary_expression; _is_call -> generate_call;
+_is_member -> generate_member; _is_index -> generate_index;
+_is_integer_literal -> emit raw integer text; _is_string_literal ->
+emit '"VALUE"' with quotes; _is_boolean_literal -> emit 'true' or
+'false' based on the 0/1 value; _is_identifier -> emit the
+identifier name. Unknown kinds fall through with no emission.
+@End Implementation
 Process called "generate_expression" takes ctx as Integer, expr_node as Integer:
     Note: Binary expression
     Let is_binary be proc hir_is_binary_expression from HIR with expr_node
@@ -907,6 +1255,18 @@ Process called "generate_expression" takes ctx as Integer, expr_node as Integer:
     End If
 End Process
 
+@Reasoning:
+Emits 'LEFT OP RIGHT'. Unlike the PHP backend, the Solidity backend
+does NOT wrap binary expressions in parentheses; the caller is
+expected to ensure that the surrounding context respects Solidity
+operator precedence, or to insert explicit parenthesisation in HIR
+when needed.
+@End Reasoning
+
+@Implementation:
+Reads operator, left, right via HIR accessors. Generates left,
+emits ' OP ', generates right.
+@End Implementation
 Process called "generate_binary_expression" takes ctx as Integer, binary_node as Integer:
     Let operator be proc hir_binary_get_operator from HIR with binary_node
     Let left be proc hir_binary_get_left from HIR with binary_node
@@ -919,6 +1279,18 @@ Process called "generate_binary_expression" takes ctx as Integer, binary_node as
     proc generate_expression with ctx, right
 End Process
 
+@Reasoning:
+Emits an unconditional prefix unary form 'OP OPERAND' (no postfix
+support). Solidity admits prefix '!', '-', '~', '++', '--' on
+expressions; the postfix '++' and '--' forms are not generated here -
+HIR-side lowering must convert any postfix forms to compound
+assignments before reaching this backend.
+@End Reasoning
+
+@Implementation:
+Reads operator and operand. Emits operator, then recurses into
+generate_expression for the operand.
+@End Implementation
 Process called "generate_unary_expression" takes ctx as Integer, unary_node as Integer:
     Let operator be proc hir_unary_get_operator from HIR with unary_node
     Let operand be proc hir_unary_get_operand from HIR with unary_node
@@ -927,6 +1299,18 @@ Process called "generate_unary_expression" takes ctx as Integer, unary_node as I
     proc generate_expression with ctx, operand
 End Process
 
+@Reasoning:
+Emits 'CALLEE(arg1, arg2, ...)'. The callee is itself a general
+expression so member calls (a.b()), index expressions, and chained
+calls all emit correctly through the recursive generate_expression
+path.
+@End Reasoning
+
+@Implementation:
+Generates the callee expression. Emits '('. Iterates
+hir_call_get_arguments, generating each and inserting ', ' between
+adjacent arguments (not after the last). Emits ')'.
+@End Implementation
 Process called "generate_call_expression" takes ctx as Integer, call_node as Integer:
     Let callee be proc hir_call_get_callee from HIR with call_node
     Let arguments be proc hir_call_get_arguments from HIR with call_node
@@ -951,6 +1335,16 @@ Process called "generate_call_expression" takes ctx as Integer, call_node as Int
     proc emit with ctx, ")"
 End Process
 
+@Reasoning:
+Emits 'OBJECT.MEMBER'. Solidity uses '.' for both contract-member
+access and struct-field access; the syntactic form is identical so
+this one routine covers both.
+@End Reasoning
+
+@Implementation:
+Generates the object expression. Emits '.'. Emits the member name
+verbatim.
+@End Implementation
 Process called "generate_member_expression" takes ctx as Integer, member_node as Integer:
     Let object be proc hir_member_get_object from HIR with member_node
     Let member_name be proc hir_member_get_name from HIR with member_node
@@ -960,6 +1354,17 @@ Process called "generate_member_expression" takes ctx as Integer, member_node as
     proc emit with ctx, member_name
 End Process
 
+@Reasoning:
+Emits 'OBJECT[INDEX]'. Solidity uses [] subscript for arrays
+(fixed-size and dynamic) and mappings. The index expression's type
+is determined by the object's type at the HIR layer; this generator
+treats them uniformly.
+@End Reasoning
+
+@Implementation:
+Generates the object expression. Emits '['. Generates the index
+expression. Emits ']'.
+@End Implementation
 Process called "generate_index_expression" takes ctx as Integer, index_node as Integer:
     Let object be proc hir_index_get_object from HIR with index_node
     Let index be proc hir_index_get_index from HIR with index_node
@@ -974,6 +1379,19 @@ Note: ===================================================================
 Note: TYPE EXPRESSION GENERATION
 Note: ===================================================================
 
+@Reasoning:
+Emits a Solidity type reference. The input may be either a raw string
+('uint256', 'address payable', 'mapping(...)', etc.) or an HIR type
+node. The is_string_value probe lets either form work without the
+caller knowing which kind it has on hand - useful because metadata
+slots often carry strings while AST slots carry HIR nodes.
+@End Reasoning
+
+@Implementation:
+Calls is_string_value on the input. If 1, emits the input directly
+(string-literal form). Otherwise treats it as an HIR type node and
+emits hir_type_get_name.
+@End Implementation
 Process called "generate_type_expression" takes ctx as Integer, type_expr as Integer:
     Note: Handle type node or string
     Let is_string be proc is_string_value from type_expr
@@ -991,6 +1409,23 @@ Note: ===================================================================
 Note: METADATA UTILITIES
 Note: ===================================================================
 
+@Reasoning:
+HIR metadata is encoded as an interleaved flat List of
+[key1, val1, key2, val2, ...]. This routine collects all values
+whose preceding key matches the supplied key string. Some metadata
+keys are inherently multi-valued (modifiers, inheritance bases) so
+duplicates are preserved in declared order. A null metadata pointer
+or missing key yields an empty list rather than null so the caller
+can iterate without a null-check.
+@End Reasoning
+
+@Implementation:
+Allocates a fresh empty List via list_create. Null metadata returns
+the empty list. Iterates 0..count in steps of 2: reads
+metadata[i] as a key, compares against the requested key via
+string_equals; on match reads metadata[i+1] (if in bounds) and
+appends to the values list. Returns the populated list.
+@End Implementation
 Process called "get_all_metadata_values" takes metadata as Integer, key as Integer returns Integer:
     Let values be proc list_create from ListCore
 
@@ -1019,6 +1454,29 @@ Process called "get_all_metadata_values" takes metadata as Integer, key as Integ
     Return values
 End Process
 
+@Reasoning:
+Tag-discriminator for the metadata/AST polymorphic input accepted by
+generate_type_expression. Tries the HIR-side string predicate first;
+if that fails, applies a heuristic memory probe: real
+StringCore handles store a length integer in their first 8 bytes
+that lies in a plausible range [0, 1MB), whereas AST node handles
+store a type tag that does not. The probe is safe on Layout-allocated
+memory and avoids false positives in practice for typical Solidity
+HIR shapes.
+@End Reasoning
+
+@Implementation:
+Null short-circuits to 0. Calls is_string_hir from HIR; on match
+returns 1. Otherwise reads the first i64 at the input pointer and
+checks 0 <= length < 1048576; if so returns 1 (likely string).
+Otherwise returns 0 (likely HIR node).
+@End Implementation
+
+@Security_Scope:
+The memory probe assumes the input pointer is at least 8 bytes of
+allocated memory; this is always true for Layout.allocate results
+and StringCore handles. Callers must not pass arbitrary integers.
+@End Security_Scope
 Process called "is_string_value" takes value as Integer returns Integer:
     Note: Check if value is a string by examining its type tag or structure
 
@@ -1052,10 +1510,31 @@ Note: ===================================================================
 Note: OUTPUT UTILITIES
 Note: ===================================================================
 
+@Reasoning:
+The output primitive: appends a chunk of text to the context's
+running output string. Every other generate_* routine flows its
+output through here.
+@End Reasoning
+
+@Implementation:
+ctx.output := StringCore.string_concat(ctx.output, text). The concat
+allocates a fresh string each call; this is O(N) per emission but
+acceptable for the bootstrap's small input sizes.
+@End Implementation
 Process called "emit" takes ctx as Integer, text as Integer:
     Set ctx.output to proc string_concat from StringCore with ctx.output, text
 End Process
 
+@Reasoning:
+Writes four spaces times the current indent_level. Solidity's
+de-facto style guide (per the official documentation) prescribes
+four-space indentation; this routine encodes that style.
+@End Reasoning
+
+@Implementation:
+Loop 0..ctx.indent_level: each iteration emits a four-space string.
+No-op at indent_level 0.
+@End Implementation
 Process called "emit_indent" takes ctx as Integer:
     Let i be 0
     While i is less than ctx.indent_level:
@@ -1064,10 +1543,28 @@ Process called "emit_indent" takes ctx as Integer:
     End While
 End Process
 
+@Reasoning:
+Bumps the context's indent counter so subsequent emit_indent calls
+produce one more level of indentation. Paired with decrease_indent
+around any nested block.
+@End Reasoning
+
+@Implementation:
+ctx.indent_level += 1.
+@End Implementation
 Process called "increase_indent" takes ctx as Integer:
     Set ctx.indent_level to ctx.indent_level plus 1
 End Process
 
+@Reasoning:
+Companion to increase_indent. The caller must never let indent_level
+go negative; the convention is that every increase has a paired
+decrease on every exit path.
+@End Reasoning
+
+@Implementation:
+ctx.indent_level -= 1.
+@End Implementation
 Process called "decrease_indent" takes ctx as Integer:
     Set ctx.indent_level to ctx.indent_level minus 1
 End Process
@@ -1076,6 +1573,16 @@ Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
 
+@Reasoning:
+Public entry-point alias for generate_solidity_from_hir. Provides
+the 'hir_to_<lang>' naming convention that the translation pipeline
+drivers expect when locating backends by symbol name.
+@End Reasoning
+
+@Implementation:
+Tail-calls generate_solidity_from_hir with the same hir_module
+argument.
+@End Implementation
 Process called "hir_to_solidity" takes hir_module as Integer returns Integer:
     Return proc generate_solidity_from_hir from hir_module
 End Process

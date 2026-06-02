@@ -14,6 +14,19 @@ Note: ================================================================
 Note: Code Generation Context Type
 Note: ================================================================
 
+@Reasoning:
+51+ HIR-to-target backends all need the same emission scaffolding: output
+buffer, indent tracking, position tracking for diagnostics, error/warning
+lists, and a metadata slot for backend-private state. Centralizing the layout
+here lets a backend pick up the full feature set by passing the context handle
+through its emitters rather than reinventing buffer plumbing.
+@End Reasoning
+@Implementation:
+72-byte heap layout. Fixed offsets (used by every accessor): output@0,
+indent_level@8, indent_string@16, current_line@24, current_column@32,
+errors@40, warnings@48, has_error@56, metadata@64. Reordering ANY field breaks
+every backend in the tree; treat this as a stable ABI.
+@End Implementation
 Type called "CodeGenerationContext":
     output as String
     indent_level as Integer
@@ -30,6 +43,19 @@ Note: ================================================================
 Note: Context Creation and Destruction
 Note: ================================================================
 
+@Reasoning:
+A factory rather than per-field construction is used because the context has
+nine fields with non-trivial defaults: empty output, level-0 indent, four-space
+indent string (the conventional default), 1-based line/column counters,
+fresh error/warning lists, and zeroed has_error/metadata. Backends that need a
+different indent style call create_code_context_with_indent instead.
+@End Reasoning
+@Implementation:
+Allocates 72 bytes via Layout, then writes each field by absolute offset.
+Allocation failure surfaces as a 0 return so callers can check without
+exceptions. Lines and columns start at 1 (not 0) to match human-readable
+diagnostic conventions.
+@End Implementation
 Process called "create_code_context" that takes nothing returns Integer:
     Let context_size be 72
     Let context be proc allocate from Layout with context_size
@@ -64,6 +90,16 @@ Process called "create_code_context" that takes nothing returns Integer:
     Return context
 End Process
 
+@Reasoning:
+Some target languages have strong house style (Python: 4 spaces; Go: tab; Lisp:
+2 spaces). Letting the backend pick the indent unit up front avoids every
+backend having to call set_indent_string immediately after creation.
+@End Reasoning
+@Implementation:
+Builds on create_code_context then overwrites offset 16. The custom string is
+not validated; passing a non-whitespace string would produce visible artifacts
+but no error.
+@End Implementation
 Process called "create_code_context_with_indent" that takes indent_string as String returns Integer:
     Let context be proc create_code_context
 
@@ -77,6 +113,17 @@ Process called "create_code_context_with_indent" that takes indent_string as Str
     Return context
 End Process
 
+@Reasoning:
+The 72-byte block, errors list, and warnings list are owned by the caller's
+allocator (the driver passes them through to its arena/ARC strategy of
+choice). Releasing them here would double-free; this routine therefore exists
+only as a contract endpoint so backends can call "destroy" without thinking
+about ownership.
+@End Reasoning
+@Implementation:
+Null-checks the input and returns 1 on success. The actual memory release is
+the caller's responsibility per Runa's five-tier memory model.
+@End Implementation
 Process called "destroy_code_context" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -90,6 +137,26 @@ Note: ================================================================
 Note: Output Emission
 Note: ================================================================
 
+@Reasoning:
+The fundamental write primitive: append to output and advance the column
+counter. Column tracking is char-count based (length of the appended String),
+which matches what diagnostics want for byte-oriented targets but is
+approximate for variable-width Unicode (acceptable here because emitted code
+is typically ASCII).
+@End Reasoning
+@Implementation:
+1. Read current output at offset 0.
+2. Concat with the new text via StringCore.
+3. Write back to offset 0.
+4. Read column at offset 32, add text length, write back.
+Note: this is NOT line-aware - newlines inside `text` will desync column
+tracking. Callers that emit newlines should prefer emit_line.
+@End Implementation
+@Performance_Hints:
+Repeated concat is O(n^2) in total emitted bytes. For multi-megabyte outputs,
+either pre-buffer or switch to a chunk-list builder; both are out-of-scope here
+since this module is a hot path for many backends.
+@End Performance_Hints
 Process called "emit" that takes context as Integer, text as String returns Integer:
     If context is equal to 0:
         Return 0
@@ -112,6 +179,18 @@ Process called "emit" that takes context as Integer, text as String returns Inte
     Return 1
 End Process
 
+@Reasoning:
+A single emit-then-newline helper centralizes the line/column bookkeeping that
+plain emit cannot do (incrementing line, resetting column to 1). All
+indent-aware emitters terminate lines through this routine so position state
+stays consistent.
+@End Reasoning
+@Implementation:
+Emits text via emit (which advances column), emits "\n" via emit (which
+desyncs column briefly), then explicitly fixes line up by one and column back
+to 1. The intermediate emit of "\n" is acceptable because the explicit fixups
+that follow it overwrite the broken column.
+@End Implementation
 Process called "emit_line" that takes context as Integer, text as String returns Integer:
     If context is equal to 0:
         Return 0
@@ -133,6 +212,15 @@ Process called "emit_line" that takes context as Integer, text as String returns
     Return 1
 End Process
 
+@Reasoning:
+Common enough to deserve a named alias rather than `emit_line(ctx, "")`.
+Reads clearer at call sites and lets future implementations specialize the
+empty-text case without touching every caller.
+@End Reasoning
+@Implementation:
+Forwards to emit_line with the empty string, which still triggers the line
+counter increment and column reset.
+@End Implementation
 Process called "emit_newline" that takes context as Integer returns Integer:
     Return proc emit_line with context, ""
 End Process
@@ -141,6 +229,17 @@ Note: ================================================================
 Note: Indentation Management
 Note: ================================================================
 
+@Reasoning:
+Indentation is emitted as N copies of the stored indent_string, not as
+indent_level multiplied into a precomputed buffer. This avoids cache effects
+from per-context indent strings of varying widths and keeps the implementation
+allocator-free aside from the underlying string concat.
+@End Reasoning
+@Implementation:
+Read indent_level from offset 8, indent_string from offset 16, then loop
+indent_level times calling emit. The loop runs once for each indent stop, not
+once per character.
+@End Implementation
 Process called "emit_indent" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -159,6 +258,16 @@ Process called "emit_indent" that takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+A dedicated helper instead of inline increment keeps the indent_level offset
+(8) constant in one place. Backends call this when entering a nested scope,
+paired with decrease_indent on exit; the pairing discipline is enforced by
+convention rather than by an indent stack.
+@End Reasoning
+@Implementation:
+Read offset 8, add 1, write back. No upper-bound clamp; deeply pathological
+indentation would just produce very wide output, never overflow.
+@End Implementation
 Process called "increase_indent" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -170,6 +279,17 @@ Process called "increase_indent" that takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Underflow protection (clamp at zero) is included here, unlike the Verilog
+backend's indent_dec, because this routine is the shared infrastructure used
+by 50+ backends; a single mismatched increase/decrease pair in one backend
+must not corrupt all downstream emission.
+@End Reasoning
+@Implementation:
+Read offset 8; only decrement if greater than 0. Silent saturation rather
+than an error because diagnosing a malformed indent stack from inside a code
+emitter is not actionable in production.
+@End Implementation
 Process called "decrease_indent" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -185,6 +305,17 @@ Process called "decrease_indent" that takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Direct level setting (as opposed to inc/dec only) supports backends that want
+to snapshot and restore the indent (e.g., for emitting an inline expression
+inside a deeply indented context). Negative inputs are clamped to zero with
+the same rationale as decrease_indent.
+@End Reasoning
+@Implementation:
+Branches on sign of `level`. Non-negative values are stored verbatim;
+negatives become 0 so the indent state stays consistent regardless of caller
+arithmetic mistakes.
+@End Implementation
 Process called "set_indent_level" that takes context as Integer, level as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -200,6 +331,15 @@ Process called "set_indent_level" that takes context as Integer, level as Intege
     Return 1
 End Process
 
+@Reasoning:
+Read-only accessor so backends needing to checkpoint and restore the indent
+level (e.g., emit a deeply nested expression then return) don't have to know
+the offset 8 contract.
+@End Reasoning
+@Implementation:
+Direct memory read from offset 8; returns 0 on null context to remain safe in
+"defensive" emission paths.
+@End Implementation
 Process called "get_indent_level" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -208,6 +348,15 @@ Process called "get_indent_level" that takes context as Integer returns Integer:
     Return proc memory_get_int64 from Layout with context, 8
 End Process
 
+@Reasoning:
+A late-binding alternative to create_code_context_with_indent for backends
+that compute their indent style after context creation (e.g., from a project
+config file read mid-pipeline).
+@End Reasoning
+@Implementation:
+Overwrites offset 16. The previously stored String is left for the allocator
+to reclaim per the project's memory model.
+@End Implementation
 Process called "set_indent_string" that takes context as Integer, indent_string as String returns Integer:
     If context is equal to 0:
         Return 0
@@ -218,6 +367,15 @@ Process called "set_indent_string" that takes context as Integer, indent_string 
     Return 1
 End Process
 
+@Reasoning:
+Returns the conventional four-space default on null context so callers can
+unconditionally use the result for cosmetic purposes (e.g., embedded snippets)
+without a separate null guard.
+@End Reasoning
+@Implementation:
+Reads offset 16. The "    " (four spaces) fallback matches the default set in
+create_code_context, keeping behavior consistent on the error path.
+@End Implementation
 Process called "get_indent_string" that takes context as Integer returns String:
     If context is equal to 0:
         Return "    "
@@ -230,23 +388,55 @@ Note: ================================================================
 Note: Indented Block Helpers
 Note: ================================================================
 
+@Reasoning:
+The dominant emission shape across backends - indent then text then newline -
+is consolidated into one call so the indent-then-emit-then-newline pattern is
+not duplicated 50+ times in the codebase.
+@End Reasoning
+@Implementation:
+Calls emit_indent, then emit_line. Two separate primitive calls rather than
+a fused implementation so behavior stays composable.
+@End Implementation
 Process called "emit_indented_line" that takes context as Integer, text as String returns Integer:
     proc emit_indent from context
     proc emit_line with context, text
     Return 1
 End Process
 
+@Reasoning:
+Companion to emit_indented_line for cases that need to follow the text with
+additional inline content before terminating the line (e.g., emit "func "
+then a parameter list then ";").
+@End Reasoning
+@Implementation:
+Indent then emit, with NO trailing newline; the caller controls when the
+current line ends.
+@End Implementation
 Process called "emit_indented" that takes context as Integer, text as String returns Integer:
     proc emit_indent from context
     proc emit with context, text
     Return 1
 End Process
 
+@Reasoning:
+Semantic alias for increase_indent that reads better at backend call sites
+opening a block, parallel to end_indented_block on exit.
+@End Reasoning
+@Implementation:
+One-line delegation to increase_indent.
+@End Implementation
 Process called "begin_indented_block" that takes context as Integer returns Integer:
     proc increase_indent from context
     Return 1
 End Process
 
+@Reasoning:
+Semantic alias for decrease_indent paired with begin_indented_block. Inherits
+the underflow protection from decrease_indent.
+@End Reasoning
+@Implementation:
+One-line delegation to decrease_indent.
+@End Implementation
 Process called "end_indented_block" that takes context as Integer returns Integer:
     proc decrease_indent from context
     Return 1
@@ -256,6 +446,15 @@ Note: ================================================================
 Note: Output Retrieval
 Note: ================================================================
 
+@Reasoning:
+Final-result retrieval for the driver. Returns the empty string on null
+context so the caller can blindly write it to disk without crashing on an
+error path.
+@End Reasoning
+@Implementation:
+Reads offset 0. The String is shared by reference, not copied; if the caller
+intends to mutate the context further the result should be copied first.
+@End Implementation
 Process called "get_output" that takes context as Integer returns String:
     If context is equal to 0:
         Return ""
@@ -264,6 +463,15 @@ Process called "get_output" that takes context as Integer returns String:
     Return proc memory_get_string from Layout with context, 0
 End Process
 
+@Reasoning:
+Length lookup without materializing the String at the call site is useful for
+size-budget checks (e.g., warn if the emitted file exceeds a target size) and
+for delta computations between emission phases.
+@End Reasoning
+@Implementation:
+Composes get_output and StringCore length. The intermediate String reference
+costs nothing extra because it is the same handle stored at offset 0.
+@End Implementation
 Process called "get_output_length" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -273,6 +481,17 @@ Process called "get_output_length" that takes context as Integer returns Integer
     Return proc length from StringCore with output
 End Process
 
+@Reasoning:
+Reset for multi-pass backends that emit, validate, then re-emit with
+adjustments. Errors and warnings are intentionally NOT cleared so accumulated
+diagnostics survive a content reset, matching the typical "retry emission
+after rejecting partial result" workflow.
+@End Reasoning
+@Implementation:
+Zeroes the output String and resets line/column to 1. Indent level, indent
+string, error list, warning list, has_error flag, and metadata are left
+untouched.
+@End Implementation
 Process called "clear_output" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -289,6 +508,14 @@ Note: ================================================================
 Note: Position Tracking
 Note: ================================================================
 
+@Reasoning:
+1-based position accessor for diagnostics. Returning 1 (not 0) on null context
+keeps downstream "Error at L:C" formatters from producing the visually
+suspicious "Error at 0:0" message.
+@End Reasoning
+@Implementation:
+Direct read of offset 24.
+@End Implementation
 Process called "get_current_line" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 1
@@ -297,6 +524,12 @@ Process called "get_current_line" that takes context as Integer returns Integer:
     Return proc memory_get_int64 from Layout with context, 24
 End Process
 
+@Reasoning:
+Pair of get_current_line; same null-context fallback rationale.
+@End Reasoning
+@Implementation:
+Direct read of offset 32. Tracks chars since last newline as advanced by emit.
+@End Implementation
 Process called "get_current_column" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 1
@@ -309,6 +542,16 @@ Note: ================================================================
 Note: Error and Warning Management
 Note: ================================================================
 
+@Reasoning:
+Errors and warnings are kept in separate lists because callers (drivers, IDE
+servers) frequently need to render them with different severities and counts.
+Setting the has_error flag in addition to the list lets a fast check
+("did anything fail?") skip the list-size traversal.
+@End Reasoning
+@Implementation:
+Append the message to the error list at offset 40 and set has_error at
+offset 56 to 1. The flag is idempotent (multiple errors still leave it at 1).
+@End Implementation
 Process called "add_generation_error" that takes context as Integer, message as String returns Integer:
     If context is equal to 0:
         Return 0
@@ -326,6 +569,15 @@ Process called "add_generation_error" that takes context as Integer, message as 
     Return 1
 End Process
 
+@Reasoning:
+Codifies the "Error at L:C: message" prefix once so every backend gets
+uniform error formatting. Diagnostic consumers (IDEs, log parsers) can rely
+on the prefix shape.
+@End Reasoning
+@Implementation:
+Builds the prefix by chained concat, then delegates to add_generation_error
+which handles list append and flag setting.
+@End Implementation
 Process called "add_generation_error_with_location" that takes context as Integer, message as String, line as Integer, column as Integer returns Integer:
     Note: Format error with location
     Let line_str be proc to_string from StringCore with line
@@ -340,6 +592,15 @@ Process called "add_generation_error_with_location" that takes context as Intege
     Return proc add_generation_error with context, formatted
 End Process
 
+@Reasoning:
+Warnings DO NOT set has_error; this is the central reason for keeping
+add_generation_warning and add_generation_error as distinct routines. A
+warning-only run should still be considered successful by has_errors callers.
+@End Reasoning
+@Implementation:
+Single append to the warning list at offset 48. has_error at offset 56 stays
+unchanged.
+@End Implementation
 Process called "add_generation_warning" that takes context as Integer, message as String returns Integer:
     If context is equal to 0:
         Return 0
@@ -354,6 +615,13 @@ Process called "add_generation_warning" that takes context as Integer, message a
     Return 1
 End Process
 
+@Reasoning:
+Mirror of add_generation_error_with_location for warnings; keeps the prefix
+shape ("Warning at L:C: ...") symmetric and parser-friendly.
+@End Reasoning
+@Implementation:
+Builds the prefix by chained concat and delegates to add_generation_warning.
+@End Implementation
 Process called "add_generation_warning_with_location" that takes context as Integer, message as String, line as Integer, column as Integer returns Integer:
     Note: Format warning with location
     Let line_str be proc to_string from StringCore with line
@@ -368,6 +636,14 @@ Process called "add_generation_warning_with_location" that takes context as Inte
     Return proc add_generation_warning with context, formatted
 End Process
 
+@Reasoning:
+Exposes the raw list handle so drivers can iterate, format, and print
+diagnostics without copying. Caller MUST treat the returned handle as
+read-only; mutating it would corrupt the context's view of error state.
+@End Reasoning
+@Implementation:
+Direct read of offset 40. Returns 0 (null handle) on null context.
+@End Implementation
 Process called "get_errors" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -376,6 +652,12 @@ Process called "get_errors" that takes context as Integer returns Integer:
     Return proc memory_get_int64 from Layout with context, 40
 End Process
 
+@Reasoning:
+Companion to get_errors; same caller contract (read-only view).
+@End Reasoning
+@Implementation:
+Direct read of offset 48.
+@End Implementation
 Process called "get_warnings" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -384,6 +666,14 @@ Process called "get_warnings" that takes context as Integer returns Integer:
     Return proc memory_get_int64 from Layout with context, 48
 End Process
 
+@Reasoning:
+The boolean flag exists precisely so this question doesn't require an O(n)
+list traversal; it's checked frequently by emission decision branches that
+want to bail early on a failed backend.
+@End Reasoning
+@Implementation:
+Direct read of offset 56. 0 = clean, non-zero = at least one error logged.
+@End Implementation
 Process called "has_errors" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -392,6 +682,15 @@ Process called "has_errors" that takes context as Integer returns Integer:
     Return proc memory_get_int64 from Layout with context, 56
 End Process
 
+@Reasoning:
+Distinct from has_errors because some consumers (test runners, summaries)
+report total error count. Computed on demand to avoid maintaining a second
+counter that could drift from the list size.
+@End Reasoning
+@Implementation:
+Reads list handle from offset 40, calls List.size. O(1) since List tracks
+its size internally.
+@End Implementation
 Process called "get_error_count" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -401,6 +700,13 @@ Process called "get_error_count" that takes context as Integer returns Integer:
     Return proc size from List with errors
 End Process
 
+@Reasoning:
+Mirror of get_error_count for warnings. Kept separate so summary lines
+can read "N errors, M warnings" without a custom enumerator.
+@End Reasoning
+@Implementation:
+Reads list handle from offset 48 and calls List.size.
+@End Implementation
 Process called "get_warning_count" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -414,6 +720,15 @@ Note: ================================================================
 Note: Metadata Storage (Backend-Specific Data)
 Note: ================================================================
 
+@Reasoning:
+The metadata slot is an opaque integer (typically a pointer) where each
+backend stows its private state - symbol tables, import maps, label
+counters, etc. - without polluting the shared CodeGenerationContext schema.
+@End Reasoning
+@Implementation:
+Single write to offset 64. The value is uninterpreted; backends are
+responsible for the lifetime of whatever they store there.
+@End Implementation
 Process called "set_metadata" that takes context as Integer, metadata as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -424,6 +739,14 @@ Process called "set_metadata" that takes context as Integer, metadata as Integer
     Return 1
 End Process
 
+@Reasoning:
+Read-side of the metadata slot. Returns 0 on null context so backends can
+unconditionally call get_metadata and then check the result rather than
+checking the context first.
+@End Reasoning
+@Implementation:
+Direct read of offset 64.
+@End Implementation
 Process called "get_metadata" that takes context as Integer returns Integer:
     If context is equal to 0:
         Return 0
@@ -436,46 +759,121 @@ Note: ================================================================
 Note: Convenience Helpers
 Note: ================================================================
 
+@Reasoning:
+Named alias for emit clarifies intent when the call site wants to make the
+"this is a delimiter between items" structure visible in code.
+@End Reasoning
+@Implementation:
+Pass-through to emit.
+@End Implementation
 Process called "emit_separator" that takes context as Integer, separator as String returns Integer:
     Return proc emit with context, separator
 End Process
 
+@Reasoning:
+Frequent enough across backends that a named helper avoids string-literal
+duplication (" " or " " in many places) and gives a single point to swap
+for non-breaking spaces if a target ever requires that.
+@End Reasoning
+@Implementation:
+Emits a single ASCII space.
+@End Implementation
 Process called "emit_space" that takes context as Integer returns Integer:
     Return proc emit with context, " "
 End Process
 
+@Reasoning:
+Tight `,` (no trailing space) used when the caller manages spacing
+independently, e.g. between consecutive tokens in compact emission modes.
+@End Reasoning
+@Implementation:
+Emits a single comma.
+@End Implementation
 Process called "emit_comma" that takes context as Integer returns Integer:
     Return proc emit with context, ","
 End Process
 
+@Reasoning:
+Statement-terminator helper for C-family targets. Backends that don't use
+semicolons (Python, ML) simply don't call it.
+@End Reasoning
+@Implementation:
+Emits a single semicolon.
+@End Implementation
 Process called "emit_semicolon" that takes context as Integer returns Integer:
     Return proc emit with context, ";"
 End Process
 
+@Reasoning:
+`, ` with trailing space is the dominant inter-item separator in
+comma-separated lists. Splitting from emit_comma keeps the trailing-space
+choice in one place per target.
+@End Reasoning
+@Implementation:
+Emits comma followed by space.
+@End Implementation
 Process called "emit_comma_separator" that takes context as Integer returns Integer:
     Return proc emit with context, ", "
 End Process
 
+@Reasoning:
+C-family block-opener. Named helpers (vs. raw emit) make the structural intent
+obvious at call sites and make grep for "where do we start a brace block"
+trivial.
+@End Reasoning
+@Implementation:
+Emits `{`. No indent change here; see begin_block for the indent-aware variant.
+@End Implementation
 Process called "emit_opening_brace" that takes context as Integer returns Integer:
     Return proc emit with context, "{"
 End Process
 
+@Reasoning:
+Counterpart to emit_opening_brace; same naming rationale.
+@End Reasoning
+@Implementation:
+Emits `}`.
+@End Implementation
 Process called "emit_closing_brace" that takes context as Integer returns Integer:
     Return proc emit with context, "}"
 End Process
 
+@Reasoning:
+Index/subscript opener for C/Java/Rust/Python-style array access.
+@End Reasoning
+@Implementation:
+Emits `[`.
+@End Implementation
 Process called "emit_opening_bracket" that takes context as Integer returns Integer:
     Return proc emit with context, "["
 End Process
 
+@Reasoning:
+Counterpart to emit_opening_bracket.
+@End Reasoning
+@Implementation:
+Emits `]`.
+@End Implementation
 Process called "emit_closing_bracket" that takes context as Integer returns Integer:
     Return proc emit with context, "]"
 End Process
 
+@Reasoning:
+Argument-list and grouping-expression opener for most curly/braced languages.
+@End Reasoning
+@Implementation:
+Emits `(`.
+@End Implementation
 Process called "emit_opening_paren" that takes context as Integer returns Integer:
     Return proc emit with context, "("
 End Process
 
+@Reasoning:
+Counterpart to emit_opening_paren.
+@End Reasoning
+@Implementation:
+Emits `)`.
+@End Implementation
 Process called "emit_closing_paren" that takes context as Integer returns Integer:
     Return proc emit with context, ")"
 End Process
@@ -484,26 +882,63 @@ Note: ================================================================
 Note: Block Generation Helpers
 Note: ================================================================
 
+@Reasoning:
+The "block scaffolding" pattern is a fused emit+indent so callers always pair
+the opener with the indent push, eliminating the bug class where one is
+forgotten and child statements emit at the parent's column.
+@End Reasoning
+@Implementation:
+emit_line for the opener (e.g. "{") followed by increase_indent. The opener
+goes on its own line so brace style is "Allman" by default; backends wanting
+K&R style emit the opener manually before calling increase_indent.
+@End Implementation
 Process called "begin_block" that takes context as Integer, opening as String returns Integer:
     proc emit_line with context, opening
     proc increase_indent from context
     Return 1
 End Process
 
+@Reasoning:
+Symmetric counterpart to begin_block: decrease indent first so the closing
+token aligns at the parent scope's column, then emit it on its own line.
+@End Reasoning
+@Implementation:
+decrease_indent then emit_indented_line with the closing token (e.g. "}").
+@End Implementation
 Process called "end_block" that takes context as Integer, closing as String returns Integer:
     proc decrease_indent from context
     proc emit_indented_line with context, closing
     Return 1
 End Process
 
+@Reasoning:
+Named alias for the C-family brace case, the dominant block form across the
+backends in this tree.
+@End Reasoning
+@Implementation:
+Delegates to begin_block with "{".
+@End Implementation
 Process called "begin_brace_block" that takes context as Integer returns Integer:
     Return proc begin_block with context, "{"
 End Process
 
+@Reasoning:
+Counterpart to begin_brace_block.
+@End Reasoning
+@Implementation:
+Delegates to end_block with "}".
+@End Implementation
 Process called "end_brace_block" that takes context as Integer returns Integer:
     Return proc end_block with context, "}"
 End Process
 
+@Reasoning:
+Convenience for emitting a single statement string at the current indent on
+its own line, the most common shape inside a block body.
+@End Reasoning
+@Implementation:
+Delegates to emit_indented_line.
+@End Implementation
 Process called "emit_block_statement" that takes context as Integer, statement as String returns Integer:
     proc emit_indented_line with context, statement
     Return 1
@@ -513,6 +948,15 @@ Note: ================================================================
 Note: List Generation Helpers
 Note: ================================================================
 
+@Reasoning:
+Inline (single-line) list-item helper that takes the is_last flag at the call
+site so the separator is added if and only if more items follow. This removes
+the trailing-comma bug class from per-backend list emitters.
+@End Reasoning
+@Implementation:
+Emit item; if NOT last (is_last == 0) emit ", ". Backends are expected to
+compute is_last as (index == count - 1) when iterating.
+@End Implementation
 Process called "emit_list_item" that takes context as Integer, item as String, is_last as Integer returns Integer:
     proc emit with context, item
 
@@ -524,6 +968,16 @@ Process called "emit_list_item" that takes context as Integer, item as String, i
     Return 1
 End Process
 
+@Reasoning:
+Multi-line list form for cases where each item is emitted on its own indented
+line (e.g., Python tuple literals or formatted argument lists). Uses comma
+without space because the newline acts as the visual separator.
+@End Reasoning
+@Implementation:
+emit_indented(item), then if not last emit ",", then unconditionally
+emit_newline. The terminating newline runs even on the last item so the
+closing bracket lands on a fresh line.
+@End Implementation
 Process called "emit_list_item_with_newline" that takes context as Integer, item as String, is_last as Integer returns Integer:
     proc emit_indented with context, item
 
@@ -540,6 +994,16 @@ Note: ================================================================
 Note: Comment Generation Helpers
 Note: ================================================================
 
+@Reasoning:
+The comment prefix is parameterized because different targets use different
+markers (// for C-family, # for Python/shell, -- for Lua/SQL). Centralizing
+the indent-prefix-space-text-newline shape ensures every backend's line
+comments line up under the same column rules.
+@End Reasoning
+@Implementation:
+emit_indented(prefix), emit_space, emit_line(text). The space between prefix
+and text matches widely-used style guides.
+@End Implementation
 Process called "emit_line_comment" that takes context as Integer, comment_prefix as String, text as String returns Integer:
     proc emit_indented with context, comment_prefix
     proc emit_space from context
@@ -547,16 +1011,40 @@ Process called "emit_line_comment" that takes context as Integer, comment_prefix
     Return 1
 End Process
 
+@Reasoning:
+Block-comment scaffolding is broken into start/line/end helpers so
+backend-specific decoration ("*" prefix on each interior line for C-style
+JSDoc, for example) can be injected by the caller between start and end.
+@End Reasoning
+@Implementation:
+Emits the start prefix (e.g. "/*") on its own indented line.
+@End Implementation
 Process called "emit_block_comment_start" that takes context as Integer, prefix as String returns Integer:
     proc emit_indented_line with context, prefix
     Return 1
 End Process
 
+@Reasoning:
+Each interior comment line is emitted at the current indent. The caller is
+responsible for prefixing per-line decoration ("* ") in the text argument; the
+helper itself stays decoration-agnostic.
+@End Reasoning
+@Implementation:
+Delegates to emit_indented_line with the supplied text.
+@End Implementation
 Process called "emit_block_comment_line" that takes context as Integer, text as String returns Integer:
     proc emit_indented_line with context, text
     Return 1
 End Process
 
+@Reasoning:
+Symmetric counterpart to emit_block_comment_start. Suffix is parameterized
+to support "*/" (C-family) and ":End Note" (Runa-style) without two distinct
+helpers.
+@End Reasoning
+@Implementation:
+Delegates to emit_indented_line with the supplied suffix.
+@End Implementation
 Process called "emit_block_comment_end" that takes context as Integer, suffix as String returns Integer:
     proc emit_indented_line with context, suffix
     Return 1

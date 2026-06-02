@@ -25,6 +25,22 @@ Note: ================================================================
 Note: Backend Translator State
 Note: ================================================================
 
+@Reasoning:
+Backend state aggregates everything translate_* helpers mutate: an output
+buffer for the in-progress source, indentation depth (Makefile recipe rules
+demand a literal TAB), a current_line scratch field for incremental
+construction, a newline_pending flag so adjacent emit_* calls don't
+accidentally collapse lines, an error list, and the runtime options. All
+fields are pointers/integers so the record is exactly 48 bytes (6 * 8).
+@End Reasoning
+
+@Implementation:
+Field offsets: output_buffer (0), indentation_level (8), current_line (16),
+newline_pending (24), error_list (32), options (40). The current_line is
+inline (not a separate buffer) because Makefile lines rarely exceed the
+String layout's inline capacity and this keeps a hot field zero-allocation.
+@End Implementation
+
 Type called "MakefileBackend":
     output_buffer as Integer  Note: Pointer to output string buffer
     indentation_level as Integer  Note: Current indentation depth
@@ -38,6 +54,20 @@ Note: ================================================================
 Note: Backend Options
 Note: ================================================================
 
+@Reasoning:
+Backend-level toggles that influence emission style but not semantics.
+Separating them from MakefileBackend lets callers share one options record
+across multiple short-lived backend instances and lets us round-trip a
+formatter's preferred style without rebuilding the backend.
+@End Reasoning
+
+@Implementation:
+Five int64 fields at offsets 0/8/16/24/32 (total 40 bytes). use_tabs is
+forced to 1 by create_default_options regardless of caller preference
+because POSIX make requires tab-indented recipes — toggling it would
+produce a non-buildable Makefile.
+@End Implementation
+
 Type called "MakefileBackendOptions":
     use_tabs_for_indentation as Integer  Note: 1 to use tabs, 0 for spaces
     preserve_comments as Integer  Note: 1 to preserve original comments
@@ -49,6 +79,20 @@ End Type
 Note: ================================================================
 Note: Backend Initialization
 Note: ================================================================
+
+@Reasoning:
+Wires together the four heap allocations the backend depends on: the
+string buffer, the error list, the options record, and the MakefileBackend
+itself. Owning these via embedded pointers lets a future free_backend
+release them in one tear-down pass rather than at scattered call sites.
+@End Reasoning
+
+@Implementation:
+48-byte record. Allocates a string buffer (create_string_buffer) for
+output_buffer, a ListCore list for error_list, and a default options
+record. current_line is zero-initialised to "" because emit_text appends
+to it before any first explicit Set.
+@End Implementation
 
 Process called "create_backend" that takes nothing returns Integer:
     @Reasoning
@@ -81,6 +125,13 @@ Process called "create_backend" that takes nothing returns Integer:
     Return backend_ptr
 End Process
 
+@Reasoning:
+Canonical "POSIX-make compatible" defaults: tabs for recipes (mandatory),
+preserve comments (round-trip fidelity), format variables (run the
+formatter pass), $(VAR) syntax (most portable), and 80-column wrap (the
+classic source-code line budget Make tools tend to assume).
+@End Reasoning
+
 Process called "create_default_options" that takes nothing returns Integer:
     @Reasoning
     Create default backend options structure.
@@ -96,6 +147,13 @@ Process called "create_default_options" that takes nothing returns Integer:
 
     Return options_ptr
 End Process
+
+@Reasoning:
+A 24-byte mutable string carrier (content, length, capacity) used as the
+backend's accumulating output. Pre-reserving 4096 bytes of capacity covers
+the median Makefile size without an initial growth cycle; emit_line will
+extend on overflow.
+@End Reasoning
 
 Process called "create_string_buffer" that takes nothing returns Integer:
     @Reasoning
@@ -114,6 +172,21 @@ End Process
 Note: ================================================================
 Note: Main Translation Entry Point
 Note: ================================================================
+
+@Reasoning:
+Top-level driver: walks the HIR module's members list (offset 16), defers
+each member to translate_hir_node, and inserts a blank line between top-
+level constructs so the output Makefile reads cleanly. Returns the final
+accumulated buffer contents — the buffer outlives the call only because
+its String backing is shared by reference.
+@End Reasoning
+
+@Implementation:
+Module layout: members list pointer at offset 16. The blank-line emission
+is suppressed after the last member to avoid trailing whitespace, which
+some Make versions warn about. Output buffer pointer lives at backend
+offset 0; read_string at content offset 0 yields the assembled source.
+@End Implementation
 
 Process called "translate_hir_module" that takes backend_ptr as Integer, hir_module as Integer returns String:
     @Reasoning
@@ -149,6 +222,16 @@ End Process
 Note: ================================================================
 Note: HIR Node Translation Dispatcher
 Note: ================================================================
+
+@Reasoning:
+Linear-chain dispatcher on the HIR node tag at offset 0. Eight Makefile-
+specific node kinds (variable, target, pattern_rule, special_target,
+conditional, include, export, define_block) each have a dedicated
+translate_* helper. Unknown tags route to add_backend_error rather than
+silently emitting nothing, because a missing kind almost always means
+the makefile_to_hir frontend produced a node this backend does not yet
+support — that situation must surface, not hide.
+@End Reasoning
 
 Process called "translate_hir_node" that takes backend_ptr as Integer, hir_node as Integer returns Integer:
     @Reasoning
@@ -207,6 +290,22 @@ End Process
 Note: ================================================================
 Note: Variable Assignment Translation
 Note: ================================================================
+
+@Reasoning:
+Makefile variable assignment has four operator flavours (=, :=, +=, ?=)
+chosen by the HIR assign_type tag (offset 16). The override flag emits
+"override " prefix; the export flag emits a separate "export NAME" line
+afterwards because the two are independent and combining them inline is
+non-portable. Value goes through translate_expression so nested $(...)
+references render correctly.
+@End Reasoning
+
+@Implementation:
+HIR variable node layout: name (8), assign_type (16), value expr (24),
+override flag (32), export flag (40). Assignment-operator dispatch is
+nested If/Otherwise chains because a single Match on assign_type is not
+yet available — but the chain is exhaustive for the four ASSIGN_* tags.
+@End Implementation
 
 Process called "translate_variable" that takes backend_ptr as Integer, var_node as Integer returns Integer:
     @Reasoning
@@ -273,6 +372,15 @@ End Process
 Note: ================================================================
 Note: Target Rule Translation
 Note: ================================================================
+
+@Reasoning:
+A Makefile target rule packs four list components: target names, normal
+prereqs, order-only prereqs (after a "|" separator), and recipe lines.
+Field offsets (8/16/24/32) are fixed by makefile_to_hir, and the double-
+colon flag at offset 48 distinguishes :: rules (multiple definitions
+allowed) from : rules. Recipes are emitted only if the recipes list is
+non-null; an empty target with no recipe is legal in Make.
+@End Reasoning
 
 Process called "translate_target" that takes backend_ptr as Integer, target_node as Integer returns Integer:
     @Reasoning
@@ -341,6 +449,13 @@ Process called "translate_target" that takes backend_ptr as Integer, target_node
     Return 1
 End Process
 
+@Reasoning:
+Pattern rules ("%.o: %.c") share their record layout with regular targets
+— the only surface difference is the presence of "%" in the names, which
+the upstream frontend has already embedded in the target strings. So this
+helper is a thin alias for translate_target rather than duplicated logic.
+@End Reasoning
+
 Process called "translate_pattern_rule" that takes backend_ptr as Integer, pattern_node as Integer returns Integer:
     @Reasoning
     Translate a HIR pattern rule (with % wildcard) to Makefile pattern rule syntax.
@@ -350,6 +465,13 @@ Process called "translate_pattern_rule" that takes backend_ptr as Integer, patte
     Note: Pattern rules use same structure as regular targets
     Return proc translate_target with backend_ptr, pattern_node
 End Process
+
+@Reasoning:
+Special targets (.PHONY, .SUFFIXES, .DEFAULT, etc.) are syntactically
+ordinary targets — the leading dot is what makes them special to Make
+itself. Same record layout, same emission path. Keeping a separate
+helper makes intent explicit at call sites without forking the code.
+@End Reasoning
 
 Process called "translate_special_target" that takes backend_ptr as Integer, special_node as Integer returns Integer:
     @Reasoning
@@ -363,6 +485,21 @@ End Process
 Note: ================================================================
 Note: Recipe Translation
 Note: ================================================================
+
+@Reasoning:
+Each recipe line must literally begin with a TAB or Make rejects it. The
+silent (@) and ignore-errors (-) modifiers are single-character prefixes
+that go between the tab and the command. The HIR encoding holds the
+command expression at offset 8 and the two flags at 16/24; translate_-
+expression handles any embedded $(VAR) references.
+@End Reasoning
+
+@Security_Scope:
+Recipes are arbitrary shell commands. This translator passes them through
+verbatim — escaping is the responsibility of the HIR producer because
+Make has no general escape convention; introducing one here would corrupt
+otherwise-correct input.
+@End Security_Scope
 
 Process called "translate_recipe" that takes backend_ptr as Integer, recipe_node as Integer returns Integer:
     @Reasoning
@@ -402,6 +539,21 @@ End Process
 Note: ================================================================
 Note: Conditional Translation
 Note: ================================================================
+
+@Reasoning:
+Make's four conditional directives split into two shapes: ifeq/ifneq take
+a "(arg1,arg2)" comma-list; ifdef/ifndef take a single variable name. The
+HIR encoding always carries both arg slots (offset 16/24) and the second
+is unused for the def/ndef variants — translate_expression on a null
+expression returns "" so it costs nothing to read.
+@End Reasoning
+
+@Implementation:
+Then-block at offset 32 is mandatory; else-block at offset 40 is optional
+(0 if absent). Recurses into translate_statement_list for both blocks so
+nested conditionals and nested rules compose naturally. Always closes
+with a literal "endif" because Make requires explicit termination.
+@End Implementation
 
 Process called "translate_conditional" that takes backend_ptr as Integer, cond_node as Integer returns Integer:
     @Reasoning
@@ -468,6 +620,13 @@ Process called "translate_conditional" that takes backend_ptr as Integer, cond_n
     Return 1
 End Process
 
+@Reasoning:
+Pure iteration helper used by translate_conditional for both then-block
+and else-block. Lives separately so we don't open-code the for-each loop
+in every conditional / future block-bearing node (e.g., loops if Make
+ever grows them through GNU extensions).
+@End Reasoning
+
 Process called "translate_statement_list" that takes backend_ptr as Integer, stmts_list as Integer returns Integer:
     @Reasoning
     Translate a list of HIR statements.
@@ -490,6 +649,13 @@ End Process
 Note: ================================================================
 Note: Include Directive Translation
 Note: ================================================================
+
+@Reasoning:
+include and -include differ only by silently swallowing "file not found"
+errors. The optional_flag (offset 16) selects the dash-prefixed form.
+Multiple paths in one directive are space-joined — Make accepts them all
+in one include line so we preserve that compactness on round trip.
+@End Reasoning
 
 Process called "translate_include" that takes backend_ptr as Integer, include_node as Integer returns Integer:
     @Reasoning
@@ -524,6 +690,14 @@ Note: ================================================================
 Note: Export Directive Translation
 Note: ================================================================
 
+@Reasoning:
+export and unexport are dual operations the HIR encodes as one node with
+a boolean flag (offset 16). Variable names go in a list (offset 8), space-
+joined on emit. An empty list with the export form is legal in GNU make
+(it means "export all" — same surface meaning preserved by join_string_list
+returning "" for an empty list).
+@End Reasoning
+
 Process called "translate_export" that takes backend_ptr as Integer, export_node as Integer returns Integer:
     @Reasoning
     Translate a HIR export directive to Makefile export/unexport syntax.
@@ -556,6 +730,14 @@ End Process
 Note: ================================================================
 Note: Define Block Translation
 Note: ================================================================
+
+@Reasoning:
+define/endef pairs hold multi-line recursive variable values where the
+body can contain embedded newlines, command substitutions, and even
+recipes. The body is stored as a single String at offset 16 (verbatim,
+preserving its internal newlines) so emit_text writes it without an
+intervening line-break that would otherwise corrupt the contents.
+@End Reasoning
 
 Process called "translate_define_block" that takes backend_ptr as Integer, define_node as Integer returns Integer:
     @Reasoning
@@ -597,6 +779,21 @@ Note: ================================================================
 Note: Expression Translation
 Note: ================================================================
 
+@Reasoning:
+Expression dispatch supports four HIR shapes: a list of sub-expressions
+(concatenate), a literal string, a variable reference $(VAR), an automatic
+variable like $@, or a function call $(shell ...). is_list_type is a
+heuristic check (lists are tagged in their first word); the explicit tag
+lookup at offset 0 covers all other kinds.
+@End Reasoning
+
+@Implementation:
+Unknown node types return "" rather than abort because translate_-
+expression is called recursively from translate_variable and translate_-
+recipe — an abort on an unknown leaf would silently truncate the parent
+expression. The caller is expected to check the result if it cares.
+@End Implementation
+
 Process called "translate_expression" that takes backend_ptr as Integer, expr_ptr as Integer returns String:
     @Reasoning
     Translate a HIR expression (literal, variable reference, function call, etc.) to Makefile syntax.
@@ -635,6 +832,13 @@ Process called "translate_expression" that takes backend_ptr as Integer, expr_pt
     Return ""
 End Process
 
+@Reasoning:
+Composite-expression handler. Concatenates without any separator because
+Make-style juxtaposition is intentional ("$(CC) $(CFLAGS) -o" is three
+sub-expressions: var-ref, literal, var-ref, literal). Any separator would
+add or remove whitespace and break command-line semantics.
+@End Reasoning
+
 Process called "translate_expression_list" that takes backend_ptr as Integer, expr_list as Integer returns String:
     @Reasoning
     Translate a list of expressions and concatenate them.
@@ -656,6 +860,14 @@ Process called "translate_expression_list" that takes backend_ptr as Integer, ex
 
     Return result
 End Process
+
+@Reasoning:
+$(VAR) and ${VAR} are interchangeable to GNU make but stylistically often
+mixed in one source file. preferred_var_syntax (options offset 24)
+normalises every reference to the formatter's chosen form. Single-char
+references ($X) are encoded as $(X) here; the formatter pass downstream
+re-collapses them if desired.
+@End Reasoning
 
 Process called "translate_var_ref" that takes backend_ptr as Integer, var_ref_node as Integer returns String:
     @Reasoning
@@ -685,6 +897,13 @@ Process called "translate_var_ref" that takes backend_ptr as Integer, var_ref_no
     Return result
 End Process
 
+@Reasoning:
+Automatic variables ($@, $<, $^, $?, $*, $+) are single-character names
+Make assigns inside recipes. The HIR carries their canonical symbol
+string at offset 8 verbatim, including the leading "$", because there is
+no normalisation choice to make — the symbol is the syntax.
+@End Reasoning
+
 Process called "translate_auto_var" that takes backend_ptr as Integer, auto_var_node as Integer returns String:
     @Reasoning
     Translate an automatic variable to Makefile syntax: $@, $<, $^, $?, $*.
@@ -693,6 +912,13 @@ Process called "translate_auto_var" that takes backend_ptr as Integer, auto_var_
     Let symbol be proc read_string from Memory with auto_var_node, 16
     Return symbol
 End Process
+
+@Reasoning:
+Make functions ($(shell ...), $(patsubst ...), etc.) render as
+$(name arg1,arg2,...). Argument list at offset 16; comma is the
+separator. The first argument is space-joined to the function name
+(no comma before the first), per Make syntax.
+@End Reasoning
 
 Process called "translate_function_call" that takes backend_ptr as Integer, func_node as Integer returns String:
     @Reasoning
@@ -735,6 +961,14 @@ Note: ================================================================
 Note: Output Emission Utilities
 Note: ================================================================
 
+@Reasoning:
+Single emission point for newline-terminated lines. Centralising the
+write here means the output_buffer's growth and the trailing newline
+convention can change once, without auditing every translate_*. Reads
+output_buffer at backend offset 0 and writes its existing content +
+new line + "\n" back at content offset 0.
+@End Reasoning
+
 Process called "emit_line" that takes backend_ptr as Integer, line as String returns Integer:
     @Reasoning
     Emit a complete line to the output buffer (adds newline).
@@ -756,6 +990,13 @@ Process called "emit_line" that takes backend_ptr as Integer, line as String ret
     Return 1
 End Process
 
+@Reasoning:
+Sibling of emit_line that does NOT append a trailing newline. Used by
+translate_define_block where the body string already contains its own
+internal newlines and an added trailing "\n" would either be redundant
+or insert an empty line before the endef marker.
+@End Reasoning
+
 Process called "emit_text" that takes backend_ptr as Integer, text as String returns Integer:
     @Reasoning
     Emit text to the output buffer without adding newline (for multi-line content).
@@ -774,6 +1015,13 @@ Process called "emit_text" that takes backend_ptr as Integer, text as String ret
     Return 1
 End Process
 
+@Reasoning:
+Single "\n" emission used between top-level constructs in
+translate_hir_module for readability. Separating it from emit_line lets
+the caller skip-on-last-item without needing to construct an "" line
+that emit_line would terminate with "\n" anyway.
+@End Reasoning
+
 Process called "emit_blank_line" that takes backend_ptr as Integer returns Integer:
     @Reasoning
     Emit a blank line for readability.
@@ -785,6 +1033,13 @@ End Process
 Note: ================================================================
 Note: Utility Functions
 Note: ================================================================
+
+@Reasoning:
+String-join used by target/dependency emission and a few other list-to-
+line conversions. Skips appending the separator before the first element
+so the result starts cleanly. Empty list yields "" with zero allocation
+churn.
+@End Reasoning
 
 Process called "join_string_list" that takes backend_ptr as Integer, list_ptr as Integer, separator as String returns String:
     @Reasoning
@@ -810,6 +1065,14 @@ Process called "join_string_list" that takes backend_ptr as Integer, list_ptr as
 
     Return result
 End Process
+
+@Reasoning:
+Discriminates between a HIR node pointer and a ListCore list pointer.
+Both are heap pointers and both have a header at offset 0 — the
+distinction is which header. Used by translate_expression to decide
+whether to recurse through the element list or interpret the pointer as
+a single tagged node.
+@End Reasoning
 
 Process called "is_list_type" that takes backend_ptr as Integer, ptr as Integer returns Integer:
     @Reasoning
@@ -857,6 +1120,13 @@ Note: ================================================================
 Note: Error Handling
 Note: ================================================================
 
+@Reasoning:
+Appends a diagnostic to error_list (offset 32) rather than overwriting,
+because a single translation pass can surface multiple unrelated errors
+and the driver wants them all. The optional hir_node pointer lets a
+future diagnostics formatter pin the error to a source location.
+@End Reasoning
+
 Process called "add_backend_error" that takes backend_ptr as Integer, message as String, hir_node as Integer returns Integer:
     @Reasoning
     Add a backend translation error to the error list.
@@ -873,6 +1143,12 @@ Process called "add_backend_error" that takes backend_ptr as Integer, message as
     Return 1
 End Process
 
+@Reasoning:
+Single-purpose accessor: returns the size of error_list. The driver uses
+it as the success predicate (zero errors => clean translation) instead of
+walking the list itself.
+@End Reasoning
+
 Process called "get_error_count" that takes backend_ptr as Integer returns Integer:
     @Reasoning
     Get the number of backend errors.
@@ -885,6 +1161,13 @@ End Process
 Note: ================================================================
 Note: Public API
 Note: ================================================================
+
+@Reasoning:
+Top-level convenience entry point: create a default-options backend,
+translate, return the result. Hides the backend lifecycle from callers
+that don't need to customise options. Matches the analogous "translate"
+entry in the matched makefile_to_hir frontend so callers can pair them.
+@End Reasoning
 
 Process called "translate" that takes hir_module as Integer returns String:
     @Reasoning
@@ -905,6 +1188,14 @@ Process called "translate" that takes hir_module as Integer returns String:
 
     Return makefile_content
 End Process
+
+@Reasoning:
+Same as translate but accepts a caller-owned options record. Caller
+retains ownership of the options pointer; this function does not free it
+on the way out so the same options can be reused across many module
+translations (e.g., translating each file of a project with one shared
+style configuration).
+@End Reasoning
 
 Process called "translate_with_options" that takes hir_module as Integer, options_ptr as Integer returns String:
     @Reasoning

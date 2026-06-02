@@ -64,6 +64,21 @@ Note: ==========================================================================
 Note: Parser State
 Note: ============================================================================
 
+@Reasoning:
+Captures everything the parser needs across calls: the token list, the
+current cursor, a sticky has_error flag plus message, and the AST node
+arena. Field-based struct (not a raw layout block) because Lua parser
+uses memory_read/memory_write with full record copies.
+@End Reasoning
+
+@Implementation:
+Struct constructed via "a value of type"; allocated on heap via
+memory_allocate(size_of LuaParserState). tokens is a List handle of
+LuaToken records. current is the 0-based token index. had_error and
+error_message track first-error state. ast_nodes is a list of
+allocated LuaASTNode handles for bulk cleanup.
+@End Implementation
+
 Type called "LuaParserState":
     tokens as Integer              Note: List of tokens
     current as Integer             Note: Current token index
@@ -75,6 +90,21 @@ End Type
 Note: ============================================================================
 Note: AST Node Structure
 Note: ============================================================================
+
+@Reasoning:
+Single AST node shape covering every Lua construct. value is a String
+(for identifier names and literal text); line/column carry source
+position; children is a flat list for positional sub-nodes; metadata
+is a dictionary for kind-specific attributes (e.g. boolean flags on
+local declarations).
+@End Reasoning
+
+@Implementation:
+6-field struct allocated via memory_allocate(size_of LuaASTNode).
+node_type uses the LUA_* constants. children and metadata are List
+handles created in create_ast_node so every node is fully initialised
+on construction.
+@End Implementation
 
 Type called "LuaASTNode":
     node_type as Integer
@@ -88,6 +118,19 @@ End Type
 Note: ============================================================================
 Note: Parser Initialization
 Note: ============================================================================
+
+@Reasoning:
+Allocates parser state pre-loaded with the token stream produced by
+the lexer. Begins at index 0 with no errors and an empty AST-node
+arena.
+@End Reasoning
+
+@Implementation:
+Constructs LuaParserState struct via "a value of type" with tokens
+set, current=0, had_error=0, empty error_message, and a fresh
+ast_nodes list. Allocates a heap copy via memory_allocate and writes
+the struct into it. Returns the pointer.
+@End Implementation
 
 Process called "create_parser" takes tokens as Integer returns Integer:
     @Reasoning
@@ -111,6 +154,19 @@ Note: ==========================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Single constructor that initialises every AST node — including the
+children and metadata lists — so callers can attach children
+immediately without worrying about lazy creation.
+@End Reasoning
+
+@Implementation:
+Builds a LuaASTNode with the supplied node_type, empty value string,
+zero line/column, and freshly allocated children and metadata lists.
+Allocates a heap copy via memory_allocate and writes the struct.
+Returns the pointer.
+@End Implementation
+
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     @Reasoning
     Create a new AST node with the given type.
@@ -130,6 +186,18 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
     Return node_ptr
 End Process
 
+@Reasoning:
+Appends a child to the parent's children list. Must round-trip the
+parent record through memory_read/memory_write because LuaASTNode is
+stored by value at node_ptr.
+@End Reasoning
+
+@Implementation:
+Reads the node struct from node_ptr. Appends child_ptr to
+node.children via ListCore.list_append. Writes the struct back so
+the updated list-handle (if reallocated) is observed by future reads.
+@End Implementation
+
 Process called "ast_node_add_child" takes node_ptr as Integer, child_ptr as Integer:
     @Reasoning
     Add a child node to an AST node.
@@ -140,6 +208,16 @@ Process called "ast_node_add_child" takes node_ptr as Integer, child_ptr as Inte
     proc memory_write from MemoryCore with node_ptr, node
 End Process
 
+@Reasoning:
+Updates the .value field on an existing node. Round-trips the struct
+through memory_read/memory_write because nodes are stored inline at
+their pointers.
+@End Reasoning
+
+@Implementation:
+Reads the node, assigns value to node.value, writes the node back.
+@End Implementation
+
 Process called "ast_node_set_value" takes node_ptr as Integer, value as String:
     @Reasoning
     Set the value of an AST node.
@@ -149,6 +227,17 @@ Process called "ast_node_set_value" takes node_ptr as Integer, value as String:
     Set node.value to value
     proc memory_write from MemoryCore with node_ptr, node
 End Process
+
+@Reasoning:
+Records the source position of a node for diagnostic reporting.
+Called by every parse_* helper right after node creation to attach
+location info from the consumed token.
+@End Reasoning
+
+@Implementation:
+Reads the node, sets node.line and node.column from the parameters,
+writes the node back.
+@End Implementation
 
 Process called "ast_node_set_location" takes node_ptr as Integer, line as Integer, column as Integer:
     @Reasoning
@@ -161,6 +250,16 @@ Process called "ast_node_set_location" takes node_ptr as Integer, line as Intege
     proc memory_write from MemoryCore with node_ptr, node
 End Process
 
+@Reasoning:
+Indexed child accessor. Read-only — does not mutate the node, so no
+memory_write needed.
+@End Reasoning
+
+@Implementation:
+Reads the node struct; reads children list; returns list_get at the
+given index. Out-of-range indices are the caller's responsibility.
+@End Implementation
+
 Process called "ast_node_get_child" takes node_ptr as Integer, index as Integer returns Integer:
     @Reasoning
     Get a child node by index.
@@ -170,6 +269,15 @@ Process called "ast_node_get_child" takes node_ptr as Integer, index as Integer 
     Let child be proc list_get from ListCore with node.children, index
     Return child
 End Process
+
+@Reasoning:
+Reports the child count for iteration loops. Used pervasively by
+traversal code that wants to walk a node's children.
+@End Reasoning
+
+@Implementation:
+Reads the node; returns list_length of the children list.
+@End Implementation
 
 Process called "ast_node_child_count" takes node_ptr as Integer returns Integer:
     @Reasoning
@@ -184,6 +292,19 @@ End Process
 Note: ============================================================================
 Note: Token Navigation
 Note: ============================================================================
+
+@Reasoning:
+Returns the token under the parser cursor. Guards against past-end
+access by returning the last token (typically the EOF sentinel emitted
+by the lexer) so callers can safely dispatch on its type without
+bounds-checking each call.
+@End Reasoning
+
+@Implementation:
+Reads parser struct, fetches token count, returns token at
+parser.current — or the last token if current is at or past the end
+of the stream.
+@End Implementation
 
 Process called "current_token" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -202,6 +323,18 @@ Process called "current_token" takes parser_ptr as Integer returns Integer:
     Let token be proc list_get from ListCore with parser.tokens, parser.current
     Return token
 End Process
+
+@Reasoning:
+Lookahead variant of current_token: returns the token at
+current + offset without consuming. Used to disambiguate constructs
+that share a prefix (e.g. `function name(` vs `function(`).
+@End Reasoning
+
+@Implementation:
+Reads parser; computes peek_index = current + offset; returns the
+last token if past end, otherwise the token at peek_index. No
+mutation.
+@End Implementation
 
 Process called "peek_token" takes parser_ptr as Integer, offset as Integer returns Integer:
     @Reasoning
@@ -222,6 +355,18 @@ Process called "peek_token" takes parser_ptr as Integer, offset as Integer retur
     Return token
 End Process
 
+@Reasoning:
+Consumes the current token and steps the cursor forward. Returns the
+just-consumed token so the caller can capture its lexeme/location
+without an extra read. Stays put once past end-of-stream.
+@End Reasoning
+
+@Implementation:
+Reads parser; captures current_token via current_token helper.
+Increments parser.current only when not yet at end. Writes parser
+back. Returns the captured token.
+@End Implementation
+
 Process called "advance" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Advance to the next token and return the previous token.
@@ -239,6 +384,16 @@ Process called "advance" takes parser_ptr as Integer returns Integer:
     Return current_tok
 End Process
 
+@Reasoning:
+Non-consuming "is current token of type X" predicate. Used as the
+gate for optional grammar rules.
+@End Reasoning
+
+@Implementation:
+Fetches the current token; reads its struct; returns 1 if
+tok.token_type matches token_type, 0 otherwise. No mutation.
+@End Implementation
+
 Process called "check" takes parser_ptr as Integer, token_type as Integer returns Integer:
     @Reasoning
     Check if the current token is of the given type.
@@ -254,6 +409,17 @@ Process called "check" takes parser_ptr as Integer, token_type as Integer return
     Return 0
 End Process
 
+@Reasoning:
+Consume-on-match helper. Returns 1 + advances if the current token
+matches expected_type, returns 0 + no advance otherwise. Used for
+optional tokens (commas, semicolons, optional keywords).
+@End Reasoning
+
+@Implementation:
+Calls check; on match (1) calls advance and returns 1. On mismatch
+returns 0 with no side effects.
+@End Implementation
+
 Process called "match" takes parser_ptr as Integer, token_type as Integer returns Integer:
     @Reasoning
     Check if the current token matches the given type and advance if it does.
@@ -266,6 +432,19 @@ Process called "match" takes parser_ptr as Integer, token_type as Integer return
 
     Return 0
 End Process
+
+@Reasoning:
+Mandatory-token gate. On match, advances and returns the consumed
+token so callers can use it. On mismatch, records the error and
+returns the current token so the parser can attempt recovery rather
+than crash.
+@End Reasoning
+
+@Implementation:
+Calls check. If 1, calls advance and returns the consumed token.
+Otherwise calls parser_error with the supplied message and returns
+the current token (without advancing).
+@End Implementation
 
 Process called "consume" takes parser_ptr as Integer, token_type as Integer, error_message as String returns Integer:
     @Reasoning
@@ -286,6 +465,17 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Sticky-error recorder. Once set, had_error stays at 1 so callers can
+short-circuit subsequent parse logic. Last-error wins on the message
+field because the most informative diagnostic is typically the most
+recent one.
+@End Reasoning
+
+@Implementation:
+Reads parser; sets had_error=1 and error_message=message; writes back.
+@End Implementation
+
 Process called "parser_error" takes parser_ptr as Integer, message as String:
     @Reasoning
     Record a parser error.
@@ -300,6 +490,25 @@ End Process
 Note: ============================================================================
 Note: Expression Parsing
 Note: ============================================================================
+
+@Reasoning:
+Bottom of the Lua expression grammar: nil/true/false/number/string
+literals, vararg `...`, table constructors `{...}`, function
+expressions, parenthesised expressions, and bare identifiers. Above
+this layer the precedence climbing functions wrap operands in
+operators.
+@End Reasoning
+
+@Implementation:
+Sequential If/match chain consuming the matching token and producing
+the corresponding LUA_*_LITERAL node. Number/string literals capture
+literal_value from the token. Table constructors and function
+expressions delegate to dedicated helpers. Parenthesised expression
+recurses parse_expression and consumes the closing `)`. Identifiers
+build LUA_IDENTIFIER nodes. Falls through to a parser_error with
+"Expected expression" and returns a nil-literal placeholder so the
+caller does not crash on a null pointer.
+@End Implementation
 
 Process called "parse_primary" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -382,6 +591,23 @@ Process called "parse_primary" takes parser_ptr as Integer returns Integer:
     Let error_node be proc create_ast_node from LUA_NIL_LITERAL
     Return error_node
 End Process
+
+@Reasoning:
+Postfix operations chain left-to-right after a primary: `.field`,
+`[index]`, `(args)` calls, and `:method(args)` method calls. Each
+operation wraps the current expression as the operand of a new
+node.
+@End Reasoning
+
+@Implementation:
+Parses a primary as starting `expr`. Loops on current token:
+TOKEN_DOT consumes and builds LUA_FIELD_ACCESS with the next
+identifier; TOKEN_LBRACKET builds LUA_INDEX with the bracketed
+expression; TOKEN_LPAREN or TOKEN_STRING/TOKEN_LBRACE call-without-
+parens build LUA_FUNCTION_CALL with parsed arguments; TOKEN_COLON
+builds LUA_METHOD_CALL with the method name + arguments. Breaks
+when no postfix token follows. Returns the assembled expression.
+@End Implementation
 
 Process called "parse_postfix" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -490,6 +716,19 @@ Process called "parse_postfix" takes parser_ptr as Integer returns Integer:
     Return expr
 End Process
 
+@Reasoning:
+Lua's prefix operators: `not`, `-` (negate), `#` (length), `~` (bitwise
+not). Right-associative — recursing into parse_unary itself for the
+operand makes `not not x` work correctly.
+@End Reasoning
+
+@Implementation:
+Checks for each prefix token (NOT, MINUS, HASH, TILDE). On match,
+captures operator, advances, recurses parse_unary for the operand,
+builds a LUA_UNARY_EXPRESSION node with the operator string and the
+operand as child. Otherwise delegates to parse_postfix.
+@End Implementation
+
 Process called "parse_unary" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse unary expressions (not, -, #, ~).
@@ -534,6 +773,19 @@ Process called "parse_unary" takes parser_ptr as Integer returns Integer:
     Return proc parse_postfix with parser_ptr
 End Process
 
+@Reasoning:
+Exponentiation `^` is right-associative in Lua: `2^3^2` parses as
+`2^(3^2)`. Recurse into parse_power itself for the right operand to
+express the right-association rather than left-association.
+@End Reasoning
+
+@Implementation:
+Parses parse_unary as left. If current token is CARET, builds
+LUA_BINARY_OP with value "^", attaches left as child, recurses
+parse_power for the right operand, attaches right. Returns the binary
+node or the bare left if no `^` follows.
+@End Implementation
+
 Process called "parse_power" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse power expressions (right-associative ^).
@@ -554,6 +806,18 @@ Process called "parse_power" takes parser_ptr as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Multiplicative precedence layer: `*`, `/`, `//` (floor div), `%`.
+Left-associative chain over parse_power operands.
+@End Reasoning
+
+@Implementation:
+Parses parse_power as left. Loop consumes any of STAR, SLASH,
+DOUBLE_SLASH, PERCENT, recursing parse_power for each right operand,
+wrapping in LUA_BINARY_OP with the matching operator string,
+rebinding left. Returns the left-associated tree.
+@End Implementation
 
 Process called "parse_multiplicative" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -606,6 +870,17 @@ Process called "parse_multiplicative" takes parser_ptr as Integer returns Intege
     Return left
 End Process
 
+@Reasoning:
+Additive precedence layer: `+` and `-` binary operators.
+Left-associative chain over parse_multiplicative operands.
+@End Reasoning
+
+@Implementation:
+Parses parse_multiplicative as left. Loop consumes PLUS or MINUS,
+recursing parse_multiplicative for right operand, builds
+LUA_BINARY_OP with operator string, rebinds left.
+@End Implementation
+
 Process called "parse_additive" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse additive expressions (+, -).
@@ -639,6 +914,18 @@ Process called "parse_additive" takes parser_ptr as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Lua's `..` concatenation is right-associative per the reference
+manual; the right operand therefore recurses parse_concatenation
+itself.
+@End Reasoning
+
+@Implementation:
+Parses parse_additive as left. If current token is DOT_DOT, builds
+LUA_BINARY_OP with operator "..", attaches left, recurses
+parse_concatenation for right, attaches right.
+@End Implementation
+
 Process called "parse_concatenation" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse concatenation expressions (right-associative ..).
@@ -659,6 +946,18 @@ Process called "parse_concatenation" takes parser_ptr as Integer returns Integer
 
     Return left
 End Process
+
+@Reasoning:
+Bitwise shift precedence layer: `<<` (left shift) and `>>` (right
+shift), left-associative.
+@End Reasoning
+
+@Implementation:
+Parses parse_concatenation as left. Loops on LEFT_SHIFT or RIGHT_SHIFT
+tokens, recursing parse_concatenation for right operand each iteration,
+wrapping in LUA_BINARY_OP with the matching operator string, rebinding
+left.
+@End Implementation
 
 Process called "parse_bitwise_shift" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -692,6 +991,17 @@ Process called "parse_bitwise_shift" takes parser_ptr as Integer returns Integer
 
     Return left
 End Process
+
+@Reasoning:
+Relational and equality operators: `<`, `>`, `<=`, `>=`, `==`, and
+Lua's `~=` (inequality). Left-associative chain.
+@End Reasoning
+
+@Implementation:
+Parses parse_bitwise_shift as left. Loops checking each relational
+token type; on match consumes, recurses parse_bitwise_shift for right
+operand, builds LUA_BINARY_OP with operator spelling, rebinds left.
+@End Implementation
 
 Process called "parse_relational" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -762,6 +1072,17 @@ Process called "parse_relational" takes parser_ptr as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Bitwise AND `&` layer, sitting between relational and bitwise XOR in
+Lua's precedence table. Left-associative.
+@End Reasoning
+
+@Implementation:
+Parses parse_relational as left. Loops on TOKEN_AMPERSAND consuming,
+recursing for right, wrapping in LUA_BINARY_OP value "&", rebinding
+left.
+@End Implementation
+
 Process called "parse_bitwise_and" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse bitwise AND expressions (&).
@@ -785,6 +1106,17 @@ Process called "parse_bitwise_and" takes parser_ptr as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Bitwise XOR `~` (binary form, distinct from unary `~` complement).
+Sits between bitwise AND and bitwise OR. Left-associative.
+@End Reasoning
+
+@Implementation:
+Parses parse_bitwise_and as left. Loops on TOKEN_TILDE consuming,
+recursing for right, wrapping in LUA_BINARY_OP value "~", rebinding
+left.
+@End Implementation
 
 Process called "parse_bitwise_xor" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -810,6 +1142,18 @@ Process called "parse_bitwise_xor" takes parser_ptr as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Bitwise OR `|` is the lowest-precedence bitwise operator. Above it
+sit only the short-circuit logical operators (`and`, `or`).
+Left-associative.
+@End Reasoning
+
+@Implementation:
+Parses parse_bitwise_xor as left. Loops on TOKEN_PIPE consuming,
+recursing for right, wrapping in LUA_BINARY_OP value "|", rebinding
+left.
+@End Implementation
+
 Process called "parse_bitwise_or" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse bitwise OR expressions (|).
@@ -833,6 +1177,18 @@ Process called "parse_bitwise_or" takes parser_ptr as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Lua's short-circuit `and` operator. Binds tighter than `or`. Left-
+associative. Semantically distinct from bitwise AND — `and` returns
+either the first falsy operand or the last operand.
+@End Reasoning
+
+@Implementation:
+Parses parse_bitwise_or as left. Loops on TOKEN_AND consuming,
+recursing parse_bitwise_or for right, wrapping in LUA_BINARY_OP
+value "and", rebinding left.
+@End Implementation
 
 Process called "parse_logical_and" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -858,6 +1214,17 @@ Process called "parse_logical_and" takes parser_ptr as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Lua's `or` operator — lowest-precedence binary operator. Returns the
+first truthy operand or the last operand. Left-associative.
+@End Reasoning
+
+@Implementation:
+Parses parse_logical_and as left. Loops on TOKEN_OR consuming,
+recursing parse_logical_and for right, wrapping in LUA_BINARY_OP
+value "or", rebinding left.
+@End Implementation
+
 Process called "parse_logical_or" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse logical OR expressions (or).
@@ -882,6 +1249,16 @@ Process called "parse_logical_or" takes parser_ptr as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Public expression entry that starts the precedence ladder at the
+lowest level (`or`). Every parser helper that needs a sub-expression
+calls into here so the full precedence chain is honoured.
+@End Reasoning
+
+@Implementation:
+Single forwarding call into parse_logical_or.
+@End Implementation
+
 Process called "parse_expression" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse a complete expression following Lua precedence rules.
@@ -893,6 +1270,20 @@ End Process
 Note: ============================================================================
 Note: Table Constructor Parsing
 Note: ============================================================================
+
+@Reasoning:
+Lua table constructors mix positional and hash entries. Three field
+forms: `[key] = value`, `name = value`, and bare `value` (implicit
+next array index).
+@End Reasoning
+
+@Implementation:
+Consumes `{`. Builds LUA_TABLE_CONSTRUCTOR. Loops until `}`: if
+TOKEN_LBRACKET, parses `[key] = value` field; else-if identifier
+followed by `=`, parses `name = value` field; else parses positional
+expression. Each field becomes a child LUA_TABLE_FIELD node. Consumes
+comma or semicolon separator. Closes with `}`.
+@End Implementation
 
 Process called "parse_table_constructor" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -983,6 +1374,19 @@ Note: ==========================================================================
 Note: Function Parsing
 Note: ============================================================================
 
+@Reasoning:
+Anonymous function values: `function(p1, p2, ...) body end`. Used in
+expression position; named function statements have their own helper.
+The vararg `...` may appear as the final parameter.
+@End Reasoning
+
+@Implementation:
+Caller has already consumed the `function` keyword. Consumes `(`,
+parses comma-separated parameter names (or `...`) into a parameter
+list child. Consumes `)`. Parses body via parse_block. Consumes
+`end`. Returns LUA_FUNCTION_EXPRESSION node.
+@End Implementation
+
 Process called "parse_function_expression" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse a function expression: function(params) body end.
@@ -1031,6 +1435,20 @@ Process called "parse_function_expression" takes parser_ptr as Integer returns I
     Return func_node
 End Process
 
+@Reasoning:
+Lua function calls accept three argument-list forms: parenthesised
+list, single string literal (`fn"str"`), or single table constructor
+(`fn{...}`). The string and table forms are syntactic sugar for a
+single-argument call.
+@End Reasoning
+
+@Implementation:
+Builds LUA_ARGUMENT_LIST. If current is LPAREN: consumes it, parses
+comma-separated expressions, consumes RPAREN. If STRING: appends a
+single literal-expression child. If LBRACE: appends a single
+table-constructor child. Returns the populated argument list node.
+@End Implementation
+
 Process called "parse_argument_list" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse a function argument list.
@@ -1056,6 +1474,20 @@ End Process
 Note: ============================================================================
 Note: Statement Parsing
 Note: ============================================================================
+
+@Reasoning:
+Lua's if statement supports a fully-fledged elseif chain. The parser
+keeps the elseif arms flat in the AST (condition/block pairs as
+siblings) for readability and downstream simplicity.
+@End Reasoning
+
+@Implementation:
+Consumes `if`. Parses condition expression, expects `then`, parses
+then-block. Loops on TOKEN_ELSEIF: each iteration parses condition
++ `then` + block, attaching as paired children. If TOKEN_ELSE
+present, consumes and parses the final else block. Consumes `end`.
+Returns LUA_IF_STATEMENT.
+@End Implementation
 
 Process called "parse_if_statement" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -1099,6 +1531,17 @@ Process called "parse_if_statement" takes parser_ptr as Integer returns Integer:
     Return if_node
 End Process
 
+@Reasoning:
+Lua's while loop uses `do`/`end` rather than braces. Head-tested:
+the condition is checked before each iteration.
+@End Reasoning
+
+@Implementation:
+Consumes `while`. Parses condition expression. Expects `do`. Parses
+body via parse_block. Expects `end`. Returns LUA_WHILE_STATEMENT with
+condition + body as children.
+@End Implementation
+
 Process called "parse_while_statement" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse a while statement: while condition do block end.
@@ -1123,6 +1566,17 @@ Process called "parse_while_statement" takes parser_ptr as Integer returns Integ
     Return while_node
 End Process
 
+@Reasoning:
+Lua's tail-tested loop: `repeat body until cond`. The condition is
+checked AFTER each iteration, so the body always runs at least once.
+@End Reasoning
+
+@Implementation:
+Consumes `repeat`. Parses body via parse_block. Expects `until`.
+Parses condition expression. Returns LUA_REPEAT_STATEMENT with body
++ condition as children.
+@End Implementation
+
 Process called "parse_repeat_statement" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse a repeat statement: repeat block until condition.
@@ -1144,6 +1598,22 @@ Process called "parse_repeat_statement" takes parser_ptr as Integer returns Inte
 
     Return repeat_node
 End Process
+
+@Reasoning:
+Lua has two for-loop forms: numeric (`for i = start, stop[, step]
+do ... end`) and generic (`for k, v in iterator do ... end`). The
+parser disambiguates by looking at the token after the loop
+variable: `=` -> numeric, `,` or `in` -> generic.
+@End Reasoning
+
+@Implementation:
+Consumes `for`. Parses first identifier as loop variable. Peeks for
+`=` (numeric form): parses start, stop, optional step expressions
+separated by commas; consumes `do`, body via parse_block, `end`;
+emits LUA_NUMERIC_FOR_STATEMENT. Otherwise (generic form): parses
+additional names until `in`, then comma-separated iterator
+expressions; consumes `do`, body, `end`; emits LUA_GENERIC_FOR_STATEMENT.
+@End Implementation
 
 Process called "parse_for_statement" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -1236,6 +1706,20 @@ Process called "parse_for_statement" takes parser_ptr as Integer returns Integer
         Return for_node
     End If
 End Process
+
+@Reasoning:
+Named function declaration: `function name body end` or
+`function obj:method body end`. The method-call form gets an implicit
+`self` first parameter so the AST records that distinction via a
+metadata flag.
+@End Reasoning
+
+@Implementation:
+Consumes `function`. Reads name (possibly dotted: `a.b.c`). If a `:`
+follows, captures method name and marks the node as a method
+declaration (implicit self). Parses parameter list inside `()`. Parses
+body via parse_block. Consumes `end`. Returns LUA_FUNCTION_STATEMENT.
+@End Implementation
 
 Process called "parse_function_statement" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -1336,6 +1820,20 @@ Process called "parse_function_statement" takes parser_ptr as Integer returns In
 
     Return func_node
 End Process
+
+@Reasoning:
+`local` introduces lexically-scoped bindings: variable declarations
+(`local name [, name]* [= expr [, expr]*]`) or local function
+declarations (`local function name(...) body end`). The parser
+disambiguates via lookahead.
+@End Reasoning
+
+@Implementation:
+Consumes `local`. If next is TOKEN_FUNCTION, delegates to a local-
+function path (parses name + params + body). Otherwise parses
+comma-separated name list, optional `=` + comma-separated expression
+list. Returns LUA_LOCAL_STATEMENT with names and values as children.
+@End Implementation
 
 Process called "parse_local_statement" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -1442,6 +1940,18 @@ Process called "parse_local_statement" takes parser_ptr as Integer returns Integ
     Return local_node
 End Process
 
+@Reasoning:
+`return [expr [, expr]*]` — Lua allows zero or more return values.
+The statement must be the last in its block (enforced by the lexer/
+parser elsewhere), and may be followed by an optional `;`.
+@End Reasoning
+
+@Implementation:
+Consumes `return`. If next token can start an expression (not `end`,
+`else`, `elseif`, `until`, EOF, or `;`), parses comma-separated
+expression list. Optional `;` is consumed. Returns LUA_RETURN_STATEMENT.
+@End Implementation
+
 Process called "parse_return_statement" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse a return statement: return [exp1, exp2, ...].
@@ -1479,6 +1989,18 @@ Process called "parse_return_statement" takes parser_ptr as Integer returns Inte
     Return return_node
 End Process
 
+@Reasoning:
+Lua 5.2+ label syntax `::name::` introduces a goto target. Used in
+combination with `goto name` for limited unstructured control flow
+(e.g. continue-like behaviour).
+@End Reasoning
+
+@Implementation:
+Consumes the opening `::`. Expects an identifier (the label name).
+Consumes the closing `::`. Returns LUA_LABEL_STATEMENT with the name
+in the value field.
+@End Implementation
+
 Process called "parse_label_statement" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse a label statement: ::name::.
@@ -1497,6 +2019,17 @@ Process called "parse_label_statement" takes parser_ptr as Integer returns Integ
     Return label_node
 End Process
 
+@Reasoning:
+`goto name` companion to label statements. Lua's scoping rules
+restrict goto-target visibility, but the parser does not enforce them
+— that's a semantic analysis concern downstream.
+@End Reasoning
+
+@Implementation:
+Consumes `goto`. Expects an identifier (the target label name).
+Returns LUA_GOTO_STATEMENT with the name in the value field.
+@End Implementation
+
 Process called "parse_goto_statement" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse a goto statement: goto name.
@@ -1512,6 +2045,23 @@ Process called "parse_goto_statement" takes parser_ptr as Integer returns Intege
 
     Return goto_node
 End Process
+
+@Reasoning:
+Lua's "expression statement" position can be either a function-call
+expression (used as a statement) or an assignment `lhs[, lhs]* = expr
+[, expr]*`. The parser builds the LHS as an expression first, then
+disambiguates by looking for `=` (assignment) or treating a
+function-call form as a statement directly.
+@End Reasoning
+
+@Implementation:
+Parses a postfix expression as the first LHS candidate. If next is
+`,`, accumulates more comma-separated LHS expressions. If next is
+`=`, consumes it, parses comma-separated RHS expressions, builds
+LUA_ASSIGNMENT_STATEMENT with lhs-list and rhs-list. If first LHS
+was a function call (LUA_FUNCTION_CALL or LUA_METHOD_CALL), treats it
+as a call statement. Otherwise records a parser error.
+@End Implementation
 
 Process called "parse_assignment_or_call" takes parser_ptr as Integer returns Integer:
     @Reasoning
@@ -1592,6 +2142,19 @@ Process called "parse_assignment_or_call" takes parser_ptr as Integer returns In
     End If
 End Process
 
+@Reasoning:
+Statement-level dispatcher. Maps Lua keywords to their dedicated
+parse_* helpers. Falls back to parse_assignment_or_call for the
+expression-statement / assignment residual case.
+@End Reasoning
+
+@Implementation:
+Reads current token type. Sequential dispatch: IF, WHILE, REPEAT, FOR,
+FUNCTION, LOCAL, RETURN, BREAK (inline simple node), DO (block
+with `do`/`end`), DOUBLE_COLON (label), GOTO. Anything else delegates
+to parse_assignment_or_call.
+@End Implementation
+
 Process called "parse_statement" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse a single statement.
@@ -1663,6 +2226,19 @@ Note: ==========================================================================
 Note: Block and Program Parsing
 Note: ============================================================================
 
+@Reasoning:
+A sequence of statements terminating at a block-end token (`end`,
+`else`, `elseif`, `until`, EOF). Block-end detection is centralised
+here so every block-bearing construct (function bodies, control-flow
+arms) uses the same terminator logic.
+@End Reasoning
+
+@Implementation:
+Builds LUA_BLOCK. Loops while current token is not a terminator
+(end/else/elseif/until/EOF). Each iteration parses a statement via
+parse_statement; if non-zero, attaches as child. Returns the block.
+@End Implementation
+
 Process called "parse_block" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse a block of statements.
@@ -1700,6 +2276,17 @@ Process called "parse_block" takes parser_ptr as Integer returns Integer:
     Return block_node
 End Process
 
+@Reasoning:
+A Lua source file is itself a block (the chunk). This helper just
+wraps parse_block with a LUA_PROGRAM root node so downstream tools
+can distinguish file-level from nested blocks.
+@End Reasoning
+
+@Implementation:
+Builds LUA_PROGRAM. Calls parse_block; attaches the resulting block
+as the program's only child. Returns the program node.
+@End Implementation
+
 Process called "parse_program" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse the entire Lua program (top-level block).
@@ -1716,6 +2303,17 @@ Process called "parse_program" takes parser_ptr as Integer returns Integer:
     Return program_node
 End Process
 
+@Reasoning:
+Public top-level entry point that all consumers call. Delegates to
+parse_program. Kept as a thin alias so the public name stays stable
+even if the internal driver is renamed.
+@End Reasoning
+
+@Implementation:
+Single forwarding call into parse_program. Returns the resulting
+LUA_PROGRAM AST.
+@End Implementation
+
 Process called "parse" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse the token stream and return the AST root.
@@ -1725,6 +2323,16 @@ Process called "parse" takes parser_ptr as Integer returns Integer:
     Return ast
 End Process
 
+@Reasoning:
+Read-only accessor for the parser's sticky has-error flag. Callers
+check this after parse() to decide whether to consume the AST or
+discard it.
+@End Reasoning
+
+@Implementation:
+Reads the parser struct and returns parser.had_error.
+@End Implementation
+
 Process called "had_error" takes parser_ptr as Integer returns Integer:
     @Reasoning
     Check if the parser encountered any errors.
@@ -1733,6 +2341,15 @@ Process called "had_error" takes parser_ptr as Integer returns Integer:
     Let parser be proc memory_read from MemoryCore with parser_ptr of type LuaParserState
     Return parser.had_error
 End Process
+
+@Reasoning:
+Companion to had_error: exposes the last error message recorded by
+parser_error so the caller can display it.
+@End Reasoning
+
+@Implementation:
+Reads the parser struct and returns parser.error_message.
+@End Implementation
 
 Process called "get_error_message" takes parser_ptr as Integer returns String:
     @Reasoning

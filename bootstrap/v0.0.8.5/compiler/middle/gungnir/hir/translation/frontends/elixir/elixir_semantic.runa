@@ -2,6 +2,12 @@ Note: Elixir Semantic Analyzer for Translation Translation System
 Note: Handles Elixir's actor model, pattern matching, OTP behaviors, and metaprogramming
 
 Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_parser.runa" as ElixirParser
+@Reasoning:
+The analyzer is the single mutable context threaded through every recursive AST visit; bundling all per-analysis state (module/function cursors, pattern bindings, actor registry, OTP behavior map, error/warning accumulators) into one struct lets the visitor restore prior state on exit without an explicit stack and keeps cross-cutting concerns (supervision tree, ETS usage, protocols) addressable from any visit site.
+@End Reasoning
+@Implementation:
+Fields are typed Integer because they hold opaque pointers into Runa-side dictionaries and lists allocated via memory_allocate; that uniform handle representation lets the visitor functions accept any container without overloads. current_module and current_function are saved-and-restored across recursive analyze_* calls so nested module/function scopes do not corrupt outer state.
+@End Implementation
 Type called "ElixirSemanticAnalyzer":
     symbol_table as Integer  Note: Module and function scope tracking
     current_module as Integer  Note: Current module being analyzed
@@ -21,6 +27,9 @@ Type called "ElixirSemanticAnalyzer":
     message_protocols as Integer  Note: Message passing protocols
 End Type
 
+@Reasoning:
+A semantic Elixir module is more than a name and function list: OTP behavior membership, supervision strategy, protocols, structs, and use/import/alias dependencies all influence later semantic checks (callback completeness, supervision tree shape, protocol dispatch). Recording them on the module record lets validate_otp_behavior_compliance and analyze_supervision_tree work without re-walking the AST.
+@End Reasoning
 Type called "ElixirSemanticModule":
     name as String
     attributes as Integer  Note: Module attributes (@moduledoc, @doc, etc.)
@@ -34,6 +43,9 @@ Type called "ElixirSemanticModule":
     dependencies as Integer  Note: use, import, alias, require
 End Type
 
+@Reasoning:
+Elixir functions are multi-clause with guards, and pattern variables bound in one clause are scoped to that clause only; the semantic record therefore carries clauses, guards, and pattern_variables together so exhaustiveness, redundancy, and binding leakage can be checked locally. otp_callback is captured to flag deviations between callback signatures and behavior contracts (e.g., handle_call/3 arity).
+@End Reasoning
 Type called "ElixirSemanticFunction":
     name as String
     arity as Integer
@@ -46,6 +58,9 @@ Type called "ElixirSemanticFunction":
     side_effects as Integer  Note: List of side effects
 End Type
 
+@Reasoning:
+Elixir processes form a graph (links and monitors) and an inheritance tree (supervision); modeling each spawn site with linked_processes, monitored_by, and supervision_info lets downstream checks detect orphan processes, missing trap_exit handlers, and unsupervised long-lived actors without re-traversing the AST.
+@End Reasoning
 Type called "ActorProcess":
     spawn_location as Integer  Note: AST node where spawned
     process_type as String  Note: "spawn", "Task", "GenServer", etc.
@@ -55,6 +70,12 @@ Type called "ActorProcess":
     supervision_info as Integer  Note: Supervisor information
 End Type
 
+@Reasoning:
+Construction zeros every container by allocating fresh dicts/lists rather than sharing module-level state, which prevents cross-analysis bleed when the same compiler invocation analyzes multiple Elixir source files. initialize_elixir_builtins is called here so users never see "undefined GenServer" against the standard library.
+@End Reasoning
+@Implementation:
+Each container field is initialized via create_dict or create_list which call memory_allocate; the analyzer struct is returned by value but Runa's struct semantics carry the heap pointers, so the caller owns the analyzer lifetime and is responsible for releasing it once the file has been fully analyzed.
+@End Implementation
 Process called "create_elixir_semantic_analyzer" returns Integer:
     Note: Create new Elixir semantic analyzer instance
 
@@ -82,6 +103,12 @@ Process called "create_elixir_semantic_analyzer" returns Integer:
     Return analyzer
 End Process
 
+@Reasoning:
+This is the central visitor dispatch. Using a Match on node_type instead of a polymorphic vtable keeps the dispatch tight and lets the type tags imported from ElixirParser stay the single source of truth; the Otherwise arm recurses into children so unknown node shapes never silently drop sub-analysis (e.g., nested defs inside an unrecognized macro expansion).
+@End Reasoning
+@Security_Scope:
+Input AST is untrusted user source; the Otherwise branch must walk children so attacker-crafted nodes cannot smuggle unanalyzed receive/spawn/send into the program. Every callee returns an Integer status and accumulates errors on analyzer.error_list rather than throwing, so a malformed subtree never aborts a whole-program analysis.
+@End Security_Scope
 Process called "analyze_elixir_ast" takes analyzer as Integer, ast as Integer returns Integer:
     Note: Perform semantic analysis of Elixir AST with actor model validation
 
@@ -133,6 +160,9 @@ Process called "analyze_elixir_ast" takes analyzer as Integer, ast as Integer re
     End Match
 End Process
 
+@Reasoning:
+defmodule establishes a new lexical and behavioral scope; we save the previous current_module before walking children and restore it after so nested defmodule (Elixir permits this) does not leak state. OTP and supervision validation are deferred to the end so they observe the fully populated function table.
+@End Reasoning
 Process called "analyze_defmodule" takes analyzer as Integer, ast as Integer returns Integer:
     Note: Analyze Elixir module with OTP behavior detection
 
@@ -183,6 +213,9 @@ Process called "analyze_defmodule" takes analyzer as Integer, ast as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+def builds an ElixirSemanticFunction record, registers it in the enclosing module before analyzing the body so recursive self-references resolve, and runs validate_pattern_exhaustiveness only after every clause is in the record. The previous_function save/restore mirrors the module case for nested-definition tolerance.
+@End Reasoning
 Process called "analyze_def" takes analyzer as Integer, ast as Integer returns Integer:
     Note: Analyze Elixir function definition with pattern matching
 
@@ -231,6 +264,9 @@ Process called "analyze_def" takes analyzer as Integer, ast as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+case introduces a fresh pattern-binding scope; we swap pattern_context for the duration so bindings made inside the case do not leak to siblings (e.g., {:ok, x} = case ... matches only inside that arm). pattern_coverage is collected across clauses and handed to check_pattern_exhaustiveness so the warning fires once with full information.
+@End Reasoning
 Process called "analyze_case" takes analyzer as Integer, ast as Integer returns Integer:
     Note: Analyze case expression with pattern matching validation
 
@@ -266,6 +302,9 @@ Process called "analyze_case" takes analyzer as Integer, ast as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+receive is only meaningful inside a process; the context check emits a warning rather than an error because the host process may be set up dynamically (spawn(fn -> receive ... end)). Message patterns are gathered into one list before validate_message_protocol so cross-clause protocol gaps are detected in a single pass.
+@End Reasoning
 Process called "analyze_receive" takes analyzer as Integer, ast as Integer returns Integer:
     Note: Analyze receive block for actor message handling
 
@@ -303,6 +342,12 @@ Process called "analyze_receive" takes analyzer as Integer, ast as Integer retur
     Return 1
 End Process
 
+@Reasoning:
+spawn variants (spawn, spawn_link, spawn_monitor) all share target validation but differ on link/monitor registration; the spawn_type string discriminates them so the actor process record can record the relationship for later supervision-tree analysis. Arity mismatch is an error (not a warning) because OTP processes will crash at startup otherwise.
+@End Reasoning
+@Security_Scope:
+The target module/function come from user source; function_exists must be called before recording the spawn so the actor registry never contains references to undefined callables. process_id is generated freshly per spawn to avoid registry-key collisions across analyses.
+@End Security_Scope
 Process called "analyze_spawn" takes analyzer as Integer, ast as Integer returns Integer:
     Note: Analyze process spawning for actor model validation
 
@@ -347,6 +392,9 @@ Process called "analyze_spawn" takes analyzer as Integer, ast as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+GenServer.call is synchronous; mismatched request shapes against handle_call clauses are the most common Elixir bug, so we resolve the target module and validate the request pattern against its handle_call clauses. Server module resolution may legitimately fail (dynamic Process.whereis), so unknown servers degrade to a warning rather than blocking compilation.
+@End Reasoning
 Process called "analyze_genserver_call" takes analyzer as Integer, ast as Integer returns Integer:
     Note: Analyze GenServer.call for OTP compliance
 
@@ -376,6 +424,9 @@ Process called "analyze_genserver_call" takes analyzer as Integer, ast as Intege
     Return 1
 End Process
 
+@Reasoning:
+Elixir's = is a match operator that both tests and binds; we analyze the expression first because pattern reachability depends on what the expression can produce, then collect bindings into a local dict and merge them into pattern_context only after reachability is confirmed so unreachable patterns do not pollute the outer scope.
+@End Reasoning
 Process called "analyze_pattern_match" takes analyzer as Integer, ast as Integer returns Integer:
     Note: Analyze pattern matching with variable binding
 
@@ -398,6 +449,9 @@ Process called "analyze_pattern_match" takes analyzer as Integer, ast as Integer
     Return 1
 End Process
 
+@Reasoning:
+use is the macro mechanism by which OTP behaviors are mixed in; we detect well-known behaviors and dispatch to behavior-specific analyzers (each of which knows the contract: GenServer expects handle_call/handle_cast/handle_info, Supervisor expects init/1 returning child specs, etc.). Non-behavior use directives still record a dependency so module-resolution stays complete.
+@End Reasoning
 Process called "analyze_use" takes analyzer as Integer, ast as Integer returns Integer:
     Note: Analyze use directive for OTP behavior inclusion
 
@@ -432,6 +486,9 @@ Process called "analyze_use" takes analyzer as Integer, ast as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+OTP behaviors are contractual: a module declaring `use GenServer` MUST implement every required callback or the BEAM will crash on first message. We loop over the behavior's required-callback table and emit a hard error per missing callback rather than aggregating, so the error messages point users at each individual omission.
+@End Reasoning
 Process called "validate_otp_behavior_compliance" takes analyzer as Integer, module_info as Integer returns Integer:
     Note: Validate that module implements required OTP callbacks
 
@@ -461,6 +518,9 @@ Process called "validate_otp_behavior_compliance" takes analyzer as Integer, mod
     Return 1
 End Process
 
+@Reasoning:
+Supervisors are validated by extracting child specs from init/1 because the OTP runtime calls exactly that function to bootstrap the tree; absence of init/1 is unrecoverable so we emit an error and return 0. Each child spec is validated individually so a single malformed entry does not mask the rest.
+@End Reasoning
 Process called "analyze_supervision_tree" takes analyzer as Integer, module_info as Integer returns Integer:
     Note: Analyze supervisor module and build supervision tree
 
@@ -492,6 +552,9 @@ Process called "analyze_supervision_tree" takes analyzer as Integer, module_info
     Return 1
 End Process
 
+@Reasoning:
+The built-in module set is seeded at analyzer construction so user code that references Enum.map or GenServer.start_link never produces spurious "undefined module" errors. Registering OTP behaviors separately (vs. plain modules) lets is_otp_behavior remain a constant-time check.
+@End Reasoning
 Process called "initialize_elixir_builtins" takes analyzer as Integer returns Integer:
     Note: Initialize built-in Elixir and OTP modules
 
@@ -525,6 +588,9 @@ End Process
 
 Note: Helper processes for Elixir semantic analysis
 
+@Reasoning:
+Errors are recorded as structured dicts (message + line + column + severity) so the downstream diagnostics formatter can sort and group them; storing severity alongside the message keeps a single error_list capable of holding both errors and warnings if needed, while the dedicated warning_list keeps the two streams separable at the source.
+@End Reasoning
 Process called "add_semantic_error" takes analyzer as Integer, message as String, ast as Integer returns Integer:
     Note: Add semantic error with location information
 
@@ -538,6 +604,9 @@ Process called "add_semantic_error" takes analyzer as Integer, message as String
     Return 1
 End Process
 
+@Reasoning:
+Warnings have the same shape as errors but go to a separate list so callers can choose to suppress them without losing error semantics. Severity is still recorded inside the dict to keep individual records self-describing for downstream consumers.
+@End Reasoning
 Process called "add_semantic_warning" takes analyzer as Integer, message as String, ast as Integer returns Integer:
     Note: Add semantic warning with location information
 
@@ -551,6 +620,9 @@ Process called "add_semantic_warning" takes analyzer as Integer, message as Stri
     Return 1
 End Process
 
+@Reasoning:
+The five canonical OTP behaviors are hard-coded because they're a closed set defined by OTP itself; using Match instead of a dict lookup keeps the test branch-free and is the natural shape for a fixed enumeration. Otherwise returns 0 (false) so user modules cannot impersonate a behavior by name.
+@End Reasoning
 Process called "is_otp_behavior" takes module_name as String returns Integer:
     Note: Check if module is an OTP behavior
 
@@ -564,6 +636,9 @@ Process called "is_otp_behavior" takes module_name as String returns Integer:
     End Match
 End Process
 
+@Reasoning:
+Each OTP behavior declares a minimum-viable callback set: GenServer needs init/1 (handle_* are optional in the BEAM but typically required in practice), Supervisor needs init/1, Application needs start/2. We deliberately list only the truly-required callbacks so validate_otp_behavior_compliance doesn't false-positive on minimal but valid implementations.
+@End Reasoning
 Process called "get_required_callbacks" takes behavior as String returns Integer:
     Note: Get required callbacks for OTP behavior
 
@@ -585,6 +660,9 @@ Process called "get_required_callbacks" takes behavior as String returns Integer
     End Match
 End Process
 
+@Reasoning:
+A function is considered to exist iff its enclosing module is in the symbol table AND the module's functions dict contains the function name; we short-circuit on missing module so the dict_contains call is never invoked against a null pointer. Arity is intentionally not checked here because spawn-site validation handles arity separately.
+@End Reasoning
 Process called "function_exists" takes analyzer as Integer, module_name as String, function_name as String returns Integer:
     Note: Check if function exists in module
 
@@ -596,6 +674,9 @@ Process called "function_exists" takes analyzer as Integer, module_name as Strin
     Return proc dict_contains with module_info.functions, function_name
 End Process
 
+@Reasoning:
+GenServer membership is determined by the otp_behavior field set during analyze_use, not by any structural pattern (a module can implement handle_call without `use GenServer`, but the OTP runtime won't treat it as a GenServer). String equality on the behavior tag therefore matches the BEAM's own membership test.
+@End Reasoning
 Process called "implements_genserver" takes analyzer as Integer, module_name as String returns Integer:
     Note: Check if module implements GenServer behavior
 
@@ -607,21 +688,33 @@ Process called "implements_genserver" takes analyzer as Integer, module_name as 
     Return module_info.otp_behavior is equal to "GenServer"
 End Process
 
+@Reasoning:
+The dictionary stores keys/values plus a size counter; 24 bytes is the analyzer-local convention for the header (three 8-byte slots) before any entries are appended via set_dict_value, keeping construction O(1) and decoupling from the dict implementation's growth policy.
+@End Reasoning
 Process called "create_dict" returns Integer:
     Note: Create dictionary for storage
     Return proc memory_allocate from Layout with 24
 End Process
 
+@Reasoning:
+The list header is two 8-byte slots (data pointer + size) which the list operations grow on demand; allocating just the header here keeps the analyzer's many empty lists (warning_list when there are no warnings, etc.) cheap.
+@End Reasoning
 Process called "create_list" returns Integer:
     Note: Create list for storage
     Return proc memory_allocate from Layout with 16
 End Process
 
+@Reasoning:
+Errors are exposed via accessor rather than direct field access so the analyzer remains free to switch its internal representation (e.g., to a deduplicated set) without changing the consumer contract.
+@End Reasoning
 Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
     Note: Return list of semantic errors
     Return analyzer.error_list
 End Process
 
+@Reasoning:
+Warning access mirrors error access so callers using a single iterator pattern can swap streams without code changes; both lists share the same record shape established in add_semantic_error/add_semantic_warning.
+@End Reasoning
 Process called "get_semantic_warnings" takes analyzer as Integer returns Integer:
     Note: Return list of semantic warnings
     Return analyzer.warning_list

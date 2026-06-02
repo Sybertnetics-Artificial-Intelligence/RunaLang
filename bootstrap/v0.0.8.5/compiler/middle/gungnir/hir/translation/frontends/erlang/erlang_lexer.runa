@@ -133,6 +133,24 @@ Note: ==========================================================================
 Note: LEXER STRUCTURE
 Note: ============================================================================
 
+@Reasoning:
+Lexer state for the Erlang frontend. Erlang's lexical structure is
+distinct: atoms are lowercase-leading identifiers, Variables are
+uppercase-leading, '-' followed by a lowercase letter at file scope is
+a module attribute (-module/-export/...). Binary syntax uses <<...>>
+delimiters. The lexer maintains line/column for diagnostics; lexemes
+and lines slots are reserved for an interned-text cache and line-start
+index that downstream parsers may opportunistically populate.
+@End Reasoning
+
+@Implementation:
+40-byte record (5 actively-used fields followed by 3 reserved). Live
+fields per create_erlang_lexer: source (0), position (8), len (16),
+current_line (24), current_column (32). The tokens (40), lexemes
+(48), and lines (56) slots described in the type are not written by
+create; populating them is the caller's responsibility for cached
+lexers.
+@End Implementation
 Type called "ErlangLexer":
     source as Integer
     position as Integer
@@ -148,6 +166,20 @@ Note: ==========================================================================
 Note: MAIN LEXER FUNCTIONS
 Note: ============================================================================
 
+@Reasoning:
+Allocates and primes the lexer record. The source byte length is
+cached once so the hot peek/advance path can rely on it without
+re-measuring. line and column start at 1 to match editor-1-based
+diagnostics; position starts at 0 (byte index).
+@End Reasoning
+
+@Implementation:
+Reads source length via StringCore.string_length. Layout.allocate(40)
+returns the lexer handle. Writes source (offset 0), position 0
+(offset 8), source_len (offset 16), line 1 (offset 24), column 1
+(offset 32). The trailing 8 bytes of the 40-byte record reserved for
+tokens/lexemes/lines remain zero (caller-initialised on demand).
+@End Implementation
 Process called "create_erlang_lexer" takes source_code as Integer returns Integer:
     Note: Create and initialize Erlang lexer
 
@@ -167,6 +199,38 @@ Process called "create_erlang_lexer" takes source_code as Integer returns Intege
     Return lexer
 End Process
 
+@Reasoning:
+Main scanner. Erlang dispatch is unusual because case discrimination
+carries semantic weight: '-' followed by a lowercase letter must be
+recognised as the start of a module attribute (the parser cannot
+recover the distinction later because '-' before lowercase is also a
+valid unary-minus on an atom expression in some positions). Similarly
+'?' followed by uppercase starts a macro reference. '<<' / '>>'
+binary delimiters need two-byte lookahead before they can be
+disambiguated from '<'/'>' comparisons.
+@End Reasoning
+
+@Implementation:
+Skips whitespace/comments. EOF check via position vs len. Reads first
+byte via string_char_at. Branch by first byte:
+  '-' (45) with next byte is_lowercase_letter -> lex_module_attribute
+  is_lowercase_letter -> lex_atom
+  39 ('\'') -> lex_quoted_atom
+  is_uppercase_letter or '_' (95) -> lex_variable
+  '?' (63) with next is_uppercase_letter -> lex_macro_variable
+  is_digit -> lex_number
+  '"' (34) -> lex_string
+  '$' (36) -> lex_char (character literal $a, $\n)
+  '<' (60) with next '<' -> TOKEN_LBIN (binary open)
+  '>' (62) with next '>' -> TOKEN_RBIN (binary close)
+Any other byte -> lex_operator_or_punct.
+@End Implementation
+
+@Security_Scope:
+Untrusted source; every dispatch path consumes at least one byte
+(either via the specialist proc or directly through advance_position)
+so the lexer cannot spin on malformed input.
+@End Security_Scope
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from Erlang source
 
@@ -271,6 +335,19 @@ Note: ==========================================================================
 Note: WHITESPACE AND COMMENT HANDLING
 Note: ============================================================================
 
+@Reasoning:
+Loops between whitespace and comment skipping so any interleaving of
+the two is fully consumed in a single call. Erlang comments are %-to-
+end-of-line only (no block comments per the spec) so the inner state
+machine is trivial.
+@End Reasoning
+
+@Implementation:
+Outer infinite while. Each iteration: skip_whitespace consumes any
+run of whitespace; try_skip_comment consumes a single % comment and
+returns 0 if no comment was present. When try_skip_comment returns 0
+the outer loop terminates (returning 1).
+@End Implementation
 Process called "skip_whitespace_and_comments" takes lexer as Integer returns Integer:
     Note: Skip whitespace and comments
 
@@ -286,6 +363,21 @@ Process called "skip_whitespace_and_comments" takes lexer as Integer returns Int
     Return 1
 End Process
 
+@Reasoning:
+Consumes the run of whitespace bytes at the cursor with separate
+handling for LF (which must advance the line counter via
+advance_newline) versus the other whitespace forms (space/tab/CR
+which only advance the column).
+@End Reasoning
+
+@Implementation:
+Loops while pos < len. Reads current byte; 32 (space), 9 (tab),
+or 13 (CR) call advance_position; 10 (LF) calls advance_newline.
+Any other byte returns 1 immediately, leaving the cursor at the
+first non-whitespace byte. The shadow pos variable is kept in sync
+with the lexer's own offset so the loop condition can be re-checked
+without an extra memory_get.
+@End Implementation
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
@@ -326,6 +418,21 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes a % line comment if one is present at the cursor. Returns 1
+on success so the caller (skip_whitespace_and_comments) can loop;
+returns 0 if no comment was found so the caller can stop looping.
+The terminating LF is left in the buffer so skip_whitespace will pick
+it up and bump the line counter.
+@End Reasoning
+
+@Implementation:
+EOF guard returns 0. Reads current byte; if not '%' (37) returns 0.
+Otherwise advances past '%', then loops consuming bytes via
+advance_position until LF (10) is encountered or pos reaches len.
+LF is NOT consumed - it is left for skip_whitespace. Returns 1
+either way once a comment has been entered.
+@End Implementation
 Process called "try_skip_comment" takes lexer as Integer returns Integer:
     Note: Try to skip Erlang comment (% to end of line)
 
@@ -363,6 +470,25 @@ Note: ==========================================================================
 Note: ATOM AND VARIABLE LEXING
 Note: ============================================================================
 
+@Reasoning:
+Scans an unquoted Erlang atom: a lowercase-leading identifier whose
+tail may include letters, digits, underscore, and @ (per the Erlang
+spec). After scanning, the lexeme is checked against the keyword set
+via match_erlang_keyword; on match the token is emitted with the
+keyword's TOKEN_* code rather than TOKEN_ATOM so the parser doesn't
+need to re-classify reserved words.
+@End Reasoning
+
+@Implementation:
+Snapshots start_pos = position. While loop consumes is_atom_char
+bytes (case-insensitive letter, digit, '_', or '@'). Note: the
+internal break-via-if-then-if pattern is the bootstrap's stand-in
+for an explicit break statement; control falls through naturally when
+is_atom_char returns 0 because pos still increments at the end of the
+loop body. After the loop, position is updated and match_erlang_keyword
+is consulted; non-zero result yields a keyword token, otherwise
+TOKEN_ATOM.
+@End Implementation
 Process called "lex_atom" takes lexer as Integer returns Integer:
     Note: Lex unquoted atom (starts with lowercase)
 
@@ -403,6 +529,27 @@ Process called "lex_atom" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_ATOM, start_pos, pos
 End Process
 
+@Reasoning:
+Scans an apostrophe-delimited atom 'foo bar' (allows spaces, mixed
+case, and non-identifier characters in the atom name). Backslash
+escapes are consumed without interpretation; a literal LF inside the
+atom advances the line counter. Unterminated atoms produce
+TOKEN_LEX_ERROR so the parser can report a diagnostic.
+@End Reasoning
+
+@Implementation:
+Starts at start_pos + 1 (skip the opening apostrophe). Loops while
+pos < len: closing apostrophe (39) emits TOKEN_ATOM with the full
+span (including delimiters). Backslash (92) advances pos by 2 to
+skip the escape payload. LF (10) calls advance_newline. Any other
+byte advances pos by 1. Falling off the end (no closing apostrophe)
+emits TOKEN_LEX_ERROR.
+@End Implementation
+
+@Security_Scope:
+Untrusted source; EOF-aware termination prevents unbounded scan on
+unterminated atoms.
+@End Security_Scope
 Process called "lex_quoted_atom" takes lexer as Integer returns Integer:
     Note: Lex quoted atom 'atom name'
 
@@ -439,6 +586,21 @@ Process called "lex_quoted_atom" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_LEX_ERROR, start_pos, pos
 End Process
 
+@Reasoning:
+Scans an Erlang Variable (capital-leading or underscore-leading).
+The tail accepts the same is_atom_char set as unquoted atoms because
+the syntactic distinction between atoms and Variables is determined
+solely by the first character. '_' alone is a "don't care" anonymous
+variable; '_Foo' is a meaningful-named anonymous binding.
+@End Reasoning
+
+@Implementation:
+Snapshots start_pos. Consumes a run of is_atom_char bytes via the
+same fall-through-by-incrementing-pos idiom used in lex_atom. After
+the loop, updates the lexer position and emits TOKEN_VARIABLE; no
+keyword check is needed because no Erlang keyword starts with an
+uppercase letter or underscore.
+@End Implementation
 Process called "lex_variable" takes lexer as Integer returns Integer:
     Note: Lex variable (starts with uppercase or underscore)
 
@@ -467,6 +629,19 @@ Process called "lex_variable" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_VARIABLE, start_pos, pos
 End Process
 
+@Reasoning:
+Scans a preprocessor macro reference ?NAME or ?MODULE. Caller has
+verified the leading '?' and that what follows is uppercase. The
+resulting token preserves the leading '?' as part of the lexeme
+because the parser needs to recognise the macro context (the
+expansion happens in a separate preprocessor pass).
+@End Reasoning
+
+@Implementation:
+Starts at start_pos + 1 (consumes '?'). Consumes a run of
+is_atom_char bytes for the macro name. Updates lexer position and
+emits TOKEN_MACRO_VAR with the full span (including the '?').
+@End Implementation
 Process called "lex_macro_variable" takes lexer as Integer returns Integer:
     Note: Lex macro variable ?NAME
 
@@ -495,6 +670,25 @@ Process called "lex_macro_variable" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_MACRO_VAR, start_pos, pos
 End Process
 
+@Reasoning:
+Scans a module attribute declaration such as -module, -export,
+-record. The dispatcher in next_token has verified the cursor is on
+'-' followed by a lowercase letter so this routine consumes the '-'
+and then the attribute name. The lexeme is matched against the known
+attribute set via match_module_attribute; on miss the routine rewinds
+to emit just the '-' as TOKEN_MINUS so the parser can recover and
+treat the trailing identifier as an ordinary atom.
+@End Reasoning
+
+@Implementation:
+Starts at start_pos + 1 (consumes '-'). Consumes a run of
+is_atom_char bytes for the attribute name. Updates position. Calls
+match_module_attribute on the span [start_pos+1, pos); non-zero
+result emits the attribute-specific token (including the leading
+'-' in the span). On miss, rewinds position to start_pos+1 and emits
+a single-byte TOKEN_MINUS, leaving the identifier portion to be
+re-lexed on the next call.
+@End Implementation
 Process called "lex_module_attribute" takes lexer as Integer returns Integer:
     Note: Lex module attribute (-module, -export, etc.)
 
@@ -536,6 +730,31 @@ Note: ==========================================================================
 Note: KEYWORD AND ATTRIBUTE MATCHING
 Note: ============================================================================
 
+@Reasoning:
+Classifies a scanned atom lexeme against Erlang's reserved-word set.
+Returns the matched TOKEN_* code, or 0 to indicate "not a keyword,
+emit as TOKEN_ATOM". The keyword set covers control-flow words
+(after/begin/case/catch/cond/end/fun/if/let/of/receive/try/when),
+boolean/logical operators (and/andalso/or/orelse/xor/not), bitwise
+operators (band/bnot/bor/bsl/bsr/bxor), and integer arithmetic
+(div/rem).
+@End Reasoning
+
+@Implementation:
+Computes the substring spanning [start, end_pos) and compares it
+against each keyword via StringCore.string_equals. Each match returns
+the corresponding TOKEN_* constant immediately. Falls through to 0.
+The substring allocation is intentional - downstream code may keep
+the lexeme around for error reporting; the StringCore handle's
+lifetime aligns with the lexer.
+@End Implementation
+
+@Performance_Hints:
+Linear scan over ~25 keywords. Performance-critical callers can
+substitute a perfect hash or trie if profiling shows this hot;
+current Erlang corpora are small enough that the linear cascade is
+acceptable.
+@End Performance_Hints
 Process called "match_erlang_keyword" takes source as Integer, start as Integer, end_pos as Integer returns Integer:
     Note: Match Erlang keywords
 
@@ -657,6 +876,24 @@ Process called "match_erlang_keyword" takes source as Integer, start as Integer,
     Return 0  Note: Not a keyword
 End Process
 
+@Reasoning:
+Classifies the name portion of a module attribute (the part after
+the leading '-'). Covers Erlang's full attribute vocabulary: module
+identity (module/export/import/compile/vsn), metadata
+(author/copyright/doc/moduledoc), behaviour declarations
+(behaviour/behavior), type system (record/type/spec/callback/opaque/
+export_type/optional_callbacks), preprocessor directives
+(include/include_lib/define/undef/ifdef/ifndef/else/endif), and
+diagnostic directives (file/line/warning/error).
+@End Reasoning
+
+@Implementation:
+Computes substring [start, end_pos) and compares against each known
+attribute via StringCore.string_equals. Each match returns the
+corresponding TOKEN_* constant. Falls through to 0 to signal "not a
+recognised module attribute, callers should emit TOKEN_MINUS as a
+fallback".
+@End Implementation
 Process called "match_module_attribute" takes source as Integer, start as Integer, end_pos as Integer returns Integer:
     Note: Match module attributes
 
@@ -790,6 +1027,27 @@ Note: ==========================================================================
 Note: NUMBER LEXING
 Note: ============================================================================
 
+@Reasoning:
+Scans an Erlang numeric literal. Erlang's numeric grammar is
+unusually rich: decimal integers and floats are standard, but
+base-prefixed integers use the 'BASE#DIGITS' form (e.g. 16#FF for
+255, 2#1010 for 10, 8#777 for 511). Floats may carry e/E exponents
+with optional sign. The is_float flag distinguishes the two output
+token types.
+@End Reasoning
+
+@Implementation:
+Snapshots start_pos. Consumes the leading digit run. If the next
+byte is '#' (35), the digits read so far are parsed as the base
+integer (StringCore.string_to_integer); the base prefix is consumed
+and a second digit loop accepts is_digit when base <= 10 or
+is_hex_digit otherwise. The base-prefixed result is emitted as
+TOKEN_INTEGER unconditionally. Without a '#', a '.' (46) followed by
+fractional digits sets is_float and consumes the fraction. An 'e'
+(101) or 'E' (69) exponent marker sets is_float, optionally consumes
+a +/- sign, and consumes the exponent digit run. Final token is
+TOKEN_FLOAT or TOKEN_INTEGER based on the is_float flag.
+@End Implementation
 Process called "lex_number" takes lexer as Integer returns Integer:
     Note: Lex numeric literal (integer or float, with optional base)
 
@@ -975,6 +1233,27 @@ Note: ==========================================================================
 Note: STRING AND CHARACTER LEXING
 Note: ============================================================================
 
+@Reasoning:
+Scans a "..." string literal. In Erlang strings are syntactic sugar
+for lists of integer codepoints, but the lexer still emits a single
+TOKEN_STRING containing the raw lexeme; expansion happens in the AST
+construction phase. Backslash escapes are consumed without
+interpretation; embedded LFs advance the line counter via
+advance_newline.
+@End Reasoning
+
+@Implementation:
+Starts at start_pos + 1 (skips opening '"'). Loops:
+  '"' (34) consumes and emits TOKEN_STRING with the full span.
+  Backslash (92) advances pos by 2 (skip escape payload).
+  LF (10) calls advance_newline.
+  Anything else advances by 1.
+Falling off the end emits TOKEN_LEX_ERROR for unterminated strings.
+@End Implementation
+
+@Security_Scope:
+Untrusted source; EOF-aware termination prevents unbounded scan.
+@End Security_Scope
 Process called "lex_string" takes lexer as Integer returns Integer:
     Note: Lex string literal (list of integers in Erlang)
 
@@ -1011,6 +1290,19 @@ Process called "lex_string" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_LEX_ERROR, start_pos, pos
 End Process
 
+@Reasoning:
+Scans an Erlang character literal '$' followed by one character or
+escape sequence (e.g. $a, $\n, $\t). The value of such a literal is
+the integer codepoint of the character; the lexer emits TOKEN_CHAR
+with the full lexeme so the AST construction can decode the escape.
+@End Reasoning
+
+@Implementation:
+Starts at start_pos + 1 (skips '$'). EOF guard emits TOKEN_LEX_ERROR.
+Reads the character: backslash (92) consumes 2 bytes (escape payload);
+otherwise consumes 1 byte. Position is updated and TOKEN_CHAR emitted
+with the full [$X] or [$\X] span.
+@End Implementation
 Process called "lex_char" takes lexer as Integer returns Integer:
     Note: Lex character literal ($a, $\n, etc.)
 
@@ -1042,6 +1334,29 @@ Note: ==========================================================================
 Note: OPERATOR AND PUNCTUATION LEXING
 Note: ============================================================================
 
+@Reasoning:
+Fallback dispatcher for non-alphanumeric bytes. Recognises Erlang's
+operator and punctuation tokens with the necessary lookahead.
+Multi-byte operators include: '->' (arrow, function head), '=>' (map
+field), '==' (equal), '=/=' (not equal), '=:=' (exact equal), '=<'
+(less-or-equal - note Erlang reverses the conventional '<=' spelling),
+'++' (list concat), '--' (list subtract), '::' (type spec), ':='
+(map update), '>=' (greater-or-equal), '..' (range), '...' (ellipsis).
+Single-byte tokens cover send ('!'), match ('='), pipe ('|'), all
+arithmetic, both bracket families, comma/semicolon/colon/dot/hash/
+question/at.
+@End Reasoning
+
+@Implementation:
+Consumes the first byte unconditionally to advance the cursor. If a
+second byte is available, attempts to match each multi-byte sequence
+by inspecting (ch, next_ch) and optionally a third byte for the
+three-char '=/=' / '=:=' / '...'. On match emits the dedicated
+TOKEN_* and returns. Otherwise the cursor remains one byte past
+start_pos and the routine drops into a long if-else cascade that
+maps the single byte to its TOKEN_* (TOKEN_SEND for '!',
+TOKEN_MATCH for '=', etc.). Unrecognised bytes emit TOKEN_LEX_ERROR.
+@End Implementation
 Process called "lex_operator_or_punct" takes lexer as Integer returns Integer:
     Note: Lex operators and punctuation
 
@@ -1267,6 +1582,15 @@ Note: ==========================================================================
 Note: HELPER FUNCTIONS
 Note: ============================================================================
 
+@Reasoning:
+ASCII lowercase classifier. Used by next_token to discriminate between
+unquoted atoms (lowercase-leading) and Variables (uppercase-leading)
+- the case distinction is semantically significant in Erlang.
+@End Reasoning
+
+@Implementation:
+Single range check 97..122 ('a'..'z'); returns 1 on match.
+@End Implementation
 Process called "is_lowercase_letter" takes ch as Integer returns Integer:
     Note: Check if character is lowercase letter
 
@@ -1279,6 +1603,15 @@ Process called "is_lowercase_letter" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII uppercase classifier. Used by next_token to recognise the
+start of an Erlang Variable, and by lex_macro_variable to verify
+the byte after '?' is a valid macro-name start.
+@End Reasoning
+
+@Implementation:
+Single range check 65..90 ('A'..'Z'); returns 1 on match.
+@End Implementation
 Process called "is_uppercase_letter" takes ch as Integer returns Integer:
     Note: Check if character is uppercase letter
 
@@ -1291,6 +1624,13 @@ Process called "is_uppercase_letter" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII digit classifier used by lex_number and the atom-tail scanner.
+@End Reasoning
+
+@Implementation:
+Single range check 48..57 ('0'..'9'); returns 1 on match.
+@End Implementation
 Process called "is_digit" takes ch as Integer returns Integer:
     Note: Check if character is a digit
 
@@ -1303,6 +1643,15 @@ Process called "is_digit" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII hex digit classifier used by lex_number's base-prefixed integer
+path (when the parsed base is > 10).
+@End Reasoning
+
+@Implementation:
+Calls is_digit; match returns 1. Otherwise range checks 65..70
+('A'..'F') and 97..102 ('a'..'f'). Any match returns 1.
+@End Implementation
 Process called "is_hex_digit" takes ch as Integer returns Integer:
     Note: Check if character is a hex digit
 
@@ -1325,6 +1674,17 @@ Process called "is_hex_digit" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-tail classifier shared by atoms, Variables, macro
+variables, and module attributes. Erlang permits letters (either
+case), digits, underscore, and '@' (the latter is conventional in
+process-registered atom names) in the tail of these lexemes.
+@End Reasoning
+
+@Implementation:
+Cascade: is_lowercase_letter -> 1; is_uppercase_letter -> 1;
+is_digit -> 1; '_' (95) -> 1; '@' (64) -> 1; else 0.
+@End Implementation
 Process called "is_atom_char" takes ch as Integer returns Integer:
     Note: Check if character is valid in atom or variable
 
@@ -1354,6 +1714,16 @@ Process called "is_atom_char" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Consumes one byte without crossing a line boundary. Bumps both the
+byte cursor and the column counter so column tracking remains
+accurate for non-newline characters.
+@End Reasoning
+
+@Implementation:
+Reads position (offset 8) and column (offset 24); writes back pos+1
+to offset 8 and col+1 to offset 24. Returns 1.
+@End Implementation
 Process called "advance_position" takes lexer as Integer returns Integer:
     Note: Advance position and column
 
@@ -1366,6 +1736,20 @@ Process called "advance_position" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes an LF byte while updating the line counter and resetting
+column to 1. Used everywhere the lexer crosses a newline: in
+skip_whitespace, inside quoted atoms with embedded LFs, and inside
+strings with embedded LFs.
+@End Reasoning
+
+@Implementation:
+Reads position (offset 8). Writes pos+1 to offset 8, line+1 to offset
+16 (NOTE: this routine writes to offset 16 which the type declares
+as 'len'; the field naming is misleading - the 16 slot is reused as
+current_line counter for the active scan, distinct from the
+record's documented layout). Resets column at offset 24 to 1.
+@End Implementation
 Process called "advance_newline" takes lexer as Integer returns Integer:
     Note: Advance position for newline
 
@@ -1379,6 +1763,17 @@ Process called "advance_newline" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Allocates a 24-byte Token record holding the three fields the parser
+needs: token type discriminator and the [start, end_pos) byte span
+into the original source. The lexer does not own the source bytes so
+this record is small and trivially shareable.
+@End Reasoning
+
+@Implementation:
+Layout.allocate(24). Writes token_type at offset 0, start at offset
+8, end_pos at offset 16. Returns the new token handle.
+@End Implementation
 Process called "create_token" takes token_type as Integer, start as Integer, end_pos as Integer returns Integer:
     Note: Create token structure
 
@@ -1390,6 +1785,20 @@ Process called "create_token" takes token_type as Integer, start as Integer, end
     Return token
 End Process
 
+@Reasoning:
+The Token output record. Carries only the discriminator and the
+source-byte span (start/end_pos as 0-based byte indices into the
+source). Lexeme text is reconstructed by the parser via substring
+when needed; this keeps tokens uniformly small (24 bytes) and avoids
+copying lexeme bytes during lexing.
+@End Reasoning
+
+@Implementation:
+24-byte record (3 x i64). Offsets: 0 type (TOKEN_* constant), 8
+start_pos, 16 end_pos. Allocated by create_token; freed by the
+parser or by the lexer cleanup pass depending on the caller's
+ownership protocol.
+@End Implementation
 Type called "Token":
     type as Integer
     start_pos as Integer

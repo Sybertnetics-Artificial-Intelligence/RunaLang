@@ -61,6 +61,9 @@ Note: ==========================================================================
 Note: F# to HIR Translation Context
 Note: ============================================================================
 
+@Reasoning:
+The translator threads F# AST input, HIR module output, symbol/type tables, current scope, error state, and an arena allocator through every translation call. Arena allocation keeps short-lived HIR nodes (binary exprs, lambdas, matches) in one block that the destructor reclaims in O(1).
+@End Reasoning
 Type called "FSharpTranslator":
     ast_root as Integer         Note: Pointer to F# AST root node
     hir_module as Integer       Note: Pointer to output HIR module
@@ -76,14 +79,14 @@ Note: ==========================================================================
 Note: Translator Creation and Management
 Note: ============================================================================
 
+@Reasoning:
+Constructor allocates a 64-byte struct (8 slots) and creates an arena for HIR node lifetime; ast_root is borrowed from the parser. All other slots start null and are populated as translation phases run.
+@End Reasoning
+@Implementation:
+Field offsets are 0=ast_root, 8=hir_module, 16=symbol_table, 24=type_table, 32=current_scope, 40=error_message, 48=has_error, 56=arena. The arena is the only owned heap resource so destroy_fsharp_translator can free everything by deallocating the arena and the struct.
+@End Implementation
 Process called "create_fsharp_translator" takes ast_root as Integer returns Integer:
     Note: Create F# to HIR translator instance
-
-    @Reasoning:
-    The translator manages the complete conversion from F# AST to HIR,
-    including symbol resolution, type inference, and scope management.
-    It maintains translation context and error state throughout the process.
-    @End Reasoning
 
     Let translator_size be 64  Note: FSharpTranslator: 8 fields × 8 bytes
     Let translator be proc allocate from Layout with translator_size
@@ -106,6 +109,9 @@ Process called "create_fsharp_translator" takes ast_root as Integer returns Inte
     Return translator
 End Process
 
+@Reasoning:
+The arena owns every HIR node allocated through this translator; destroying it reclaims all node memory in one operation, which is the central advantage of arena allocation for compiler IRs.
+@End Reasoning
 Process called "destroy_fsharp_translator" takes translator as Integer returns Integer:
     Note: Destroy F# to HIR translator and free resources
 
@@ -126,6 +132,9 @@ Note: ==========================================================================
 Note: HIR Node Creation Helpers
 Note: ============================================================================
 
+@Reasoning:
+Thin wrapper around HIR.create_hir_node that passes the arena from the translator's slot; centralizing the arena pickup means callers don't repeat the memory_get_int64 boilerplate.
+@End Reasoning
 Process called "create_hir_node" takes translator as Integer, node_type as Integer returns Integer:
     Note: Create HIR node with specified type
 
@@ -133,6 +142,9 @@ Process called "create_hir_node" takes translator as Integer, node_type as Integ
     Return proc create_hir_node from HIR with arena, node_type
 End Process
 
+@Reasoning:
+Binary-expression creation is a common enough case to deserve a dedicated helper that bundles operator + left + right into a single HIR node call; this avoids three separate set-field operations at every call site.
+@End Reasoning
 Process called "create_hir_binary_expression" takes translator as Integer, operator as Integer, left as Integer, right as Integer returns Integer:
     Note: Create HIR binary expression node
 
@@ -154,6 +166,9 @@ Process called "create_hir_binary_expression" takes translator as Integer, opera
     Return node
 End Process
 
+@Reasoning:
+Call expressions take a callee and an argument list; F# applications can be partial (curried) but we eagerly materialize them as a single CallExpression with the available arguments. Currying is then a separate translator concern handled in translate_application.
+@End Reasoning
 Process called "create_hir_call_expression" takes translator as Integer, callee as Integer, arguments as Integer returns Integer:
     Note: Create HIR function call expression node
 
@@ -179,6 +194,9 @@ Process called "create_hir_call_expression" takes translator as Integer, callee 
     Return node
 End Process
 
+@Reasoning:
+F# lambdas are first-class anonymous functions; HIR represents them as LambdaExpression with parameter list and body. Multi-parameter lambdas in F# are sugar for nested single-param lambdas (Curry-Howard), but we keep them flat in HIR to preserve the user's intent for later passes that might un-curry.
+@End Reasoning
 Process called "create_hir_lambda_expression" takes translator as Integer, parameters as Integer, body as Integer returns Integer:
     Note: Create HIR lambda expression node
 
@@ -209,6 +227,12 @@ Note: ==========================================================================
 Note: F# Expression Translation
 Note: ============================================================================
 
+@Reasoning:
+The expression translator dispatches on F# AST node type (literal, identifier, application, lambda, match, if, let, pipe, list/array/record/tuple constructors, try, while, for). Each sub-case routes to its dedicated translator. Unknown types set translator error rather than crash so the rest of the program can still translate partially.
+@End Reasoning
+@Security_Scope:
+fsharp_node is from untrusted source (parser output of user code); we never deref without a type tag check, and unknown tags trigger set_translation_error rather than undefined behavior.
+@End Security_Scope
 Process called "translate_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# expression AST node to HIR expression
 
@@ -308,6 +332,9 @@ Process called "translate_expression" takes translator as Integer, fsharp_node a
     Return 0
 End Process
 
+@Reasoning:
+F# literals (int, float, char, string, bool, unit) map to corresponding HIR literal nodes; we capture both the value and the F#-source-form type tag so downstream type-inference does not have to re-derive what was already in source.
+@End Reasoning
 Process called "translate_literal" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# literal to HIR literal
 
@@ -360,6 +387,9 @@ Process called "translate_literal" takes translator as Integer, fsharp_node as I
     Return 0
 End Process
 
+@Reasoning:
+Identifier resolution looks up the name in the symbol_table; an unresolved identifier records a translation error but still returns a placeholder node so the AST traversal can continue. This lets one user-error not cascade into many.
+@End Reasoning
 Process called "translate_identifier" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# identifier to HIR variable reference
 
@@ -376,6 +406,9 @@ Process called "translate_identifier" takes translator as Integer, fsharp_node a
     Return hir_node
 End Process
 
+@Reasoning:
+F# function application "f x y" parses as nested apply nodes (Apply(Apply(f, x), y)); the translator flattens these into a single CallExpression where possible because HIR call has variadic args. Partial application is preserved when the argument count is less than the callee's known arity.
+@End Reasoning
 Process called "translate_application" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# function application to HIR call expression
 
@@ -404,6 +437,9 @@ Process called "translate_application" takes translator as Integer, fsharp_node 
     Return proc create_hir_call_expression with translator, hir_function, hir_arguments
 End Process
 
+@Reasoning:
+Lambdas in F# ("fun x y -> body") delegate to create_hir_lambda_expression after recursively translating the body in the lambda's new scope; the scope push/pop is handled here so the body's identifier references see the parameter bindings.
+@End Reasoning
 Process called "translate_lambda" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# lambda expression to HIR lambda
 
@@ -433,6 +469,9 @@ Process called "translate_lambda" takes translator as Integer, fsharp_node as In
     Return proc create_hir_lambda_expression with translator, hir_parameters, hir_body
 End Process
 
+@Reasoning:
+F# match expressions become HIR Match nodes with a discriminant and a list of (pattern, when_guard, body) clauses; we translate each clause's pattern via translate_pattern so nested pattern shapes (tuples, lists, records, constructors) compose recursively. Exhaustiveness checking happens later in semantic analysis.
+@End Reasoning
 Process called "translate_match_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# match expression to HIR match statement
 
@@ -480,6 +519,9 @@ Process called "translate_match_expression" takes translator as Integer, fsharp_
     Return match_node
 End Process
 
+@Reasoning:
+F# if-expressions are expressions (not statements) so they always have a value; HIR If carries condition + then-branch + else-branch as expression children. F#'s "if c then x" without else is rewritten to "if c then x else unit" in HIR to keep the value-shape uniform.
+@End Reasoning
 Process called "translate_if_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# if expression to HIR if statement
 
@@ -529,6 +571,9 @@ Note: ==========================================================================
 Note: F# Pattern Translation
 Note: ============================================================================
 
+@Reasoning:
+The pattern dispatcher handles every F# pattern shape (literal, wildcard, variable, constructor, tuple, list, array, record, as-binding, guard); each shape gets its own translator so the AST structure is preserved for the HIR's pattern matcher. Recursive descent into sub-patterns keeps nesting depth bounded only by source depth.
+@End Reasoning
 Process called "translate_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# pattern to HIR pattern node
 
@@ -598,6 +643,9 @@ Process called "translate_pattern" takes translator as Integer, fsharp_node as I
     Return 0
 End Process
 
+@Reasoning:
+"when" guards attach to match clauses ("pattern when condition -> body"); we translate the guard as a separate HIR expression that the match-runtime evaluates only after the pattern matches structurally. Separating the two halves lets the optimizer handle them independently.
+@End Reasoning
 Process called "translate_when_clause" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# when clause (match arm) to HIR when clause
 
@@ -655,6 +703,9 @@ Note: ==========================================================================
 Note: F# Declaration Translation
 Note: ============================================================================
 
+@Reasoning:
+Declaration dispatcher routes top-level forms (module/namespace/type/value/open) to specialized translators. Each declaration form has distinct HIR shape so a unified translator would either bloat with conditionals or lose specificity; the dispatch keeps each translator focused.
+@End Reasoning
 Process called "translate_declaration" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# declaration to HIR declaration
 
@@ -702,6 +753,9 @@ Note: ==========================================================================
 Note: Translation Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Sets the translator's has_error flag and error_message slot; subsequent translation continues but the overall result is marked invalid. Storing on the translator (not a global) lets multiple translators run in parallel without state collision.
+@End Reasoning
 Process called "set_translation_error" takes translator as Integer, message as Integer returns Integer:
     Note: Set translation error message
 
@@ -710,6 +764,9 @@ Process called "set_translation_error" takes translator as Integer, message as I
     Return 1
 End Process
 
+@Reasoning:
+Boolean accessor for the has_error slot so the orchestrator can check after each phase whether to continue or surface the diagnostic.
+@End Reasoning
 Process called "has_translation_error" takes translator as Integer returns Integer:
     Note: Check if translator has error
 
@@ -720,6 +777,9 @@ Note: ==========================================================================
 Note: Additional Translation Helper Functions
 Note: ============================================================================
 
+@Reasoning:
+F# "let x = e1 in e2" is an expression form (distinct from top-level let binding); we translate it as a HIR Let-expression with binding + body so scoping rules and shadowing semantics are preserved exactly.
+@End Reasoning
 Process called "translate_let_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# let expression to HIR let statement
 
@@ -748,6 +808,9 @@ Process called "translate_let_expression" takes translator as Integer, fsharp_no
     Return hir_block
 End Process
 
+@Reasoning:
+F# pipe operator "x |> f" desugars to "f x"; we materialize it as the call form in HIR because pipes have no special semantics beyond reordering call syntax, and downstream passes are simpler when there's only one call shape.
+@End Reasoning
 Process called "translate_pipe_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# pipeline expression to HIR function call
 
@@ -785,6 +848,9 @@ Process called "translate_pipe_expression" takes translator as Integer, fsharp_n
     Return 0
 End Process
 
+@Reasoning:
+F# list literals [a; b; c] become HIR ListExpression with a list of element expressions. F# lists are immutable singly-linked; we preserve that semantic in HIR so the backend can choose a list representation rather than treating them as arrays.
+@End Reasoning
 Process called "translate_list_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# list expression to HIR list literal
 
@@ -807,6 +873,9 @@ Process called "translate_list_expression" takes translator as Integer, fsharp_n
     Return hir_node
 End Process
 
+@Reasoning:
+F# arrays [|a; b; c|] are contiguous mutable storage with O(1) indexing; distinct from lists in HIR (ArrayExpression vs ListExpression) so backend code generation can pick the right storage layout.
+@End Reasoning
 Process called "translate_array_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# array expression to HIR array literal
 
@@ -829,6 +898,9 @@ Process called "translate_array_expression" takes translator as Integer, fsharp_
     Return hir_node
 End Process
 
+@Reasoning:
+F# records {Name = value; ...} are nominally-typed structures; HIR RecordExpression carries the field-name/value pairs explicitly so type inference can match against the record type's declared field set.
+@End Reasoning
 Process called "translate_record_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# record expression to HIR record constructor
 
@@ -851,6 +923,9 @@ Process called "translate_record_expression" takes translator as Integer, fsharp
     Return hir_node
 End Process
 
+@Reasoning:
+F# tuples (a, b, c) are structurally-typed product types; HIR TupleExpression preserves arity exactly because tuples of different arities are not assignable to each other (no width subtyping).
+@End Reasoning
 Process called "translate_tuple_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# tuple expression to HIR tuple constructor
 
@@ -873,6 +948,9 @@ Process called "translate_tuple_expression" takes translator as Integer, fsharp_
     Return hir_node
 End Process
 
+@Reasoning:
+F# try/with translates to HIR TryExpression with the protected body + handler clauses (each a pattern + body for typed exception handling); try/finally separates the cleanup block. The two forms (try/with vs try/finally) are different HIR shapes because their semantics differ (one catches, the other unconditionally runs).
+@End Reasoning
 Process called "translate_try_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# try expression to HIR try statement
 
@@ -920,6 +998,9 @@ Process called "translate_try_expression" takes translator as Integer, fsharp_no
     Return try_node
 End Process
 
+@Reasoning:
+F# while loops produce unit; the translator wraps the loop in a HIR WhileExpression whose result type is unit so downstream type inference doesn't need to special-case the loop's lack of value.
+@End Reasoning
 Process called "translate_while_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# while expression to HIR while statement
 
@@ -956,6 +1037,9 @@ Process called "translate_while_expression" takes translator as Integer, fsharp_
     Return while_node
 End Process
 
+@Reasoning:
+F# has two for forms ("for i = 1 to 10" and "for x in collection"); both produce unit. The range form translates to HIR For with start/end integers while the iteration form translates to ForEach with a sequence expression — separate shapes because backends generate different code (counter-based loop vs iterator method).
+@End Reasoning
 Process called "translate_for_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# for expression to HIR for statement
 
@@ -1000,6 +1084,9 @@ Process called "translate_for_expression" takes translator as Integer, fsharp_no
     Return for_node
 End Process
 
+@Reasoning:
+Discriminated-union constructor patterns ("Some x", "Cons(h, t)") become ConstructorPattern nodes carrying the constructor name and a list of sub-patterns; this preserves the union-variant identity for exhaustiveness checking.
+@End Reasoning
 Process called "translate_constructor_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# constructor pattern to HIR constructor pattern
 
@@ -1026,6 +1113,9 @@ Process called "translate_constructor_pattern" takes translator as Integer, fsha
     Return hir_node
 End Process
 
+@Reasoning:
+Tuple patterns "(a, b, c)" must match the discriminant's arity exactly; the HIR TuplePattern records the per-position sub-patterns so positional binding works. Arity mismatch is a static error caught in semantic analysis.
+@End Reasoning
 Process called "translate_tuple_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# tuple pattern to HIR tuple pattern
 
@@ -1048,6 +1138,9 @@ Process called "translate_tuple_pattern" takes translator as Integer, fsharp_nod
     Return hir_node
 End Process
 
+@Reasoning:
+List patterns [a; b; c] and head::tail forms both translate here; we preserve the syntactic form because the HIR pattern matcher generates different code (constant-length vs cons-cell decomposition).
+@End Reasoning
 Process called "translate_list_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# list pattern to HIR list pattern
 
@@ -1070,6 +1163,9 @@ Process called "translate_list_pattern" takes translator as Integer, fsharp_node
     Return hir_node
 End Process
 
+@Reasoning:
+Array patterns [|a; b; c|] require fixed-arity matching against array length; the HIR ArrayPattern carries the per-position sub-patterns so the matcher emits length-check plus per-element binding.
+@End Reasoning
 Process called "translate_array_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# array pattern to HIR array pattern
 
@@ -1092,6 +1188,9 @@ Process called "translate_array_pattern" takes translator as Integer, fsharp_nod
     Return hir_node
 End Process
 
+@Reasoning:
+Record patterns {Name = pat; ...} match field-by-field; the HIR RecordPattern carries the field-name/sub-pattern pairs so missing fields can be flagged at semantic-analysis time without re-walking source.
+@End Reasoning
 Process called "translate_record_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# record pattern to HIR record pattern
 
@@ -1114,6 +1213,9 @@ Process called "translate_record_pattern" takes translator as Integer, fsharp_no
     Return hir_node
 End Process
 
+@Reasoning:
+"pat as name" binds the matched value to a name in addition to whatever sub-bindings the pattern produces; HIR AsPattern records both the inner pattern and the binding name so the matcher emits the extra binding.
+@End Reasoning
 Process called "translate_as_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# as pattern to HIR as pattern
 
@@ -1140,6 +1242,9 @@ Process called "translate_as_pattern" takes translator as Integer, fsharp_node a
     Return hir_node
 End Process
 
+@Reasoning:
+Guard patterns ("pat when condition") attach a runtime predicate to the structural pattern; HIR GuardPattern wraps the underlying pattern with the guard expression so the matcher knows to evaluate the predicate only after the pattern matches structurally.
+@End Reasoning
 Process called "translate_guard_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# guard pattern to HIR guard pattern
 
@@ -1166,6 +1271,9 @@ Process called "translate_guard_pattern" takes translator as Integer, fsharp_nod
     Return hir_node
 End Process
 
+@Reasoning:
+Top-level "let" bindings (distinct from let-expressions) become HIR module-level value definitions; "let rec" is detected and produces a recursive HIR binding so self-reference inside the body resolves. Function bindings ("let f x = body") translate to let + lambda for uniformity.
+@End Reasoning
 Process called "translate_let_binding" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# let binding to HIR let statement
 
@@ -1216,6 +1324,9 @@ Process called "translate_let_binding" takes translator as Integer, fsharp_node 
     Return let_node
 End Process
 
+@Reasoning:
+F# modules group declarations under a common name; HIR ModuleDeclaration captures the name and the contained-declarations list. Modules push a new scope so child declarations resolve within the module's namespace.
+@End Reasoning
 Process called "translate_module_declaration" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# module declaration to HIR module
 
@@ -1242,6 +1353,9 @@ Process called "translate_module_declaration" takes translator as Integer, fshar
     Return hir_node
 End Process
 
+@Reasoning:
+F# namespaces are top-level partitioning (cannot nest values directly, only types and modules); HIR NamespaceDeclaration enforces this contract by accepting only module and type children, distinct from ModuleDeclaration which also accepts values.
+@End Reasoning
 Process called "translate_namespace_declaration" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# namespace declaration to HIR namespace
 
@@ -1268,6 +1382,9 @@ Process called "translate_namespace_declaration" takes translator as Integer, fs
     Return hir_node
 End Process
 
+@Reasoning:
+"type" declarations introduce records, discriminated unions, type abbreviations, and class types; the translator dispatches on the type-definition kind so each gets the right HIR shape (RecordTypeDecl, DiscriminatedUnionDecl, etc.).
+@End Reasoning
 Process called "translate_type_declaration" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# type declaration to HIR type definition
 
@@ -1292,6 +1409,9 @@ Process called "translate_type_declaration" takes translator as Integer, fsharp_
     Return hir_node
 End Process
 
+@Reasoning:
+"val" declarations declare a value without binding it (e.g., abstract members in signatures); HIR ValueDeclaration captures the type signature without an initializer so signature/implementation matching can proceed.
+@End Reasoning
 Process called "translate_value_declaration" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# value declaration to HIR value signature
 
@@ -1316,6 +1436,9 @@ Process called "translate_value_declaration" takes translator as Integer, fsharp
     Return hir_node
 End Process
 
+@Reasoning:
+"open Namespace" brings a namespace into scope; HIR OpenDirective records the namespace path so name resolution at lookup time can walk the open list.
+@End Reasoning
 Process called "translate_open_statement" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# open statement to HIR import
 
@@ -1332,6 +1455,9 @@ Note: ==========================================================================
 Note: Main Translation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+The public entry point: create translator, walk the AST root through translate_expression/translate_declaration recursion, and return the resulting HIR module. Errors are surfaced via has_translation_error so the orchestrator can inspect before consuming the HIR.
+@End Reasoning
 Process called "translate_fsharp_to_hir" takes ast_root as Integer returns Integer:
     Note: Main entry point for translating F# AST to HIR
 

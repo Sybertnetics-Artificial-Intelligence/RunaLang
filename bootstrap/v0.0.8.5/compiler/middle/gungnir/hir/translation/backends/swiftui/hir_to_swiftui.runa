@@ -64,6 +64,20 @@ Note: ==========================================================================
 Note: SwiftUI Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Generation context: holds the buffered output emitter, indent cursor,
+and sticky error channel. Separated indent state lets emit_indent
+write the right whitespace prefix per call without each call site
+threading the depth explicitly.
+@End Reasoning
+
+@Implementation:
+32-byte record (4 x i64). Offsets: emitter (0, owned SwiftUIEmitter
+instance), indent_level (8, integer depth incremented by structural
+nesting), error_message (16, owned StringCore copy), has_error (24,
+sticky flag set on first error and never cleared).
+@End Implementation
+
 Type called "SwiftUIGenContext":
     emitter as Integer          Note: SwiftUIEmitter instance
     indent_level as Integer     Note: Current indentation level
@@ -74,6 +88,20 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Builds the generation context with an embedded SwiftUIEmitter.
+Allocating the emitter inside this constructor (rather than passing
+one in) makes the context entirely self-contained: callers only have
+to think about creation and destruction.
+@End Reasoning
+
+@Implementation:
+32-byte struct allocate, OOM short-circuit. Allocates the embedded
+emitter via create_swiftui_emitter; on failure unwinds the context
+allocation to avoid leaks. Initializes all four fields (emitter,
+indent_level=0, error_message=null, has_error=false).
+@End Implementation
 
 Process called "create_generation_context" returns Integer:
     Note: Create SwiftUI generation context
@@ -101,6 +129,18 @@ Process called "create_generation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Tears down the context plus the owned emitter and error_message
+buffers. Null-safe so defensive double-destroy is harmless.
+@End Reasoning
+
+@Implementation:
+Null context returns 1. Reads emitter at offset 0; if non-null
+destroys via destroy_swiftui_emitter. Reads error_message at offset
+16; if non-null deallocates. Then deallocates the 32-byte context
+struct.
+@End Implementation
 
 Process called "destroy_generation_context" takes context as Integer returns Integer:
     Note: Destroy generation context and free resources
@@ -131,6 +171,18 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Records the most recent generation error, overwriting any previous.
+Last-error-wins suits backend codegen because the deepest error is
+usually the most localized and actionable.
+@End Reasoning
+
+@Implementation:
+Frees previous error at offset 16 if non-null. Allocates msg_length+1
+bytes, copies message via memory_copy, NUL-terminates. Stores at
+offset 16. Sets has_error to 1 at offset 24 (sticky thereafter).
+@End Implementation
+
 Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set generation error message
 
@@ -156,6 +208,15 @@ Process called "set_generation_error" takes context as Integer, message as Integ
     Return 1
 End Process
 
+@Reasoning:
+Predicate for the sticky-error flag. Used by the public generate_swiftui
+entry point to decide whether to return the partial buffer or 0.
+@End Reasoning
+
+@Implementation:
+Returns the integer at offset 24. 0/1 boolean.
+@End Implementation
+
 Process called "has_generation_error" takes context as Integer returns Integer:
     Note: Check if generation has error
 
@@ -163,6 +224,16 @@ Process called "has_generation_error" takes context as Integer returns Integer:
 
     Return has_error
 End Process
+
+@Reasoning:
+Accessor for the (context-owned) error message pointer used by
+diagnostic-format callers.
+@End Reasoning
+
+@Implementation:
+Returns the pointer at offset 16. Caller must not free — context's
+destructor owns the buffer lifetime.
+@End Implementation
 
 Process called "get_error_message" takes context as Integer returns Integer:
     Note: Get generation error message
@@ -175,6 +246,18 @@ End Process
 Note: ============================================================================
 Note: HIR Node Type Detection
 Note: ============================================================================
+
+@Reasoning:
+HIR node-type predicate for dictionary literals. The SwiftUI codegen
+dispatches based on _type strings inside dictionaries, so the first
+classification step is "is this even a dictionary".
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0 and compares against the HIR module's
+DictionaryLiteral constant resolved via get_hir_node_type. Returns
+1 on match, 0 otherwise (including null input).
+@End Implementation
 
 Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a dictionary literal
@@ -193,6 +276,16 @@ Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+HIR string-literal predicate. Used by parameter and expression
+generators to choose between quoted-string output and other formats.
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0 and compares against
+get_hir_node_type("StringLiteral"). Returns 1/0.
+@End Implementation
+
 Process called "is_string_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a string literal
 
@@ -209,6 +302,16 @@ Process called "is_string_hir" takes hir_node as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+HIR list-literal predicate. Used in generators that iterate over
+ordered HIR collections like children lists or modifier chains.
+@End Reasoning
+
+@Implementation:
+Compares node_type at offset 0 against get_hir_node_type("ListLiteral").
+Returns 1 on match, 0 otherwise.
+@End Implementation
 
 Process called "is_list_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a list literal
@@ -227,6 +330,16 @@ Process called "is_list_hir" takes hir_node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+HIR integer-literal predicate. Used by emit-parameter / emit-literal
+paths to choose unquoted numeric output.
+@End Reasoning
+
+@Implementation:
+Compares node_type at offset 0 against get_hir_node_type("IntegerLiteral").
+Returns 1/0.
+@End Implementation
+
 Process called "is_integer_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is an integer literal
 
@@ -244,6 +357,16 @@ Process called "is_integer_hir" takes hir_node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+HIR float-literal predicate, paired with is_integer_hir for full
+numeric classification.
+@End Reasoning
+
+@Implementation:
+Compares node_type at offset 0 against get_hir_node_type("FloatLiteral").
+Returns 1/0.
+@End Implementation
+
 Process called "is_float_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a float literal
 
@@ -260,6 +383,16 @@ Process called "is_float_hir" takes hir_node as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+HIR boolean-literal predicate. Booleans get distinct treatment in
+SwiftUI output (true/false keywords rather than 0/1 numerals).
+@End Reasoning
+
+@Implementation:
+Compares node_type at offset 0 against get_hir_node_type("BooleanLiteral").
+Returns 1/0.
+@End Implementation
 
 Process called "is_boolean_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a boolean literal
@@ -281,6 +414,20 @@ End Process
 Note: ============================================================================
 Note: HIR Dictionary Key Access
 Note: ============================================================================
+
+@Reasoning:
+Linear-scan accessor for HIR dictionary entries when the value is
+expected to be a string literal. Returns the underlying string
+buffer, not the HIR wrapper, so callers can emit directly.
+@End Reasoning
+
+@Implementation:
+Reads the dictionary entries list via get_dictionary_entries. Iterates
+each entry comparing the entry's key (offset 0) against the requested
+key via strings_equal. On match checks the value is a string via
+is_string_hir; if yes extracts the raw string with
+get_string_literal_value. Non-string values or missing keys return 0.
+@End Implementation
 
 Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary by key
@@ -319,6 +466,20 @@ Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer
     Return 0  Note: Key not found
 End Process
 
+@Reasoning:
+Linear-scan accessor returning the raw HIR node value for a given
+key. Companion to get_dict_string_value but doesn't unwrap — used
+when the caller needs to do further HIR-type inspection on the value
+(e.g., is it a list of children, is it a dict).
+@End Reasoning
+
+@Implementation:
+Reads entries via get_dictionary_entries. Iterates comparing each
+entry's key (offset 0) against the requested key via strings_equal.
+On match returns the entry's value (offset 8) as-is. Returns 0 if
+the key isn't found.
+@End Implementation
+
 Process called "get_dict_hir_value" takes hir_dict as Integer, key as Integer returns Integer:
     Note: Get HIR node value from HIR dictionary by key
 
@@ -353,6 +514,19 @@ Note: ==========================================================================
 Note: Indentation
 Note: ============================================================================
 
+@Reasoning:
+Bridges the context's indent_level to the emitter's indent emission
+primitive. Centralising this call lets the emitter format
+indentation (4 spaces, tab, etc.) without each generator caring
+about the rendering policy.
+@End Reasoning
+
+@Implementation:
+Reads emitter (offset 0) and indent_level (offset 8), forwards both
+to proc emit_indent from Emitter. The emitter writes the appropriate
+whitespace prefix for indent_level levels of nesting.
+@End Implementation
+
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit indentation for current level
 
@@ -364,6 +538,17 @@ Process called "emit_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Bumps the indent counter on the context. Generators call this when
+entering a new nesting level (entering a brace block, etc.).
+@End Reasoning
+
+@Implementation:
+Reads indent_level at offset 8, writes back +1. No upper bound —
+pathological deeply-nested HIR could produce huge indents but won't
+overflow normal i64.
+@End Implementation
+
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -372,6 +557,17 @@ Process called "increase_indent" takes context as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Symmetric counterpart to increase_indent, with a floor at zero to
+prevent underflow on error paths where increase/decrease don't
+match.
+@End Reasoning
+
+@Implementation:
+Reads indent_level. If > 0, writes back -1. Otherwise no-op. Returns
+1 unconditionally.
+@End Implementation
 
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
@@ -389,18 +585,25 @@ Note: ==========================================================================
 Note: View Structure Generation
 Note: ============================================================================
 
+@Reasoning:
+Emits a full `struct Name: View { ... }` declaration, the canonical
+SwiftUI form for view types. Properties are emitted before the body
+block, separated by a blank line per Swift convention. The struct
+name and body slots are required; missing struct name is a hard error.
+@End Reasoning
+
+@Implementation:
+Reads struct_name; missing name triggers a "View struct missing 'name'"
+error. Emits the header `struct Name: View {` then newline. Increases
+indent. Iterates the "properties" list (if present) calling
+generate_property on each. Emits one blank line after the property
+block if any properties existed. Then generates the body via
+generate_view_body. Decreases indent and emits the closing `}` at
+the original indent level.
+@End Implementation
+
 Process called "generate_view_struct" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate SwiftUI view struct declaration
-
-    @Reasoning:
-    Generates:
-    struct ViewName: View {
-        @State var property: Type
-        var body: some View {
-            view_hierarchy
-        }
-    }
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -462,13 +665,24 @@ Process called "generate_view_struct" takes context as Integer, hir_node as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emits a single property declaration with optional @Wrapper, type
+annotation, and initial value. Mutability defaults to `var` (mutable)
+since most SwiftUI properties are reassignable via state changes;
+explicit immutability (is_mutable=0) downgrades to `let`.
+@End Reasoning
+
+@Implementation:
+Reads name, wrapper, type_annotation, initial_value, is_mutable from
+the HIR dictionary. Emits at current indent: optional `@wrapper`
+prefix, then `var` or `let` based on is_mutable (default var), then
+the property name, optional `: Type` if type_annotation present,
+optional ` = expr` if initial_value present (recursing through
+generate_expression for the initial value). Terminates with a newline.
+@End Implementation
+
 Process called "generate_property" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate SwiftUI property declaration
-
-    @Reasoning:
-    Generates:
-    @State var propertyName: Type = initialValue
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -523,15 +737,22 @@ Process called "generate_property" takes context as Integer, hir_node as Integer
     Return 1
 End Process
 
+@Reasoning:
+Emits `var body: some View { ... }`, the standard SwiftUI body
+property syntax. The body wraps the view hierarchy that
+generate_view_hierarchy will emit.
+@End Reasoning
+
+@Implementation:
+Reads the "view" HIR sub-node from the body dict. Emits header
+`var body: some View {` then newline. Increases indent.
+Delegates to generate_view_hierarchy for the actual view tree.
+Decreases indent. Emits closing `}` at the body header's original
+indent.
+@End Implementation
+
 Process called "generate_view_body" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate SwiftUI view body property
-
-    @Reasoning:
-    Generates:
-    var body: some View {
-        view_hierarchy
-    }
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -562,15 +783,25 @@ Note: ==========================================================================
 Note: View Hierarchy Generation
 Note: ============================================================================
 
+@Reasoning:
+View dispatcher: descends into a HIR dict's "_type" to choose
+container, element, or closure rendering. Non-dictionary nodes are
+treated as bare expressions (literals, identifiers). Null nodes are
+silently skipped so missing optional view slots don't crash.
+@End Reasoning
+
+@Implementation:
+Null hir_node returns 1. Calls is_dictionary_hir; if false delegates
+to generate_expression. Reads "_type" string; if missing falls back
+to generate_expression. Three string comparisons via strings_equal:
+"container" -> generate_container_view; "element" ->
+generate_element_view; "closure" -> generate_closure. Unknown _type
+values are also routed through generate_expression as a permissive
+fallback for synthetic HIR nodes.
+@End Implementation
+
 Process called "generate_view_hierarchy" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate SwiftUI view hierarchy
-
-    @Reasoning:
-    Dispatches based on HIR dictionary "_type" field:
-    - "container" → VStack/HStack/ZStack
-    - "element" → Text/Button/Image/etc.
-    - Other types → recursively generate
-    @End Reasoning
 
     If hir_node is equal to 0:
         Return 1
@@ -619,15 +850,24 @@ Process called "generate_view_hierarchy" takes context as Integer, hir_node as I
     Return 1
 End Process
 
+@Reasoning:
+Emits a container view like VStack/HStack/ZStack/ScrollView with
+optional parameters (alignment, spacing) and a trailing closure
+containing child views. Modifiers attach AFTER the closing brace.
+This shape matches SwiftUI's standard container syntax exactly.
+@End Reasoning
+
+@Implementation:
+Reads container_name, parameters, children, modifiers from the HIR
+dict. Emits at current indent: name, optional `(` + parameters + `)`,
+then ` {` + newline. Increases indent. Iterates children calling
+generate_view_hierarchy recursively. Decreases indent and emits the
+closing `}` at the container's indent. Modifiers (if present) attach
+after the brace before the final newline.
+@End Implementation
+
 Process called "generate_container_view" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate SwiftUI container view (VStack, HStack, ZStack)
-
-    @Reasoning:
-    Generates:
-    VStack(alignment: .leading, spacing: 10) {
-        child_views
-    }
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -687,15 +927,24 @@ Process called "generate_container_view" takes context as Integer, hir_node as I
     Return 1
 End Process
 
+@Reasoning:
+Emits a leaf SwiftUI element (Text, Button, Image, TextField, Toggle,
+etc.). Like containers these have a name + parameters + optional
+trailing closure (Button actions or label content) + modifiers.
+Trailing closure is only emitted when children list is non-empty.
+@End Reasoning
+
+@Implementation:
+Reads element_name, parameters, children, modifiers. Emits at indent:
+name, optional `(`+parameters+`)`. If children list non-empty, emits
+` {` + newline, increases indent, iterates children through
+generate_view_hierarchy, decreases indent, emits closing `}`.
+Otherwise no trailing closure block. Modifiers chain on after,
+then newline.
+@End Implementation
+
 Process called "generate_element_view" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate SwiftUI element view (Text, Button, Image, etc.)
-
-    @Reasoning:
-    Generates:
-    Text("Hello")
-    Button("Click me") { action }
-    Image(systemName: "star")
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -756,15 +1005,21 @@ Process called "generate_element_view" takes context as Integer, hir_node as Int
     Return 1
 End Process
 
+@Reasoning:
+Emits a chain of view modifiers each on its own line, preserving the
+order from the HIR list (which the parser captured from source).
+Order matters in SwiftUI: `.padding().background(...)` differs from
+`.background(...).padding()`.
+@End Reasoning
+
+@Implementation:
+Verifies modifiers_list is_list_hir; if not returns 1 (no-op).
+Iterates list_elements calling generate_modifier on each. Each
+modifier handles its own indent and dot-prefix.
+@End Implementation
+
 Process called "generate_modifiers" takes context as Integer, modifiers_list as Integer returns Integer:
     Note: Generate modifier chain
-
-    @Reasoning:
-    Generates:
-    .padding()
-    .background(Color.red)
-    .foregroundColor(.blue)
-    @End Reasoning
 
     Let is_list be proc is_list_hir from modifiers_list
 
@@ -784,6 +1039,19 @@ Process called "generate_modifiers" takes context as Integer, modifiers_list as 
 
     Return 1
 End Process
+
+@Reasoning:
+Emits a single `.modifier(args)` line. The leading newline is emitted
+BEFORE indent so modifiers appear on their own lines below the
+preceding element. Empty parameter lists still emit `()` to match
+SwiftUI's syntax for parameterless modifiers.
+@End Reasoning
+
+@Implementation:
+Reads modifier_name and parameters. Emits newline first, then indent,
+then `.` (ASCII 46) and the modifier name. If parameters present
+emits `(` + generate_parameters + `)`. Otherwise emits literal `()`.
+@End Implementation
 
 Process called "generate_modifier" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate single view modifier
@@ -816,15 +1084,24 @@ Note: ==========================================================================
 Note: Parameter Generation
 Note: ============================================================================
 
+@Reasoning:
+Emits a SwiftUI parameter list mixing positional (numeric-keyed) and
+named (text-keyed) arguments. Swift requires positional first then
+named; the two-pass implementation here preserves that ordering
+regardless of the dictionary's internal iteration order.
+@End Reasoning
+
+@Implementation:
+First pass iterates dictionary entries, emitting only those with
+numeric keys (positional args) as `value`. Second pass iterates again,
+emitting only non-numeric keys as `name: value`. Both passes share
+the `first` flag to handle comma-separator placement. The
+is_numeric_string check on each key distinguishes positional from
+named.
+@End Implementation
+
 Process called "generate_parameters" takes context as Integer, params_dict as Integer returns Integer:
     Note: Generate function/modifier parameters
-
-    @Reasoning:
-    Parameters can be:
-    - Positional: keyed by "0", "1", "2", etc.
-    - Named: keyed by parameter name
-    We generate named parameters as "name: value" and positional as just "value"
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -891,17 +1168,28 @@ Note: ==========================================================================
 Note: Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+General Swift expression emitter. Handles literals (string with quotes,
+integer, float, boolean as true/false keywords) directly and routes
+HIR dictionaries through a _type-based dispatch. The four
+dictionary-tagged expression forms (binding, member_access,
+function_call, closure) each get specialised emission.
+@End Reasoning
+
+@Implementation:
+Sequential type checks. Null returns 1. is_string_hir -> emit quoted
+"value". is_integer_hir -> int_to_string into a 32-byte stack-local
+buffer, emit. is_float_hir -> float_to_string into 32-byte buffer.
+is_boolean_hir -> emit "true" or "false" based on value. For dicts:
+read "_type" and compare against "binding" (emit $name from value
+field), "member_access" (emit qualified value), "function_call"
+(emit name + parameter list), "closure" (delegate to
+generate_closure). Unknown forms set "Unknown expression type"
+error and return 0.
+@End Implementation
+
 Process called "generate_expression" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate Swift expression
-
-    @Reasoning:
-    Expressions can be:
-    - Literals (string, number, boolean)
-    - Identifiers (string literals)
-    - State bindings (dictionaries with "_type": "binding")
-    - Member access (dictionaries with "_type": "member_access")
-    - Function calls (dictionaries with "_type": "function_call")
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -1010,14 +1298,25 @@ Process called "generate_expression" takes context as Integer, hir_node as Integ
     Return 0
 End Process
 
+@Reasoning:
+Emits a Swift closure. Two forms: parameterless `{ stmts }` on a
+single or multi-line, and with-parameter `{ name in <newlines and
+indented statements> }`. The with-parameter form gets full
+indentation while parameterless closures stay compact.
+@End Reasoning
+
+@Implementation:
+Reads parameter (optional name string) and body (list of statements).
+Emits `{`. If parameter present, emits ` name in` + newline +
+increases indent. Iterates body statements: in parameterless mode
+emits each inline with a leading space; in with-parameter mode emits
+each on its own indented line. After body iteration, decreases indent
+if parameter was set, then emits `}`. Recursive calls to
+generate_view_hierarchy handle each statement.
+@End Implementation
+
 Process called "generate_closure" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate closure expression
-
-    @Reasoning:
-    Generates:
-    { }
-    { value in statements }
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -1079,13 +1378,27 @@ Note: ==========================================================================
 Note: Top-Level Generation
 Note: ============================================================================
 
+@Reasoning:
+Public entry point. Owns the lifetime of the generation context and
+returns the assembled SwiftUI source buffer. The top-level dispatcher
+treats view_struct as the canonical input but accepts arbitrary HIR
+expressions as a permissive fallback.
+@End Reasoning
+
+@Implementation:
+create_generation_context returns 0 on OOM. Then checks the HIR root:
+if a dictionary with _type=="view_struct" delegates to
+generate_view_struct; any other dict or non-dict node goes through
+generate_expression. After generation checks has_generation_error;
+on error destroys the context and returns 0 (discarding partial
+output). On success retrieves the emitter's buffer via get_output,
+destroys the context (the output buffer is owned by the emitter and
+survives — only the context wrapper is freed), and returns the
+output string.
+@End Implementation
+
 Process called "generate_swiftui" takes hir_node as Integer returns Integer:
     Note: Generate SwiftUI code from HIR (top-level entry point)
-
-    @Reasoning:
-    Entry point for generating SwiftUI code from HIR representation.
-    Typically takes a view struct HIR node and generates complete SwiftUI code.
-    @End Reasoning
 
     Note: Create generation context
     Let context be proc create_generation_context

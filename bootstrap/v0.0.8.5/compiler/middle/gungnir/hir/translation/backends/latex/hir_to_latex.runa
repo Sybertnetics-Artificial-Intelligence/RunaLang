@@ -15,6 +15,12 @@ Note: ================================================================
 Note: Backend State
 Note: ================================================================
 
+@Reasoning:
+Single owner of the emitter state for one LaTeX document. in_math_mode is a
+flag rather than a counter because LaTeX math environments do not nest in a
+way that requires depth tracking - inline $...$ inside display math is
+syntactically rejected by LaTeX itself. in_preamble flips off at \begin{document}.
+@End Reasoning
 Type called "LaTeXBackend":
     output as String
     indent_level as Integer
@@ -27,6 +33,16 @@ Note: ================================================================
 Note: Backend Creation
 Note: ================================================================
 
+@Reasoning:
+Allocates 40 bytes (5 x 8-byte slots) to match the LaTeXBackend layout
+exactly. The errors list is heap-allocated separately because lists carry
+their own buffer that grows independently of the struct.
+@End Reasoning
+@Implementation:
+Offsets: 0=output string, 8=indent_level, 16=errors_list, 24=in_math_mode,
+32=in_preamble. Defaults match the post-create_backend test fixture:
+empty output, zero indent, empty errors list, no math mode, in preamble.
+@End Implementation
 Process called "create_backend" that takes nothing returns Integer:
     Let backend_ptr be proc allocate from Memory with 40
 
@@ -46,6 +62,11 @@ Note: ================================================================
 Note: Main Translation Entry Point
 Note: ================================================================
 
+@Reasoning:
+Entry point dispatch: a top-level HIR_LATEX_DOCUMENT routes through the
+document-aware path that splits preamble from body; anything else lowers
+through generate_hir_node so the backend can serve as a fragment generator.
+@End Reasoning
 Process called "translate" that takes backend_ptr as Integer, hir_module as Integer returns String:
     If hir_module is equal to 0:
         Return ""
@@ -67,6 +88,17 @@ Note: ================================================================
 Note: Document Structure Generation
 Note: ================================================================
 
+@Reasoning:
+LaTeX strictly separates preamble (\documentclass, \usepackage, metadata)
+from body (after \begin{document}). We partition the HIR items in one pass
+into two sub-lists, emit the preamble first, then \begin{document}, then
+body, then \end{document} so the output is always well-formed.
+@End Reasoning
+@Implementation:
+Partition criterion: documentclass, usepackage, and metadata go to
+preamble; everything else goes to body. The in_preamble flag toggles at
+\begin{document} so child generators (e.g., escape_latex_text) can adapt.
+@End Implementation
 Process called "generate_document" that takes backend_ptr as Integer, doc_ptr as Integer returns Integer:
     Note: Set preamble flag
     proc write_integer from Memory with backend_ptr, 32, 1
@@ -121,6 +153,12 @@ Process called "generate_document" that takes backend_ptr as Integer, doc_ptr as
     Return 1
 End Process
 
+@Reasoning:
+Preamble emitter dispatched per item type rather than per item index because
+LaTeX preamble has no required ordering between documentclass/usepackage/
+metadata commands (though documentclass must be first; that constraint is
+enforced by the partitioning in generate_document).
+@End Reasoning
 Process called "generate_preamble" that takes backend_ptr as Integer, preamble_items as Integer returns Integer:
     Let count be proc get_list_size from ListCore with preamble_items
     Let index be 0
@@ -143,6 +181,11 @@ Process called "generate_preamble" that takes backend_ptr as Integer, preamble_i
     Return 1
 End Process
 
+@Reasoning:
+\documentclass[options]{class} - options are bracketed (square brackets)
+and must precede the class name in braces; the options string can be empty
+so we test string length rather than null pointer.
+@End Reasoning
 Process called "generate_documentclass" that takes backend_ptr as Integer, docclass_ptr as Integer returns Integer:
     proc emit with backend_ptr, "\\documentclass"
 
@@ -163,6 +206,11 @@ Process called "generate_documentclass" that takes backend_ptr as Integer, doccl
     Return 1
 End Process
 
+@Reasoning:
+\usepackage[options]{package} - same option syntax as documentclass. Mirrors
+generate_documentclass deliberately so a future refactor can collapse them
+behind a common "preamble bracket-brace command" emitter.
+@End Reasoning
 Process called "generate_usepackage" that takes backend_ptr as Integer, package_ptr as Integer returns Integer:
     proc emit with backend_ptr, "\\usepackage"
 
@@ -183,6 +231,12 @@ Process called "generate_usepackage" that takes backend_ptr as Integer, package_
     Return 1
 End Process
 
+@Reasoning:
+Preamble metadata commands like \title{...}, \author{...}, \date{...} share
+a uniform shape: command name plus one or more brace-wrapped arguments.
+Arguments may themselves be HIR nodes (e.g., \author{John \and Jane}) so we
+recurse via generate_hir_node.
+@End Reasoning
 Process called "generate_metadata_command" that takes backend_ptr as Integer, meta_ptr as Integer returns Integer:
     Note: Generate preamble commands like \title, \author, \date
     Let command_name be proc read_string from Memory with meta_ptr, 8
@@ -212,6 +266,10 @@ Note: ================================================================
 Note: Item List Generation
 Note: ================================================================
 
+@Reasoning:
+Sequential generator for the document body; each item is dispatched through
+generate_item which understands the full LaTeX-flavoured HIR node taxonomy.
+@End Reasoning
 Process called "generate_item_list" that takes backend_ptr as Integer, items_list as Integer returns Integer:
     Let count be proc get_list_size from ListCore with items_list
     Let index be 0
@@ -225,6 +283,13 @@ Process called "generate_item_list" that takes backend_ptr as Integer, items_lis
     Return 1
 End Process
 
+@Reasoning:
+Large dispatch table covering every LaTeX-flavoured HIR node kind. Encoding
+the per-kind logic as a flat If/Otherwise chain keeps the dispatch cost O(1)
+in cache behaviour (single straight-line code path) versus the overhead of
+a generic visitor table. Section types share a common emitter and differ
+only by command name passed as the third argument.
+@End Reasoning
 Process called "generate_item" that takes backend_ptr as Integer, item_ptr as Integer returns Integer:
     If item_ptr is equal to 0:
         Return 0
@@ -293,6 +358,12 @@ Note: ================================================================
 Note: Section Generation
 Note: ================================================================
 
+@Reasoning:
+LaTeX section commands take an optional short title in brackets (used in
+the table of contents and running headers when the full title is too long)
+followed by the full title in braces. We emit a literal backslash because
+LaTeX commands begin with \.
+@End Reasoning
 Process called "generate_section" that takes backend_ptr as Integer, section_ptr as Integer, section_type as String returns Integer:
     proc emit with backend_ptr, "\\"
     proc emit with backend_ptr, section_type
@@ -324,6 +395,12 @@ Note: ================================================================
 Note: Environment Generation
 Note: ================================================================
 
+@Reasoning:
+Generic LaTeX environment emitter: \begin{name}[params]...\end{name}.
+Indentation increments inside the environment body so nested content reads
+clearly in the generated source - LaTeX itself ignores indentation but
+human readers and IDEs depend on it.
+@End Reasoning
 Process called "generate_environment" that takes backend_ptr as Integer, env_ptr as Integer, env_name as String returns Integer:
     proc emit with backend_ptr, "\\begin{"
     proc emit with backend_ptr, env_name
@@ -354,11 +431,22 @@ Process called "generate_environment" that takes backend_ptr as Integer, env_ptr
     Return 1
 End Process
 
+@Reasoning:
+Adapter for HIR_LATEX_ENVIRONMENT nodes whose name is stored as a runtime
+string rather than baked into the node kind; reads the name and delegates
+to the generic emitter.
+@End Reasoning
 Process called "generate_generic_environment" that takes backend_ptr as Integer, env_ptr as Integer returns Integer:
     Let env_name be proc read_string from Memory with env_ptr, 8
     Return proc generate_environment with backend_ptr, env_ptr, env_name
 End Process
 
+@Reasoning:
+itemize/enumerate/description share a common shape: each child gets a
+preceding \item, and description additionally takes an optional label in
+brackets. The label-extraction branch only activates for description so
+the other two environments stay slim.
+@End Reasoning
 Process called "generate_list_environment" that takes backend_ptr as Integer, env_ptr as Integer, env_name as String returns Integer:
     proc emit with backend_ptr, "\\begin{"
     proc emit with backend_ptr, env_name
@@ -404,6 +492,12 @@ Process called "generate_list_environment" that takes backend_ptr as Integer, en
     Return 1
 End Process
 
+@Reasoning:
+Equation environments enter math mode for the duration of the body so the
+escape-special-chars logic in generate_literal can branch correctly: math
+mode preserves $ ^ _ etc. as syntax rather than escaping them. The math
+mode flag is saved/restored around the body.
+@End Reasoning
 Process called "generate_equation_environment" that takes backend_ptr as Integer, eq_ptr as Integer returns Integer:
     Note: Get environment name if stored, otherwise use "equation"
     Let env_name be proc read_string from Memory with eq_ptr, 8
@@ -443,6 +537,12 @@ Note: ================================================================
 Note: Text Formatting Generation
 Note: ================================================================
 
+@Reasoning:
+Text formatting commands (\textbf, \textit, \emph, \underline, \texttt)
+share a single emitter that varies only in command name. Body may be a
+plain string OR a nested HIR node (e.g., bold containing italic) - we
+prefer the string fast path when present, fall back to recursion otherwise.
+@End Reasoning
 Process called "generate_text_format" that takes backend_ptr as Integer, format_ptr as Integer, command_name as String returns Integer:
     proc emit with backend_ptr, "\\"
     proc emit with backend_ptr, command_name
@@ -469,6 +569,10 @@ Note: ================================================================
 Note: Math Mode Generation
 Note: ================================================================
 
+@Reasoning:
+Inline math is delimited by $...$ and stays on the same line as surrounding
+text. Math mode flag is set so escape_latex_text leaves $^_ alone.
+@End Reasoning
 Process called "generate_math_inline" that takes backend_ptr as Integer, math_ptr as Integer returns Integer:
     proc emit with backend_ptr, "$"
 
@@ -489,6 +593,12 @@ Process called "generate_math_inline" that takes backend_ptr as Integer, math_pt
     Return 1
 End Process
 
+@Reasoning:
+Display math \[...\] is the preferred form over $$...$$ because the former
+respects the displaymath environment's amsmath compatibility while the
+latter has LaTeX2e quirks. Newlines and indentation are added for human
+readability.
+@End Reasoning
 Process called "generate_math_display" that takes backend_ptr as Integer, math_ptr as Integer returns Integer:
     proc emit with backend_ptr, "\\[\n"
 
@@ -513,6 +623,11 @@ Process called "generate_math_display" that takes backend_ptr as Integer, math_p
     Return 1
 End Process
 
+@Reasoning:
+Iterates over math nodes within a math-mode region; dispatch happens in
+generate_math_node which knows the math-specific node taxonomy
+(frac, sqrt, sum, integral, etc.) distinct from text-mode nodes.
+@End Reasoning
 Process called "generate_math_content" that takes backend_ptr as Integer, content_list as Integer returns Integer:
     Let count be proc get_list_size from ListCore with content_list
     Let index be 0
@@ -526,6 +641,13 @@ Process called "generate_math_content" that takes backend_ptr as Integer, conten
     Return 1
 End Process
 
+@Reasoning:
+Dispatch table for math-mode HIR nodes. Operators like sum/int/prod/lim
+share generate_math_operator parameterised by the LaTeX command name,
+keeping the operator family extensible without growing the dispatcher.
+Falls back to generate_hir_node for non-math primitive nodes (identifiers,
+literals, calls) that can appear inside math.
+@End Reasoning
 Process called "generate_math_node" that takes backend_ptr as Integer, node_ptr as Integer returns Integer:
     If node_ptr is equal to 0:
         Return 0
@@ -563,6 +685,11 @@ Process called "generate_math_node" that takes backend_ptr as Integer, node_ptr 
     Return 0
 End Process
 
+@Reasoning:
+\frac{numerator}{denominator} requires two consecutive brace groups; we
+emit them in order. If a side is missing we still emit empty braces so the
+LaTeX command stays syntactically valid.
+@End Reasoning
 Process called "generate_math_frac" that takes backend_ptr as Integer, frac_ptr as Integer returns Integer:
     proc emit with backend_ptr, "\\frac{"
 
@@ -585,6 +712,11 @@ Process called "generate_math_frac" that takes backend_ptr as Integer, frac_ptr 
     Return 1
 End Process
 
+@Reasoning:
+\sqrt has two forms: \sqrt{x} for square root and \sqrt[n]{x} for the nth
+root. We branch on whether the root-degree pointer is non-null to choose
+the bracketed form.
+@End Reasoning
 Process called "generate_math_sqrt" that takes backend_ptr as Integer, sqrt_ptr as Integer returns Integer:
     Note: Check for optional root degree (nth root)
     Let root_degree_ptr be proc read_integer from Memory with sqrt_ptr, 16
@@ -608,6 +740,12 @@ Process called "generate_math_sqrt" that takes backend_ptr as Integer, sqrt_ptr 
     Return 1
 End Process
 
+@Reasoning:
+Big operators (sum, int, prod, lim) take optional subscript (lower limit)
+and superscript (upper limit) followed by an operand. Subscript-before-
+superscript order matters because LaTeX renders them differently based on
+sequence in display vs. text style.
+@End Reasoning
 Process called "generate_math_operator" that takes backend_ptr as Integer, op_ptr as Integer, op_name as String returns Integer:
     proc emit with backend_ptr, "\\"
     proc emit with backend_ptr, op_name
@@ -638,6 +776,11 @@ Process called "generate_math_operator" that takes backend_ptr as Integer, op_pt
     Return 1
 End Process
 
+@Reasoning:
+Stand-alone superscript node (^{...}) without an attached operator;
+generated for HIR expressions like x^2 where x is an identifier rather
+than an operator with limits.
+@End Reasoning
 Process called "generate_math_superscript" that takes backend_ptr as Integer, sup_ptr as Integer returns Integer:
     proc emit with backend_ptr, "^{"
 
@@ -651,6 +794,11 @@ Process called "generate_math_superscript" that takes backend_ptr as Integer, su
     Return 1
 End Process
 
+@Reasoning:
+Stand-alone subscript node (_{...}); mirrors generate_math_superscript. We
+always brace-wrap the content even when it's a single character because
+multi-character subscripts without braces silently truncate in LaTeX.
+@End Reasoning
 Process called "generate_math_subscript" that takes backend_ptr as Integer, sub_ptr as Integer returns Integer:
     proc emit with backend_ptr, "_{"
 
@@ -664,12 +812,23 @@ Process called "generate_math_subscript" that takes backend_ptr as Integer, sub_
     Return 1
 End Process
 
+@Reasoning:
+Math identifiers (variable names) are emitted verbatim because LaTeX
+already italicises identifiers in math mode automatically; we do not wrap
+them in \mathit{} which would be redundant and forbid kerning.
+@End Reasoning
 Process called "generate_math_identifier" that takes backend_ptr as Integer, id_ptr as Integer returns Integer:
     Let name be proc read_string from Memory with id_ptr, 8
     proc emit with backend_ptr, name
     Return 1
 End Process
 
+@Reasoning:
+Generic math-mode function call emission for HIR_CALL nodes that did not
+match a specialised math node kind. Arguments are emitted as brace groups
+per LaTeX convention - never as comma-separated parentheses like a
+programming-language call.
+@End Reasoning
 Process called "generate_math_command" that takes backend_ptr as Integer, call_ptr as Integer returns Integer:
     Note: Generic math command
     Let command_name be proc read_string from Memory with call_ptr, 8
@@ -697,6 +856,11 @@ Note: ================================================================
 Note: Citation and Reference Generation
 Note: ================================================================
 
+@Reasoning:
+\cite{key} or \cite[note]{key} - the optional note (e.g., page number)
+appears in brackets when present. The note is typeset together with the
+citation by BibTeX, e.g., \cite[p. 5]{smith2020}.
+@End Reasoning
 Process called "generate_citation" that takes backend_ptr as Integer, cite_ptr as Integer returns Integer:
     Note: Check for optional note
     Let note_text be proc read_string from Memory with cite_ptr, 16
@@ -717,6 +881,11 @@ Process called "generate_citation" that takes backend_ptr as Integer, cite_ptr a
     Return 1
 End Process
 
+@Reasoning:
+Cross-reference \ref{label} resolves to the auto-numbered counter at the
+label site (section number, equation number, etc.). Distinct from citation
+which goes through BibTeX.
+@End Reasoning
 Process called "generate_reference" that takes backend_ptr as Integer, ref_ptr as Integer returns Integer:
     proc emit with backend_ptr, "\\ref{"
 
@@ -728,6 +897,11 @@ Process called "generate_reference" that takes backend_ptr as Integer, ref_ptr a
     Return 1
 End Process
 
+@Reasoning:
+\label{name} attaches an identifier to the most recent counter; later
+\ref{name} resolves to that counter. The label name is emitted verbatim
+because LaTeX label names allow no special characters.
+@End Reasoning
 Process called "generate_label" that takes backend_ptr as Integer, label_ptr as Integer returns Integer:
     proc emit with backend_ptr, "\\label{"
 
@@ -743,6 +917,12 @@ Note: ================================================================
 Note: Generic HIR Node Generation
 Note: ================================================================
 
+@Reasoning:
+Fallback dispatcher for generic HIR nodes that may appear inside any
+LaTeX context. node_type > 5000 is the LaTeX-extended kind range, so we
+route those back through generate_item; otherwise we handle primitive
+node kinds (literal, identifier, block, call) directly.
+@End Reasoning
 Process called "generate_hir_node" that takes backend_ptr as Integer, node_ptr as Integer returns Integer:
     If node_ptr is equal to 0:
         Return 0
@@ -771,6 +951,16 @@ Process called "generate_hir_node" that takes backend_ptr as Integer, node_ptr a
     Return 0
 End Process
 
+@Reasoning:
+Literal emission must escape LaTeX special characters in text mode but
+preserve them verbatim in math mode where they have syntactic meaning
+(^,_,$). The in_math flag at offset 24 selects between the two paths.
+@End Reasoning
+@Security_Scope:
+Untrusted literal text could embed LaTeX command sequences if not escaped;
+escape_latex_text neutralises \,{,},$,%,&,#,_,^,~ which are the only
+characters LaTeX treats as command/group syntax.
+@End Security_Scope
 Process called "generate_literal" that takes backend_ptr as Integer, literal_ptr as Integer returns Integer:
     Let value be proc read_string from Memory with literal_ptr, 8
 
@@ -786,6 +976,12 @@ Process called "generate_literal" that takes backend_ptr as Integer, literal_ptr
     Return 1
 End Process
 
+@Reasoning:
+HIR_BLOCK nodes can carry their content list at offset 8 (statement-style)
+or offset 16 (sub-block style); we probe offset 8 first then fall back to
+offset 16 to handle both encodings. Reads are pointer-safe because each
+offset is checked before deref.
+@End Reasoning
 Process called "generate_block" that takes backend_ptr as Integer, block_ptr as Integer returns Integer:
     Let content_list be proc read_integer from Memory with block_ptr, 8
 
@@ -806,6 +1002,12 @@ Process called "generate_block" that takes backend_ptr as Integer, block_ptr as 
     Return 1
 End Process
 
+@Reasoning:
+Generic HIR_CALL emission as a LaTeX command: function name followed by
+brace-grouped arguments rather than parenthesised comma-separated args.
+Used as the default for text-mode calls and for math-mode commands that
+didn't match a specialised generator.
+@End Reasoning
 Process called "generate_call" that takes backend_ptr as Integer, call_ptr as Integer returns Integer:
     Let function_name be proc read_string from Memory with call_ptr, 8
     proc emit with backend_ptr, function_name
@@ -827,6 +1029,12 @@ Process called "generate_call" that takes backend_ptr as Integer, call_ptr as In
     Return 1
 End Process
 
+@Reasoning:
+Iterates child nodes within an environment/section body. Distinct from
+generate_item_list which is reserved for the top-level document body so
+the contracts (no surrounding context vs. inside-environment context) stay
+explicit at call sites.
+@End Reasoning
 Process called "generate_content_list" that takes backend_ptr as Integer, content_list as Integer returns Integer:
     Let count be proc get_list_size from ListCore with content_list
     Let index be 0
@@ -844,6 +1052,24 @@ Note: ================================================================
 Note: LaTeX Text Escaping
 Note: ================================================================
 
+@Reasoning:
+LaTeX reserves ten characters: backslash, braces, dollar, percent, ampersand,
+hash, underscore, caret, tilde. Each requires a different escape because some
+need a trailing {} (^, ~) to consume the next character, others need a literal
+backslash prefix, and backslash itself needs the textbackslash command since
+\\ means line break.
+@End Reasoning
+@Security_Scope:
+This is the canonical sanitiser for user-controlled strings entering text
+mode. A literal that bypasses this routine could inject arbitrary LaTeX
+commands, including \write18 (shell escape) if the document is compiled
+with -shell-escape. All generate_literal text-mode paths must funnel here.
+@End Security_Scope
+@Performance_Hints:
+Per-character string concatenation is O(n^2) for n input characters; for
+very large literal blocks (e.g. embedded data tables) the caller should
+batch-emit via a dedicated builder rather than this routine.
+@End Performance_Hints
 Process called "escape_latex_text" that takes text as String returns String:
     Let result be ""
     Let length be proc string_length from StringCore with text
@@ -888,6 +1114,11 @@ Note: ================================================================
 Note: Output Management
 Note: ================================================================
 
+@Reasoning:
+Single append point for the LaTeX output buffer; centralising the
+read-string/concat/write-string sequence means future buffered-output
+upgrades replace only this routine. All other generators flow through here.
+@End Reasoning
 Process called "emit" that takes backend_ptr as Integer, text as String returns Integer:
     Let current be proc read_string from Memory with backend_ptr, 0
     Let new_output be proc string_concat from StringCore with current, text
@@ -895,6 +1126,11 @@ Process called "emit" that takes backend_ptr as Integer, text as String returns 
     Return 1
 End Process
 
+@Reasoning:
+Two-space indentation per level for generated LaTeX source readability.
+LaTeX ignores horizontal whitespace in text mode (collapsed runs), but
+human readers and editors rely on indentation to read environment nesting.
+@End Reasoning
 Process called "emit_indent" that takes backend_ptr as Integer returns Integer:
     Let level be proc read_integer from Memory with backend_ptr, 8
     Let index be 0
@@ -907,12 +1143,22 @@ Process called "emit_indent" that takes backend_ptr as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Increments before emitting the body of an environment so the body itself
+sits one level deeper than the \begin line. Paired with indent_dec around
+the body to maintain depth invariants.
+@End Reasoning
 Process called "indent_inc" that takes backend_ptr as Integer returns Integer:
     Let level be proc read_integer from Memory with backend_ptr, 8
     proc write_integer from Memory with backend_ptr, 8, level plus 1
     Return 1
 End Process
 
+@Reasoning:
+Guards against unbalanced calls by clamping at zero rather than going
+negative; a buggy caller that double-decrements still produces valid
+(if mis-indented) output rather than an out-of-range counter.
+@End Reasoning
 Process called "indent_dec" that takes backend_ptr as Integer returns Integer:
     Let level be proc read_integer from Memory with backend_ptr, 8
     If level is greater than 0:
@@ -925,16 +1171,29 @@ Note: ================================================================
 Note: Error Handling
 Note: ================================================================
 
+@Reasoning:
+Errors are accumulated rather than aborting so the entire document can be
+walked and all problems reported in one pass; the caller checks has_errors
+after translate() and inspects get_errors for the full list.
+@End Reasoning
 Process called "add_error" that takes backend_ptr as Integer, message as String returns Integer:
     Let errors_list be proc read_integer from Memory with backend_ptr, 16
     proc add_to_list from ListCore with errors_list, message
     Return 1
 End Process
 
+@Reasoning:
+Exposes the internal list pointer rather than copying; the caller must not
+destroy the list because the backend retains ownership until destroy.
+@End Reasoning
 Process called "get_errors" that takes backend_ptr as Integer returns Integer:
     Return proc read_integer from Memory with backend_ptr, 16
 End Process
 
+@Reasoning:
+Boolean shortcut so callers can branch on success without retrieving the
+full error list; returns 1 for any-errors and 0 for none.
+@End Reasoning
 Process called "has_errors" that takes backend_ptr as Integer returns Integer:
     Let errors_list be proc read_integer from Memory with backend_ptr, 16
     Let count be proc get_list_size from ListCore with errors_list

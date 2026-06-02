@@ -32,12 +32,38 @@ Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 Import "compiler/frontend/primitives/collections/list.runa" as ListOps
 
+@Reasoning:
+Minimal per-translation state: arena for HIR allocations,
+current_scope for hoisting/scope resolution as the recursion
+descends, and an errors list for diagnostics. JavaScript's
+hoisting semantics need scope tracking even though the AST has
+already been parsed (var declarations are conceptually hoisted to
+the enclosing function/script scope).
+@End Reasoning
+
+@Implementation:
+24-byte record laid out as arena @0, current_scope @8, errors
+@16. Allocated by create_js_to_hir_context; current_scope starts
+0 since the entry HIR is the program root.
+@End Implementation
 Type called "JSToHIRContext":
     arena as Integer
     current_scope as Integer
     errors as Integer
 End Type
 
+@Reasoning:
+Constructor that establishes the three-field invariant: arena
+plumbed through, scope cleared, errors list ready. Errors uses
+List rather than a separate type because the consumer pattern
+(append, iterate) is uniform.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes via Layout.allocate. Returns 0 on allocation
+failure. Stores arena @0, 0 @8 (current_scope). Creates an empty
+list and stores at @16 (errors). Returns the context pointer.
+@End Implementation
 Process called "create_js_to_hir_context" takes arena as Integer returns Integer:
     Let context be proc allocate from Layout with 24
     If context is equal to 0:
@@ -50,6 +76,17 @@ Process called "create_js_to_hir_context" takes arena as Integer returns Integer
     Return context
 End Process
 
+@Reasoning:
+Releases the errors list and the context record. The arena is
+caller-owned and outlives the context. Idempotent on a null
+context so callers can free unconditionally.
+@End Reasoning
+
+@Implementation:
+Returns 1 immediately if context is 0. Reads errors at offset
+16; if non-zero calls destroy_list. Deallocates the context.
+Returns 1.
+@End Implementation
 Process called "destroy_js_to_hir_context" takes context as Integer returns Integer:
     If context is equal to 0:
         Return 1
@@ -62,12 +99,26 @@ Process called "destroy_js_to_hir_context" takes context as Integer returns Inte
     Return 1
 End Process
 
-Process called "translate_javascript_to_hir" takes ast as Integer, arena as Integer returns Integer:
-    @Reasoning:
-    Main entry point for JavaScript → HIR translation. Creates translation context,
-    processes AST, and returns HIR representation for universal translation.
-    @End Reasoning
+@Reasoning:
+Public facade that owns the translation-context lifecycle. The caller
+hands in a JavaScript AST root and a memory arena and gets back a HIR
+node tree (or 0 on failure). We tie the context to the arena so that
+every intermediate allocation made during translation comes out of the
+same pool - freeing the arena at end-of-compilation reclaims everything
+in O(1). Returning 0 (rather than an error code) on null AST or context
+allocation failure matches Runa's nullable-pointer convention.
+@End Reasoning
 
+@Implementation:
+Returns 0 if ast is null. Calls create_js_to_hir_context(arena); returns
+0 if that fails. Calls translate_node(context, ast) to walk the AST,
+producing a HIR root. Calls destroy_js_to_hir_context(context) to
+release the context record (the arena itself is owned by the caller and
+not freed here). Returns the HIR root pointer (or 0 if translate_node
+failed - the context is still destroyed on this path).
+@End Implementation
+
+Process called "translate_javascript_to_hir" takes ast as Integer, arena as Integer returns Integer:
     If ast is equal to 0:
         Return 0
     End If
@@ -80,6 +131,31 @@ Process called "translate_javascript_to_hir" takes ast as Integer, arena as Inte
     Return hir
 End Process
 
+@Reasoning:
+Central JS AST -> HIR dispatcher. Tests the node's type tag
+(JS_*) against every supported kind and routes to the matching
+translate_* helper. Falls through to returning 0 for unknown
+node kinds so unsupported constructs degrade silently rather
+than crashing. Recursion into children also routes back through
+this dispatcher.
+@End Reasoning
+
+@Implementation:
+Returns 0 if node is 0. Reads node_type (offset 0). Cascading
+ifs cover: JS_PROGRAM, JS_IMPORT_DECL, JS_EXPORT_DECL,
+JS_VAR_DECL, JS_FUNCTION_DECL, JS_CLASS_DECL, JS_METHOD_DECL,
+JS_BLOCK_STMT, JS_RETURN_STMT, JS_IF_STMT, JS_FOR_STMT,
+JS_WHILE_STMT, JS_EXPR_STMT, JS_IDENTIFIER, JS_LITERAL,
+JS_BINARY_EXPR, JS_UNARY_EXPR, JS_ASSIGN_EXPR, JS_CALL_EXPR,
+JS_MEMBER_EXPR, JS_ARROW_FUNCTION, JS_FOR_IN_STMT,
+JS_FOR_OF_STMT, JS_DO_WHILE_STMT, JS_SWITCH_STMT,
+JS_CASE_CLAUSE, JS_TRY_STMT, JS_CATCH_CLAUSE, JS_THROW_STMT,
+JS_BREAK_STMT, JS_CONTINUE_STMT, JS_OBJECT_EXPR, JS_ARRAY_EXPR,
+JS_SPREAD_EXPR, JS_TEMPLATE_LITERAL, JS_CONDITIONAL_EXPR,
+JS_ASSIGNMENT_EXPR (alias of assign), JS_UPDATE_EXPR,
+JS_NEW_EXPR, JS_AWAIT_EXPR, JS_YIELD_EXPR, JS_SEQUENCE_EXPR,
+JS_ASYNC_FUNCTION. Returns the result of the matched translator.
+@End Implementation
 Process called "translate_node" takes context as Integer, node as Integer returns Integer:
     If node is equal to 0:
         Return 0
@@ -218,6 +294,21 @@ Process called "translate_node" takes context as Integer, node as Integer return
     Return 0
 End Process
 
+@Reasoning:
+The script root translates to a "js_program" dict whose
+"statements" key holds a list of every top-level statement's
+HIR. AST children are stored as a count+pointer pair at offsets
+24 and 16 of the AST node (the parser's universal child-encoding
+convention this file relies on).
+@End Reasoning
+
+@Implementation:
+Builds js_program dict. Reads child_count (offset 24) and the
+children array pointer (offset 16). Iterates 0..child_count-1
+reading each child as memory_get_int64(children, i*8),
+recursively translates, appends non-null results to a
+statements list stored under "statements".
+@End Implementation
 Process called "translate_program" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_program"
@@ -237,6 +328,18 @@ Process called "translate_program" takes context as Integer, node as Integer ret
     Return hir
 End Process
 
+@Reasoning:
+ES6 `import name from "source"` carries two strings: the local
+binding name and the module source path. Both are stored as
+AST node fields (offset 8 and 40) by the parser and copied
+into the HIR as separate string-value entries.
+@End Reasoning
+
+@Implementation:
+Builds js_import dict. Reads name from AST offset 8; if non-zero
+stores under "name". Reads source from AST offset 40; if non-zero
+stores under "source". Returns the dict.
+@End Implementation
 Process called "translate_import" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_import"
@@ -251,6 +354,19 @@ Process called "translate_import" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+`export ...` wraps a single declaration (function, class, var,
+or anonymous default). The wrapped declaration is the sole AST
+child and is translated recursively so the resulting "js_export"
+dict carries the declaration's full HIR under "declaration".
+@End Reasoning
+
+@Implementation:
+Builds js_export dict. Reads child_count; if > 0 reads
+children[0], recursively translates, and stores under
+"declaration". Returns the dict (no fallback child_count == 0
+case writes "declaration").
+@End Implementation
 Process called "translate_export" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_export"
@@ -264,6 +380,25 @@ Process called "translate_export" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+JavaScript variable declarations have three flavors (var, let,
+const) differentiated by the "kind" string stored at AST offset
+40. Each declaration can have multiple declarators (`var a, b =
+1`); each declarator is its own AST child with the identifier
+name at offset 8 and an optional initializer as its first
+grandchild.
+@End Reasoning
+
+@Implementation:
+Builds js_var_decl dict. Reads kind (offset 40); if non-zero
+stores under "kind". Iterates child_count declarator children
+(child array at offset 16). For each declarator: reads name
+(offset 8), creates a per-declarator dict with "name"; then
+reads grandchild count (offset 24) and array (offset 16) - if
+>0 takes grandchild[0] as the init expression, recursively
+translates, stores under "init". Appends each declarator dict
+to a declarators list stored under "declarators".
+@End Implementation
 Process called "translate_var_decl" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_var_decl"
@@ -294,6 +429,24 @@ Process called "translate_var_decl" takes context as Integer, node as Integer re
     Return hir
 End Process
 
+@Reasoning:
+Function declarations carry name (offset 8), async flag (offset
+40), parameters as children 0..n-2, and body as the last child.
+The "body-is-last-child" convention lets the parser keep
+parameter count implicit (child_count - 1) without a separate
+field.
+@End Reasoning
+
+@Implementation:
+Builds js_function dict. Reads name (offset 8); stores under
+"name" if non-zero. Reads is_async (offset 40); if non-zero
+stores "async"="true". Computes body_index = child_count - 1.
+Iterates children 0..body_index-1: each is a parameter node with
+its name at offset 8; builds a {"name": param_name} dict,
+appends to params. Stores params under "params". If
+child_count > 0, takes children[body_index] as the body,
+recursively translates, stores under "body".
+@End Implementation
 Process called "translate_function" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_function"
@@ -327,6 +480,19 @@ Process called "translate_function" takes context as Integer, node as Integer re
     Return hir
 End Process
 
+@Reasoning:
+ES6 classes carry name, extends-target (single-string class name
+stored at offset 40), and a body of method declarations. Members
+are all uniformly translated through translate_node since they
+flow through JS_METHOD_DECL in the parser.
+@End Reasoning
+
+@Implementation:
+Builds js_class dict. Reads name (offset 8); stores if non-zero.
+Reads extends (offset 40); stores under "extends" if non-zero.
+Iterates all children, recursively translates each as a method,
+appends to a methods list stored under "methods".
+@End Implementation
 Process called "translate_class" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_class"
@@ -352,6 +518,19 @@ Process called "translate_class" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
+@Reasoning:
+Class methods share the function shape with the addition of a
+static-flag (offset 40). Parameters and body follow the same
+"params + last child = body" layout as translate_function.
+@End Reasoning
+
+@Implementation:
+Builds js_method dict. Reads name and is_static; stores "name"
+and (if is_static) "static"="true". Same param-loop and body
+handling as translate_function: parameters built from
+children[0..body_index-1] as {"name": ...} dicts into a params
+list; body is children[body_index] translated recursively.
+@End Implementation
 Process called "translate_method" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_method"
@@ -385,6 +564,18 @@ Process called "translate_method" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+Block statements are a uniform container - just an indented set
+of statements. Same shape as translate_program but tagged
+js_block so downstream consumers can preserve the source's block
+boundaries (relevant for let/const scoping).
+@End Reasoning
+
+@Implementation:
+Builds js_block dict. Iterates all children, recursively
+translates each, appends non-null results to a statements list
+stored under "statements".
+@End Implementation
 Process called "translate_block" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_block"
@@ -404,6 +595,17 @@ Process called "translate_block" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
+@Reasoning:
+`return expr` carries an optional value (single child). `return`
+with no expression maps to a missing "value" key so consumers can
+distinguish void return from value return by key presence.
+@End Reasoning
+
+@Implementation:
+Builds js_return dict. If child_count > 0, reads children[0],
+recursively translates, stores under "value". Otherwise emits
+the dict with no "value" key.
+@End Implementation
 Process called "translate_return" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_return"
@@ -417,6 +619,21 @@ Process called "translate_return" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+`if`/`else if`/`else` is encoded as three positional children:
+condition, then-branch, optional else-branch. Position-based
+ordering matches the parser's output exactly and lets a missing
+else degrade to a missing HIR key.
+@End Reasoning
+
+@Implementation:
+Builds js_if dict. Reads children pointer (offset 16) and
+child_count (offset 24). Children are indexed by their byte
+offset: children[0] -> condition, children[8] -> then-branch
+(note: addresses are children + byte_offset, where 8 = 1*8),
+children[16] -> else. Each present child is recursively
+translated and stored under "condition", "then", or "else".
+@End Implementation
 Process called "translate_if" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_if"
@@ -440,6 +657,20 @@ Process called "translate_if" takes context as Integer, node as Integer returns 
     Return hir
 End Process
 
+@Reasoning:
+C-style for-loops have four positional pieces: init, test,
+update, body. Each is optional in JavaScript syntax (`for(;;)`)
+so we use an incrementing index variable that only advances when
+a child is consumed, ensuring missing pieces don't shift the
+remaining children.
+@End Reasoning
+
+@Implementation:
+Builds js_for dict. Initializes index = 0. For each of "init",
+"test", "update", "body": if child_count > index, reads
+children[index*8], recursively translates, stores under the
+key, increments index.
+@End Implementation
 Process called "translate_for" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_for"
@@ -472,6 +703,16 @@ Process called "translate_for" takes context as Integer, node as Integer returns
     Return hir
 End Process
 
+@Reasoning:
+`while (test) body` has two positional children. The test
+expression must come first to match the natural reading order.
+@End Reasoning
+
+@Implementation:
+Builds js_while dict. If child_count > 0, reads children[0] as
+test and stores under "test". If child_count > 1, reads
+children[8] as body and stores under "body".
+@End Implementation
 Process called "translate_while" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_while"
@@ -490,6 +731,17 @@ Process called "translate_while" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
+@Reasoning:
+Expression statements (`call(); x = 1;`) are pass-through to the
+inner expression - there's no statement-level wrapping to
+preserve. Returning the inner expression's HIR directly keeps the
+output tree flatter.
+@End Reasoning
+
+@Implementation:
+If child_count > 0, reads children[0], returns its translation
+directly without wrapping. Otherwise returns 0.
+@End Implementation
 Process called "translate_expr_stmt" takes context as Integer, node as Integer returns Integer:
     Let child_count be proc memory_get_int64 from Layout with node, 24
     If child_count is greater than 0:
@@ -500,6 +752,16 @@ Process called "translate_expr_stmt" takes context as Integer, node as Integer r
     Return 0
 End Process
 
+@Reasoning:
+Bare identifier preserved as name only. Name resolution is a
+later pass's concern; here we just carry the textual reference
+through.
+@End Reasoning
+
+@Implementation:
+Builds js_identifier dict. Reads name (offset 8); if non-zero
+stores under "name". Returns the dict.
+@End Implementation
 Process called "translate_identifier" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_identifier"
@@ -510,6 +772,18 @@ Process called "translate_identifier" takes context as Integer, node as Integer 
     Return hir
 End Process
 
+@Reasoning:
+JavaScript literals carry both their textual value and a kind
+discriminator (number, string, boolean, null, regex). The
+parser pre-classifies them so backends can pick the right
+emission path without re-parsing.
+@End Reasoning
+
+@Implementation:
+Builds js_literal dict. Reads value (offset 8); if non-zero
+stores under "value". Reads lit_type (offset 40); if non-zero
+stores under "literal_type". Returns the dict.
+@End Implementation
 Process called "translate_literal" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_literal"
@@ -524,6 +798,19 @@ Process called "translate_literal" takes context as Integer, node as Integer ret
     Return hir
 End Process
 
+@Reasoning:
+Binary expressions carry the operator string (offset 8) plus
+left/right operand children. Operator strings are kept verbatim
+(`+`, `===`, `instanceof`, etc.) rather than parsed to an enum so
+the HIR preserves the source operator exactly.
+@End Reasoning
+
+@Implementation:
+Builds js_binary dict. Reads operator (offset 8); if non-zero
+stores under "operator". Reads children. If child_count > 0,
+recursively translates children[0] -> "left". If > 1, recursively
+translates children[8] -> "right".
+@End Implementation
 Process called "translate_binary" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_binary"
@@ -546,6 +833,19 @@ Process called "translate_binary" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+Unary expressions (`-x`, `!x`, `typeof x`, `++x`, `x++`) carry
+operator plus optional postfix flag for `++`/`--`. The parser
+already disambiguates prefix from postfix and sets is_postfix
+(offset 40) accordingly so the HIR can round-trip the position.
+@End Reasoning
+
+@Implementation:
+Builds js_unary dict. Reads operator (offset 8) and stores under
+"operator". Reads is_postfix (offset 40); if non-zero stores
+"postfix"="true". If child_count > 0, reads children[0],
+recursively translates, stores under "argument".
+@End Implementation
 Process called "translate_unary" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_unary"
@@ -567,6 +867,19 @@ Process called "translate_unary" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
+@Reasoning:
+Assignment expressions cover both simple (`=`) and compound
+(`+=`, `??=`, `&&=`, etc.) forms. The operator string is
+preserved as-is so lowering can expand compound assignments
+correctly later. Both JS_ASSIGN_EXPR and JS_ASSIGNMENT_EXPR
+parser node kinds route here through the dispatcher.
+@End Reasoning
+
+@Implementation:
+Builds js_assign dict. Reads operator (offset 8) and stores
+under "operator". If child_count > 0, translates children[0]
+-> "left". If > 1, translates children[8] -> "right".
+@End Implementation
 Process called "translate_assign" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_assign"
@@ -589,6 +902,18 @@ Process called "translate_assign" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+Function call: child 0 is the callee, remaining children are
+arguments. Encoding by position keeps the AST shallow and avoids
+needing a separate argument-list node from the parser.
+@End Reasoning
+
+@Implementation:
+Builds js_call dict. If child_count > 0, translates children[0]
+-> "callee". Iterates index i from 1 to child_count-1: reads
+children[i*8], recursively translates, appends to arguments
+list stored under "arguments".
+@End Implementation
 Process called "translate_call" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_call"
@@ -611,6 +936,22 @@ Process called "translate_call" takes context as Integer, node as Integer return
     Return hir
 End Process
 
+@Reasoning:
+Member access has two forms: dot-syntax `obj.prop` and bracket
+`obj[expr]`. The parser stores a computed flag (offset 40) for
+the bracket form and either the static property name (offset 8)
+for dot-syntax or an expression child for the computed form.
+Both representations are preserved so the printer can pick the
+right form on emission.
+@End Reasoning
+
+@Implementation:
+Builds js_member dict. Reads property name (offset 8); if
+non-zero stores under "property". Reads is_computed (offset 40);
+if non-zero stores "computed"="true". If child_count > 0,
+translates children[0] -> "object". If > 1, translates
+children[8] -> "property_expr" (used for computed access).
+@End Implementation
 Process called "translate_member" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_member"
@@ -637,6 +978,21 @@ Process called "translate_member" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+Arrow functions share the parameter-plus-body shape with regular
+functions. The body may be a block or a single expression; the
+parser puts whichever form it parsed into the last child slot
+without disambiguation here.
+@End Reasoning
+
+@Implementation:
+Builds js_arrow dict. body_index = child_count - 1. Iterates
+children 0..body_index-1 as parameters (each is a name-bearing
+node whose offset 8 is the param name); builds {"name": ...}
+dicts into a params list stored under "params". If child_count
+> 0, translates children[body_index] as the body and stores
+under "body".
+@End Implementation
 Process called "translate_arrow" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_arrow"
@@ -662,6 +1018,21 @@ Process called "translate_arrow" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
+@Reasoning:
+Object literals `{key: value, ...}` are emitted as a HIR dict
+whose "properties" key holds a list of property dicts (one per
+key/value pair). Each property node in the AST carries its key
+at offset 8 and the value expression as its sole grandchild.
+@End Reasoning
+
+@Implementation:
+Builds js_object dict. Iterates property children. For each
+property: reads key (offset 8) and stores under "key". Reads
+its child_count (offset 24) and children pointer (offset 16); if
+prop has children, takes children[0] as the value expression,
+recursively translates, stores under "value". Appends each
+property dict to a properties list stored under "properties".
+@End Implementation
 Process called "translate_object" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_object"
@@ -690,6 +1061,19 @@ Process called "translate_object" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+Array literals `[a, b, c]` are translated to a HIR dict whose
+"elements" key carries a list of recursively-translated element
+expressions. Sparse arrays (holes) are not represented
+specially here - the parser is expected to feed null/undefined
+expressions for holes.
+@End Reasoning
+
+@Implementation:
+Builds js_array dict. Iterates all children, recursively
+translates each, appends to elements list stored under
+"elements".
+@End Implementation
 Process called "translate_array" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_array"
@@ -707,6 +1091,17 @@ Process called "translate_array" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
+@Reasoning:
+Template literals `` `hello ${x}` `` are stored by this
+simplified path as a single value string carrying the raw
+template content (offset 8). Interpolation expressions are not
+decoded here - the printer interprets the value verbatim.
+@End Reasoning
+
+@Implementation:
+Builds js_template dict. Reads value (offset 8); if non-zero
+stores under "value". Returns the dict.
+@End Implementation
 Process called "translate_template" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_template"
@@ -717,6 +1112,18 @@ Process called "translate_template" takes context as Integer, node as Integer re
     Return hir
 End Process
 
+@Reasoning:
+The `cond ? then : else` ternary has three positional children.
+Encoded as a separate node from if-statement so backends can
+emit it as a select/cmov expression rather than control-flow
+branching.
+@End Reasoning
+
+@Implementation:
+Builds js_conditional dict. If child_count > 0, translates
+children[0] -> "test". If > 1, translates children[8] ->
+"consequent". If > 2, translates children[16] -> "alternate".
+@End Implementation
 Process called "translate_conditional" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_conditional"
@@ -740,6 +1147,17 @@ Process called "translate_conditional" takes context as Integer, node as Integer
     Return hir
 End Process
 
+@Reasoning:
+`new Foo(args)` is encoded with the callee as the first child;
+constructor arguments would follow but this simplified path
+only captures the callee. Argument capture happens via the
+JS_CALL_EXPR path when the new-expression wraps a call.
+@End Reasoning
+
+@Implementation:
+Builds js_new dict. If child_count > 0, takes children[0],
+recursively translates, stores under "callee".
+@End Implementation
 Process called "translate_new" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_new"
@@ -753,12 +1171,34 @@ Process called "translate_new" takes context as Integer, node as Integer returns
     Return hir
 End Process
 
+@Reasoning:
+`this` is a context-dependent keyword with no children or
+fields. The HIR records only its presence; downstream lowering
+binds it to the appropriate receiver based on enclosing function
+kind (arrow vs regular).
+@End Reasoning
+
+@Implementation:
+Returns a dict whose only field is _type = "js_this".
+@End Implementation
 Process called "translate_this" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_this"
     Return hir
 End Process
 
+@Reasoning:
+`await expr` wraps a single expression and marks a suspension
+point in the async state machine. A dedicated _type lets the
+backend (or a later lowering pass) rewrite the surrounding
+function into an async generator while leaving the operand
+expression unchanged.
+@End Reasoning
+
+@Implementation:
+Builds js_await dict. If child_count > 0, takes children[0],
+recursively translates, stores under "argument".
+@End Implementation
 Process called "translate_await" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_await"
@@ -772,12 +1212,25 @@ Process called "translate_await" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
-Process called "translate_for_in" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    For-in loops iterate over object properties: for (let key in obj) { }
-    Translate to HIR preserving the iterator variable, iterable expression, and body.
-    @End Reasoning
+@Reasoning:
+`for...in` enumerates the ENUMERABLE PROPERTY KEYS of an object,
+including inherited ones - distinct semantics from `for...of` which
+iterates a value sequence. The HIR captures the three structural
+positions: left (the binding variable, possibly a declaration), right
+(the object being enumerated), body (the loop body statement). Children
+order matches ECMAScript spec position so a downstream HIR consumer
+doesn't need to re-resolve which child is what.
+@End Reasoning
 
+@Implementation:
+Creates a Dict and tags _type = "js_for_in". Reads child_count (offset
+24) and children (offset 16). For child_count > 0 translates children[0]
+as "left". For > 1, translates children[8] (offset 8 = index 1) as
+"right". For > 2, translates children[16] (offset 16 = index 2) as
+"body". Returns the HIR dict.
+@End Implementation
+
+Process called "translate_for_in" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_for_in"
     Let child_count be proc memory_get_int64 from Layout with node, 24
@@ -804,12 +1257,24 @@ Process called "translate_for_in" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
-Process called "translate_for_of" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    For-of loops iterate over iterable values: for (let value of array) { }
-    Translate to HIR preserving the iterator variable, iterable expression, and body.
-    @End Reasoning
+@Reasoning:
+`for...of` iterates the VALUES produced by an iterable's Symbol.iterator,
+which is fundamentally different from `for...in` (keys) - the HIR
+distinguishes them with two separate _type tags so target backends can
+emit the correct iteration protocol. Layout matches for_in (left/right/
+body) so a generic HIR loop pass can handle both with a single visitor
+that branches on _type.
+@End Reasoning
 
+@Implementation:
+Creates a Dict, tags _type = "js_for_of". Reads child_count and
+children. For children[0] (offset 0) translates as "left". For
+children[1] (offset 8) translates as "right". For children[2] (offset
+16) translates as "body". Each guarded by child_count > 0/1/2
+respectively. Returns the HIR dict.
+@End Implementation
+
+Process called "translate_for_of" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_for_of"
     Let child_count be proc memory_get_int64 from Layout with node, 24
@@ -836,12 +1301,24 @@ Process called "translate_for_of" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
-Process called "translate_do_while" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Do-while loops execute body at least once: do { } while (condition)
-    Translate to HIR with body first, then condition.
-    @End Reasoning
+@Reasoning:
+do-while differs from while by guaranteeing at least one execution of
+the body before checking the condition - the test happens at the END of
+each iteration. Preserving this distinction in the HIR (rather than
+desugaring to `while(true) { ...; if (!cond) break; }`) lets target
+backends emit native do-while where supported, producing tighter code
+than the desugared form. Children order [body, test] mirrors the source
+order: body first, condition second.
+@End Reasoning
 
+@Implementation:
+Creates a Dict, tags _type = "js_do_while". Reads child_count and
+children. Translates children[0] (offset 0) as "body" when child_count
+> 0. Translates children[1] (offset 8) as "test" when child_count > 1.
+Returns the HIR dict.
+@End Implementation
+
+Process called "translate_do_while" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_do_while"
     Let child_count be proc memory_get_int64 from Layout with node, 24
@@ -862,12 +1339,27 @@ Process called "translate_do_while" takes context as Integer, node as Integer re
     Return hir
 End Process
 
-Process called "translate_switch" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Switch statements: switch (expr) { case x: ... default: ... }
-    Translate discriminant and all case clauses to HIR.
-    @End Reasoning
+@Reasoning:
+JavaScript switch has fall-through semantics by default (no `break` =
+execution continues into next case) - the HIR preserves the case list
+in source order so backends can choose to emit a jump table, a chained
+if/else, or, for proper fall-through targets, native goto labels. The
+children layout is positional: children[0] is always the discriminant
+expression; children[1..N-1] are the case clauses in source order
+(including `default` if present, which has its own translate_case
+handling).
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_switch". Reads child_count (offset 24) and
+children (offset 16). Translates children[0] as "discriminant" when
+child_count > 0. Then creates a List "cases" and loops i from 1 to
+child_count-1: reads children[i*8], translates it via translate_node,
+appends to the cases list. Stores cases under "cases" in the HIR dict.
+Returns the HIR dict.
+@End Implementation
+
+Process called "translate_switch" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_switch"
     Let child_count be proc memory_get_int64 from Layout with node, 24
@@ -892,12 +1384,29 @@ Process called "translate_switch" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
-Process called "translate_case" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Case clauses in switch: case value: statements or default: statements
-    Translate test expression (null for default) and consequent statements.
-    @End Reasoning
+@Reasoning:
+JavaScript case clauses have two shapes: `case <value>:` and `default:`.
+The is_default flag at parser-node offset 40 disambiguates them in the
+HIR. For default clauses, the entire children list is the consequent
+(no test). For non-default cases, children[0] is the test value and
+children[1..N-1] are the consequent statements - we track this with
+start_index (0 for default, 1 for case). Null statements (translated
+to 0) are skipped because they'd otherwise pollute the HIR with no-op
+nodes.
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_case". Reads child_count, children, and
+is_default (offset 40). If is_default != 0, sets "default" = "true"
+and does NOT translate a test. Otherwise: if child_count > 0,
+translates children[0] as "test". Creates a List "consequent". Sets
+start_index = 0 if is_default else 1. Loops i from start_index to
+child_count-1: reads children[i*8], translates via translate_node;
+if non-zero, appends to consequent. Stores consequent under
+"consequent". Returns the HIR dict.
+@End Implementation
+
+Process called "translate_case" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_case"
     Let child_count be proc memory_get_int64 from Layout with node, 24
@@ -935,12 +1444,28 @@ Process called "translate_case" takes context as Integer, node as Integer return
     Return hir
 End Process
 
-Process called "translate_try" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Try-catch-finally: try { } catch (e) { } finally { }
-    Translate try block, catch clauses, and optional finally block.
-    @End Reasoning
+@Reasoning:
+JavaScript try statements have three optional segments: the try block
+(always present), zero-or-more catch clauses (older JS allowed only
+one, modern multi-catch is rare but possible via TypeScript), and an
+optional finally block. The has_finally flag tells us whether the LAST
+child is the finalizer; without it, every child after the try block is
+a catch handler. We expose the structure as "block" (try), "handler"
+(list of catches), "finalizer" (optional) so the HIR consumer doesn't
+need to recreate the parser's positional layout.
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_try". Reads child_count, children, has_finally
+(offset 40). For child_count > 0 translates children[0] as "block".
+Computes catch_end_index = child_count, decrementing it when
+has_finally != 0 and translating the last child (children[catch_end_index*8])
+as "finalizer". Creates a "handlers" List and loops i from 1 to
+catch_end_index-1: translates children[i*8] and appends to handlers.
+Stores handlers list under "handler". Returns the HIR dict.
+@End Implementation
+
+Process called "translate_try" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_try"
     Let child_count be proc memory_get_int64 from Layout with node, 24
@@ -974,12 +1499,25 @@ Process called "translate_try" takes context as Integer, node as Integer returns
     Return hir
 End Process
 
-Process called "translate_catch" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Catch clause: catch (error) { }
-    Translate parameter name and catch body.
-    @End Reasoning
+@Reasoning:
+A catch clause optionally binds the caught error to a parameter -
+`catch (e) {}` binds, `catch {}` (ES2019 optional-catch-binding) does
+not. We store the param as a small Dict with just a "name" field
+(matching the JSON-AST conventions used by Babel/ESTree) so HIR
+consumers can extend it later with destructuring patterns without
+breaking existing producers. The body is always the first child of
+the catch node.
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_catch". Reads param_name (offset 8 of node).
+When param_name != 0, creates a child Dict with "name" = param_name
+and stores under "param". Reads child_count (offset 24); when > 0,
+reads children (offset 16) and translates children[0] as "body".
+Returns the HIR dict.
+@End Implementation
+
+Process called "translate_catch" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_catch"
 
@@ -1001,12 +1539,22 @@ Process called "translate_catch" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
-Process called "translate_throw" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Throw statement: throw expression
-    Translate the thrown expression.
-    @End Reasoning
+@Reasoning:
+throw statements are simple wrappers around the thrown expression -
+unlike return/yield, throw REQUIRES an argument in valid JS (the
+parser would have rejected bare `throw`). We still defensive-guard
+on child_count > 0 so a malformed AST doesn't crash translation;
+producing a throw HIR with no "argument" key is preferable to
+crashing.
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_throw". Reads child_count (offset 24). For
+child_count > 0 reads children (offset 16) and translates children[0]
+as "argument". Returns the HIR dict.
+@End Implementation
+
+Process called "translate_throw" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_throw"
 
@@ -1021,12 +1569,22 @@ Process called "translate_throw" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
-Process called "translate_break" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Break statement: break or break label
-    Translate with optional label.
-    @End Reasoning
+@Reasoning:
+JavaScript break supports an optional label argument: `break;` exits the
+innermost loop/switch, while `break outer;` exits the named labeled
+statement (Java-style, but rarely used). The HIR keeps the label as an
+optional "label" string field - missing-key implies unlabeled break.
+The parser already validated that an unlabeled break is in a loop or
+switch context; we don't re-check that here.
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_break". Reads label (offset 8 of node). When
+label != 0, sets "label" = label in the HIR dict. Returns the HIR
+dict.
+@End Implementation
+
+Process called "translate_break" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_break"
 
@@ -1038,12 +1596,20 @@ Process called "translate_break" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
-Process called "translate_continue" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Continue statement: continue or continue label
-    Translate with optional label.
-    @End Reasoning
+@Reasoning:
+Continue is the loop-iteration-skip counterpart of break - it advances
+to the next iteration of the innermost (or labeled) loop. Same
+optional-label structure as break; the only difference at this level
+is the _type tag, which downstream backends use to emit `continue`
+vs `break` instructions.
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_continue". Reads label (offset 8 of node).
+When label != 0, sets "label" = label. Returns the HIR dict.
+@End Implementation
+
+Process called "translate_continue" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_continue"
 
@@ -1055,12 +1621,24 @@ Process called "translate_continue" takes context as Integer, node as Integer re
     Return hir
 End Process
 
-Process called "translate_spread" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Spread operator: ...expression in arrays/objects/calls
-    Translate the spread argument expression.
-    @End Reasoning
+@Reasoning:
+ES2015's spread (`...expr`) is context-polymorphic: in array literals
+it expands an iterable into elements (`[1, ...arr, 2]`), in object
+literals it spreads own enumerable properties (`{...obj}`), in call
+expressions it expands an iterable into arguments (`fn(...args)`).
+The HIR doesn't disambiguate at this level - the surrounding
+construct's translator places the spread node into its own
+positional context. We just wrap the argument expression with the
+"js_spread" tag.
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_spread". Reads child_count (offset 24). When
+> 0, reads children (offset 16) and translates children[0] as
+"argument". Returns the HIR dict.
+@End Implementation
+
+Process called "translate_spread" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_spread"
 
@@ -1075,12 +1653,27 @@ Process called "translate_spread" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
-Process called "translate_update" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Update expressions: ++x, x++, --x, x--
-    Translate with operator and prefix/postfix flag.
-    @End Reasoning
+@Reasoning:
+JavaScript update expressions (`++x`, `x++`, `--x`, `x--`) have two
+semantic dimensions: operator (++ or --) and position (prefix or
+postfix). Both matter for code generation: prefix-update returns the
+NEW value after the modification; postfix-update returns the OLD
+value. Preserving the is_prefix flag in the HIR (as "prefix" = "true"/
+"false") lets backends emit the correct semantics without re-parsing
+source. Storing the flag as a string ("true"/"false") rather than
+boolean matches the Dict serialisation convention used throughout
+this translator.
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_update". Reads op (offset 8); if non-zero,
+sets "operator" = op. Reads is_prefix (offset 40); sets "prefix" =
+"true" if non-zero, "false" otherwise. Reads child_count and
+children; when child_count > 0, translates children[0] as
+"argument". Returns the HIR dict.
+@End Implementation
+
+Process called "translate_update" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_update"
 
@@ -1107,12 +1700,25 @@ Process called "translate_update" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
-Process called "translate_yield" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Yield expression in generators: yield value or yield* iterable
-    Translate with delegate flag and argument.
-    @End Reasoning
+@Reasoning:
+Yield expressions come in two flavours: simple `yield value` and
+delegating `yield* iterable`. The latter forwards iteration to another
+generator/iterable, equivalent to `for (const x of iter) yield x`.
+The HIR captures this distinction with the "delegate" boolean field
+(only emitted when true; absence means simple yield) so backends can
+emit the right opcode. Unlike throw, yield's argument is OPTIONAL
+(`yield;` is valid and yields undefined).
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_yield". Reads is_delegate (offset 40); if
+non-zero, sets "delegate" = "true". Reads child_count (offset 24);
+when > 0, reads children (offset 16) and translates children[0] as
+"argument". Argument key is omitted entirely if child_count is 0.
+Returns the HIR dict.
+@End Implementation
+
+Process called "translate_yield" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_yield"
 
@@ -1132,12 +1738,26 @@ Process called "translate_yield" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
-Process called "translate_sequence" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Sequence expression: (expr1, expr2, expr3)
-    Comma operator evaluates all expressions, returns last one.
-    @End Reasoning
+@Reasoning:
+JavaScript's comma operator (`a, b, c`) is a binary operator that
+left-associates - the parser typically collapses it into a flat
+sequence expression with N children, all evaluated left-to-right
+with only the LAST value contributing to the result. Preserving the
+flat shape (a list of expressions under "expressions") rather than
+nested binary nodes is what allows constant-folding passes to elide
+side-effect-free leading expressions without recursive tree
+rewriting.
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_sequence". Reads child_count and children.
+Creates a List "expressions". Loops i from 0 to child_count-1:
+reads children[i*8], translates it via translate_node, appends the
+result to expressions. Stores expressions under "expressions" in
+the HIR dict. Returns the HIR dict.
+@End Implementation
+
+Process called "translate_sequence" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_sequence"
 
@@ -1157,12 +1777,30 @@ Process called "translate_sequence" takes context as Integer, node as Integer re
     Return hir
 End Process
 
-Process called "translate_async_function" takes context as Integer, node as Integer returns Integer:
-    @Reasoning:
-    Async function declaration: async function name() { }
-    Translate same as regular function but with async flag.
-    @End Reasoning
+@Reasoning:
+async functions transform the body's `await` expressions into a state
+machine that returns a Promise. From the HIR consumer's perspective,
+async functions are STRUCTURALLY identical to regular functions but
+need a distinct emit path (returning Promise<T> from T-returning
+bodies, allowing await inside). We use a separate _type tag
+("js_async_function") plus an explicit "async": "true" marker so
+visitors can either dispatch on the type or check the marker -
+both forms work, and downstream simplification passes use both.
+@End Reasoning
 
+@Implementation:
+Creates Dict tagged "js_async_function". Reads name (offset 8); if
+non-zero sets "name" = name. Always sets "async" = "true". Creates
+a List "params". Reads child_count (offset 24) and children (offset
+16). Computes body_index = child_count - 1 (last child is the body).
+Loops i from 0 to body_index-1 (the parameter children): reads
+children[i*8] as param_node, reads param_name (offset 8 of param_node),
+creates a param_hir Dict with "name" = param_name, appends to params
+list. Stores params under "params". If child_count > 0, translates
+children[body_index*8] as "body". Returns the HIR dict.
+@End Implementation
+
+Process called "translate_async_function" takes context as Integer, node as Integer returns Integer:
     Let hir be proc create_dictionary from Dict
     proc set_dict_string_value from Dict with hir, "_type", "js_async_function"
 

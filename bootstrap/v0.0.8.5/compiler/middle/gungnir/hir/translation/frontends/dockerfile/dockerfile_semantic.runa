@@ -62,20 +62,32 @@ Note: ===================================================================
 Note: ANALYZER CREATION
 Note: ===================================================================
 
+@Reasoning:
+The Dockerfile analyzer is a 136-byte (17-slot) record holding 13 collection
+registries plus state counters: base_images, stages, exposed_ports,
+environment_vars, volumes, workdirs, users, labels, args, security_issues,
+optimization_warnings, validation_errors, validation_warnings, plus
+current_stage/layer_count counters and the error_message/has_error pair.
+We split errors from warnings (and errors from optimization-warnings)
+because Docker validation produces three severity tiers: hard syntax
+errors that block builds, security issues that compromise the container,
+and optimization hints that don't break anything but waste resources.
+Downstream tooling treats each tier differently.
+@End Reasoning
+
+@Implementation:
+Allocates a 136-byte record via Layout.allocate; returns 0 if it fails.
+Creates 11 Lists (base_images, stages, exposed_ports, volumes, workdirs,
+users, security_issues, optimization_warnings, validation_errors,
+validation_warnings) and 3 Dicts (environment_vars, labels, args), wiring
+them into the analyzer at fixed offsets 0..64. Initialises counter slots:
+offset 72 (current_stage) = 0, offset 80 (layer_count) = 0, offset 120
+(error_message) = 0, offset 128 (has_error) = 0. Returns the analyzer
+handle as an opaque Integer.
+@End Implementation
+
 Process called "create_dockerfile_semantic_analyzer" returns Integer:
     Note: Create Dockerfile semantic analyzer for container validation
-
-    @Reasoning:
-    Initialize comprehensive semantic analyzer for Dockerfile including
-    instruction validation, multi-stage build analysis, security scanning,
-    layer optimization analysis, and Docker best practices enforcement.
-    @End Reasoning
-
-    @Implementation:
-    Allocate analyzer structure with registries for base images, build stages,
-    exposed ports, environment variables, volumes, users, and security tracking.
-    Initialize all registries for comprehensive Docker container analysis.
-    @End Implementation
 
     Let analyzer_size be 136
     Let analyzer be proc allocate from Layout with analyzer_size
@@ -123,20 +135,40 @@ Note: ===================================================================
 Note: MAIN ANALYSIS ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+Sequences a six-phase analysis with strict ordering: structure validation
+must run first to populate the instruction-derived registries (base_images,
+exposed_ports, etc.); stage analysis follows because it depends on the
+already-collected FROM list; image validation needs the populated base_images
+list; security analysis must see the full instruction stream including
+USER/RUN context; layer optimization comes next because it needs the
+layer_count populated by structure validation; best-practices is last
+because it consults every registry built by the prior phases. Each phase
+runs even if earlier phases reported errors - the user wants a complete
+diagnostics dump, not a fail-fast.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately if analyzer is null. If dockerfile_ast is null,
+calls set_dockerfile_semantic_error and returns 0. Calls in order:
+validate_dockerfile_structure, analyze_build_stages, validate_base_images,
+analyze_dockerfile_security, analyze_layer_optimization,
+validate_docker_best_practices. After all six complete, reads has_error
+(offset 128); returns 0 if any phase set it, else 1. Return value is
+analysis-level success/failure; individual error and warning lists carry
+the full diagnostic detail.
+@End Implementation
+
+@Security_Scope:
+Dockerfile AST originates from untrusted source files. All instruction
+arguments are validated before being added to the registries, and
+security_issues is populated independently from validation_errors so
+downstream tooling can apply security policy distinct from syntactic
+correctness.
+@End Security_Scope
+
 Process called "analyze_dockerfile" takes analyzer as Integer, dockerfile_ast as Integer returns Integer:
     Note: Perform complete semantic analysis on Dockerfile
-
-    @Reasoning:
-    Comprehensive analysis including instruction validation, multi-stage build
-    validation, security scanning, layer optimization analysis, and Docker
-    best practices enforcement for production-ready container definitions.
-    @End Reasoning
-
-    @Implementation:
-    Multi-phase analysis: validate instruction sequences, analyze build stages,
-    check security configurations, optimize layer usage, and enforce Docker
-    best practices for secure and efficient container builds.
-    @End Implementation
 
     If analyzer is equal to 0:
         Return 0
@@ -177,14 +209,31 @@ Note: ===================================================================
 Note: DOCKERFILE STRUCTURE VALIDATION
 Note: ===================================================================
 
+@Reasoning:
+Phase 1 validates two orthogonal properties: macro structure (FROM
+placement, instruction ordering, required instructions) and micro
+structure (per-instruction syntax). An empty instruction list is treated
+as a hard error rather than being silently accepted, because an empty
+Dockerfile produces an empty image and is almost certainly a mistake.
+Order matters: FROM-placement validation runs before the per-instruction
+loop so that the "FROM must come first" rule is reported before any
+downstream errors that would result from a missing FROM.
+@End Reasoning
+
+@Implementation:
+Reads instructions list and its count via List.size. If count == 0, adds
+"Empty Dockerfile" validation error and returns. Calls
+validate_from_instruction_placement to enforce FROM-first / ARG-before-
+FROM ordering. Then loops i in 0..count-1: pulls instruction at index,
+calls validate_instruction_syntax(analyzer, instruction, i) (i used as
+the 0-based line number for error reporting), and
+collect_instruction_info to populate the per-instruction registries.
+Finally calls validate_required_instructions for whole-file checks
+(e.g., presence of CMD or ENTRYPOINT).
+@End Implementation
+
 Process called "validate_dockerfile_structure" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Validate Dockerfile instruction sequence and structure
-
-    @Reasoning:
-    First phase validates the basic structure of the Dockerfile including
-    required FROM instruction, proper instruction ordering, and valid
-    instruction syntax according to Docker specification.
-    @End Reasoning
 
     Let instructions be proc get_dockerfile_instructions from dockerfile_ast
     Let instruction_count be proc size from List with instructions
@@ -210,14 +259,31 @@ Process called "validate_dockerfile_structure" takes analyzer as Integer, docker
     proc validate_required_instructions from analyzer
 End Process
 
+@Reasoning:
+The Dockerfile spec mandates FROM as the first non-comment instruction
+EXCEPT that ARG declarations that supply variables for the FROM line
+(e.g., `ARG BASE_TAG` followed by `FROM alpine:${BASE_TAG}`) are
+permitted before it. No other instruction may precede FROM because
+without a base layer there's nothing for them to act on. We track this
+with a single found_from flag rather than an enum because the only
+states that matter are "haven't seen FROM yet" and "have seen FROM";
+once found, the placement check is satisfied for the rest of the file.
+@End Reasoning
+
+@Implementation:
+Reads instruction_count via List.size. Initialises found_from=0, i=0.
+Loops while i < count AND found_from == 0: pulls instruction, reads
+instruction_type. If type equals "FROM", sets found_from=1 and writes 0
+to analyzer offset 72 (current_stage = first stage). Otherwise, tests
+for ARG; if NOT ARG, builds an error "FROM instruction must be first
+(found <type> at line <i+1>)", adds it, and returns (early exit
+because a single misplaced instruction is enough to fail this check).
+After the loop, if found_from is still 0, adds "Missing required FROM
+instruction".
+@End Implementation
+
 Process called "validate_from_instruction_placement" takes analyzer as Integer, instructions as Integer:
     Note: Validate FROM instruction placement and syntax
-
-    @Reasoning:
-    FROM instruction must be the first instruction in a Dockerfile or
-    immediately following ARG instructions that provide build arguments
-    for the FROM instruction. This is required by Docker specification.
-    @End Reasoning
 
     Let instruction_count be proc size from List with instructions
     Let found_from be 0
@@ -253,14 +319,27 @@ Process called "validate_from_instruction_placement" takes analyzer as Integer, 
     End If
 End Process
 
+@Reasoning:
+Per-instruction syntax dispatcher. Each Docker instruction kind (FROM,
+RUN, COPY, ADD, EXPOSE, ENV, WORKDIR, USER, VOLUME, LABEL, ARG, CMD,
+ENTRYPOINT) has its own validator because the argument grammar and
+semantic constraints differ. Unknown instructions emit a warning rather
+than an error because Docker BuildKit supports extension instructions
+via `# syntax=` directives - a hard error would reject valid Dockerfiles
+that use newer or third-party frontends.
+@End Reasoning
+
+@Implementation:
+Reads instruction_type and args (Lists) from the instruction node. A
+Match expression dispatches on the type string to the corresponding
+per-instruction validator (validate_from_instruction,
+validate_run_instruction, etc.), passing analyzer, args, line_number.
+Otherwise branch builds "Unknown instruction: <type> at line <n+1>"
+warning and adds it to validation_warnings.
+@End Implementation
+
 Process called "validate_instruction_syntax" takes analyzer as Integer, instruction as Integer, line_number as Integer:
     Note: Validate individual instruction syntax
-
-    @Reasoning:
-    Validate each Docker instruction has proper syntax, required arguments,
-    and valid argument values according to Docker specification. Check
-    for common syntax errors and invalid configurations.
-    @End Reasoning
 
     Let instruction_type be proc get_instruction_type from instruction
     Let args be proc get_instruction_arguments from instruction
@@ -300,14 +379,35 @@ Process called "validate_instruction_syntax" takes analyzer as Integer, instruct
     End Match
 End Process
 
+@Reasoning:
+FROM accepts two argument shapes: `FROM <image>` for the simple/default-
+stage case, and `FROM <image> AS <name>` for multi-stage builds where
+the stage gets a referenceable name. Other forms (e.g., 4+ arguments)
+indicate a malformed instruction. Stage names registered here populate
+analyzer.stages and are looked up by COPY --from=<name> later. The image
+reference itself is delegated to validate_image_reference because the
+format (registry/repo:tag@digest) is complex enough to warrant its own
+parser.
+@End Reasoning
+
+@Implementation:
+Reads arg_count via List.size. If 0, builds and adds "FROM instruction
+missing image name at line <n+1>" and returns. Reads image_ref at
+args[0] and calls validate_image_reference. If arg_count > 2, reads
+args[1] (expected "AS") and args[2] (stage name); if args[1] equals
+"AS", calls register_build_stage(analyzer, stage_name); otherwise adds
+"Invalid FROM syntax, expected AS keyword at line <n+1>".
+@End Implementation
+
+@Security_Scope:
+Image reference originates from untrusted Dockerfile source. The image
+is not pulled or inspected here - only string-validated for format -
+so this proc cannot enforce supply-chain policy beyond syntactic
+correctness.
+@End Security_Scope
+
 Process called "validate_from_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
     Note: Validate FROM instruction syntax and image reference
-
-    @Reasoning:
-    FROM instruction must specify a valid base image with optional tag or
-    digest. Validate image name format, tag format, and check for security
-    best practices like avoiding latest tag and using specific versions.
-    @End Reasoning
 
     Let arg_count be proc size from List with args
     If arg_count is equal to 0:
@@ -336,14 +436,36 @@ Process called "validate_from_instruction" takes analyzer as Integer, args as In
     End If
 End Process
 
+@Reasoning:
+RUN creates a new image layer by executing a shell or exec-form command
+at build time, so it has three concerns: syntactic validity, security
+implications (running unauthenticated `curl | sh` or installing packages
+without GPG verification are well-known attack surfaces), and layer-
+cost implications (every RUN adds a layer; combining them with `&&`
+reduces image size). The layer_count counter is bumped here so that
+analyze_layer_optimization can detect when too many separate RUN
+layers exist.
+@End Reasoning
+
+@Implementation:
+Reads arg_count via List.size. If 0, adds "RUN instruction missing
+command at line <n+1>" and returns. Reads command at args[0]. Calls
+check_run_security_patterns(analyzer, command, line_number) which
+scans for known anti-patterns. Calls
+analyze_run_layer_optimization(analyzer, command, line_number) which
+warns when commands could be combined. Reads layer_count at offset 80,
+increments and writes back - the analyser's tally for later phase 5.
+@End Implementation
+
+@Security_Scope:
+Command string is untrusted input from the Dockerfile. The security
+pattern scanner here is best-effort heuristic; it should not be
+treated as a guarantee of safety - manual review remains required for
+production images.
+@End Security_Scope
+
 Process called "validate_run_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
     Note: Validate RUN instruction and analyze for security issues
-
-    @Reasoning:
-    RUN instruction executes commands during build. Validate command syntax,
-    check for security anti-patterns like running as root, downloading
-    unverified packages, and analyze for layer optimization opportunities.
-    @End Reasoning
 
     Let arg_count be proc size from List with args
     If arg_count is equal to 0:
@@ -366,14 +488,36 @@ Process called "validate_run_instruction" takes analyzer as Integer, args as Int
     proc memory_set_int64 from Layout with analyzer, 80, current_layers plus 1
 End Process
 
+@Reasoning:
+COPY requires at least one source and exactly one destination - the LAST
+arg is always the destination, regardless of how many sources precede
+it. This shape (`COPY src1 src2 ... dest`) lets a single COPY layer
+bring in multiple files. We must validate each source/dest pair against
+security patterns (no copying credentials/keys/secrets into images) and
+also handle the multi-stage form `COPY --from=stage src dest` which is
+parsed but not specifically validated here (analyze_stage_dependencies
+catches stage-reference errors). Layer count bumps because each COPY is
+its own layer in Docker's storage driver.
+@End Reasoning
+
+@Implementation:
+Reads arg_count. If < 2 (need at least source + dest), adds "COPY
+instruction requires source and destination at line <n+1>" and returns.
+Reads destination at args[arg_count-1]. Loops i in 0..arg_count-2:
+reads source at args[i], calls
+check_copy_security_patterns(analyzer, source, destination, line_number).
+Reads layer_count at offset 80, increments and persists.
+@End Implementation
+
+@Security_Scope:
+Source paths originate from untrusted Dockerfile source. Pattern
+matching catches common credential-leak antipatterns (e.g. `.ssh/`,
+`.aws/`, `id_rsa`, `.env`) but is not exhaustive; explicit `.dockerignore`
+remains the authoritative defense.
+@End Security_Scope
+
 Process called "validate_copy_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
     Note: Validate COPY instruction syntax and paths
-
-    @Reasoning:
-    COPY instruction copies files/directories from build context. Validate
-    source and destination paths, check for security issues like copying
-    sensitive files, and validate multi-stage build references.
-    @End Reasoning
 
     Let arg_count be proc size from List with args
     If arg_count is less than 2:
@@ -397,6 +541,26 @@ Process called "validate_copy_instruction" takes analyzer as Integer, args as In
     Let current_layers be proc memory_get_int64 from Layout with analyzer, 80
     proc memory_set_int64 from Layout with analyzer, 80, current_layers plus 1
 End Process
+
+@Reasoning:
+EXPOSE declares container-facing ports; we must reject empty arg lists and
+non-numeric/out-of-range port specs so downstream tooling (compose, runtime
+port maps) never receives a malformed declaration. Valid specs are appended
+to the analyzer's exposed_ports list at offset 16 for later aggregation.
+@End Reasoning
+
+@Implementation:
+After confirming at least one arg, walks args via List.size/get, delegating
+each entry to validate_port_specification (which handles single and
+PORT/PROTO forms). Valid entries are added to the analyzer's exposed_ports
+list (offset 16); invalid ones generate a validation error pointing to the
+1-based line number.
+@End Implementation
+
+@Security_Scope:
+Args originate from untrusted Dockerfile text. Validation rejects anything
+outside 1..65535 to prevent passing bogus port specs to runtime tooling.
+@End Security_Scope
 
 Process called "validate_expose_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
     Note: Validate EXPOSE instruction and track exposed ports
@@ -434,20 +598,52 @@ Note: ===================================================================
 Note: BUILD STAGE ANALYSIS
 Note: ===================================================================
 
+@Reasoning:
+Phase 2 builds the stage dependency graph by running four sub-analyses
+in fixed order: identify_build_stages populates analyzer.stages (must
+run first - everything else reads from this list), analyze_stage_dependencies
+walks COPY --from references to construct the dependency edges,
+check_unused_stages flags stages that no later stage references (waste of
+build time), validate_stage_references catches forward references and
+self-references which Docker treats as errors. The ordering is strict:
+references can't be validated until the stage set is known, and unused-
+stage detection needs the dependency graph already built.
+@End Reasoning
+
+@Implementation:
+Calls four procs in sequence:
+identify_build_stages(analyzer, dockerfile_ast) which populates the
+stages List (offset 8) from FROM instructions with optional AS clauses;
+analyze_stage_dependencies(analyzer, dockerfile_ast) which walks COPY
+--from to add edges; check_unused_stages(analyzer) which is registry-
+only (no ast); validate_stage_references(analyzer, dockerfile_ast).
+No return value - results flow into the analyzer's security_issues and
+optimization_warnings lists.
+@End Implementation
+
 Process called "analyze_build_stages" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Analyze multi-stage build structure and dependencies
-
-    @Reasoning:
-    Second phase analyzes multi-stage builds for proper stage dependencies,
-    unused stages, efficient stage ordering, and copy operations between
-    stages following Docker multi-stage build best practices.
-    @End Reasoning
 
     proc identify_build_stages with analyzer, dockerfile_ast
     proc analyze_stage_dependencies with analyzer, dockerfile_ast
     proc check_unused_stages from analyzer
     proc validate_stage_references with analyzer, dockerfile_ast
 End Process
+
+@Reasoning:
+Multi-stage builds are recognised by FROM <image> [AS <name>] occurrences;
+this pass populates analyzer.stages (offset 8) with one entry per FROM so
+later passes can validate stage references and detect unused stages. Unnamed
+FROMs receive a synthetic "stage<N>" label so downstream graph code can
+treat every stage uniformly.
+@End Reasoning
+
+@Implementation:
+Walks the instruction list once. For each FROM with arg_count > 2 (image
+plus AS plus name), pushes args[2] onto the stages list; otherwise pushes
+"stage" concatenated with the running stage_count. stage_count is local —
+the list itself is the durable record.
+@End Implementation
 
 Process called "identify_build_stages" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Identify all build stages in the Dockerfile
@@ -483,14 +679,30 @@ Process called "identify_build_stages" takes analyzer as Integer, dockerfile_ast
     End While
 End Process
 
+@Reasoning:
+Cross-stage COPY references (`COPY --from=stage_name src dest`) are the
+only way one Docker stage references another, so this dependency walk
+focuses exclusively on COPY instructions. The current_stage counter
+starts at 0 and bumps on each FROM, giving each instruction a known
+home stage. Stage dependencies flow backwards in source order: a COPY
+in stage N can reference stage M only if M < N. The detector here
+counts FROM occurrences to maintain current_stage, and dispatches each
+COPY to analyze_copy_stage_dependency which actually examines the
+--from argument.
+@End Reasoning
+
+@Implementation:
+Reads instructions list and its count. Initialises current_stage=0 and
+i=0. Loops: reads instruction at index i and its instruction_type. If
+type equals "FROM", bumps current_stage by 1. Otherwise tests for "COPY";
+if matched, calls analyze_copy_stage_dependency(analyzer, instruction,
+current_stage). Other types are skipped (they can't reference stages).
+The current_stage value is local because we just need the running index,
+not a persistent state.
+@End Implementation
+
 Process called "analyze_stage_dependencies" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Analyze dependencies between build stages
-
-    @Reasoning:
-    Analyze COPY --from instructions to build dependency graph between
-    stages. Detect circular dependencies and ensure proper stage ordering
-    for efficient parallel builds and cache utilization.
-    @End Reasoning
 
     Let instructions be proc get_dockerfile_instructions from dockerfile_ast
     Let instruction_count be proc size from List with instructions
@@ -519,14 +731,35 @@ Note: ===================================================================
 Note: SECURITY ANALYSIS
 Note: ===================================================================
 
+@Reasoning:
+Phase 4 runs four orthogonal security sub-checks: user privileges
+(detecting root-running containers, the #1 container security CWE),
+sensitive data exposure (catching secrets baked into image layers via
+ENV or COPY), package security (insecure download/install patterns),
+and general best-practice security policy (e.g., no SETUID binaries,
+no curl-to-bash piping). Each sub-check is independent so they can run
+in any order; we chose this order because user privileges and sensitive
+data are the highest-frequency issues in CVE reports.
+@End Reasoning
+
+@Implementation:
+Calls four sub-checks sequentially: check_user_privileges (scans for
+USER instructions), check_sensitive_data_exposure (walks COPY, ENV,
+LABEL for credential-shaped strings), check_package_security (scans
+RUN commands for unsafe package-manager invocations),
+validate_security_best_practices (the policy aggregator). All findings
+flow into analyzer.security_issues (offset 88). No return value.
+@End Implementation
+
+@Security_Scope:
+This phase is the primary defense against image security issues found
+post-build. The checks here are pattern-based and best-effort;
+production deployments must additionally run dedicated scanners
+(Trivy, Grype, etc.) against the built image.
+@End Security_Scope
+
 Process called "analyze_dockerfile_security" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Perform comprehensive security analysis
-
-    @Reasoning:
-    Fourth phase performs security analysis including privilege escalation
-    detection, sensitive data exposure, insecure package installations,
-    and Docker security best practices enforcement.
-    @End Reasoning
 
     proc check_user_privileges with analyzer, dockerfile_ast
     proc check_sensitive_data_exposure with analyzer, dockerfile_ast
@@ -534,14 +767,36 @@ Process called "analyze_dockerfile_security" takes analyzer as Integer, dockerfi
     proc validate_security_best_practices with analyzer, dockerfile_ast
 End Process
 
+@Reasoning:
+Docker containers default to running as root (UID 0) if no USER
+instruction overrides it - and root inside a container has near-host
+privileges when combined with `--privileged` or volume mounts. This
+check walks the instruction list noting the most recent USER, and at
+the end determines whether the FINAL effective user is root (either
+"root" / "0" string match or no USER instruction at all). Only the
+LAST USER matters for the running container - intermediate USER changes
+during build are not the security concern; what runs in production is.
+@End Reasoning
+
+@Implementation:
+Initialises has_user_instruction=0, current_user="root", i=0. Loops
+instruction list: reads instruction_type, tests for "USER". On match
+sets has_user_instruction=1, reads instruction's args; if args has
+content, updates current_user to args[0]. After the loop, tests if
+current_user equals "root" OR has_user_instruction equals 0. Either
+condition adds "Container running as root user - security risk" to
+analyzer.security_issues (offset 88).
+@End Implementation
+
+@Security_Scope:
+Detection is string-comparison only - "root", "0", and "ROOT" are
+matched, but a hostile actor could craft `USER 0:0` or use numeric
+forms not caught by the simple match. This is a defense-in-depth
+hint, not a complete privilege analysis.
+@End Security_Scope
+
 Process called "check_user_privileges" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Check for privilege escalation and root usage
-
-    @Reasoning:
-    Running containers as root increases security risk. Check for explicit
-    USER instructions, detect privilege escalation patterns, and recommend
-    running as non-privileged user for production containers.
-    @End Reasoning
 
     Let instructions be proc get_dockerfile_instructions from dockerfile_ast
     Let instruction_count be proc size from List with instructions
@@ -579,28 +834,59 @@ Note: ===================================================================
 Note: LAYER OPTIMIZATION ANALYSIS
 Note: ===================================================================
 
+@Reasoning:
+Phase 5 examines layer-economy concerns: each layer in a Docker image
+adds storage overhead, slows cold pulls, and bloats the image graph in
+registries. The three sub-checks address: (1) RUN-combining (consecutive
+RUNs should be merged with `&&` to share one layer), (2) cache-friendly
+ordering (instructions that change rarely should appear before those
+that change often, maximising cache hits during incremental builds),
+(3) layer-ordering policy (e.g., COPY application code AFTER package
+installs so app-only changes don't bust the install cache).
+@End Reasoning
+
+@Implementation:
+Calls three sub-procedures: check_run_command_combining (counts
+consecutive RUN instructions, warns when > 1),
+analyze_cache_efficiency (scans for ordering anti-patterns),
+check_layer_ordering (validates standard Docker layer-ordering
+recommendations). All findings flow into
+analyzer.optimization_warnings (offset 96). No return value.
+@End Implementation
+
 Process called "analyze_layer_optimization" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Analyze layer optimization opportunities
-
-    @Reasoning:
-    Fifth phase analyzes layer structure for optimization opportunities
-    including combining RUN commands, proper instruction ordering for
-    cache efficiency, and minimizing layer count for smaller images.
-    @End Reasoning
 
     proc check_run_command_combining with analyzer, dockerfile_ast
     proc analyze_cache_efficiency with analyzer, dockerfile_ast
     proc check_layer_ordering with analyzer, dockerfile_ast
 End Process
 
+@Reasoning:
+Each RUN instruction creates a distinct image layer with full filesystem
+state. Three consecutive `RUN apt-get install ...`, `RUN apt-get install ...`,
+`RUN apt-get install ...` instructions creates three layers when one
+combined RUN with `&&` would produce one. Beyond size savings, combining
+is also a SECURITY measure: temporary files (e.g., apt cache) created
+in one RUN persist into the layer even if a later RUN deletes them,
+because layers are append-only - only combining the create and delete
+into a single RUN actually removes them from the image. We count runs
+of CONSECUTIVE RUN instructions; non-RUN instructions reset the counter.
+@End Reasoning
+
+@Implementation:
+Reads instructions and its count. Initialises consecutive_runs=0 and
+i=0. Loops: reads instruction_type. If equals "RUN", bumps
+consecutive_runs. Otherwise: if consecutive_runs > 1, builds warning
+"<n> consecutive RUN commands could be combined into one layer" and
+appends to optimization_warnings (offset 96), then resets
+consecutive_runs to 0. After loop: handles the trailing case - if the
+file ends with consecutive_runs > 1, adds "<n> consecutive RUN commands
+at end could be combined".
+@End Implementation
+
 Process called "check_run_command_combining" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Check for consecutive RUN commands that could be combined
-
-    @Reasoning:
-    Multiple consecutive RUN commands create separate layers. Combining
-    them with && operators reduces layer count and image size while
-    improving build cache efficiency and reducing attack surface.
-    @End Reasoning
 
     Let instructions be proc get_dockerfile_instructions from dockerfile_ast
     Let instruction_count be proc size from List with instructions
@@ -640,14 +926,31 @@ Note: ===================================================================
 Note: DOCKER BEST PRACTICES VALIDATION
 Note: ===================================================================
 
+@Reasoning:
+Phase 6 (final) is the catch-all best-practices aggregator covering
+issues that don't fit into the previous five specific phases: base
+image selection (avoid `latest`, prefer slim/alpine, avoid deprecated
+images), HEALTHCHECK presence (production containers should declare
+liveness probes), signal handling (PID 1 inside containers needs to
+forward SIGTERM correctly for graceful shutdown), and metadata
+completeness (LABEL maintainer, org.opencontainers.image.* labels for
+provenance). Each of these is a soft policy concern - violations don't
+break builds but flag the image as non-production-ready.
+@End Reasoning
+
+@Implementation:
+Calls four sub-procs: check_base_image_best_practices(analyzer) which
+consults the already-populated base_images registry,
+check_healthcheck_configuration(analyzer, dockerfile_ast) which scans
+for HEALTHCHECK instructions, validate_signal_handling(analyzer,
+dockerfile_ast) which checks ENTRYPOINT/CMD shell vs exec form and
+related concerns, check_metadata_completeness(analyzer) which audits
+labels and args. All findings go to optimization_warnings or
+security_issues depending on severity.
+@End Implementation
+
 Process called "validate_docker_best_practices" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Validate Docker best practices compliance
-
-    @Reasoning:
-    Sixth phase validates adherence to Docker best practices including
-    proper base image selection, efficient caching strategies, security
-    configurations, and production readiness requirements.
-    @End Reasoning
 
     proc check_base_image_best_practices from analyzer
     proc check_healthcheck_configuration with analyzer, dockerfile_ast
@@ -655,14 +958,37 @@ Process called "validate_docker_best_practices" takes analyzer as Integer, docke
     proc check_metadata_completeness from analyzer
 End Process
 
+@Reasoning:
+Two image-reference anti-patterns flagged here: (1) the `:latest` tag
+which is a moving target - the image rebuilt tomorrow may be different
+from today's, making builds non-reproducible AND creating a supply-chain
+attack vector if the upstream maintainer is compromised; (2) entirely
+missing tag, which Docker silently resolves to `:latest` with the same
+problems. Both are reported but at different severities: `:latest` is
+a security issue (someone deliberately chose it), missing tag is an
+optimization warning (likely a forgot-to-pin oversight).
+@End Reasoning
+
+@Implementation:
+Reads base_images list (analyzer offset 0) and its count. Loops i in
+0..count-1: reads image_ref at index i. First substring test:
+string_contains(image_ref, ":latest"); on match appends "Base image
+uses 'latest' tag: <ref>" to security_issues (offset 88). Second
+test: string_contains(image_ref, ":"); if FALSE (no tag at all),
+appends "Base image missing explicit tag: <ref>" to
+optimization_warnings (offset 96). Both checks fire independently;
+a `foo:latest` reference fails only the first; a `foo` reference
+fails only the second.
+@End Implementation
+
+@Security_Scope:
+The `:latest` tag check is the primary supply-chain defense in this
+analyzer; combined with a registry-side immutable-tag policy and
+SBOM generation, it forms the syntactic-side of provenance enforcement.
+@End Security_Scope
+
 Process called "check_base_image_best_practices" takes analyzer as Integer:
     Note: Check base image selection best practices
-
-    @Reasoning:
-    Validate base images follow security and efficiency best practices
-    including using specific tags instead of latest, preferring minimal
-    images, using official images, and avoiding deprecated images.
-    @End Reasoning
 
     Let base_images be proc memory_get_int64 from Layout with analyzer, 0
     Let image_count be proc size from List with base_images
@@ -695,14 +1021,35 @@ Note: ===================================================================
 Note: UTILITY FUNCTIONS
 Note: ===================================================================
 
+@Reasoning:
+Docker EXPOSE arguments accept three formats: a bare port (`80`), port
+with protocol (`80/tcp` or `80/udp`), or port range (`8080-8090` or
+`8080-8090/tcp`). Other protocols (sctp, etc.) are not standard Docker
+and are rejected. The dash-separated range form requires BOTH endpoints
+to parse as integers in 1..65535 - we do not enforce start < end here
+because Docker accepts both orders and normalises. Returning Integer
+0/1 lets the caller branch cleanly without parsing diagnostic strings.
+@End Reasoning
+
+@Implementation:
+Locates `/` via string_find. If found, splits into port_part (before)
+and protocol_part (after); checks protocol_part equals "tcp" or "udp",
+returning 0 on any other value. Then operates on port_part. Locates
+`-`; if found, splits into start_port and end_port substrings and
+validates each as a valid port number via is_valid_port_number,
+returning 0 if either fails. If no dash, validates port_part directly.
+Returns 1 only when every component passes.
+@End Implementation
+
+@Security_Scope:
+Port spec originates from untrusted Dockerfile source. Strict
+1..65535 validation prevents downstream tooling from receiving
+out-of-range values that could underflow/overflow into kernel-managed
+port tables.
+@End Security_Scope
+
 Process called "validate_port_specification" takes port_spec as Integer returns Integer:
     Note: Validate Docker port specification format
-
-    @Reasoning:
-    Docker port specifications can be just port numbers (80), port with
-    protocol (80/tcp), or port ranges (8080-8090). Validate format and
-    ensure port numbers are in valid range (1-65535).
-    @End Reasoning
 
     Let slash_pos be proc string_find from StringCore with port_spec, "/"
     Let port_part be port_spec
@@ -734,6 +1081,18 @@ Process called "validate_port_specification" takes port_spec as Integer returns 
     Note: Single port number
     Return proc is_valid_port_number from port_part
 End Process
+
+@Reasoning:
+Final numeric check for an EXPOSE port: a 1..65535 decimal integer with at
+most 5 characters (length cap is a quick reject for over-long strings even
+if all-digit). Pure validator returning 0/1 — does not raise diagnostics.
+@End Reasoning
+
+@Implementation:
+Three gates: length in 1..5, every byte in '0'..'9' (ASCII 48..57), and the
+parsed integer in 1..65535. Uses string_char_at/string_to_int from
+StringCore; no allocations beyond what those calls perform internally.
+@End Implementation
 
 Process called "is_valid_port_number" takes port_str as Integer returns Integer:
     Note: Check if string is valid port number (1-65535)

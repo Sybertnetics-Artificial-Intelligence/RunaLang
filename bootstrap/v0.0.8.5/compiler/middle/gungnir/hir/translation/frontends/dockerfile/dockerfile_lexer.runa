@@ -72,6 +72,21 @@ Note: ==========================================================================
 Note: Lexer State
 Note: ============================================================================
 
+@Reasoning:
+The Dockerfile lexer is single-pass and line-oriented. It needs the
+source string, a byte position cursor, line/column counters for
+diagnostics, the currently-decoded character (so peek_ahead can look
+beyond the cursor without re-decoding), an emitted token list, and an
+error flag plus message for the first lex failure.
+@End Reasoning
+
+@Implementation:
+Eight fields: source (input String), position (zero-based byte offset),
+line (1-based), column (1-based), current_char (codepoint at position
+or 0 at EOF), tokens (handle to a ListCore List of DockerfileToken
+values), had_error (0/1 sticky flag), error_message (String, "" when
+no error).
+@End Implementation
 Type called "DockerfileLexerState":
     source as String
     position as Integer
@@ -83,6 +98,20 @@ Type called "DockerfileLexerState":
     error_message as String
 End Type
 
+@Reasoning:
+Each emitted token carries the TOKEN_* kind constant, the source
+substring that produced it, position info for diagnostics, and a
+separate literal_value for processed forms (e.g. de-escaped string
+contents or numeric values converted from text). Storing both lexeme
+and literal_value lets the parser format diagnostics with the original
+text while consuming the cooked literal.
+@End Reasoning
+
+@Implementation:
+Five fields: token_type (TOKEN_* discriminant), lexeme (the raw source
+slice), line and column (1-based, pointing to the lexeme's start),
+literal_value (cooked value or empty when lexeme is already canonical).
+@End Implementation
 Type called "DockerfileToken":
     token_type as Integer
     lexeme as String
@@ -95,6 +124,22 @@ Note: ==========================================================================
 Note: Lexer Initialization
 Note: ============================================================================
 
+@Reasoning:
+Constructs a DockerfileLexerState value, allocates a heap home for it,
+and primes the current_char field so the first call to scan_token does
+not have to special-case the empty cursor. Returning a pointer keeps
+the lexer state mutable across the public lexer entry points.
+@End Reasoning
+
+@Implementation:
+Builds a DockerfileLexerState value with source set, position=0,
+line=1, column=1, current_char=0 placeholder, tokens=fresh List from
+ListCore, had_error=0, empty error_message. Allocates a heap slot via
+MemoryCore.memory_allocate sized for the struct and writes the value
+in via memory_write. If the source is non-empty re-reads the first
+character via StringCore.string_char_at and updates current_char by
+re-writing the struct. Returns the heap pointer.
+@End Implementation
 Process called "create_lexer" takes source as String returns Integer:
     @Reasoning
     Create and initialize Dockerfile lexer state.
@@ -127,6 +172,22 @@ Note: ==========================================================================
 Note: Character Navigation
 Note: ============================================================================
 
+@Reasoning:
+Advancing the cursor must keep three things in sync: byte position,
+line/column counters (for diagnostics), and current_char (for cheap
+lookup by scanners). Newline detection bumps the line counter and
+resets column to 1 so post-newline positions are correct.
+@End Reasoning
+
+@Implementation:
+Reads the lexer struct from memory. Captures the current character to
+return at the end. Increments position and column by 1. If the
+previous character was 10 (newline) bumps line and resets column to 1.
+Reads the next character via StringCore.string_char_at when
+position < source length; otherwise stores 0 as the EOF sentinel.
+Writes the modified struct back. Returns the character that was
+current at the start of the call.
+@End Implementation
 Process called "advance" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Move to next character, update position tracking.
@@ -158,6 +219,17 @@ Process called "advance" takes lexer_ptr as Integer returns Integer:
     Return current
 End Process
 
+@Reasoning:
+Constant-time non-consuming character access. Returns the already-
+decoded current_char field, so callers do not pay for re-decoding the
+character at the cursor on every check.
+@End Reasoning
+
+@Implementation:
+Reads the DockerfileLexerState struct from lexer_ptr and returns its
+current_char field directly. Returns 0 at EOF (current_char carries the
+EOF sentinel after advance walks past end of source).
+@End Implementation
 Process called "peek" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Look at current character without consuming.
@@ -167,6 +239,19 @@ Process called "peek" takes lexer_ptr as Integer returns Integer:
     Return lexer.current_char
 End Process
 
+@Reasoning:
+Multi-character lookahead is needed for two-character tokens (==, &&,
+etc.) and for distinguishing line continuations from independent
+backslashes. The variable offset lets callers reach arbitrary distances
+without re-reading current_char first.
+@End Reasoning
+
+@Implementation:
+Reads the lexer struct. Computes look_pos = position + offset. If
+look_pos is within source bounds, returns the character at that
+position via StringCore.string_char_at. Otherwise returns 0 (EOF
+sentinel). Does NOT mutate lexer state.
+@End Implementation
 Process called "peek_ahead" takes lexer_ptr as Integer, offset as Integer returns Integer:
     @Reasoning
     Look ahead at character at given offset.
@@ -184,6 +269,15 @@ Process called "peek_ahead" takes lexer_ptr as Integer, offset as Integer return
     Return 0  Note: EOF
 End Process
 
+@Reasoning:
+Uses current_char==0 as the EOF sentinel rather than re-checking
+position vs source length, so this is a single field read instead of a
+length computation.
+@End Reasoning
+
+@Implementation:
+Reads the lexer struct. Returns 1 if current_char is 0, otherwise 0.
+@End Implementation
 Process called "is_at_end" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Check if at end of source.
@@ -202,6 +296,16 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+Dockerfile syntax is line-oriented so newline must NOT be treated as
+whitespace; only space (32) and tab (9) are. This routine implements
+that policy in one place so scanners do not have to remember the
+exclusion.
+@End Reasoning
+
+@Implementation:
+Returns 1 if char equals 32 (space) or 9 (tab); otherwise returns 0.
+@End Implementation
 Process called "is_whitespace" takes char as Integer returns Integer:
     @Reasoning
     Check if character is whitespace (space or tab, NOT newline).
@@ -218,6 +322,17 @@ Process called "is_whitespace" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII-only alpha check (no Unicode). Dockerfile instruction names and
+identifiers are restricted to ASCII so an ICU-aware classifier would
+be wasted overhead and would also accept names that the engine would
+later reject.
+@End Reasoning
+
+@Implementation:
+Returns 1 when char is in [65..90] (A-Z) or [97..122] (a-z). Otherwise
+returns 0.
+@End Implementation
 Process called "is_alpha" takes char as Integer returns Integer:
     @Reasoning
     Check if character is alphabetic.
@@ -238,6 +353,15 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII decimal digit predicate, matching the Dockerfile-allowed numeric
+character set. Hex digits etc. are not handled here because Dockerfile
+literals do not require them.
+@End Reasoning
+
+@Implementation:
+Returns 1 when char is in [48..57] (0-9), otherwise 0.
+@End Implementation
 Process called "is_digit" takes char as Integer returns Integer:
     @Reasoning
     Check if character is a digit.
@@ -252,6 +376,19 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Dockerfile identifiers include the usual alphanumeric/underscore set
+plus hyphen (image tags like `python-slim`), dot (versions like
+`alpine:3.18`), and forward slash (registry paths like
+`gcr.io/project/image`). This wider character set is the one downstream
+parsers expect.
+@End Reasoning
+
+@Implementation:
+Delegates to is_alpha and is_digit for letter/digit categories. Then
+returns 1 for the explicit punctuation codepoints: 95 (_), 45 (-),
+46 (.), 47 (/). Returns 0 for anything else.
+@End Implementation
 Process called "is_identifier_char" takes char as Integer returns Integer:
     @Reasoning
     Check if character can be part of identifier (alphanumeric, underscore, hyphen, dot).
@@ -288,6 +425,19 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Tokens have a fixed shape across all kinds, so a single factory keeps
+the lexer scanners focused on classification and value extraction. The
+factory always allocates on the heap because the tokens are stored in
+the lexer's token list across calls.
+@End Reasoning
+
+@Implementation:
+Builds a DockerfileToken value with the five supplied fields. Allocates
+a heap slot via MemoryCore.memory_allocate sized for the struct. Writes
+the value via memory_write. Returns the heap pointer; ownership
+transfers to whatever list ultimately holds it.
+@End Implementation
 Process called "create_token" takes token_type as Integer, lexeme as String, line as Integer, column as Integer, literal_value as String returns Integer:
     @Reasoning
     Create new token with given properties.
@@ -306,6 +456,19 @@ Process called "create_token" takes token_type as Integer, lexeme as String, lin
     Return token_ptr
 End Process
 
+@Reasoning:
+Combines token creation and list append behind a single call site so
+each scanner does not have to thread line/column through itself - the
+helper pulls them from the lexer state at the moment of emission.
+@End Reasoning
+
+@Implementation:
+Reads the lexer struct. Calls create_token with the supplied
+token_type/lexeme/literal_value plus the current lexer.line and
+lexer.column. Appends the resulting token pointer to lexer.tokens via
+ListCore.list_append. Writes the lexer struct back (no field changes
+but keeps the API contract consistent).
+@End Implementation
 Process called "add_token" takes lexer_ptr as Integer, token_type as Integer, lexeme as String, literal_value as String:
     @Reasoning
     Create token and add to lexer's token list.
@@ -319,6 +482,17 @@ Process called "add_token" takes lexer_ptr as Integer, token_type as Integer, le
     proc memory_write from MemoryCore with lexer_ptr, lexer
 End Process
 
+@Reasoning:
+Records the first lex failure into the sticky had_error flag and
+captures the diagnostic message. Subsequent calls overwrite the
+message but had_error remains 1, ensuring callers see at least the
+last error if multiple occur.
+@End Reasoning
+
+@Implementation:
+Reads the lexer struct, sets had_error=1, copies message into the
+error_message field, writes the struct back via memory_write.
+@End Implementation
 Process called "lexer_error" takes lexer_ptr as Integer, message as String:
     @Reasoning
     Record lexer error.
@@ -336,6 +510,17 @@ Note: ==========================================================================
 Note: Whitespace and Comments
 Note: ============================================================================
 
+@Reasoning:
+Inter-token whitespace must be consumed between scans but newlines are
+significant in Dockerfiles (they separate instructions), so this
+routine deliberately only consumes the subset is_whitespace accepts.
+@End Reasoning
+
+@Implementation:
+Loops while peek returns a whitespace character: each iteration calls
+advance to consume the character. Exits as soon as peek returns a
+non-whitespace codepoint (including newline or EOF).
+@End Implementation
 Process called "skip_whitespace" takes lexer_ptr as Integer:
     @Reasoning
     Skip spaces and tabs (but NOT newlines).
@@ -354,6 +539,18 @@ Process called "skip_whitespace" takes lexer_ptr as Integer:
     End While
 End Process
 
+@Reasoning:
+Dockerfile comments start with `#` and run to end-of-line. The newline
+itself is preserved (not consumed) so the line-counter logic in
+advance still treats the line boundary as a significant statement
+separator.
+@End Reasoning
+
+@Implementation:
+Peeks current character. Returns 0 if not 35 ('#'). Otherwise loops
+advancing until peek returns 10 (newline) or 0 (EOF); both terminate
+the loop without consuming. Returns 1 to signal "comment scanned".
+@End Implementation
 Process called "scan_comment" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Scan Dockerfile comment (# to end of line).
@@ -391,6 +588,27 @@ Note: ==========================================================================
 Note: String and Identifier Scanning
 Note: ============================================================================
 
+@Reasoning:
+Dockerfile strings support both single and double quotes. Common
+escape sequences (\\n, \\t, \\\\, and the delimiter itself) are
+recognized inside the body. The lexeme retains its quotes for
+diagnostic display, while literal_value holds the decoded string the
+parser will consume.
+@End Reasoning
+
+@Implementation:
+Initializes string_value to "". Advances past the opening delimiter.
+Loops until the matching delimiter or EOF: on EOF records "Unterminated
+string" and returns 0. On the delimiter, advances past it and stops.
+On 92 ('\\'), advances and dispatches on the escape character:
+110='n'->10, 116='t'->9, 92='\\'->92, delimiter->delimiter; each case
+appends the cooked codepoint to string_value via
+StringCore.string_concat + string_from_char. For any other char calls
+advance and appends the raw character. After the closing delimiter is
+consumed, rebuilds the displayed lexeme by sandwiching string_value
+between delim_str copies, then emits a TOKEN_STRING via add_token
+with lexeme + literal_value. Returns 1.
+@End Implementation
 Process called "scan_string" takes lexer_ptr as Integer, delimiter as Integer returns Integer:
     @Reasoning
     Scan quoted string with given delimiter (' or ").
@@ -453,6 +671,25 @@ Process called "scan_string" takes lexer_ptr as Integer, delimiter as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Identifier scanning has two responsibilities: collect a run of
+identifier characters, and classify the result as either a Dockerfile
+instruction keyword (case-insensitive), one of the small reserved-word
+keywords (AS, NONE), or a plain identifier. Doing the classification
+here means the parser never has to second-guess token kinds.
+@End Reasoning
+
+@Implementation:
+Captures starting line/column for diagnostics. Loops calling advance
+while peek returns an is_identifier_char codepoint, building the
+identifier string via string_concat + string_from_char. Uppercases the
+result via StringCore.string_to_upper and feeds it to
+get_instruction_type; on non-zero result emits a token of that
+instruction kind. Otherwise checks for "AS" and "NONE" explicitly,
+emitting TOKEN_AS / TOKEN_NONE; on no match emits TOKEN_IDENTIFIER. In
+every case the original (non-uppercased) identifier is emitted as the
+lexeme.
+@End Implementation
 Process called "scan_identifier" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Scan identifier or keyword.
@@ -498,6 +735,21 @@ Process called "scan_identifier" takes lexer_ptr as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Maps an uppercased identifier to its Dockerfile-instruction TOKEN_*
+constant. Returning 0 for non-instructions lets the caller treat
+non-zero as "this is an instruction keyword". A flat If chain over
+canonical keywords is preferred to a hashtable lookup because the keyword
+set is small and fixed.
+@End Reasoning
+
+@Implementation:
+String-equals comparison against each known instruction keyword
+(FROM, RUN, CMD, LABEL, EXPOSE, ENV, ADD, COPY, ENTRYPOINT, VOLUME,
+USER, WORKDIR, ARG, ONBUILD, STOPSIGNAL, HEALTHCHECK, SHELL, MAINTAINER,
+etc.); returns the matching TOKEN_* constant on the first hit. Returns
+0 if no keyword matches.
+@End Implementation
 Process called "get_instruction_type" takes instruction as String returns Integer:
     @Reasoning
     Map Dockerfile instruction to token type.
@@ -561,6 +813,21 @@ Process called "get_instruction_type" takes instruction as String returns Intege
     Return 0  Note: Not an instruction
 End Process
 
+@Reasoning:
+Dockerfile variables come in two shapes: bare `$VAR` and braced
+`${VAR}`. The braced form supports additional syntax (defaults,
+patterns) downstream, so it must be preserved verbatim in the lexeme;
+the bare form ends at the first non-identifier character.
+@End Reasoning
+
+@Implementation:
+Initializes var_text to "$" and consumes the `$`. If next char is 123
+('{'): appends `{`, advances, then accumulates a body of [A-Za-z0-9_]
+chars; expects 125 ('}') closing - on success appends `}` and consumes
+it, on mismatch records an error. For the bare form, accumulates the
+same [A-Za-z0-9_] set without surrounding braces. Emits a TOKEN_VARIABLE
+with the full var_text as lexeme. Returns 1.
+@End Implementation
 Process called "scan_variable" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Scan variable substitution: $VAR or ${VAR}.
@@ -638,6 +905,20 @@ Process called "scan_variable" takes lexer_ptr as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Dockerfile flags like `--from=stage` and `--chown=user:group` are
+recognized as a single token so the parser does not have to assemble
+the `--`-prefix from individual characters. The value part is included
+in the lexeme so downstream consumers can split on `=` if needed.
+@End Reasoning
+
+@Implementation:
+Initializes flag_text to "--" and consumes the two leading dashes.
+Loops accumulating characters while peek is alpha, hyphen (45), equals
+(61), or any is_identifier_char codepoint - matching the union of flag
+name and value characters. Stops on any other character. Emits a
+TOKEN_FLAG with the full flag_text as lexeme. Returns 1.
+@End Implementation
 Process called "scan_flag" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Scan Dockerfile flags like --from=stage, --chown=user:group.
@@ -685,6 +966,25 @@ Note: ==========================================================================
 Note: Main Scanning
 Note: ============================================================================
 
+@Reasoning:
+The outer scanner dispatches on the first character of each token,
+calling the appropriate sub-scanner. Skipping whitespace and comments
+first means token dispatch never sees them, simplifying the dispatch
+table. Newline is its own token because Dockerfiles are line-oriented.
+@End Reasoning
+
+@Implementation:
+Calls skip_whitespace. If scan_comment recognizes and consumes a
+comment, returns 1. If at EOF, emits a TOKEN_EOF and returns 0. Peeks
+the next character and dispatches: newline (10) -> consume and emit
+TOKEN_NEWLINE; quote (34, 39) -> scan_string with the matching
+delimiter; `$` (36) -> scan_variable; `--` (peek_ahead detects double
+dash) -> scan_flag; alpha or underscore -> scan_identifier; digit ->
+scan_identifier (Dockerfile identifiers can start with digits in some
+contexts like image tags); any other recognized punctuation produces
+its own single-character token. Unknown characters trigger
+lexer_error.
+@End Implementation
 Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Scan next token from source.
@@ -843,6 +1143,18 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Public entry point that drives scan_token to completion. Returns the
+accumulated token list so the parser can consume it directly without
+needing to know the internal lexer struct layout.
+@End Reasoning
+
+@Implementation:
+Loops calling scan_token; the loop exits when scan_token returns 0
+(EOF or hard error). Reads the final lexer struct from memory and
+returns its tokens List handle. The caller takes a borrowed reference -
+ownership remains with the lexer until destruction.
+@End Implementation
 Process called "tokenize" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Tokenize entire source and return token list.
@@ -861,6 +1173,16 @@ Process called "tokenize" takes lexer_ptr as Integer returns Integer:
     Return lexer.tokens
 End Process
 
+@Reasoning:
+Accessor for the token list separate from tokenize so callers that
+have already invoked tokenize can fetch the list later without
+re-running the scanner.
+@End Reasoning
+
+@Implementation:
+Reads the lexer struct and returns its tokens slot directly. Pure
+read; no mutation.
+@End Implementation
 Process called "get_tokens" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Get list of tokens from lexer.
@@ -870,6 +1192,15 @@ Process called "get_tokens" takes lexer_ptr as Integer returns Integer:
     Return lexer.tokens
 End Process
 
+@Reasoning:
+Boolean read of the sticky had_error flag for the parser/driver to
+decide whether to proceed with the token stream or surface a lexical
+error to the user.
+@End Reasoning
+
+@Implementation:
+Reads the lexer struct and returns its had_error field directly.
+@End Implementation
 Process called "had_error" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Check if lexer encountered errors.
@@ -879,6 +1210,17 @@ Process called "had_error" takes lexer_ptr as Integer returns Integer:
     Return lexer.had_error
 End Process
 
+@Reasoning:
+Companion to had_error returning the last-set diagnostic. Callers are
+expected to check had_error first; this routine returns an empty
+string when no error has been set.
+@End Reasoning
+
+@Implementation:
+Reads the lexer struct and returns its error_message field directly.
+The string is borrowed from the lexer; the caller must not mutate or
+free it.
+@End Implementation
 Process called "get_error_message" takes lexer_ptr as Integer returns String:
     @Reasoning
     Get error message if lexer encountered error.

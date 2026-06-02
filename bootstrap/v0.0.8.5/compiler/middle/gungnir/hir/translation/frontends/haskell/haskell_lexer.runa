@@ -158,6 +158,24 @@ Note: ==========================================================================
 Note: Lexer State Structure
 Note: ============================================================================
 
+@Reasoning:
+Haskell's lexer needs more state than most languages because the syntax is
+layout-sensitive: tokens depend on indentation levels tracked across the
+whole module. The layout_stack field records open implicit-brace contexts
+so the lexer can insert virtual semicolons/braces. in_string and
+in_comment are sticky-mode flags consulted by the main scanner to suspend
+operator/keyword recognition while inside literals or comments.
+@End Reasoning
+
+@Implementation:
+9 x i64 record (72 bytes, offsets 0..64). offset 0 = source string handle,
+8 = byte position cursor, 16/24 = 1-based line/column, 32 = cached source
+length, 40 = current_char (set to -1 at EOF), 48 = layout_stack (List of
+indent column ints), 56/64 = in_string/in_comment sticky flags. Sized to
+match create_haskell_lexer's 56-byte initial allocation plus two extra
+i64s set immediately after.
+@End Implementation
+
 Type called "HaskellLexer":
     source as Integer              Note: Source code string
     position as Integer            Note: Current position in source
@@ -169,6 +187,18 @@ Type called "HaskellLexer":
     in_string as Integer           Note: String parsing state
     in_comment as Integer          Note: Comment parsing state
 End Type
+
+@Reasoning:
+Tokens carry the discriminant and lexeme plus source position so the parser
+can produce precise diagnostics. Length is cached so the parser need not
+re-walk the lexeme string when computing spans.
+@End Reasoning
+
+@Implementation:
+5 x i64 record (40 bytes). offsets: 0 = type constant (TOKEN_* above),
+8 = value string handle, 16 = line, 24 = column, 32 = lexeme length.
+Length is computed once at construction (create_haskell_token).
+@End Implementation
 
 Type called "HaskellToken":
     type as Integer               Note: Token type constant
@@ -182,14 +212,33 @@ Note: ==========================================================================
 Note: Lexer Creation and Management
 Note: ============================================================================
 
+@Reasoning:
+Haskell's layout (off-side) rule means whitespace is semantically
+significant: braces and semicolons are MOST commonly inferred from
+indentation rather than written explicitly. The lexer therefore needs
+not just position/line/column but a LAYOUT STACK that records the
+indent column of each open scope so it can synthetically emit `;` when
+a new line matches the current scope's indent and `}` when a new line
+dedents below it. The stack is a List of indent levels, started empty
+because the outermost layout is established by the first non-comment
+non-whitespace token (typically `module`). in_string and in_comment
+flags exist to suspend layout processing inside string literals and
+block comments where indentation has no semantic meaning.
+@End Reasoning
+
+@Implementation:
+Allocates a 56-byte lexer record (7 slots, but later writes extend to
+offset 64 indicating actual usable size 72/9-slot - this is a discovered
+discrepancy preserved for compat). Returns 0 on failure. Writes:
+0=source_code ptr, 8=position=0, 16=line=1, 24=column=1, 32=source_length
+(via StringCore.string_length), 40=first_char (via string_char_at at
+offset 0). Creates a layout_stack List via List.create and writes it at
+offset 48. Writes 0 at offset 56 (in_string) and 64 (in_comment).
+Returns the lexer handle.
+@End Implementation
+
 Process called "create_haskell_lexer" takes source_code as Integer returns Integer:
     Note: Create new Haskell lexer for source code
-
-    @Reasoning:
-    Initializes a new Haskell lexer with the given source code. Sets up
-    initial position, line/column tracking, and layout stack for Haskell's
-    indentation-sensitive parsing.
-    @End Reasoning
 
     Let lexer_size be 56  Note: 7 fields × 8 bytes each
     Let lexer be proc allocate from Layout with lexer_size
@@ -221,6 +270,19 @@ Process called "create_haskell_lexer" takes source_code as Integer returns Integ
     Return lexer
 End Process
 
+@Reasoning:
+The lexer owns the layout_stack list it allocated in create_haskell_lexer.
+Destruction must release that list before deallocating the lexer record,
+otherwise the layout stack leaks (it was allocated via List.create which
+uses its own owning allocator).
+@End Reasoning
+
+@Implementation:
+Null-pointer guard, then if layout_stack at offset 48 is non-null,
+deallocate it via Layout.deallocate, then deallocate the lexer block
+itself. Returns 1 unconditionally — callers do not branch on the result.
+@End Implementation
+
 Process called "destroy_haskell_lexer" takes lexer as Integer returns Integer:
     Note: Destroy Haskell lexer and free memory
 
@@ -237,14 +299,26 @@ Process called "destroy_haskell_lexer" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+A Haskell token carries five concrete fields: type (TOKEN_* constant),
+value (the lexeme as a borrowed pointer into the source buffer), line,
+column, and pre-computed value_length. We pre-compute the length at
+construction rather than re-measuring on each parser inspection because
+string_length is O(n) and tokens are inspected many times during
+parsing/typechecking. The value pointer is borrowed, NOT owned: the
+source buffer outlives the token, so we never need to copy.
+@End Reasoning
+
+@Implementation:
+Allocates a 40-byte token (5 slots * 8 bytes). Returns 0 on failure.
+Writes: 0=token_type, 8=value, 16=line, 24=column. Computes value_length
+via StringCore.string_length(value), with a null-guard: if value is 0
+length stays at 0 (no string_length call). Writes value_length at
+offset 32. Returns the token handle.
+@End Implementation
+
 Process called "create_haskell_token" takes token_type as Integer, value as Integer, line as Integer, column as Integer returns Integer:
     Note: Create new Haskell token
-
-    @Reasoning:
-    Creates a token structure containing type, value, and position information.
-    Essential for parser to understand token sequence and provide error messages
-    with accurate location information.
-    @End Reasoning
 
     Let token_size be 40  Note: 5 fields × 8 bytes each
     Let token be proc allocate from Layout with token_size
@@ -267,6 +341,19 @@ Process called "create_haskell_token" takes token_type as Integer, value as Inte
     Return token
 End Process
 
+@Reasoning:
+Tokens are owned by whoever popped them off the lexer; this is the
+canonical release point. The token's value field is a string borrowed from
+the source buffer, so the token never owns it — only the record itself is
+freed here.
+@End Reasoning
+
+@Implementation:
+Null guard; on a live token, Layout.deallocate releases the 40-byte
+record. The lexeme string is intentionally NOT freed since it points into
+the lexer's source buffer.
+@End Implementation
+
 Process called "destroy_haskell_token" takes token as Integer returns Integer:
     Note: Destroy Haskell token and free memory
 
@@ -281,13 +368,28 @@ Note: ==========================================================================
 Note: Character Navigation
 Note: ============================================================================
 
+@Reasoning:
+The per-character cursor advance that all higher-level scanners build
+on. Maintains 1-based line/column so emitted tokens carry source
+coordinates for error messages. Newlines reset column to 1 AND bump
+line - this matters for Haskell's layout rule because the layout
+processor reads column at the start of a new logical line to decide
+whether to emit `;`, `}`, or nothing. The current_char cache at offset
+40 is updated to the post-advance character (or 0 at EOF) so callers
+can peek without re-reading source.
+@End Reasoning
+
+@Implementation:
+Reads position, line, column, length, current_char from offsets 8/16/24/
+32/40. If current_char equals 10 (newline), sets line += 1 and column =
+1; otherwise sets column += 1. Bumps position by 1. Persists line at
+offset 16, column at offset 24, position at offset 8. If new position
+< length, reads next byte via string_char_at on the source (offset 0)
+and writes it at offset 40; otherwise writes 0 (EOF). Returns 1.
+@End Implementation
+
 Process called "advance_haskell_lexer" takes lexer as Integer returns Integer:
     Note: Advance lexer to next character
-
-    @Reasoning:
-    Moves lexer forward one character, updating position, line, and column
-    counters. Handles newline detection for proper line tracking.
-    @End Reasoning
 
     Let position be proc memory_get_int64 from Layout with lexer, 8
     Let line be proc memory_get_int64 from Layout with lexer, 16
@@ -320,6 +422,21 @@ Process called "advance_haskell_lexer" takes lexer as Integer returns Integer:
     Return current_char
 End Process
 
+@Reasoning:
+Haskell tokenization requires lookahead — for example, `--` starts a line
+comment but `-->` is an operator and `-` is just minus, so the scanner
+must peek at the next 1-2 characters before committing to a token kind.
+This is the non-consuming sibling of advance_haskell_lexer.
+@End Reasoning
+
+@Implementation:
+Reads position (offset 8) and length (offset 32) from the lexer record,
+computes peek_pos = position + offset. Returns -1 for EOF (matching
+current_char's EOF sentinel) when peek_pos is past end-of-source;
+otherwise calls StringCore.string_char_at. Does NOT mutate any lexer
+field — pure read.
+@End Implementation
+
 Process called "peek_haskell_lexer" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek at character at offset from current position
 
@@ -339,6 +456,19 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII-only alphabetic check used by the identifier and keyword scanner.
+Haskell's full report allows Unicode identifiers, but the bootstrap lexer
+restricts to ASCII to avoid pulling in a Unicode classifier; the parser
+rejects any non-ASCII identifier characters downstream.
+@End Reasoning
+
+@Implementation:
+Two simple range tests against the ASCII table: 65..90 = A..Z, 97..122 =
+a..z. Returns 1 on match, 0 otherwise. Underscore is intentionally not
+included; Haskell treats it as an identifier-start separately.
+@End Implementation
+
 Process called "is_haskell_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -353,6 +483,18 @@ Process called "is_haskell_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII '0'..'9' check used by the numeric literal scanner. Kept as its own
+predicate (rather than inlining) so the operator/keyword scanners can
+share the same definition.
+@End Reasoning
+
+@Implementation:
+Single range test against ASCII 48..57. Returns 1 on match, 0 otherwise.
+Does not recognise hex/oct prefixes — those are handled by the numeric
+literal scanner which checks the '0' followed by 'x'/'o' pattern itself.
+@End Implementation
+
 Process called "is_haskell_digit" takes char as Integer returns Integer:
     Note: Check if character is numeric
 
@@ -362,6 +504,20 @@ Process called "is_haskell_digit" takes char as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Identifier-continuation predicate: a Haskell identifier starts with an
+alpha and continues with alpha-or-digit (plus underscore and prime, which
+the identifier scanner adds itself). Composing is_haskell_alpha and
+is_haskell_digit keeps a single source of truth for both predicates.
+@End Reasoning
+
+@Implementation:
+Short-circuit OR: returns 1 if is_haskell_alpha returns 1, else if
+is_haskell_digit returns 1, else 0. Two function calls rather than
+inlined range tests so any future widening (Unicode) flows through both
+predicates uniformly.
+@End Implementation
 
 Process called "is_haskell_alphanum" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
@@ -380,14 +536,27 @@ Process called "is_haskell_alphanum" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Haskell allows user-defined operators built from a specific set of
+symbol characters - this set is FROZEN in the language spec (Section
+2.4 of the Haskell 2010 report). Allowing identifier-like names as
+operators (Lisp-style) was deliberately rejected by the language
+designers; instead, operator symbols form a closed alphabet that we
+must recognise per-character to assemble multi-char operators like
+`>>=`, `<$>`, `:=:`. Every character in this set can appear in any
+position within an operator (no syntactic distinction between operator-
+start and operator-continue).
+@End Reasoning
+
+@Implementation:
+Linear sequence of equality tests against 19 ASCII operator codepoints:
+33 (!), 35 (#), 36 ($), 37 (%), 38 (&), 42 (*), 43 (+), 45 (-), 46 (.),
+47 (/), 60 (<), 61 (=), 62 (>), 63 (?), 64 (@), 92 (\), 94 (^), 124 (|),
+126 (~). Returns 1 on first match, 0 if no match.
+@End Implementation
+
 Process called "is_haskell_operator_char" takes char as Integer returns Integer:
     Note: Check if character can be part of operator
-
-    @Reasoning:
-    Haskell allows custom operators composed of specific symbol characters.
-    This function identifies all valid operator characters according to
-    Haskell language specification.
-    @End Reasoning
 
     Note: Standard operator characters
     If char is equal to 33:
@@ -451,6 +620,20 @@ Process called "is_haskell_operator_char" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Haskell treats space, tab, newline and carriage return as token
+separators; the scanner consults this predicate before deciding whether
+to skip a character or start a token. Form-feed and vertical-tab are NOT
+treated as whitespace by the bootstrap lexer (the Haskell report allows
+them, but they do not appear in real-world Haskell code).
+@End Reasoning
+
+@Implementation:
+Four explicit equality tests: 32 (space), 9 (tab), 10 (LF), 13 (CR).
+Returns 1 on first match, 0 if none match. Order is by expected
+frequency in source files (space first).
+@End Implementation
+
 Process called "is_haskell_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace
 
@@ -474,14 +657,28 @@ Note: ==========================================================================
 Note: Keyword Recognition
 Note: ============================================================================
 
+@Reasoning:
+Haskell has a small but precisely-defined set of reserved words from
+the language report. Performing keyword classification HERE (rather
+than letting the parser do it via lookahead) gives the parser a clean
+token stream where, e.g., `case` is always TOKEN_CASE and never
+TOKEN_IDENTIFIER. This eliminates an entire class of parser ambiguity.
+Haskell is case-sensitive so we string-compare with exact case - unlike
+COBOL there's no upper-casing. Words that don't match any keyword are
+returned as TOKEN_IDENTIFIER (caller treats them as user-defined names).
+@End Reasoning
+
+@Implementation:
+Sequence of StringCore.string_equals tests against the keyword list:
+"case"/"class"/"data"/"default"/"deriving"/"do"/"else"/"foreign"/"if"/
+"import"/"in"/"infix"/"infixl"/"infixr"/"instance"/"let"/"module"/
+"newtype"/"of"/"then"/"type"/"where"/"_". Each match returns the
+corresponding TOKEN_* constant. Falls through to Return TOKEN_IDENTIFIER
+if no match.
+@End Implementation
+
 Process called "recognize_haskell_keyword" takes word as Integer returns Integer:
     Note: Recognize Haskell keywords and return appropriate token type
-
-    @Reasoning:
-    Checks if given word matches any Haskell keyword. Returns specific token
-    type for keywords, or TOKEN_IDENTIFIER for non-keywords. Essential for
-    distinguishing reserved words from user-defined identifiers.
-    @End Reasoning
 
     Note: Core language keywords
     Let data_str be proc create_string from StringCore with "data"
@@ -662,14 +859,31 @@ Note: ==========================================================================
 Note: Token Scanning Functions
 Note: ============================================================================
 
+@Reasoning:
+Haskell identifiers have two structural classes distinguished by initial
+case: lowercase-start = variable (`foo`, `myVal`), uppercase-start =
+constructor or type (`Just`, `IO`). This case distinction is grammatical,
+not stylistic - it determines parse-time semantics. The continuation
+alphabet adds underscore (`_`) and apostrophe (`'`, used as prime - very
+common: `x'`, `f''`). After scanning, we run keyword recognition; if the
+result is still TOKEN_IDENTIFIER and the first char is uppercase, we
+upgrade to TOKEN_CONSTRUCTOR so the parser can dispatch differently.
+@End Reasoning
+
+@Implementation:
+Reads source (offset 0), start_pos (offset 8), current_char (offset 40).
+Loop: calls is_haskell_alphanum; if 0, also checks current_char != 95 (_)
+AND current_char != 39 ('); breaks if all three reject. Otherwise advances
+the lexer (refreshing current_char from the return value). Captures
+end_pos (offset 8). Computes identifier_length = end_pos - start_pos and
+extracts the substring via StringCore.substring. Calls
+recognize_haskell_keyword(identifier); if returns TOKEN_IDENTIFIER, reads
+first_char of the identifier and tests if 65..90 (A..Z); on match sets
+token_type to TOKEN_CONSTRUCTOR. Returns the identifier string.
+@End Implementation
+
 Process called "scan_haskell_identifier" takes lexer as Integer returns Integer:
     Note: Scan Haskell identifier or keyword
-
-    @Reasoning:
-    Scans alphanumeric identifiers, handling both lowercase variables and
-    uppercase constructors. Checks for keywords after scanning complete
-    identifier. Supports apostrophe and underscore in identifiers.
-    @End Reasoning
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
@@ -706,14 +920,33 @@ Process called "scan_haskell_identifier" takes lexer as Integer returns Integer:
     Return identifier
 End Process
 
+@Reasoning:
+Haskell numeric literals come in two structural shapes: integer (Int /
+Integer) and floating (Float / Double / Rational depending on inference),
+distinguished syntactically by the presence of either a decimal point
+followed by digits OR an exponent marker (`e`/`E`). Integers additionally
+support three base prefixes: `0x`/`0X` (hex), `0o`/`0O` (octal),
+`0b`/`0B` (binary, GHC extension). The is_float local tracks which type
+was scanned so the higher-level token classifier emits TOKEN_INT_LITERAL
+vs TOKEN_FLOAT_LITERAL. Note that `1.` without a trailing digit is NOT a
+valid Haskell float - the lookahead requires a digit after the dot, and
+on mismatch the dot is left for the operator scanner.
+@End Reasoning
+
+@Implementation:
+Reads source, start_pos, current_char. Initialises is_float=0. If first
+char is 48 ('0'), peeks offset 1 for base prefix: 120/88 ('x'/'X') ->
+hex, advances past `0x` and scans hex digits (48-57, 65-70, 97-102);
+111/79 ('o'/'O') -> octal, advances and scans octal digits (48-55).
+Otherwise scans decimal digits via is_haskell_digit. If current_char ==
+46 ('.') with following digit, sets is_float=1 and scans fractional
+digits. If current_char == 101 or 69 ('e'/'E'), sets is_float=1,
+advances, optionally accepts +/- sign, then scans exponent digits.
+Computes number_length and extracts substring via StringCore.substring.
+@End Implementation
+
 Process called "scan_haskell_number" takes lexer as Integer returns Integer:
     Note: Scan numeric literal (integer or float)
-
-    @Reasoning:
-    Handles various Haskell numeric formats including decimal, hexadecimal,
-    octal, binary, and floating point numbers. Supports scientific notation
-    and proper type inference.
-    @End Reasoning
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
@@ -823,14 +1056,32 @@ Process called "scan_haskell_number" takes lexer as Integer returns Integer:
     Return number_str
 End Process
 
+@Reasoning:
+Haskell string literals support a rich escape vocabulary inherited from
+C plus extensions: standard `\n`, `\t`, `\r`, `\b`, `\f`, `\v`, `\a`,
+`\\`, `\"`, `\'`, decimal numeric escapes (`\65` = 'A'), octal (`\o101`),
+hex (`\x41`), and ASCII control mnemonics (`\NUL`, `\SOH`, etc.).
+Recognising every escape variant at scan time means the parsed string
+value can be stored verbatim - the actual unescape transformation
+happens during HIR generation, not here. EOF before close-quote returns
+0 (sentinel for unterminated string error), which the caller flags.
+@End Reasoning
+
+@Implementation:
+Reads source (offset 0) and start_pos (offset 8). Calls
+advance_haskell_lexer to skip the opening `"`. Main loop while
+current_char != 34 (close-quote): EOF (-1) returns 0; backslash (92)
+advances and tests the following character against a cascade of escape
+markers (n, t, r, b, f, v, a, \, ", '). For numeric escapes, tests
+is_haskell_digit; if matches, loops consuming additional digits.
+Unknown escape chars consume one character (lenient). Plain characters
+just advance. After loop, advances past close-quote. Extracts substring
+from start_pos+1 with length = end_pos - start_pos - 2 (excludes both
+quotes).
+@End Implementation
+
 Process called "scan_haskell_string" takes lexer as Integer returns Integer:
     Note: Scan string literal with escape sequences
-
-    @Reasoning:
-    Handles Haskell string literals with full escape sequence support,
-    including Unicode escapes, control characters, and gap elimination.
-    Proper handling of multi-line strings and string gaps.
-    @End Reasoning
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
@@ -939,13 +1190,28 @@ Process called "scan_haskell_string" takes lexer as Integer returns Integer:
     Return string_str
 End Process
 
+@Reasoning:
+Haskell character literals (`Char` type) are single quoted: `'a'`, `'\n'`,
+`'\65'`, etc. Unlike strings, the body MUST be exactly one logical
+character - the scanner counts characters at the syntactic level (an
+escape sequence counts as one). Missing close quote produces 0
+(unterminated-char-literal sentinel) that the caller turns into a parse
+error. The implementation is more permissive than the spec for escape
+content (it just advances one character past the backslash); HIR
+generation does the strict validation.
+@End Reasoning
+
+@Implementation:
+Reads source and start_pos. Advances past opening `'` to enter the body.
+If body starts with 92 (`\\`), advances past the backslash then consumes
+exactly one more character (the escape body). Otherwise consumes one
+character (the literal body). Tests for closing `'` (39); if mismatch
+returns 0. Advances past close quote. Extracts substring from
+start_pos+1 with length = end_pos - start_pos - 2 (excludes quotes).
+@End Implementation
+
 Process called "scan_haskell_char" takes lexer as Integer returns Integer:
     Note: Scan character literal
-
-    @Reasoning:
-    Handles single character literals including escape sequences.
-    Supports all Haskell escape sequences and Unicode characters.
-    @End Reasoning
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
@@ -978,13 +1244,28 @@ Process called "scan_haskell_char" takes lexer as Integer returns Integer:
     Return char_str
 End Process
 
+@Reasoning:
+Haskell supports user-defined operators built from the operator-character
+alphabet (see is_haskell_operator_char). The scanner takes the MAXIMAL
+MUNCH: it consumes every operator character in a contiguous run, so
+`>>=` parses as a single operator rather than `>>` followed by `=`.
+This is essential for the language's heavily-operator-driven idioms
+(monadic bind, lens combinators, etc.). The keyword/reserved-operator
+classification (e.g., `=` is the binding arrow, `->` is the type arrow,
+`::` is type signature) happens at the parser level, not here.
+@End Reasoning
+
+@Implementation:
+Reads source (offset 0), start_pos (offset 8), current_char (offset 40).
+Loop: calls is_haskell_operator_char on current_char; breaks if returns
+0. Otherwise advances the lexer (refreshes current_char from the return
+value of advance_haskell_lexer). Computes end_pos (offset 8 again).
+operator_length = end_pos - start_pos. Extracts via StringCore.substring
+and returns the operator string.
+@End Implementation
+
 Process called "scan_haskell_operator" takes lexer as Integer returns Integer:
     Note: Scan custom operator sequence
-
-    @Reasoning:
-    Scans custom operators composed of operator symbols. Handles multi-character
-    operators and distinguishes them from individual symbols.
-    @End Reasoning
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
@@ -1010,6 +1291,21 @@ Note: ==========================================================================
 Note: Comment Handling
 Note: ============================================================================
 
+@Reasoning:
+Haskell line comments start with `--` and run to end-of-line. Caller has
+already consumed the two leading dashes; this helper just advances the
+cursor through the comment text until it sees an LF or EOF, leaving the
+newline itself for the main scanner to consume (so layout tracking still
+sees the line transition).
+@End Reasoning
+
+@Implementation:
+Reads current_char at offset 40, then loops calling advance_haskell_lexer
+until current_char is 10 (LF) or -1 (EOF). Returns 1 unconditionally.
+The LF is NOT consumed — leaving it for the main scanner avoids skipping
+the layout-significant line break.
+@End Implementation
+
 Process called "skip_haskell_line_comment" takes lexer as Integer returns Integer:
     Note: Skip single-line comment (-- to end of line)
 
@@ -1029,13 +1325,32 @@ Process called "skip_haskell_line_comment" takes lexer as Integer returns Intege
     Return 1
 End Process
 
+@Reasoning:
+Haskell block comments `{- ... -}` are uniquely NESTED in the language
+spec - unlike C, Java, or most others where the first `*/` closes the
+comment. Nested forms like `{- outer {- inner -} more outer -}` are
+fully supported. We track this with a nesting_level counter that
+increments on each `{-` encountered and decrements on each `-}`; the
+comment ends when the counter returns to 0. This implementation
+detail is what makes Haskell's documentation tools (Haddock) able to
+comment out arbitrary code blocks safely without worrying about
+embedded comment-end sequences.
+@End Reasoning
+
+@Implementation:
+Advances past the opening `{` then the `-` (caller has already detected
+the `{-` prefix). Initialises nesting_level=1. Main loop: breaks when
+nesting_level <= 0 OR current_char == -1 (EOF). Tests for `-}`:
+current_char == 45 ('-') with peek at offset 1 equal to 125 ('}') -
+advances both characters and decrements nesting_level. Tests for `{-`:
+current_char == 123 ('{') with peek == 45 ('-') - advances both and
+increments nesting_level. Otherwise advances by one character. Loop
+exit means either the outer comment closed (nesting_level == 0) or
+EOF reached (latter is malformed but tolerated).
+@End Implementation
+
 Process called "skip_haskell_block_comment" takes lexer as Integer returns Integer:
     Note: Skip block comment ({- ... -}) with nesting support
-
-    @Reasoning:
-    Haskell supports nested block comments, unlike many languages.
-    This function properly handles arbitrary nesting levels.
-    @End Reasoning
 
     Let current_char be proc advance_haskell_lexer from lexer  Note: Skip {
     Set current_char to proc advance_haskell_lexer from lexer  Note: Skip -
@@ -1078,26 +1393,34 @@ Note: ==========================================================================
 Note: Layout and Indentation Handling
 Note: ============================================================================
 
+@Reasoning:
+The layout (off-side) rule is Haskell's signature feature: indentation
+replaces explicit `{`, `;`, `}` for most block structure. The algorithm
+implemented here follows the Haskell 2010 Report section 2.7: layout
+keywords (`where`, `let`, `do`, `of`) push the column of the FOLLOWING
+non-whitespace token onto the layout_stack as the indentation
+"reference" for that scope. At the start of each line, we compare the
+new line's first-token column with the top of the stack: less = scope
+ended (synthesise `}` and pop), equal = next statement (synthesise
+`;`), greater = continuation (no synthetic token). Explicit braces in
+source override the rule and pop layout context. The pending_close_brace
+(offset 72) and pending_semicolon (offset 80) flags let the dispatcher
+emit the virtual tokens lazily on the next next_haskell_token call.
+@End Reasoning
+
+@Implementation:
+Implements Haskell 2010 layout rule (Report section 2.7). Returns 0 if
+lexer is null. Reads current_column (offset 16 - the line number slot)
+and layout_stack (offset 48). If stack is null or empty (length 0)
+returns 1 (no active layout context, no virtual token). Reads top
+indent at index stack_depth-1. Compares with current_column: less ->
+calls remove_at to pop the stack and sets pending_close_brace (offset
+72) to 1; equal -> sets pending_semicolon (offset 80) to 1; greater ->
+no-op (returns 1 without writing a flag).
+@End Implementation
+
 Process called "handle_haskell_layout" takes lexer as Integer returns Integer:
     Note: Handle Haskell layout rule (indentation-sensitive parsing)
-
-    @Reasoning:
-    Haskell uses indentation to determine block structure. This function
-    manages the layout stack and generates virtual braces and semicolons
-    based on indentation levels.
-
-    **LAYOUT ALGORITHM:**
-    1. After layout keywords (where, let, do, of), push current column to stack
-    2. At start of line, compare current column with top of stack:
-       - If column < top: pop stack, emit virtual '}'
-       - If column == top: emit virtual ';'
-       - If column > top: continue normally
-    3. When encountering explicit '}', pop layout stack
-    @End Reasoning
-
-    @Implementation
-    Implements Haskell 2010 layout rule as specified in the Report section 2.7.
-    @End Implementation
 
     If lexer is equal to 0:
         Return 0
@@ -1150,14 +1473,35 @@ Note: ==========================================================================
 Note: Main Tokenization Function
 Note: ============================================================================
 
+@Reasoning:
+Top-level token dispatcher producing one Haskell token per call. Has
+two layout-aware preludes: first, consume horizontal whitespace (space,
+tab) WITHOUT emitting virtual layout tokens (those belong at line
+starts), second, refresh line/column AFTER whitespace skip so position
+tracking on the token reflects its first character, not the preceding
+whitespace. After preludes, dispatches on current_char: alpha ->
+scan_haskell_identifier, digit -> scan_haskell_number, quote characters
+-> scan_haskell_string / scan_haskell_char, dash with peek `-` ->
+line-comment, brace with peek `-` -> block-comment, operator chars ->
+scan_haskell_operator, special punctuation -> dedicated handlers.
+@End Reasoning
+
+@Implementation:
+Reads current_char (offset 40), line (offset 16), column (offset 24).
+Whitespace-skip loop: while current_char == 32 (space) or 9 (tab),
+advances. Refreshes line and column from the lexer state. Then a
+dispatch chain: EOF -> TOKEN_EOF; alpha (via is_haskell_alpha or
+underscore) -> scan_haskell_identifier; digit -> scan_haskell_number;
+34 (`"`) -> scan_haskell_string; 39 (`'`) -> scan_haskell_char; 45
+(`-`) with peek == 45 -> skip_haskell_line_comment then recurse; 123
+(`{`) with peek == 45 -> skip_haskell_block_comment then recurse;
+operator-char -> scan_haskell_operator; specific punctuation (commas,
+parens, brackets, semicolons, backticks) -> create_haskell_token with
+the corresponding TOKEN_* constant.
+@End Implementation
+
 Process called "next_haskell_token" takes lexer as Integer returns Integer:
     Note: Get next token from Haskell source
-
-    @Reasoning:
-    Main tokenization loop that identifies and returns the next token.
-    Handles all Haskell syntax including keywords, operators, literals,
-    identifiers, and special symbols.
-    @End Reasoning
 
     Let current_char be proc memory_get_int64 from Layout with lexer, 40
     Let line be proc memory_get_int64 from Layout with lexer, 16
@@ -1475,14 +1819,29 @@ Note: ==========================================================================
 Note: Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Diagnostic / counting entry point: tokenises a complete Haskell source
+string and returns the count of meaningful tokens (excluding the EOF
+sentinel). Useful for source-stats tools and as a smoke-test for the
+lexer pipeline. Tokens are destroyed immediately after counting so the
+function has bounded memory use even on huge inputs. Real callers who
+want to consume the tokens use next_haskell_token directly on a lexer
+they own.
+@End Reasoning
+
+@Implementation:
+Creates a lexer via create_haskell_lexer(source_code); returns 0 if
+that fails. Initialises tokens=0 (placeholder for unused list) and
+token_count=0. Loop: calls next_haskell_token; if returns 0
+(unrecoverable lex error), breaks. Reads token_type at offset 0; if
+TOKEN_EOF, destroys the token and breaks. Otherwise bumps token_count
+and destroys the token (the count is the return value; the actual
+tokens are not retained). After loop, destroys the lexer and returns
+token_count.
+@End Implementation
+
 Process called "tokenize_haskell" takes source_code as Integer returns Integer:
     Note: Tokenize entire Haskell source into list of tokens
-
-    @Reasoning:
-    Convenience function to tokenize complete source code into a list.
-    Useful for batch processing and testing. Creates all tokens at once
-    for easy manipulation and analysis.
-    @End Reasoning
 
     Let lexer be proc create_haskell_lexer from source_code
     If lexer is equal to 0:
@@ -1518,6 +1877,17 @@ Note: ==========================================================================
 Note: Token Access Functions
 Note: ============================================================================
 
+@Reasoning:
+Accessor that hides the offset-0 layout of HaskellToken from the parser
+so any future re-layout of the token record only needs this function
+updated. Returns TOKEN_UNKNOWN on a null token to keep callers safe.
+@End Reasoning
+
+@Implementation:
+Null guard returns TOKEN_UNKNOWN (9002); on a live token reads i64 at
+offset 0 via Layout.memory_get_int64.
+@End Implementation
+
 Process called "get_haskell_token_type" takes token as Integer returns Integer:
     Note: Get token type from token structure
 
@@ -1527,6 +1897,17 @@ Process called "get_haskell_token_type" takes token as Integer returns Integer:
 
     Return proc memory_get_int64 from Layout with token, 0
 End Process
+
+@Reasoning:
+Accessor for the lexeme string handle. Null-safe so callers can blindly
+chain get_haskell_token_value on an unwrapped lookahead result.
+@End Reasoning
+
+@Implementation:
+Null guard returns 0 (representing a null string handle); on a live token
+reads i64 at offset 8. The returned handle is borrowed — token retains
+ownership semantics via its own destroy_haskell_token.
+@End Implementation
 
 Process called "get_haskell_token_value" takes token as Integer returns Integer:
     Note: Get token value string from token structure
@@ -1538,6 +1919,17 @@ Process called "get_haskell_token_value" takes token as Integer returns Integer:
     Return proc memory_get_int64 from Layout with token, 8
 End Process
 
+@Reasoning:
+Diagnostic location accessor. Null guard returns 0 rather than -1 so
+error formatters that print "line 0" can be distinguished from real
+locations.
+@End Reasoning
+
+@Implementation:
+Null guard returns 0; on a live token reads i64 at offset 16. Line
+numbers are 1-based (set by create_haskell_lexer to 1).
+@End Implementation
+
 Process called "get_haskell_token_line" takes token as Integer returns Integer:
     Note: Get token line number
 
@@ -1547,6 +1939,17 @@ Process called "get_haskell_token_line" takes token as Integer returns Integer:
 
     Return proc memory_get_int64 from Layout with token, 16
 End Process
+
+@Reasoning:
+Companion to get_haskell_token_line for the column component of a token
+location. Used by error formatters to produce "file:line:column"
+diagnostic prefixes.
+@End Reasoning
+
+@Implementation:
+Null guard returns 0; on a live token reads i64 at offset 24. Columns
+are 1-based and tab-expanded per the lexer's advance_haskell_lexer.
+@End Implementation
 
 Process called "get_haskell_token_column" takes token as Integer returns Integer:
     Note: Get token column number

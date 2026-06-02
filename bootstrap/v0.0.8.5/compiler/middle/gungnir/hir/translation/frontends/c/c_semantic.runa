@@ -44,6 +44,21 @@ Note: ==========================================================================
 Note: Semantic Analyzer State
 Note: ============================================================================
 
+@Reasoning:
+C semantic analyzer state: holds the lexical-scope stack plus a sticky
+error channel. Storing current_scope separately from the stack top is
+a microoptimization — direct read at offset 8 avoids a List index
+operation on every lookup. The two stay synchronised via push/pop.
+@End Reasoning
+
+@Implementation:
+40-byte record (5 x i64). Offsets: global_scope (0, Dict, the program-
+wide symbol table, never popped), current_scope (8, alias of stack
+top, used for direct add_symbol writes), scope_stack (16, List of
+Dicts), error_message (24, owned StringCore copy), has_error (32,
+sticky flag).
+@End Implementation
+
 Type called "CSemanticAnalyzer":
     global_scope as Integer       Note: Global symbol table
     current_scope as Integer      Note: Current scope symbol table
@@ -55,6 +70,21 @@ End Type
 Note: ============================================================================
 Note: Symbol Table Entry
 Note: ============================================================================
+
+@Reasoning:
+Symbol table entry: every name binding (variable, function, struct,
+union, enum, typedef) is represented uniformly with a kind tag plus
+type info. Storing kind alongside type_info means lookup-and-classify
+is one operation: lookup_symbol returns the symbol pointer, then the
+caller checks symbol_type to decide what to do with type_info.
+@End Reasoning
+
+@Implementation:
+32-byte record (4 x i64). Offsets: name (0, owned string copy),
+symbol_type (8, SYMBOL_* constant), type_info (16, points to the
+declaration's type AST node), attributes (24, reserved for future
+extensions like storage class, linkage, qualifiers).
+@End Implementation
 
 Type called "CSymbol":
     name as Integer           Note: Symbol name
@@ -74,6 +104,21 @@ Constant SYMBOL_TYPEDEF as Integer is 6
 Note: ============================================================================
 Note: Analyzer Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Constructs the analyzer with an initial empty global scope and an
+empty scope stack containing only that global scope. Pushing the
+global onto the stack means push_scope/pop_scope can be symmetric
+without special-casing the bottom of the stack.
+@End Reasoning
+
+@Implementation:
+40-byte allocation, OOM short-circuit. Creates the global_scope Dict
+and scope_stack List; OOM at either stage unwinds prior allocations
+to prevent leaks. Writes global_scope at both offset 0 and offset 8
+(current_scope mirror). Initial scope_stack contains global_scope
+via an append call. Returns analyzer or 0 on failure.
+@End Implementation
 
 Process called "create_semantic_analyzer" returns Integer:
     Note: Create semantic analyzer with global scope
@@ -112,6 +157,20 @@ Process called "create_semantic_analyzer" returns Integer:
     Return analyzer
 End Process
 
+@Reasoning:
+Tears down the analyzer along with every scope and the error message.
+Note that the scope_stack List destruction doesn't destroy the
+per-scope Dicts (other than global) — those should have been freed
+by pop_scope as scopes were exited; this destructor handles the
+straight-line case where popping wasn't fully completed.
+@End Reasoning
+
+@Implementation:
+Null analyzer returns 1 (defensive double-free). Destroys global_scope
+Dict (offset 0), scope_stack List (offset 16), error_message buffer
+(offset 24) if non-null. Then deallocates the 40-byte analyzer struct.
+@End Implementation
+
 Process called "destroy_semantic_analyzer" takes analyzer as Integer returns Integer:
     Note: Destroy semantic analyzer and free resources
 
@@ -146,6 +205,20 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Records the most recent semantic error message, overwriting any
+previous. Last-error-wins suits C semantics because the leaf error
+(e.g., undefined identifier in a deeply-nested expression) is usually
+more actionable than the outer "function failed" message.
+@End Reasoning
+
+@Implementation:
+Reads existing error pointer at offset 24; frees it if non-null to
+prevent leak. Allocates msg_length+1 bytes, copies the message via
+memory_copy, NUL-terminates. Stores the new pointer at offset 24.
+Sets has_error to 1 at offset 32 (sticky thereafter).
+@End Implementation
+
 Process called "set_semantic_error" takes analyzer as Integer, message as Integer returns Integer:
     Note: Set semantic error message
 
@@ -169,6 +242,15 @@ Process called "set_semantic_error" takes analyzer as Integer, message as Intege
     Return 1
 End Process
 
+@Reasoning:
+Predicate for the sticky-error flag, polled by validate_program after
+every top-level declaration to decide whether to abort.
+@End Reasoning
+
+@Implementation:
+Returns the int64 at offset 32. 0/1 boolean.
+@End Implementation
+
 Process called "has_semantic_error" takes analyzer as Integer returns Integer:
     Note: Check if analyzer has error
 
@@ -176,6 +258,16 @@ Process called "has_semantic_error" takes analyzer as Integer returns Integer:
 
     Return has_error
 End Process
+
+@Reasoning:
+Public accessor exposing the (analyzer-owned) error message pointer
+for diagnostic formatting.
+@End Reasoning
+
+@Implementation:
+Returns the pointer at offset 24. Callers must not free — the
+analyzer's destructor owns the buffer.
+@End Implementation
 
 Process called "get_semantic_error" takes analyzer as Integer returns Integer:
     Note: Get semantic error message
@@ -188,6 +280,19 @@ End Process
 Note: ============================================================================
 Note: Scope Management
 Note: ============================================================================
+
+@Reasoning:
+Enters a new lexical scope by allocating a fresh symbol table Dict
+and pushing it onto the stack. The current_scope mirror at offset 8
+is updated so add_symbol writes to the new (innermost) scope.
+@End Reasoning
+
+@Implementation:
+Creates a new Dict for the scope's symbol table; OOM returns 0.
+Appends the Dict to scope_stack at offset 16. Writes the new Dict
+pointer to current_scope at offset 8, displacing the previous
+current scope (which is still reachable via the stack).
+@End Implementation
 
 Process called "push_scope" takes analyzer as Integer returns Integer:
     Note: Push new scope onto scope stack
@@ -205,6 +310,21 @@ Process called "push_scope" takes analyzer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Exits the current lexical scope by popping the stack, destroying the
+popped Dict, and updating current_scope to point at the new top.
+Refuses to pop the global scope (stack size 1) — global must remain
+for top-level symbol lookups even after all blocks exit.
+@End Reasoning
+
+@Implementation:
+Reads scope_stack and checks size; <= 1 returns 0 (refuse to pop
+global). Pops the top via proc pop from List, destroys the popped
+Dict (its symbols are no longer reachable). Then reads the new top
+via get_at (size-1 -1 == new size -1), writes back to current_scope
+at offset 8.
+@End Implementation
 
 Process called "pop_scope" takes analyzer as Integer returns Integer:
     Note: Pop scope from scope stack
@@ -234,6 +354,21 @@ Note: ==========================================================================
 Note: Symbol Table Operations
 Note: ============================================================================
 
+@Reasoning:
+Factory for the CSymbol record. The name is copied (owned by symbol)
+so subsequent lexer/parser reuse of the original string buffer doesn't
+corrupt symbol table entries.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes for the symbol struct, OOM short-circuit. Computes
+name_length, allocates name_length+1, copies via memory_copy and
+NUL-terminates. Writes name_copy (0), symbol_type (8), type_info (16),
+attributes=0 (24). type_info pointer is aliased (not copied) because
+type AST nodes are owned by the parser-produced AST which outlives
+the analyzer.
+@End Implementation
+
 Process called "create_symbol" takes name as Integer, symbol_type as Integer, type_info as Integer returns Integer:
     Note: Create symbol entry
 
@@ -260,6 +395,21 @@ Process called "create_symbol" takes name as Integer, symbol_type as Integer, ty
     Return symbol
 End Process
 
+@Reasoning:
+Inserts a new symbol into the innermost scope. Same-scope redeclaration
+is a C error (multiple definition); the check uses Dict.contains rather
+than lookup_symbol because we only want to detect collisions in the
+current scope, not shadow-conflicts across enclosing scopes (shadowing
+is legal in C).
+@End Reasoning
+
+@Implementation:
+Reads current_scope at offset 8. Uses Dict.contains to check if name
+already exists in this scope — on collision sets a "Symbol already
+defined" error and returns 0. Otherwise creates the CSymbol via
+create_symbol and inserts into the scope Dict.
+@End Implementation
+
 Process called "add_symbol" takes analyzer as Integer, name as Integer, symbol_type as Integer, type_info as Integer returns Integer:
     Note: Add symbol to current scope
 
@@ -284,13 +434,22 @@ Process called "add_symbol" takes analyzer as Integer, name as Integer, symbol_t
     Return 1
 End Process
 
+@Reasoning:
+Inner-to-outer scope traversal implements lexical shadowing: an inner
+binding hides an outer one with the same name. Linear search through
+the scope stack is acceptable because real-world C scope depths are
+small (typically 3-5 nested function/block levels).
+@End Reasoning
+
+@Implementation:
+Reads scope_stack and its size. Iterates from index size-1 (innermost)
+down to 0 (global). At each scope, uses Dict.contains to check
+membership; on hit returns the symbol via Dict.get. On miss across
+all scopes returns 0 (undefined symbol).
+@End Implementation
+
 Process called "lookup_symbol" takes analyzer as Integer, name as Integer returns Integer:
     Note: Look up symbol in current scope and parent scopes
-
-    @Reasoning:
-    Search from innermost scope to outermost scope (global).
-    Return first match found.
-    @End Reasoning
 
     Let scope_stack be proc memory_get_int64 from Layout with analyzer, 16
     Let stack_size be proc size from List with scope_stack
@@ -314,6 +473,21 @@ End Process
 Note: ============================================================================
 Note: Type Checking
 Note: ============================================================================
+
+@Reasoning:
+Strips through pointer and array wrappers to return the underlying
+type's name string. Used by type predicates (is_integer_type,
+is_float_type) which only care about the base type, not the layers
+of indirection.
+@End Reasoning
+
+@Implementation:
+Null type_node returns 0. Reads node_type at offset 0. For
+C_TYPE_NODE (a simple type like "int") returns the name string from
+offset 8. For C_POINTER_TYPE or C_ARRAY_TYPE reads the base type at
+offset 24 and recurses. Anything else returns 0 — unknown shapes
+are treated as "unnameable".
+@End Implementation
 
 Process called "get_type_name" takes type_node as Integer returns Integer:
     Note: Get type name from type node
@@ -345,16 +519,26 @@ Process called "get_type_name" takes type_node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Structural type compatibility check. Two types are compatible iff
+they have the same shape (both simple, both pointer, both array) and
+their components are compatible. Implicit conversions (int -> double,
+etc.) are deliberately NOT considered here — that's the responsibility
+of arithmetic-conversion logic elsewhere. This routine answers "are
+these the same type up to recursive identity".
+@End Reasoning
+
+@Implementation:
+Null on either side returns 0 (incompatible). Reads both node types.
+Three branches: simple-simple compares the name strings via
+strings_equal; pointer-pointer recurses on base types at offset 24;
+array-array first compares sizes (offset 16) then recurses on base
+types. Mixed-kind comparisons (pointer-array, etc.) return 0 — the
+caller must handle pointer-array decay separately if needed.
+@End Implementation
+
 Process called "types_compatible" takes type1 as Integer, type2 as Integer returns Integer:
     Note: Check if two types are compatible
-
-    @Reasoning:
-    Types are compatible if:
-    - They are the same primitive type
-    - Both are pointers to compatible types
-    - Both are arrays of compatible types with same size
-    - One is compatible with the other via implicit conversion
-    @End Reasoning
 
     If type1 is equal to 0:
         Return 0
@@ -405,6 +589,21 @@ Process called "types_compatible" takes type1 as Integer, type2 as Integer retur
     Return 0  Note: Types not compatible
 End Process
 
+@Reasoning:
+Tests if a type is one of the C integer family used by index, bitwise,
+and modulus operations. Recognizes the four canonical integer width
+names: int, char, short, long. Unsigned variants and the
+fixed-width int8_t/int32_t/etc. are not covered — they would need
+additional cases here.
+@End Reasoning
+
+@Implementation:
+Calls get_type_name to strip pointer/array wrappers (so `int[5]` and
+`int*` both test as integer's base). On null name returns 0. Otherwise
+four sequential strings_equal calls against the canonical names.
+First match returns 1; falling through returns 0.
+@End Implementation
+
 Process called "is_integer_type" takes type_node as Integer returns Integer:
     Note: Check if type is integer type
 
@@ -441,6 +640,17 @@ Process called "is_integer_type" takes type_node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Companion to is_integer_type for the floating-point family.
+Recognizes float and double; long double is intentionally omitted
+to match the bootstrap subset.
+@End Reasoning
+
+@Implementation:
+Calls get_type_name. Two strings_equal checks against "float" and
+"double". Returns 1 on either match, 0 otherwise.
+@End Implementation
+
 Process called "is_float_type" takes type_node as Integer returns Integer:
     Note: Check if type is floating-point type
 
@@ -465,6 +675,18 @@ Process called "is_float_type" takes type_node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Single-step predicate: is this node a pointer type at the top level
+(not whether the underlying name is pointer-like). Used by deref-op
+checks where the immediate type's shape determines legality.
+@End Reasoning
+
+@Implementation:
+Null returns 0. Reads node_type at offset 0; returns 1 if equal to
+C_POINTER_TYPE from Parser, else 0. Does not strip array wrappers
+because `(int*)[3]` and `int[3]` are distinct types in C.
+@End Implementation
+
 Process called "is_pointer_type" takes type_node as Integer returns Integer:
     Note: Check if type is pointer type
 
@@ -484,6 +706,28 @@ End Process
 Note: ============================================================================
 Note: Expression Type Checking
 Note: ============================================================================
+
+@Reasoning:
+Bottom-up type inference for C expressions. Each expression-kind has
+its own type-derivation rule encoded as a dedicated helper. The
+top-level routine dispatches on the AST node kind and either inlines
+the literal/identifier case or delegates. Returned type is a type
+AST node (either pre-existing in the type info or newly constructed
+for literals).
+@End Reasoning
+
+@Implementation:
+Null expr returns 0. Reads node_type at offset 0 and dispatches.
+C_LITERAL_EXPR: constructs a fresh type AST node based on the
+literal token type (TOKEN_INTEGER -> "int" or "long" based on
+2^31 threshold, TOKEN_FLOAT -> "double", TOKEN_STRING -> "char*",
+TOKEN_CHARACTER -> "char"); falls back to "int" if classification
+fails. C_IDENTIFIER_EXPR: lookup_symbol on the name; on miss sets
+"Undefined identifier" and returns 0, otherwise returns symbol's
+type_info. The five other expression kinds (binary, unary, call,
+subscript, member, assignment) delegate to their specialised
+checkers.
+@End Implementation
 
 Process called "check_expression_type" takes analyzer as Integer, expr_node as Integer returns Integer:
     Note: Check expression and return its type
@@ -579,6 +823,23 @@ Process called "check_expression_type" takes analyzer as Integer, expr_node as I
     Return 0
 End Process
 
+@Reasoning:
+Binary expression typing: derives both operand types, verifies they
+are compatible (no implicit conversion in this layer), and returns
+the left type as the result type. For arithmetic, comparison, and
+logical operators on compatible operands this is approximately
+correct; the simplification of returning left rather than applying
+the usual-arithmetic-conversions is a known limitation.
+@End Reasoning
+
+@Implementation:
+Reads children list at offset 32, takes index 0 (left) and 1 (right).
+Recursively types both. On either failing (returns 0) propagates the
+failure. Calls types_compatible; on incompatibility sets "Type
+mismatch in binary expression" and returns 0. Otherwise returns
+left_type as the result.
+@End Implementation
+
 Process called "check_binary_expression" takes analyzer as Integer, expr_node as Integer returns Integer:
     Note: Check binary expression and return result type
 
@@ -608,6 +869,23 @@ Process called "check_binary_expression" takes analyzer as Integer, expr_node as
     Note: Result type is same as operands for arithmetic/logical operators
     Return left_type
 End Process
+
+@Reasoning:
+Two special unary operators change type: `&` (address-of) wraps the
+operand type in a new pointer-type node, and `*` (dereference)
+unwraps a pointer type to its base. Other unary operators (-, +, !,
+~, ++, --) preserve the operand's type. Dereferencing a non-pointer
+is a hard error caught here.
+@End Reasoning
+
+@Implementation:
+Reads operand at children[0], recursively types it. On null propagates
+0. Reads operator string from offset 16. Branches on `&` -> creates
+C_POINTER_TYPE with operand_type stored at the base slot; `*` ->
+checks is_pointer_type, sets "Cannot dereference non-pointer type"
+on failure, otherwise returns the base type at offset 24. Default
+fallthrough returns operand_type unchanged.
+@End Implementation
 
 Process called "check_unary_expression" takes analyzer as Integer, expr_node as Integer returns Integer:
     Note: Check unary expression and return result type
@@ -651,6 +929,22 @@ Process called "check_unary_expression" takes analyzer as Integer, expr_node as 
     Return operand_type
 End Process
 
+@Reasoning:
+Function call typing: resolves the callee name to a symbol, verifies
+it's a function (not a variable), and returns the function's return
+type. Argument-type checking against the declared parameter types
+is not currently performed here — known gap, would need parameter
+type list on the symbol.
+@End Reasoning
+
+@Implementation:
+Reads children[0] as the function-name expression. Reads the name
+string at offset 8. lookup_symbol; on miss "Undefined function".
+Reads symbol_type at offset 8 of the symbol; if not SYMBOL_FUNCTION
+sets "Not a function". Otherwise returns the symbol's type_info
+(offset 16) which is the function's return type AST node.
+@End Implementation
+
 Process called "check_call_expression" takes analyzer as Integer, expr_node as Integer returns Integer:
     Note: Check function call and return return type
 
@@ -678,6 +972,24 @@ Process called "check_call_expression" takes analyzer as Integer, expr_node as I
 
     Return func_type_info
 End Process
+
+@Reasoning:
+Array subscript `arr[i]`: the index must be an integer type, and the
+subscripted value must be either an array or a pointer (pointer
+subscripting is the well-known C idiom). The result type is the
+element type — for arrays that's the base; for pointers it's the
+pointee.
+@End Reasoning
+
+@Implementation:
+Reads children[0] (array_expr) and children[1] (index_expr). Recursively
+types both. Verifies index_type is integer via is_integer_type; sets
+"Array index must be integer" on failure. Branches on array_type's
+node kind: C_ARRAY_TYPE returns the base type at offset 24;
+C_POINTER_TYPE returns the pointee type also at offset 24 (same
+slot in both representations). Other kinds set "Subscript operator
+requires array or pointer" and return 0.
+@End Implementation
 
 Process called "check_subscript_expression" takes analyzer as Integer, expr_node as Integer returns Integer:
     Note: Check array subscript and return element type
@@ -721,6 +1033,24 @@ Process called "check_subscript_expression" takes analyzer as Integer, expr_node
     proc set_semantic_error with analyzer, "Subscript operator requires array or pointer"
     Return 0
 End Process
+
+@Reasoning:
+Struct/union member access `s.field` or `s->field`. Resolves the
+member name against the struct definition's member list, returning
+the matched member's type. Hard-errors on undefined struct, no
+members, or missing member.
+@End Reasoning
+
+@Implementation:
+Reads struct_expr from children[0] and types it. Reads member_name
+from the expression node (offset 16). Looks up the struct definition
+symbol by struct_name, then reads the member list from struct_def
+offset 32. Iterates members, comparing each member's name (at
+member offset 8) to the requested name via string_equals. On match
+returns the member's type_info (offset 24); when missing, falls back
+to a default int type AST node so downstream passes can continue.
+On total miss sets "Member not found in struct/union".
+@End Implementation
 
 Process called "check_member_expression" takes analyzer as Integer, expr_node as Integer returns Integer:
     Note: Check struct/union member access
@@ -786,6 +1116,20 @@ Process called "check_member_expression" takes analyzer as Integer, expr_node as
     Return 0
 End Process
 
+@Reasoning:
+Assignment expression `lhs = rhs` returns the LHS type (so chained
+assignments `a = b = c` work correctly). Types must be compatible —
+C does allow some implicit conversions in assignment but this layer
+treats those as caller's responsibility.
+@End Reasoning
+
+@Implementation:
+Reads children[0] (left, the lvalue) and children[1] (right, the
+value expression). Recursively types both. types_compatible check;
+on incompatibility sets "Type mismatch in assignment" and returns 0.
+Otherwise returns left_type.
+@End Implementation
+
 Process called "check_assignment_expression" takes analyzer as Integer, expr_node as Integer returns Integer:
     Note: Check assignment expression
 
@@ -818,6 +1162,26 @@ End Process
 Note: ============================================================================
 Note: Statement Validation
 Note: ============================================================================
+
+@Reasoning:
+Recursive statement validator covering C's compound and control
+statements. Compound statements push/pop a new scope so block-local
+variables don't leak out. Expression statements just check the
+expression's type for its side-effects. Each control statement
+checks its condition expression and recurses into nested statements.
+@End Reasoning
+
+@Implementation:
+Null stmt returns 1 (vacuously valid). Reads node_type at offset 0.
+Six branches: C_COMPOUND_STMT pushes scope, iterates children
+validating each, pops scope. C_EXPR_STMT type-checks the wrapped
+expression. C_IF_STMT type-checks condition (children[0]), validates
+then-branch (children[1]), and validates else-branch (children[2])
+if present. C_WHILE_STMT validates condition + body. C_FOR_STMT
+optionally validates init/cond/incr/body based on children count.
+C_RETURN_STMT optionally type-checks the return value. Unknown
+statement kinds return 1 (treated as no-op for unknown forms).
+@End Implementation
 
 Process called "validate_statement" takes analyzer as Integer, stmt_node as Integer returns Integer:
     Note: Validate statement node
@@ -931,6 +1295,23 @@ Note: ==========================================================================
 Note: Declaration Validation
 Note: ============================================================================
 
+@Reasoning:
+Adds a variable to the current scope's symbol table and, if an
+initializer is present, validates that its type is compatible with
+the declared type. Validation is best-effort: missing initializer
+type info (returns 0) is treated as "couldn't check, continue" rather
+than failure.
+@End Reasoning
+
+@Implementation:
+Reads var_name at offset 8 and var_type at offset 24. Calls add_symbol
+with SYMBOL_VARIABLE — collision in current scope is signalled by
+add_symbol's "Symbol already defined" error. If the var node has
+children, the first child is the initializer expression; type-check
+it and call types_compatible against var_type. On incompatibility
+sets "Type mismatch in initialization" and returns 0.
+@End Implementation
+
 Process called "validate_variable_declaration" takes analyzer as Integer, var_node as Integer returns Integer:
     Note: Validate variable declaration and add to symbol table
 
@@ -960,6 +1341,23 @@ Process called "validate_variable_declaration" takes analyzer as Integer, var_no
 
     Return 1
 End Process
+
+@Reasoning:
+Adds the function to the current (typically global) scope, then opens
+a new scope for the function body where parameter symbols and local
+variables can be added. The function scope is popped after the body
+validation completes, restoring the previous scope.
+@End Reasoning
+
+@Implementation:
+Reads func_name at offset 8, return_type at offset 24. add_symbol
+registers the function with SYMBOL_FUNCTION kind. push_scope opens
+a new scope. Iterates children at offset 32: C_PARAMETER children
+each register a SYMBOL_VARIABLE with the parameter's type;
+C_COMPOUND_STMT children invoke validate_statement (the function body).
+pop_scope on exit. Returns 1 unconditionally — errors propagate via
+the sticky-error channel.
+@End Implementation
 
 Process called "validate_function_declaration" takes analyzer as Integer, func_node as Integer returns Integer:
     Note: Validate function declaration and add to symbol table
@@ -1005,13 +1403,26 @@ Note: ==========================================================================
 Note: Program Validation (Top-Level)
 Note: ============================================================================
 
+@Reasoning:
+Top-level analyzer that walks every program-level declaration in order
+(functions, variables, etc.). Iterating in source order means a
+function defined later in the file isn't visible to one defined
+earlier — matching C's "must declare before use" semantics. After
+each declaration checks has_semantic_error and aborts on first
+failure.
+@End Reasoning
+
+@Implementation:
+Null program returns 0. Reads children list at offset 32. Iterates
+the children, dispatching on each child's node_type: C_FUNCTION ->
+validate_function_declaration; C_VARIABLE -> validate_variable_declaration.
+Other kinds (struct, union, enum, typedef) are currently ignored —
+known gap, would need their own validators. After each iteration
+checks has_semantic_error; non-zero short-circuits to 0.
+@End Implementation
+
 Process called "validate_program" takes analyzer as Integer, program_node as Integer returns Integer:
     Note: Validate entire C program
-
-    @Reasoning:
-    Walk through all top-level declarations (functions, variables, structs)
-    and validate each one, building symbol table and checking types.
-    @End Reasoning
 
     If program_node is equal to 0:
         Return 0
@@ -1045,13 +1456,23 @@ Process called "validate_program" takes analyzer as Integer, program_node as Int
     Return 1
 End Process
 
+@Reasoning:
+Public entry point. Manages analyzer lifetime so callers don't need to
+think about scope-stack/Dict resource cleanup. Returns success/failure
+as a single boolean.
+@End Reasoning
+
+@Implementation:
+create_semantic_analyzer — on OOM returns 0 with no cleanup needed
+since the analyzer wasn't created. validate_program walks the AST.
+has_semantic_error check distinguishes success from failure;
+destroy_semantic_analyzer cleans up in either case so the analyzer
+never leaks. Returns the validate_program result on success, 0 on
+error.
+@End Implementation
+
 Process called "analyze_c_program" takes program_node as Integer returns Integer:
     Note: Analyze C program (top-level entry point)
-
-    @Reasoning:
-    Entry point for semantic analysis. Create analyzer, validate program,
-    and return success/failure.
-    @End Reasoning
 
     Let analyzer be proc create_semantic_analyzer
 

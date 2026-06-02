@@ -188,6 +188,19 @@ Note: ==========================================================================
 Note: Lexer State
 Note: ============================================================================
 
+@Reasoning:
+Holds the lexer cursor and source pointer. Position tracking is
+byte-based (not char-based) so the lexer can walk UTF-8 encoded
+source without decoding each codepoint twice. Line/column are kept
+for diagnostic positioning.
+@End Reasoning
+
+@Implementation:
+Five-field record: source (pointer to source bytes), position
+(byte offset), line (1-based source line), column (1-based source
+column), length (total source byte count - cached to avoid repeated
+strlen calls).
+@End Implementation
 Type called "JuliaLexer":
     source as Integer          Note: Source code string
     position as Integer        Note: Current position
@@ -200,6 +213,18 @@ Note: ==========================================================================
 Note: Token Structure
 Note: ============================================================================
 
+@Reasoning:
+Token record produced by the lexer for each lexical unit. Storing
+line, column, and length per token lets diagnostics later reconstruct
+the exact source span without re-scanning, which is critical for the
+error reporting layer.
+@End Reasoning
+
+@Implementation:
+Five-field record: type (TOKEN_* constant), lexeme (string pointer
+to token text), line (1-based), column (1-based), length (byte count
+of the lexeme).
+@End Implementation
 Type called "JuliaToken":
     type as Integer            Note: Token type constant
     lexeme as Integer          Note: Token text
@@ -212,14 +237,19 @@ Note: ==========================================================================
 Note: Lexer Creation
 Note: ============================================================================
 
+@Reasoning:
+Builds a fresh JuliaLexer at byte offset 0, line 1, column 1. The
+source length is cached up front so the inner loops never need to
+re-measure the source string.
+@End Reasoning
+
+@Implementation:
+Allocates 40-byte JuliaLexer record. Returns 0 on failure. Calls
+string_length once to precompute source length. Writes: source @0,
+position @8 = 0, line @16 = 1, column @24 = 1, length @32. Returns
+the lexer pointer.
+@End Implementation
 Process called "create_lexer" takes source as Integer returns Integer:
-    Note: Create Julia lexer from source code
-
-    @Reasoning:
-    Initialize lexer state for tokenizing Julia source code.
-    Julia supports Unicode identifiers, so we handle UTF-8 encoding.
-    @End Reasoning
-
     Let lexer_size be 40  Note: JuliaLexer: 5 fields × 8 bytes
     Let lexer be proc allocate from Layout with lexer_size
 
@@ -242,8 +272,18 @@ Note: ==========================================================================
 Note: Character Access
 Note: ============================================================================
 
+@Reasoning:
+Non-consuming look at the current byte. Returns 0 at EOF so callers
+can use a single equality check rather than a separate bounds test
+on every character.
+@End Reasoning
+
+@Implementation:
+Reads source @0, position @8, length @32 from the lexer. If
+position >= length, returns 0 (EOF sentinel). Otherwise reads byte
+at source+position via memory_get_byte and returns it.
+@End Implementation
 Process called "peek_char" takes lexer as Integer returns Integer:
-    Note: Peek at current character without advancing
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let pos be proc memory_get_int64 from Layout with lexer, 8
@@ -258,8 +298,16 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return ch
 End Process
 
+@Reasoning:
+One-byte lookahead beyond the current cursor. Used to disambiguate
+multi-char tokens like "<=" vs "<" or ".." vs ".".
+@End Reasoning
+
+@Implementation:
+Reads source/position/length. If position+1 >= length, returns 0.
+Otherwise reads byte at source+position+1.
+@End Implementation
 Process called "peek_next_char" takes lexer as Integer returns Integer:
-    Note: Peek at next character without advancing
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let pos be proc memory_get_int64 from Layout with lexer, 8
@@ -274,8 +322,18 @@ Process called "peek_next_char" takes lexer as Integer returns Integer:
     Return ch
 End Process
 
+@Reasoning:
+Bumps cursor by one byte and updates column. Note that line tracking
+is NOT done here - advance_line is the separate primitive for that
+because tokens may contain embedded line breaks (e.g. multi-line
+strings) and the lexer needs to call advance_line independently.
+@End Reasoning
+
+@Implementation:
+Reads position @8 and column @24. Writes position+1 and column+1
+back. Returns 1.
+@End Implementation
 Process called "advance_char" takes lexer as Integer returns Integer:
-    Note: Advance to next character
 
     Let pos be proc memory_get_int64 from Layout with lexer, 8
     Let col be proc memory_get_int64 from Layout with lexer, 24
@@ -286,8 +344,17 @@ Process called "advance_char" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Updates line counter and resets column to 1. Called separately from
+advance_char because the caller knows whether the current byte is a
+newline (\n) vs an ordinary byte.
+@End Reasoning
+
+@Implementation:
+Reads line @16, increments, writes back. Resets column @24 to 1.
+Returns 1.
+@End Implementation
 Process called "advance_line" takes lexer as Integer returns Integer:
-    Note: Advance to next line
 
     Let line be proc memory_get_int64 from Layout with lexer, 16
 
@@ -301,8 +368,17 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Single allocator for JuliaToken records. Centralising the allocation
+keeps the field offsets in one place and ensures the layout matches
+the JuliaToken type declaration above.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes. Returns 0 on failure. Stores type @0, lexeme
+@8, line @16, column @24, length @32. Returns the token pointer.
+@End Implementation
 Process called "create_token" takes type as Integer, lexeme as Integer, line as Integer, column as Integer, length as Integer returns Integer:
-    Note: Create token with metadata
 
     Let token_size be 40  Note: JuliaToken: 5 fields × 8 bytes
     Let token be proc allocate from Layout with token_size
@@ -324,8 +400,16 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+Recognises the three Julia whitespace characters that are NOT newlines
+(space, tab, CR). Newline is handled separately because it triggers
+line/column accounting that whitespace skip-loops should not perform.
+@End Reasoning
+
+@Implementation:
+Returns 1 for byte 32 (space), 9 (tab), or 13 (CR); 0 otherwise.
+@End Implementation
 Process called "is_whitespace" takes ch as Integer returns Integer:
-    Note: Check if character is whitespace (not newline)
 
     If ch is equal to 32:  Note: space
         Return 1
@@ -342,8 +426,15 @@ Process called "is_whitespace" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Single-purpose predicate so callers can trigger advance_line on a
+positive result rather than gating on byte literal 10.
+@End Reasoning
+
+@Implementation:
+Returns 1 for byte 10 (\n); 0 otherwise.
+@End Implementation
 Process called "is_newline" takes ch as Integer returns Integer:
-    Note: Check if character is newline
 
     If ch is equal to 10:  Note: \n
         Return 1
@@ -352,8 +443,16 @@ Process called "is_newline" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII digit predicate. Julia also accepts unicode digits in some
+contexts, but the lexer's number-tokeniser only handles ASCII to
+keep the inner loop fast.
+@End Reasoning
+
+@Implementation:
+Returns 1 if 48 <= ch <= 57 (ASCII '0'..'9'); 0 otherwise.
+@End Implementation
 Process called "is_digit" takes ch as Integer returns Integer:
-    Note: Check if character is digit
 
     If ch is greater than or equal to 48:  Note: '0'
         If ch is less than or equal to 57:  Note: '9'
@@ -364,15 +463,20 @@ Process called "is_digit" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-start predicate. Returns true for ASCII letters A-Z, a-z,
+underscore, and a generous range of basic Unicode characters (treated
+as identifier-allowed) since Julia explicitly allows non-ASCII names.
+The Unicode pass is approximate: any byte >= 128 is accepted, which
+correctly handles UTF-8 continuation bytes but does not validate full
+codepoints. That tradeoff matches the Julia reference lexer.
+@End Reasoning
+
+@Implementation:
+Returns 1 for: 65..90 (A-Z), 97..122 (a-z), 95 (underscore), and any
+byte >= 128 (assumed Unicode). Returns 0 otherwise.
+@End Implementation
 Process called "is_alpha" takes ch as Integer returns Integer:
-    Note: Check if character is alphabetic or underscore
-
-    @Reasoning:
-    Julia allows Unicode identifiers. This implementation handles both
-    ASCII and basic Unicode characters for complete identifier support
-    as required by the Julia language specification.
-    @End Reasoning
-
     Note: A-Z
     If ch is greater than or equal to 65:
         If ch is less than or equal to 90:
@@ -418,9 +522,18 @@ Process called "is_alpha" takes ch as Integer returns Integer:
     Return 0
 End Process
 
-Process called "is_alphanumeric" takes ch as Integer returns Integer:
-    Note: Check if character is alphanumeric
+@Reasoning:
+Identifier-continuation predicate: alpha + digit + Julia-specific
+characters like "!" (end-of-mutating-function-name marker). Used by
+the identifier tokeniser after the first character has already
+passed is_alpha.
+@End Reasoning
 
+@Implementation:
+Calls is_alpha and is_digit; returns 1 on either positive. Also
+returns 1 for byte 33 (!) per Julia's ident rule allowing "func!".
+@End Implementation
+Process called "is_alphanumeric" takes ch as Integer returns Integer:
     Let alpha be proc is_alpha from ch
     Let digit be proc is_digit from ch
 
@@ -444,6 +557,20 @@ Note: ==========================================================================
 Note: Keyword Recognition
 Note: ============================================================================
 
+@Reasoning:
+Julia has ~50 reserved keywords. After the identifier tokeniser
+collects a name, this routine compares it against every keyword to
+decide whether the token type should be the generic TOKEN_IDENTIFIER
+or the specific keyword constant (TOKEN_FUNCTION, TOKEN_IF, ...).
+Sequential strcmp is fast enough given the bounded keyword count
+and shorter average lexeme length.
+@End Reasoning
+
+@Implementation:
+For each known keyword, allocates a comparison string and calls
+string_equals; on match returns the corresponding TOKEN_* constant.
+Falls through to TOKEN_IDENTIFIER if no keyword matches.
+@End Implementation
 Process called "check_keyword" takes lexeme as Integer returns Integer:
     Note: Check if identifier is a Julia keyword
 
@@ -606,6 +733,24 @@ Note: ==========================================================================
 Note: Number Tokenization
 Note: ============================================================================
 
+@Reasoning:
+Numeric literal lexer handling Julia's full numeric syntax: ints,
+floats (with decimal point or e-notation exponent), hex (0x), octal
+(0o), and binary (0b) prefixes, and the trailing type suffixes
+(0x10u8, 1.5f0). The branching is large but bounded - each prefix
+selects a separate sub-loop that recognises only the digits valid in
+that base.
+@End Reasoning
+
+@Implementation:
+Reads start character to dispatch on prefix: 0x/0X -> hex digits
+(0-9, a-f, A-F); 0o/0O -> octal (0-7); 0b/0B -> binary (0-1);
+otherwise decimal. Consumes digits greedily. Optional "." with more
+digits promotes to float. Optional "e"/"E" with sign + digits is an
+exponent. Final suffix (u8, i32, f0, ...) sets the precise type.
+Constructs a token via create_token with the computed type and
+lexeme span.
+@End Implementation
 Process called "tokenize_number" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize Julia number literal
 
@@ -803,6 +948,21 @@ Note: ==========================================================================
 Note: String Tokenization
 Note: ============================================================================
 
+@Reasoning:
+String literal lexer handling Julia's string syntax including
+interpolation ("$var"), triple-quoted multi-line strings, raw
+strings, byte strings, and escape sequences. The delimiter
+parameter lets the same routine handle "..." (default) and
+'...' (character literal) by varying the close character.
+@End Reasoning
+
+@Implementation:
+Consumes characters until the matching delimiter is found, handling
+backslash escapes (\n, \t, \\, \", \xHH, \uHHHH). Tracks newlines
+via advance_line for multi-line strings. On EOF before close,
+emits TOKEN_ERROR. Builds the lexeme span (excluding outer quotes)
+and constructs the token via create_token.
+@End Implementation
 Process called "tokenize_string" takes lexer as Integer, start_pos as Integer, delimiter as Integer returns Integer:
     Note: Tokenize Julia string literal
 
@@ -908,6 +1068,19 @@ Note: ==========================================================================
 Note: Identifier and Macro Tokenization
 Note: ============================================================================
 
+@Reasoning:
+Identifier lexer. Reads alpha-start identifier, then continues
+through is_alphanumeric characters. After collecting the lexeme,
+calls check_keyword to upgrade the token type to a keyword
+constant if the lexeme matches one.
+@End Reasoning
+
+@Implementation:
+Walks while peek_char is_alphanumeric, advancing the cursor each
+iteration. Materialises the lexeme substring at start_pos..position,
+then calls check_keyword for type classification and constructs the
+token via create_token.
+@End Implementation
 Process called "tokenize_identifier" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize Julia identifier
 
@@ -938,6 +1111,18 @@ Process called "tokenize_identifier" takes lexer as Integer, start_pos as Intege
     Return proc create_token with token_type, lexeme, line, column, length
 End Process
 
+@Reasoning:
+Julia macro invocations use "@name" syntax. The lexer captures the
+leading "@" plus the macro name as a single TOKEN_MACRO so the
+parser can dispatch on macro calls distinctly from ordinary function
+calls.
+@End Reasoning
+
+@Implementation:
+Consumes the leading "@" then walks is_alphanumeric for the macro
+name. Materialises the lexeme substring (including the "@"
+character) and creates a TOKEN_MACRO token.
+@End Implementation
 Process called "tokenize_macro" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize Julia macro name (@macro)
 
@@ -971,6 +1156,20 @@ Note: ==========================================================================
 Note: Symbol Tokenization
 Note: ============================================================================
 
+@Reasoning:
+Julia operator/punctuation lexer. Handles single-char operators
+(+, -, *, /, %, ^, =, <, >, !, ~, &, |, ., ,, ;, :) plus their
+multi-char extensions (==, !=, <=, >=, ..., ::, ->, =>, &&, ||, etc).
+The multi-char tokens are detected by checking peek_next_char before
+committing to the single-char interpretation.
+@End Reasoning
+
+@Implementation:
+Reads the start character, then uses peek_next_char to detect the
+common multi-char extensions. Dispatches to the correct TOKEN_*
+constant. Builds the lexeme span and creates the token. Falls
+through to TOKEN_ERROR for unrecognised characters.
+@End Implementation
 Process called "tokenize_symbol" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize Julia symbol (:symbol)
 
@@ -1017,6 +1216,22 @@ Note: ==========================================================================
 Note: Main Tokenization
 Note: ============================================================================
 
+@Reasoning:
+Main lexer step function. Skips whitespace and comments, then
+dispatches on the first non-whitespace character to the appropriate
+tokeniser. EOF returns a TOKEN_EOF marker rather than null so
+callers can use a uniform end-condition.
+@End Reasoning
+
+@Implementation:
+Loops skipping whitespace (via is_whitespace + advance_char) and
+newlines (via is_newline + advance_line). Skips "#" line comments
+and "#=...=#" block comments. After skip, if at EOF returns
+TOKEN_EOF. Otherwise reads the first character to dispatch:
+is_digit -> tokenize_number; is_alpha or _ -> tokenize_identifier;
+quote -> tokenize_string; @ -> tokenize_macro; otherwise ->
+tokenize_symbol. Returns the produced token.
+@End Implementation
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
 
@@ -1485,6 +1700,18 @@ Note: ==========================================================================
 Note: Tokenization Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Drives the lexer to completion, collecting all tokens into a list.
+The public entry point for the frontend - callers receive a fully
+tokenised input ready for the parser to consume.
+@End Reasoning
+
+@Implementation:
+Allocates an empty List. Loops calling next_token; appends each
+result to the list. Continues until a TOKEN_EOF is encountered
+(the TOKEN_EOF itself is also appended so the parser has an explicit
+end marker). Returns the token list pointer.
+@End Implementation
 Process called "tokenize" takes lexer as Integer returns Integer:
     Note: Tokenize entire source into token array
 
@@ -1557,6 +1784,14 @@ Process called "tokenize" takes lexer as Integer returns Integer:
     Return tokens
 End Process
 
+@Reasoning:
+Convenience accessor for the total token count. Used by tests and
+diagnostics to verify the expected number of tokens was produced.
+@End Reasoning
+
+@Implementation:
+Returns list_length of the lexer's token list.
+@End Implementation
 Process called "get_token_count" takes lexer as Integer returns Integer:
     Note: Get number of tokens by counting tokens during lexical analysis
 

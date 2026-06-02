@@ -68,6 +68,15 @@ Note: ==========================================================================
 Note: HIR to F# Backend Context
 Note: ============================================================================
 
+@Reasoning:
+FSharpBackend bundles every piece of state the HIR-to-F# pipeline must thread
+between validation, optimisation, emission, and IO: the input module, output
+sink, optimisation tier, diagnostic policy, and the arena that owns transient
+allocations. Encoding fields as Integer slots (raw 8-byte offsets) is the
+v0.0.8.5 convention used by all backends; offsets 0..72 here are wired into
+create_fsharp_backend's memory_set_int64 calls and every accessor in the file,
+so the field order and width below are load-bearing.
+@End Reasoning
 Type called "FSharpBackend":
     hir_module as Integer         Note: Input HIR module
     output_path as Integer        Note: Output file path (optional)
@@ -85,15 +94,25 @@ Note: ==========================================================================
 Note: Backend Creation and Configuration
 Note: ============================================================================
 
+@Reasoning:
+The backend struct is laid out as a flat 80-byte block (ten int64 slots) instead of
+a heap-allocated graph because every field is either a pointer or a small integer
+and the layout offsets are referenced by hand throughout this file. Defaults are
+seeded inline: optimisation level 2, comment emission on, F# 8.0 target, and the
+diagnostics flag enabled so that add_error/add_warning surface early failures.
+The arena handle at offset 72 owns transient string and HIR allocations made
+during code generation; it is destroyed in destroy_fsharp_backend so the lifetime
+of intermediate F# emissions is bounded by the backend instance itself.
+@End Reasoning
+@Implementation:
+A null return from allocate is propagated as 0 (failure) to the caller; on success
+the function returns the backend pointer directly so downstream calls can chain
+configuration via set_* helpers. The error_log and warning_log are created with
+proc create_list because diagnostics must accumulate across the pipeline before
+the backend is destroyed.
+@End Implementation
 Process called "create_fsharp_backend" takes hir_module as Integer returns Integer:
     Note: Create F# backend instance
-
-    @Reasoning:
-    The F# backend manages the complete translation pipeline from HIR
-    to F# source code, including optimization passes, error handling,
-    and output formatting. It provides configurable options for
-    different use cases and target environments.
-    @End Reasoning
 
     Let backend_size be 80  Note: FSharpBackend: 10 fields × 8 bytes
     Let backend be proc allocate from Layout with backend_size
@@ -123,6 +142,14 @@ Process called "create_fsharp_backend" takes hir_module as Integer returns Integ
     Return backend
 End Process
 
+@Reasoning:
+The backend owns three heap resources beyond the struct itself: the error log,
+the warning log, and the arena holding transient HIR/string allocations. Each
+must be released in reverse-allocation order to avoid leaking on long-running
+toolchains that recycle backend instances per compilation unit. A null backend
+is treated as a no-op success because callers may invoke this in error paths
+where create_fsharp_backend itself failed.
+@End Reasoning
 Process called "destroy_fsharp_backend" takes backend as Integer returns Integer:
     Note: Destroy F# backend and free resources
 
@@ -153,6 +180,14 @@ Note: ==========================================================================
 Note: Backend Configuration
 Note: ============================================================================
 
+@Reasoning:
+The output path field at offset 8 doubles as both a destination indicator and
+a feature flag: a non-zero value triggers file emission in
+generate_fsharp_code_from_hir, while zero forces string-only return. The
+caller is responsible for the lifetime of the path buffer; we store the
+pointer verbatim rather than copying so that string ownership remains with
+whatever driver constructed it.
+@End Reasoning
 Process called "set_output_path" takes backend as Integer, path as Integer returns Integer:
     Note: Set output file path for generated F# code
 
@@ -160,6 +195,14 @@ Process called "set_output_path" takes backend as Integer, path as Integer retur
     Return 1
 End Process
 
+@Reasoning:
+The optimisation tier drives a cumulative pipeline in optimize_hir_for_fsharp:
+level 1 enables pipeline+match rewrites, level 2 adds composition+tail-call
+recognition, and level 3 layers DCE and inference cleanup on top. Clamping
+out-of-range inputs to [0,3] is mandatory because higher numbers would skip
+unimplemented passes silently while negatives would disable optimisation in a
+way that violates the F# 8 emission contract.
+@End Reasoning
 Process called "set_optimization_level" takes backend as Integer, level as Integer returns Integer:
     Note: Set optimization level (0=none, 1=basic, 2=standard, 3=aggressive)
 
@@ -174,6 +217,13 @@ Process called "set_optimization_level" takes backend as Integer, level as Integ
     Return 1
 End Process
 
+@Reasoning:
+The comment-generation flag at offset 24 gates two distinct emissions: the
+HIR-derived inline commentary inside fsharp_emitter, and the post-process
+header banner added in post_process_fsharp_code. Production builds typically
+disable this to keep object output small, while debug runs enable it for
+provenance tracking back to HIR nodes.
+@End Reasoning
 Process called "set_generate_comments" takes backend as Integer, enabled as Integer returns Integer:
     Note: Enable or disable comment generation
 
@@ -181,6 +231,13 @@ Process called "set_generate_comments" takes backend as Integer, enabled as Inte
     Return 1
 End Process
 
+@Reasoning:
+F# language version selection is consumed by fsharp_emitter when deciding
+between feature sets: pre-7 builds avoid task computation expressions, pre-6
+disables anonymous records, and pre-5 cannot emit nameof. The version is
+stored as an integer rather than a string so emission paths can branch with
+a single integer comparison rather than a string match per call site.
+@End Reasoning
 Process called "set_target_fsharp_version" takes backend as Integer, version as Integer returns Integer:
     Note: Set target F# language version
 
@@ -192,14 +249,17 @@ Note: ==========================================================================
 Note: HIR Optimization Passes
 Note: ============================================================================
 
+@Reasoning:
+The pass set is layered cumulatively so that lower levels are strict subsets of
+higher levels: a level-3 build re-runs every level-1 and level-2 transform before
+adding aggressive DCE and type-inference cleanup. Each sub-pass mutates hir_node
+in place and returns the (possibly substituted) root, which is why this
+dispatcher rebinds hir_node after every call rather than chaining returns. Level
+0 short-circuits before any work to give bit-identical output to the un-optimised
+emitter, which is required by the diagnostic mode that bisects optimisation bugs.
+@End Reasoning
 Process called "optimize_hir_for_fsharp" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Apply F#-specific optimizations to HIR
-
-    @Reasoning:
-    F#-specific optimizations transform HIR to better match F# idioms
-    and patterns. This includes pipeline operator introduction,
-    pattern matching simplification, and functional composition.
-    @End Reasoning
 
     Let optimization_level be proc memory_get_int64 from Layout with backend, 16
 
@@ -229,6 +289,13 @@ Process called "optimize_hir_for_fsharp" takes backend as Integer, hir_node as I
     Return hir_node
 End Process
 
+@Reasoning:
+Pipeline rewriting is a top-down walk: only HIR_CALL_EXPRESSION nodes are
+candidates for transform_to_pipeline, but children must still be visited so
+nested compositions like f(g(h(x))) can be unwound into x |> h |> g |> f. The
+in-place list_set update relies on the child list being mutable storage owned
+by the parent node; this is guaranteed by the HIR allocator contract.
+@End Reasoning
 Process called "optimize_pipeline_operators" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Transform function calls to pipeline operators where appropriate
 
@@ -258,6 +325,13 @@ Process called "optimize_pipeline_operators" takes backend as Integer, hir_node 
     Return hir_node
 End Process
 
+@Reasoning:
+The pass targets HIR_MATCH_STATEMENT nodes specifically because F#'s match
+emission benefits from arm coalescing and unreachable-arm removal; the actual
+rewriting is delegated to simplify_match_patterns. Children are still walked
+so that match expressions nested inside lambdas, let-bindings, or other
+matches all receive the simplification, not just the top-level node.
+@End Reasoning
 Process called "optimize_pattern_matching" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Simplify and optimize pattern matching constructs
 
@@ -287,6 +361,13 @@ Process called "optimize_pattern_matching" takes backend as Integer, hir_node as
     Return hir_node
 End Process
 
+@Reasoning:
+F# expresses function composition via the >> operator, which is idiomatically
+cheaper than explicit lambdas. This walker drives optimize_lambda_composition
+on HIR_LAMBDA_EXPRESSION nodes so the emitter can later print the composed
+form rather than the un-eta-reduced lambda. Children are visited even for
+non-lambda nodes since lambdas occur inside almost every other HIR shape.
+@End Reasoning
 Process called "optimize_function_composition" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Detect and optimize function composition patterns
 
@@ -316,6 +397,13 @@ Process called "optimize_function_composition" takes backend as Integer, hir_nod
     Return hir_node
 End Process
 
+@Reasoning:
+F# only guarantees tail-call elimination when functions are explicitly marked
+or when the JIT recognises the pattern. By tagging HIR_PROCESS_DEFINITION
+nodes whose body ends in a self-call (see optimize_recursive_function +
+check_tail_recursion), the emitter can choose between iterative loops, let-rec
+bindings, or the explicit [<TailCall>] attribute available in F# 8.
+@End Reasoning
 Process called "optimize_tail_recursion" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Optimize tail recursive functions
 
@@ -345,6 +433,13 @@ Process called "optimize_tail_recursion" takes backend as Integer, hir_node as I
     Return hir_node
 End Process
 
+@Reasoning:
+DCE is a two-phase routine: analyze_variable_liveness builds the live-variable
+set across the whole subtree, then remove_dead_assignments prunes assignments
+whose targets are absent from that set. We pass the liveness set explicitly
+rather than recomputing it per-node because the analysis is O(N) per query
+and the pass would otherwise degrade to O(N^2).
+@End Reasoning
 Process called "eliminate_dead_code" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Remove unused variables and unreachable code
 
@@ -357,6 +452,14 @@ Process called "eliminate_dead_code" takes backend as Integer, hir_node as Integ
     Return proc remove_dead_assignments with backend, hir_node, live_variables
 End Process
 
+@Reasoning:
+F# has powerful Hindley-Milner inference, so emitting fewer type annotations
+produces more idiomatic and resilient code. This pass delegates to
+remove_redundant_type_annotations which only strips annotations on
+declarations whose RHS is a literal whose F# type is fixed-by-syntax
+(integer, string, boolean) so we never blind the type checker on ambiguous
+numeric types like uint8 vs int.
+@End Reasoning
 Process called "optimize_type_inference" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Refine type annotations for better F# inference
 
@@ -372,14 +475,16 @@ Note: ==========================================================================
 Note: HIR Validation and Preprocessing
 Note: ============================================================================
 
+@Reasoning:
+The validation entry point is intentionally thin: it owns the root-null check,
+then delegates the recursive structural pass to validate_hir_node_recursive and
+turns the boolean result into a backend-level error. Splitting the entry from the
+recursion lets the recursive helper return early without distinguishing 'root
+missing' from 'subtree malformed' to its callers - the entry guarantees the
+caller sees a precise diagnostic at the top level.
+@End Reasoning
 Process called "validate_hir_for_fsharp" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Validate HIR for F# code generation
-
-    @Reasoning:
-    HIR validation ensures the input is well-formed and compatible
-    with F# language semantics. This catches errors early in the
-    pipeline and provides better diagnostics.
-    @End Reasoning
 
     If hir_node is equal to 0:
         proc add_error with backend, "HIR root node is null"
@@ -396,6 +501,14 @@ Process called "validate_hir_for_fsharp" takes backend as Integer, hir_node as I
     Return 1
 End Process
 
+@Reasoning:
+Validation is short-circuit recursive: any failure at the current node aborts
+the whole walk to keep diagnostics actionable (a single root failure should
+not produce dozens of cascading child errors). The validator never modifies
+the HIR; it only consults shape and emits errors via add_error, so the same
+HIR pointer can be safely passed to the subsequent optimisation phase if
+validation succeeds.
+@End Reasoning
 Process called "validate_hir_node_recursive" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Recursively validate HIR node structure
 
@@ -427,6 +540,14 @@ Process called "validate_hir_node_recursive" takes backend as Integer, hir_node 
     Return 1
 End Process
 
+@Reasoning:
+Node-shape invariants enforced here mirror what fsharp_emitter assumes: every
+HIR_CALL_EXPRESSION must carry a callee at data-offset 8, every lambda must
+have a body at data-offset 24, and every match must have at least one arm
+(empty matches are warned, not errored, because some HIR pipelines produce
+exhaustive 'fun _ -> ()' shells before later passes populate them). These
+constants are wire-format with the HIR layout module.
+@End Reasoning
 Process called "validate_node_constraints" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Validate specific node type constraints
 
@@ -471,14 +592,23 @@ Note: ==========================================================================
 Note: Code Generation Pipeline
 Note: ============================================================================
 
+@Reasoning:
+The pipeline runs validate -> optimise -> emit -> post-process -> write in that
+fixed order because the optimiser presupposes structural validity, the emitter
+presupposes optimised HIR (it does not re-do dead-code elimination), and
+post-processing presupposes a syntactically complete F# string. The output file
+is written only when an output_path is set so the same entry point covers both
+in-memory string compilation and disk-output compilation. The final F# string is
+returned even when written to disk so callers can echo or hash the artefact.
+@End Reasoning
+@Implementation:
+Each phase that can fail logs its own diagnostic via add_error and short-circuits
+with a 0 return rather than continuing with a partial result; this keeps the
+backend's error_log authoritative for callers that read get_error_count after a
+failed compilation.
+@End Implementation
 Process called "generate_fsharp_code_from_hir" takes backend as Integer returns Integer:
     Note: Generate F# code from HIR using the complete pipeline
-
-    @Reasoning:
-    This is the main code generation pipeline that coordinates
-    validation, optimization, and code emission to produce
-    high-quality F# source code from HIR.
-    @End Reasoning
 
     Let hir_module be proc memory_get_int64 from Layout with backend, 0
 
@@ -523,6 +653,13 @@ Process called "generate_fsharp_code_from_hir" takes backend as Integer returns 
     Return final_code
 End Process
 
+@Reasoning:
+Post-processing is intentionally minimal: we only prepend a provenance header
+when comment generation is enabled. We deliberately avoid touching the
+emitter's body output here because the emitter is the only authority on F#
+formatting and any string-level rewriting would risk corrupting nested
+string literals, triple-quoted strings, or verbatim string forms.
+@End Reasoning
 Process called "post_process_fsharp_code" takes backend as Integer, code as Integer returns Integer:
     Note: Apply post-processing to generated F# code
 
@@ -543,6 +680,13 @@ Note: ==========================================================================
 Note: Error and Warning Management
 Note: ============================================================================
 
+@Reasoning:
+Errors are accumulated rather than thrown so multiple diagnostics can surface
+from a single pipeline run. The diagnostics_enabled flag controls
+synchronous console echoing, which is useful for interactive runac sessions
+but suppressed in batch / IDE language-server modes where the LSP layer
+queries get_error_count and walks the list explicitly.
+@End Reasoning
 Process called "add_error" takes backend as Integer, message as Integer returns Integer:
     Note: Add error message to error log
 
@@ -558,6 +702,13 @@ Process called "add_error" takes backend as Integer, message as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Warnings flow through the same diagnostic channel as errors but never abort
+compilation; they only inform the user about questionable but legal HIR
+shapes (e.g. empty match expressions, redundant type annotations stripped).
+Storing them on a separate list at offset 56 lets compile_hir_to_fsharp print
+counts independently and lets callers treat warnings-as-errors when desired.
+@End Reasoning
 Process called "add_warning" takes backend as Integer, message as Integer returns Integer:
     Note: Add warning message to warning log
 
@@ -573,6 +724,12 @@ Process called "add_warning" takes backend as Integer, message as Integer return
     Return 1
 End Process
 
+@Reasoning:
+Compilation drivers use this count to decide whether to write the output
+file: compile_hir_to_fsharp suppresses file IO when any error has been
+recorded so partial / corrupt F# is never persisted. Querying the list
+length is O(1) for v0.0.8.5's array-backed List representation.
+@End Reasoning
 Process called "get_error_count" takes backend as Integer returns Integer:
     Note: Get number of errors
 
@@ -580,6 +737,12 @@ Process called "get_error_count" takes backend as Integer returns Integer:
     Return proc list_length from List with error_log
 End Process
 
+@Reasoning:
+Warning counts feed the summary printed at the end of compile_hir_to_fsharp,
+giving the operator visibility into HIR quality even when compilation
+ultimately succeeds. Like get_error_count, this is a thin accessor: the
+warning list ownership stays with the backend struct.
+@End Reasoning
 Process called "get_warning_count" takes backend as Integer returns Integer:
     Note: Get number of warnings
 
@@ -587,6 +750,13 @@ Process called "get_warning_count" takes backend as Integer returns Integer:
     Return proc list_length from List with warning_log
 End Process
 
+@Reasoning:
+The diagnostic formatter writes to stdout via four separate print_string
+calls rather than concatenating in memory; this avoids allocating a
+throwaway concatenated buffer per diagnostic, which would churn the
+compile-time arena on noisy HIR. The bracketed level prefix matches the
+format expected by the v0.0.8.5 IDE/LSP filter regex.
+@End Reasoning
 Process called "print_diagnostic" takes backend as Integer, level as Integer, message as Integer returns Integer:
     Note: Print diagnostic message
 
@@ -603,14 +773,22 @@ Note: ==========================================================================
 Note: High-level Backend Interface
 Note: ============================================================================
 
+@Reasoning:
+This entry hides the backend lifecycle from one-shot callers: it creates the
+backend, optionally binds the output_path, runs the pipeline, prints a
+human-readable summary, then destroys the backend before returning. The return
+contract differs from the string-mode helper: this function returns the
+generated-code pointer on success and 0 if any error was logged, so callers can
+distinguish 'compiled but emitted warnings' (non-zero pointer, warning_count>0)
+from 'compilation failed' (zero return).
+@End Reasoning
+@Implementation:
+The destruction of the backend at the end is unconditional even when result_code
+is non-zero, because the returned pointer is into a region that outlives the
+backend - generated F# source lives in its own buffer, not in the backend arena.
+@End Implementation
 Process called "compile_hir_to_fsharp" takes hir_module as Integer, output_path as Integer returns Integer:
     Note: High-level interface for HIR to F# compilation
-
-    @Reasoning:
-    This is the main entry point for converting HIR to F# code.
-    It provides a simple interface while allowing access to the
-    full feature set through the backend configuration.
-    @End Reasoning
 
     Let backend be proc create_fsharp_backend from hir_module
 
@@ -650,12 +828,25 @@ Process called "compile_hir_to_fsharp" takes hir_module as Integer, output_path 
     Return result_code
 End Process
 
+@Reasoning:
+The string-form entry point passes a null output path to suppress file IO,
+returning only the in-memory generated source. This is the entry point used
+by HermodIDE-style live preview where compilation results are streamed to a
+buffer rather than persisted to disk.
+@End Reasoning
 Process called "compile_hir_to_fsharp_string" takes hir_module as Integer returns Integer:
     Note: Compile HIR to F# code and return as string
 
     Return proc compile_hir_to_fsharp with hir_module, 0
 End Process
 
+@Reasoning:
+The file-form entry point normalises the return contract to 1/0 success
+because batch drivers and shell wrappers expect boolean exit semantics; the
+underlying compile_hir_to_fsharp returns the generated buffer pointer (or 0
+on failure), which is more useful for in-process callers but ambiguous on
+the command line.
+@End Reasoning
 Process called "compile_hir_to_fsharp_file" takes hir_module as Integer, output_file as Integer returns Integer:
     Note: Compile HIR to F# code and write to file
 
@@ -672,6 +863,13 @@ Note: ==========================================================================
 Note: Optimization Helper Functions
 Note: ============================================================================
 
+@Reasoning:
+Only single-argument call chains are converted because F#'s |> operator
+applies its left operand as the final argument to the right operand;
+multi-argument calls would require currying or named-argument rewrites that
+the emitter does not yet support. The recursion on transformed_arg lets a
+chain f(g(h(x))) unwind one level per call until the leaf is reached.
+@End Reasoning
 Process called "transform_to_pipeline" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Transform nested function calls to F# pipeline operators (|>)
     Note: Example: f(g(h(x))) becomes x |> h |> g |> f
@@ -720,6 +918,14 @@ Process called "transform_to_pipeline" takes backend as Integer, hir_node as Int
     Return hir_node
 End Process
 
+@Reasoning:
+Once a wildcard arm is encountered every subsequent arm is unreachable in
+F# semantics. The pass keeps the first wildcard intact and drops the
+remainder by ending the loop early (setting i to case_count is the v0.0.8.5
+idiom for short-circuiting a While). The optimised arms are wrapped in a
+fresh HIR_MATCH node so the original is not mutated, allowing other passes
+to reference the prior shape if needed.
+@End Reasoning
 Process called "simplify_match_patterns" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Simplify F# match expression patterns
     Note: Combines redundant patterns, eliminates unreachable branches
@@ -771,6 +977,14 @@ Process called "simplify_match_patterns" takes backend as Integer, hir_node as I
     Return optimized_match
 End Process
 
+@Reasoning:
+The pattern recognised is the eta-form fun x -> f (g x), which is precisely
+F#'s f << g operator. We only fire when the outer call has exactly one
+argument and that argument is itself a call, because otherwise the
+composition would change arity and break call-site semantics. The lambda's
+own parameter list is dropped by the emitter when it sees the composition
+node.
+@End Reasoning
 Process called "optimize_lambda_composition" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Optimize F# lambda composition (fun x -> f (g x)) to (f shifted left by g)
 
@@ -821,6 +1035,13 @@ Process called "optimize_lambda_composition" takes backend as Integer, hir_node 
     Return hir_node
 End Process
 
+@Reasoning:
+This pass does not transform the function body; it only sets an HIR attribute
+("tail_recursive", 1) that fsharp_emitter reads when deciding whether to emit
+[<TailCall>] or convert the recursion to a while-loop in F# 7- targets. We
+avoid attempting CPS conversion here because the F# compiler's own analyser
+is more sophisticated; we merely surface the hint.
+@End Reasoning
 Process called "optimize_recursive_function" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Detect and mark tail-recursive functions for F# tail call optimization
 
@@ -854,6 +1075,14 @@ Process called "optimize_recursive_function" takes backend as Integer, hir_node 
     Return hir_node
 End Process
 
+@Reasoning:
+The detector is structurally scoped: it returns 1 only when the body node
+itself is a direct call whose callee identifier matches the function name.
+This is the precise pattern the F# emitter needs to know about for the
+TailCall attribute; the full dominator-based tail-position analysis lives
+in the middle/gungnir/analysis layer and is consulted separately by the
+gungnir HIR-to-MIR lowering.
+@End Reasoning
 Process called "check_tail_recursion" takes body as Integer, func_name as Integer returns Integer:
     Note: Check if function body ends with recursive call in tail position
 
@@ -884,6 +1113,15 @@ Process called "check_tail_recursion" takes body as Integer, func_name as Intege
     Return 0
 End Process
 
+@Reasoning:
+The walker accumulates variable references (HIR_VARIABLE_REF) into a flat
+list rather than a set because v0.0.8.5's List supports O(1) append while a
+hash-set would require allocating a hash table for each subtree; duplicate
+entries are tolerated because remove_dead_assignments uses list_contains
+(membership) and not exact occurrence counts. Block statements have their
+liveness sets unioned upward to model that any reference inside a block
+keeps the variable live at the block's entry.
+@End Reasoning
 Process called "analyze_variable_liveness" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Perform liveness analysis to identify live variables at each program point
 
@@ -935,6 +1173,14 @@ Process called "analyze_variable_liveness" takes backend as Integer, hir_node as
     Return live_vars
 End Process
 
+@Reasoning:
+Returning 0 (null) for a dead HIR_ASSIGNMENT instructs the caller to drop
+the node from its parent's child list - this is the v0.0.8.5 convention for
+HIR pruning since the walker pattern in optimize_hir_for_fsharp expects
+either a transformed node or a null sentinel. Live or non-assignment nodes
+are returned unchanged so the structural shape of the surrounding tree is
+preserved.
+@End Reasoning
 Process called "remove_dead_assignments" takes backend as Integer, hir_node as Integer, live_vars as Integer returns Integer:
     Note: Remove assignments to variables that are never read
 
@@ -960,6 +1206,13 @@ Process called "remove_dead_assignments" takes backend as Integer, hir_node as I
     Return hir_node
 End Process
 
+@Reasoning:
+Annotations are removed only when the initializer is a literal whose F#
+inferred type is unambiguous (see infer_type for the precise rules). We
+avoid touching annotations on numeric literals beyond the basic integer
+because F# defaults int literals to int32, and stripping an annotation on
+an int64 declaration would silently retype the value.
+@End Reasoning
 Process called "remove_redundant_type_annotations" takes backend as Integer, hir_node as Integer returns Integer:
     Note: Remove F# type annotations that can be inferred by the compiler
 
@@ -991,6 +1244,14 @@ Process called "remove_redundant_type_annotations" takes backend as Integer, hir
     Return hir_node
 End Process
 
+@Reasoning:
+The inference rules are restricted to three literal kinds whose F# type is
+fixed-by-grammar: integer literals are int, string literals are System.String,
+and boolean literals are bool. Returning 0 for anything else is deliberate -
+the caller (remove_redundant_type_annotations) interprets 0 as "do not strip",
+so non-literal initializers are left annotated rather than risk altering the
+declared type.
+@End Reasoning
 Process called "infer_type" takes hir_node as Integer returns Integer:
     Note: Simple type inference for literals and obvious cases
 

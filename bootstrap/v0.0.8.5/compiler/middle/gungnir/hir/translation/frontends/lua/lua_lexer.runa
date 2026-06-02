@@ -90,6 +90,17 @@ Note: ==========================================================================
 Note: Lua Lexer State
 Note: ============================================================================
 
+@Reasoning:
+Unlike other lexers in this tree, the Lua lexer uses a value-of-type struct
+(reading/writing via memory_read/memory_write) rather than raw offsets. The
+current_char cache mirrors the JS lexer pattern; an embedded tokens list
+makes scan_token side-effect-driven (each scan APPENDS rather than returning).
+@End Reasoning
+@Implementation:
+Field-based access via memory_read/memory_write; the actual byte offsets
+are managed by the type system (StringCore handles source as a String, and
+the integer fields follow). 8 fields total.
+@End Implementation
 Type called "LuaLexerState":
     source as String
     position as Integer
@@ -105,6 +116,16 @@ Note: ==========================================================================
 Note: Token Structure
 Note: ============================================================================
 
+@Reasoning:
+A Lua token carries both the raw lexeme (the exact source text) and a
+separately-stored literal_value (the decoded value: stripped quotes for
+strings, normalized form for numbers). Keeping both lets diagnostics
+show the source while the parser uses the cooked value.
+@End Reasoning
+@Implementation:
+5 fields. literal_value defaults to "" for tokens where no decoded value
+is needed (operators, keywords, identifiers).
+@End Implementation
 Type called "LuaToken":
     token_type as Integer
     lexeme as String
@@ -117,6 +138,16 @@ Note: ==========================================================================
 Note: Lexer Initialization
 Note: ============================================================================
 
+@Reasoning:
+Allocates and primes a LuaLexerState with the source, position 0, and
+current_char cache initialized to source[0]. The tokens list is created
+ahead of time so scan_token can blindly append without first allocating.
+@End Reasoning
+@Implementation:
+Construct value-of-type LuaLexerState; allocate via MemoryCore; write back.
+If source is non-empty, read the first byte and update current_char then
+write again. Returns the pointer.
+@End Implementation
 Process called "create_lexer" takes source as String returns Integer:
     @Reasoning
     Create and initialize a new Lua lexer state.
@@ -150,6 +181,16 @@ Note: ==========================================================================
 Note: Character Navigation
 Note: ============================================================================
 
+@Reasoning:
+Returns the character BEING consumed (the previous current_char) and
+updates state to point at the next character. This "return-the-consumed"
+shape lets scan helpers capture the byte in one call.
+@End Reasoning
+@Implementation:
+Read state; cache current; increment position and column; if current was
+LF increment line and reset column. Reload current_char from source at
+the new position, or 0 on EOF. Write state back. Return the cached value.
+@End Implementation
 Process called "advance" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Move to the next character in the source.
@@ -183,6 +224,13 @@ Process called "advance" takes lexer_ptr as Integer returns Integer:
     Return current
 End Process
 
+@Reasoning:
+Just reads the cached current_char field; no source-buffer access needed
+because advance keeps the cache fresh.
+@End Reasoning
+@Implementation:
+memory_read state; return current_char field.
+@End Implementation
 Process called "peek" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Look at the current character without consuming it.
@@ -192,6 +240,15 @@ Process called "peek" takes lexer_ptr as Integer returns Integer:
     Return lexer.current_char
 End Process
 
+@Reasoning:
+Multi-byte lookahead used by scan helpers (e.g. `..` concat, `...` vararg,
+`==`/`~=`/`<=`/`>=` comparisons, `--[[` block comments). Bypasses the
+current_char cache because the cache only covers position 0.
+@End Reasoning
+@Implementation:
+Read state. Compute position + offset. If within source_len, read source
+byte; otherwise return 0 (EOF).
+@End Implementation
 Process called "peek_ahead" takes lexer_ptr as Integer, offset as Integer returns Integer:
     @Reasoning
     Look ahead at a character at the given offset without consuming it.
@@ -209,6 +266,14 @@ Process called "peek_ahead" takes lexer_ptr as Integer, offset as Integer return
     Return 0  Note: EOF
 End Process
 
+@Reasoning:
+Checks current_char == 0 (the EOF sentinel) rather than comparing position
+against source_len. Source files with embedded NUL bytes would falsely
+trigger this check, but Lua source NULs aren't valid input.
+@End Reasoning
+@Implementation:
+Read state; return 1 if current_char is 0, else 0.
+@End Implementation
 Process called "is_at_end" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Check if we've reached the end of the source.
@@ -227,6 +292,12 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII digit predicate (48-57). Lua number literals use ASCII digits only.
+@End Reasoning
+@Implementation:
+Range test 48 <= char <= 57.
+@End Implementation
 Process called "is_digit" takes char as Integer returns Integer:
     @Reasoning
     Check if a character is a decimal digit (0-9).
@@ -241,6 +312,12 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+For Lua `0x...` hexadecimal number literals. Accepts both cases.
+@End Reasoning
+@Implementation:
+Range 48-57 OR 65-70 OR 97-102.
+@End Implementation
 Process called "is_hex_digit" takes char as Integer returns Integer:
     @Reasoning
     Check if a character is a hexadecimal digit (0-9, A-F, a-f).
@@ -265,6 +342,13 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII letter check. Lua identifiers also include underscore but that's
+handled separately by is_identifier_start.
+@End Reasoning
+@Implementation:
+Ranges 65-90 OR 97-122.
+@End Implementation
 Process called "is_alpha" takes char as Integer returns Integer:
     @Reasoning
     Check if a character is alphabetic (A-Z, a-z).
@@ -285,6 +369,13 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Lua identifier first character: letter or underscore. Digits disallowed at
+the start. No dollar-sign as in JS.
+@End Reasoning
+@Implementation:
+is_alpha OR char == 95.
+@End Implementation
 Process called "is_identifier_start" takes char as Integer returns Integer:
     @Reasoning
     Check if a character can start an identifier (letter or underscore).
@@ -301,6 +392,12 @@ Process called "is_identifier_start" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier continuation: letter, digit, or underscore.
+@End Reasoning
+@Implementation:
+is_identifier_start OR is_digit.
+@End Implementation
 Process called "is_identifier_continue" takes char as Integer returns Integer:
     @Reasoning
     Check if a character can continue an identifier (letter, digit, or underscore).
@@ -317,6 +414,13 @@ Process called "is_identifier_continue" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Lua whitespace: space, tab, LF, CR, plus form feed and vertical tab. The
+extended set matches Lua's official lexer behavior.
+@End Reasoning
+@Implementation:
+Equality against 32, 9, 10, 13, 12 (FF), 11 (VT).
+@End Implementation
 Process called "is_whitespace" takes char as Integer returns Integer:
     @Reasoning
     Check if a character is whitespace (space, tab, newline, carriage return).
@@ -345,6 +449,14 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Allocates a LuaToken on the heap with the supplied fields. literal_value
+is "" for tokens with no separate decoded form.
+@End Reasoning
+@Implementation:
+Construct value-of-type LuaToken; allocate via MemoryCore; write back;
+return pointer.
+@End Implementation
 Process called "create_token" takes token_type as Integer, lexeme as String, line as Integer, column as Integer, literal_value as String returns Integer:
     @Reasoning
     Create a new token with the given properties.
@@ -363,6 +475,15 @@ Process called "create_token" takes token_type as Integer, lexeme as String, lin
     Return token_ptr
 End Process
 
+@Reasoning:
+Side-effect helper: build a token using the lexer's current line/column
+and append it to the lexer's tokens list. Centralizes the
+"create-and-append" idiom every scan_ helper uses.
+@End Reasoning
+@Implementation:
+Read state; create_token with current line/column; append to lexer.tokens
+via list_append.
+@End Implementation
 Process called "add_token" takes lexer_ptr as Integer, token_type as Integer, lexeme as String, literal_value as String:
     @Reasoning
     Create a token and add it to the lexer's token list.
@@ -380,6 +501,13 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Records a lexer-level error. Sets had_error=1 and stores the message so
+the parser can decide whether to attempt recovery or abort.
+@End Reasoning
+@Implementation:
+Read state; set had_error and error_message; write state back.
+@End Implementation
 Process called "lexer_error" takes lexer_ptr as Integer, message as String:
     @Reasoning
     Record a lexer error.
@@ -397,6 +525,13 @@ Note: ==========================================================================
 Note: Whitespace and Comments
 Note: ============================================================================
 
+@Reasoning:
+Consumes a run of whitespace including newlines (Lua is whitespace-
+insensitive between tokens; newlines are not significant).
+@End Reasoning
+@Implementation:
+Loop peek; advance while is_whitespace returns 1.
+@End Implementation
 Process called "skip_whitespace" takes lexer_ptr as Integer:
     @Reasoning
     Skip over whitespace characters.
@@ -415,6 +550,16 @@ Process called "skip_whitespace" takes lexer_ptr as Integer:
     End While
 End Process
 
+@Reasoning:
+Lua has two comment forms: `--text` (line) and `--[[text]]` (block, with
+optional `=`-padded level markers `--[=[ ]=]` for nested-ish content).
+This routine handles both by checking what follows the initial `--`.
+@End Reasoning
+@Implementation:
+Already past `--`. If next is `[` followed by zero-or-more `=` then `[`,
+enter block-comment mode counting the `=` level and looking for the
+matching `]=*]`. Otherwise consume to end of line.
+@End Implementation
 Process called "scan_comment" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Scan a Lua comment (line comment -- or block comment --[[ ]]).
@@ -540,6 +685,17 @@ Note: ==========================================================================
 Note: Number Scanning
 Note: ============================================================================
 
+@Reasoning:
+Lua numbers come in decimal (with optional fraction and exponent) and
+hexadecimal (`0x` with optional hex fraction and `p`/`P` exponent). The
+hex-float-with-p-exponent form is a Lua extension.
+@End Reasoning
+@Implementation:
+Snapshot start. If `0` followed by `x`/`X`, scan hex digits, optional
+hex fraction, optional `p`/`P` + signed decimal exponent. Otherwise
+scan decimal digits, optional `.` and fractional digits, optional
+`e`/`E` + signed exponent. Build lexeme and emit TOKEN_NUMBER.
+@End Implementation
 Process called "scan_number" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Scan a Lua number (decimal, hexadecimal, or floating point).
@@ -766,6 +922,24 @@ Note: ==========================================================================
 Note: String Scanning
 Note: ============================================================================
 
+@Reasoning:
+Standard Lua short-string literal terminated by the same delimiter byte
+that opened it (`"` or `'`). Backslash escapes include the usual \n, \t,
+\r, \", \', \\, \a, \b, \f, \v, plus \xXX hex, \z line-continuation, and
+\<digits> decimal byte escapes.
+@End Reasoning
+@Implementation:
+Consume opening delimiter. Loop: on delimiter advance and break; on '\\'
+handle the escape sequence (multi-char for \x, \z, \<digit>); on LF
+without a preceding `\z` skip-whitespace mark, lexer_error("unterminated
+string"). Otherwise accumulate the byte. Emit TOKEN_STRING with the
+decoded literal_value.
+@End Implementation
+@Security_Scope:
+Producer-side input that becomes a Lua string literal must escape
+delimiter, backslash, and control characters; this routine processes
+the byte stream as-is.
+@End Security_Scope
 Process called "scan_string" takes lexer_ptr as Integer, delimiter as Integer returns Integer:
     @Reasoning
     Scan a Lua string literal with the given delimiter (' or ").
@@ -847,6 +1021,17 @@ Process called "scan_string" takes lexer_ptr as Integer, delimiter as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Lua's `[[ ... ]]` (and level-padded `[=[ ... ]=]`) long-bracket string.
+Inside the brackets, NO escape processing - every byte including LF is
+literal. The opening `[[` immediately followed by LF strips that LF
+(per Lua spec).
+@End Reasoning
+@Implementation:
+Already past the opening bracket. Count the `=` padding level. If next is
+LF, consume it. Loop accumulating bytes until `]` followed by N `=` and
+another `]` matches the opening level. On EOF without close, lexer_error.
+@End Implementation
 Process called "scan_long_string" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Scan a Lua long string literal [[...]] or [=[...]=].
@@ -962,6 +1147,15 @@ Note: ==========================================================================
 Note: Identifier and Keyword Scanning
 Note: ============================================================================
 
+@Reasoning:
+After is_identifier_start confirmed, extend while is_identifier_continue
+and delegate keyword check to get_keyword_type.
+@End Reasoning
+@Implementation:
+Snapshot start; advance while is_identifier_continue; build lexeme; call
+get_keyword_type. If non-zero emit that token type; else emit
+TOKEN_IDENTIFIER.
+@End Implementation
 Process called "scan_identifier" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Scan an identifier or keyword.
@@ -994,6 +1188,15 @@ Process called "scan_identifier" takes lexer_ptr as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Lua has 22 reserved words. Returns the matching TOKEN_* code or 0 (which
+the caller interprets as TOKEN_IDENTIFIER). Case-sensitive match because
+Lua keywords are all lowercase per the language spec.
+@End Reasoning
+@Implementation:
+Compares identifier against each Lua keyword via StringCore.string_equals.
+On match returns the appropriate TOKEN_* constant.
+@End Implementation
 Process called "get_keyword_type" takes identifier as String returns Integer:
     @Reasoning
     Check if an identifier is a Lua keyword and return its token type.
@@ -1074,6 +1277,19 @@ Note: ==========================================================================
 Note: Main Scanning
 Note: ============================================================================
 
+@Reasoning:
+The dispatch for one token. Skip whitespace and comments, then branch on
+first significant char: digit -> number, letter/underscore -> identifier,
+`"`/`'` -> short string, `[` followed by `[`/`=` -> long string, otherwise
+handle each operator inline including two-char `..`, `==`, `~=`, `<=`,
+`>=`, and three-char `...`.
+@End Reasoning
+@Implementation:
+skip_whitespace; if `--` lookahead, scan_comment and re-enter. Peek; on
+EOF emit TOKEN_EOF. Dispatch by char class to scan_number/scan_identifier/
+scan_string/scan_long_string or handle operators inline. Unknown char
+yields lexer_error and a TOKEN_ERROR.
+@End Implementation
 Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Scan the next token from the source.
@@ -1365,6 +1581,15 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Driver loop that calls scan_token until EOF or error. Appends a final
+TOKEN_EOF to mark the end of stream so the parser doesn't have to check
+list bounds separately.
+@End Reasoning
+@Implementation:
+Loop calling scan_token while !is_at_end and !had_error. After loop,
+append a TOKEN_EOF token at the current line/column.
+@End Implementation
 Process called "tokenize" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Tokenize the entire source and return the list of tokens.
@@ -1383,6 +1608,14 @@ Process called "tokenize" takes lexer_ptr as Integer returns Integer:
     Return lexer.tokens
 End Process
 
+@Reasoning:
+Exposes the accumulated token list to the parser. Returns the list handle
+directly (not a copy), so the parser must finish reading before the lexer
+is destroyed.
+@End Reasoning
+@Implementation:
+Read state; return lexer.tokens field.
+@End Implementation
 Process called "get_tokens" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Get the list of tokens from the lexer.
@@ -1392,6 +1625,13 @@ Process called "get_tokens" takes lexer_ptr as Integer returns Integer:
     Return lexer.tokens
 End Process
 
+@Reasoning:
+Boolean accessor for the had_error flag; parser uses this to skip ahead
+to the next safe sync point.
+@End Reasoning
+@Implementation:
+Read state; return had_error field.
+@End Implementation
 Process called "had_error" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Check if the lexer encountered any errors.
@@ -1401,6 +1641,13 @@ Process called "had_error" takes lexer_ptr as Integer returns Integer:
     Return lexer.had_error
 End Process
 
+@Reasoning:
+Companion to had_error; returns the diagnostic message that lexer_error
+recorded.
+@End Reasoning
+@Implementation:
+Read state; return error_message field.
+@End Implementation
 Process called "get_error_message" takes lexer_ptr as Integer returns String:
     @Reasoning
     Get the error message if the lexer encountered an error.

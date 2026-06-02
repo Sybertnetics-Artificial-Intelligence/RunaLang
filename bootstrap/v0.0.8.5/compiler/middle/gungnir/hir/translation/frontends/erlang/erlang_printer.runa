@@ -15,12 +15,41 @@ Note: ==========================================================================
 Note: EMITTER CONFIGURATION
 Note: ============================================================================
 
+@Reasoning:
+Emitter formatting context that threads through every emission routine.
+indent_size sets the per-level width (Erlang convention is 4 spaces),
+indent_level tracks current depth so increase/decrease are O(1) integer
+ops rather than string-stack manipulations. current_column and
+max_line_length together enable line-break decisions when output would
+exceed the soft margin.
+@End Reasoning
+
+@Implementation:
+Four Integer fields stored as a Runa struct. The pointer to this struct
+is threaded through every emit_* function as the `config` parameter so
+state is shared without globals. indent_size=4 is the Erlang community
+standard; max_line_length=100 matches the OTP guideline.
+@End Implementation
+
 Type called "ErlangEmitterConfig":
     indent_size as Integer
     indent_level as Integer
     current_column as Integer
     max_line_length as Integer
 End Type
+
+@Reasoning:
+Factory for the default Erlang emitter configuration. Defaults match
+OTP coding-style guidance so the emitter output reads as idiomatic
+Erlang without per-call tuning.
+@End Reasoning
+
+@Implementation:
+Constructs an ErlangEmitterConfig with indent_size=4 (OTP standard),
+indent_level=0 (top-level), current_column=0 (start of line), and
+max_line_length=100 (OTP soft margin). Returns the struct pointer
+for use as the config argument across the whole emitter.
+@End Implementation
 
 Process called "create_emitter_config" returns Integer:
     Let config be a value of type ErlangEmitterConfig
@@ -30,6 +59,20 @@ Process called "create_emitter_config" returns Integer:
     Set config.max_line_length to 100
     Return config
 End Process
+
+@Reasoning:
+Builds a fresh whitespace prefix matching the current indent depth.
+Recomputing each call rather than caching is acceptable because
+indent strings are short and indent levels rarely exceed single
+digits in real Erlang code.
+@End Reasoning
+
+@Implementation:
+Multiplies indent_level by indent_size to get total_spaces, then
+loops 1..total_spaces appending a single space each iteration.
+Returns the assembled string. No cap on indent depth — pathological
+deeply-nested AST will produce wide indents but no truncation.
+@End Implementation
 
 Process called "indent" that takes config as Integer returns Integer:
     Let spaces be ""
@@ -42,9 +85,33 @@ Process called "indent" that takes config as Integer returns Integer:
     Return spaces
 End Process
 
+@Reasoning:
+In-place mutation of the indent cursor when entering a nested
+construct (case body, function body, list comprehension body).
+Side-effecting on the config object lets every subsequent indent
+call see the new depth without explicit threading.
+@End Reasoning
+
+@Implementation:
+Single increment of indent_level. No range check — the matching
+decrease_indent on exit is the only thing that can return it.
+@End Implementation
+
 Process called "increase_indent" that takes config as Integer returns Nothing:
     Set config.indent_level to config.indent_level plus 1
 End Process
+
+@Reasoning:
+Counterpart to increase_indent. Guards against going below zero
+because emit routines occasionally call exit-paths multiple times
+on error and double-decrement should not produce negative indent
+(which would underflow when multiplied by indent_size).
+@End Reasoning
+
+@Implementation:
+If indent_level > 0 decrements; otherwise no-op. The guard makes
+this idempotent at the zero boundary, simplifying error-path code.
+@End Implementation
 
 Process called "decrease_indent" that takes config as Integer returns Nothing:
     If config.indent_level is greater than 0:
@@ -55,6 +122,23 @@ End Process
 Note: ============================================================================
 Note: MODULE EMISSION
 Note: ============================================================================
+
+@Reasoning:
+Top-level emitter that produces a complete Erlang source file from an
+ErlangModule AST. Emits the canonical module section order: attributes
+(including the mandatory -module declaration), then records, then type
+declarations, then function definitions. Blank lines between sections
+and between functions match OTP style.
+@End Reasoning
+
+@Implementation:
+Builds the output incrementally with string concatenation through four
+sequential sections. Attributes are followed by one blank line if any
+were emitted. Records and types each get two trailing newlines for the
+blank-line separator. Functions iterate with index so the last function
+omits the trailing blank line — the file naturally ends after the last
+function's terminating period.
+@End Implementation
 
 Process called "emit_module" that takes module as ErlangModule, config as Integer returns Integer:
     Let output be ""
@@ -103,6 +187,25 @@ End Process
 Note: ============================================================================
 Note: ATTRIBUTE EMISSION
 Note: ============================================================================
+
+@Reasoning:
+Emits Erlang module attributes which have the form -name(value).
+or -name. for valueless attributes. Three attribute kinds need
+specialised formatting: -module(Name) takes a bare atom, -export/-import
+take a list of Name/Arity entries, and generic attributes take an
+expression list. Routing through specialised paths produces idiomatic
+output instead of Term-printer fallbacks.
+@End Reasoning
+
+@Implementation:
+Always starts with `-` and the attribute type name. When attr_values
+is non-empty: opens `(`, then dispatches on attr_type. "module"
+inlines attr_values[0] as a bare atom. "export"/"import" emit
+`[Name/Arity, ...]` from a list of {name, arity} dictionaries. Generic
+fallback emits each value through emit_term separated by `, `. All
+paths close with `)`. Finally appends `.` as required by Erlang
+attribute syntax.
+@End Implementation
 
 Process called "emit_attribute" that takes attr as ErlangAttribute, config as Integer returns Integer:
     Let output be "-"
@@ -155,6 +258,23 @@ Note: ==========================================================================
 Note: RECORD EMISSION
 Note: ============================================================================
 
+@Reasoning:
+Erlang record declaration syntax is -record(Name, {field, field = Default,
+field :: Type, ...}). Field defaults use `=`, type annotations use `::`,
+both are optional per field. Multi-field records get one field per line
+for readability, matching OTP coding-style conventions.
+@End Reasoning
+
+@Implementation:
+Opens with `-record(Name, {`. If fields list is non-empty: emits newline,
+increases indent, then iterates fields. Each field emits at the
+current indent followed by its name, optional ` = default` (only if
+default_value is non-zero), optional ` :: type` (only if field_type is
+non-zero), trailing `,` (only when not the last field), then newline.
+After the loop decreases indent and re-emits the indent prefix so the
+closing brace aligns with `-record`. Finishes with `})` followed by `.`.
+@End Implementation
+
 Process called "emit_record" that takes record as ErlangRecord, config as Integer returns Integer:
     Let output be "-record("
     Set output to output joined with record.name
@@ -202,6 +322,20 @@ Note: ==========================================================================
 Note: TYPE DECLARATION EMISSION
 Note: ============================================================================
 
+@Reasoning:
+Emits -type, -opaque, or -spec declarations. The decl_type field selects
+which (it stores the literal keyword). Type variables (the polymorphism
+parameters in `-type list(T) :: ...`) are emitted in parentheses after
+the name when present.
+@End Reasoning
+
+@Implementation:
+Output begins with `-` followed by decl_type (e.g., "type"), a space,
+and the declaration name. If type_vars is non-empty, emits them in
+parentheses comma-separated. Then ` :: ` and the type expression
+through emit_type_expr. Closes with `.` per Erlang attribute syntax.
+@End Implementation
+
 Process called "emit_type_decl" that takes type_decl as ErlangTypeDecl, config as Integer returns Integer:
     Let output be "-"
     Set output to output joined with type_decl.decl_type
@@ -229,6 +363,25 @@ Process called "emit_type_decl" that takes type_decl as ErlangTypeDecl, config a
 
     Return output
 End Process
+
+@Reasoning:
+Dispatches Erlang type expressions across seven shapes: atom, type
+variable, parameterized application, list, tuple, fun (function type),
+binary, and union. Each shape has its own syntactic surface in Erlang
+(e.g., union uses `|`, fun uses `fun(...) -> ...`, tuple uses braces).
+Recursive call handles nested types like list(tuple(integer, atom)).
+@End Reasoning
+
+@Implementation:
+Switches on type_kind string. "atom"/"var" emit the first type_arg
+directly. "parameterized" emits Name(arg1, arg2, ...) with recursive
+emit_type_expr for each arg from index 1 onward. "list" wraps a single
+inner type in `[...]`. "tuple" wraps comma-separated types in `{...}`.
+"fun" emits `fun(arg1, ..., argN-1) -> argN` where the last type_arg
+is the return type. "binary" emits the literal `<<>>` (binary type
+syntax). "union" emits types separated by ` | `. Unknown kinds fall
+through with an empty string.
+@End Implementation
 
 Process called "emit_type_expr" that takes type_expr as ErlangTypeExpr, config as Integer returns Integer:
     Let output be ""
@@ -313,6 +466,25 @@ Note: ==========================================================================
 Note: FUNCTION EMISSION
 Note: ============================================================================
 
+@Reasoning:
+Erlang functions can have multiple clauses (pattern-matched
+alternatives) separated by `;` and terminated by `.`. Each clause has
+its own pattern list, optional guard sequence after `when`, and a
+body of comma-separated expressions. Function bodies are indented
+one level deeper than the clause headers.
+@End Reasoning
+
+@Implementation:
+Iterates func.clauses. For each clause: emits the function name and
+opens `(`, then comma-separated patterns through emit_expression, then
+`)`. If guards are non-empty appends ` when ` followed by emit_guards
+output. Then ` ->` and newline. Increases indent, iterates body
+expressions emitting each at the new indent with trailing `,` between
+them (last body expression has no trailing comma). Decreases indent.
+Between clauses emits `;` + newline; after the last clause emits `.`
+to terminate the function.
+@End Implementation
+
 Process called "emit_function" that takes func as ErlangFunction, config as Integer returns Integer:
     Let output be ""
 
@@ -371,6 +543,21 @@ Process called "emit_function" that takes func as ErlangFunction, config as Inte
     Return output
 End Process
 
+@Reasoning:
+Erlang guard syntax has two levels: a sequence of guards separated by
+`;` (OR) where each guard is a sequence of tests separated by `,`
+(AND). The doubly-nested list structure of the parameter mirrors this
+exactly so emission is just two nested loops with the right separators.
+@End Reasoning
+
+@Implementation:
+Outer loop iterates guard_seqs (alternatives, OR-separated). Inner
+loop iterates each guard_seq (conjunction, AND-separated). Tests are
+emitted through emit_expression. Inner separator is `, ` (comma-AND);
+outer separator between alternatives is `; ` (semicolon-OR). Last
+elements in each loop suppress the trailing separator.
+@End Implementation
+
 Process called "emit_guards" that takes guard_seqs as List[List[ErlangExpression]], config as Integer returns Integer:
     Let output be ""
 
@@ -398,6 +585,27 @@ End Process
 Note: ============================================================================
 Note: EXPRESSION EMISSION
 Note: ============================================================================
+
+@Reasoning:
+The central expression dispatcher covering all Erlang expression kinds.
+Twenty-two expression types route to either an inline branch (literals,
+atoms, variables, integers, floats, characters, strings, macros) or a
+specialised emit_X helper (lists, tuples, binaries, operators, calls,
+funs, case/if/receive/try/begin, comprehensions, record create/access).
+The fallback emits a `<<unsupported: name>>` marker rather than aborting
+so unknown nodes surface as obvious text rather than crashing the emit
+pass.
+@End Reasoning
+
+@Implementation:
+String comparison on expr_type drives a long Otherwise If chain. Inline
+branches: atom -> emit_atom on value (handles quoting), var -> raw
+name, integer/float -> string-of-value, char -> `$` + value, string ->
+quoted+escaped value, macro -> `?` + name. Helper branches delegate
+to the specialised emit_X function which handles the full sub-shape
+including indentation. Order matters only for the literal-then-complex
+flow; otherwise tags are mutually exclusive.
+@End Implementation
 
 Process called "emit_expression" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let output be ""
@@ -507,6 +715,20 @@ Process called "emit_expression" that takes expr as ErlangExpression, config as 
     Return output
 End Process
 
+@Reasoning:
+Erlang atoms are bare lowercase identifiers; anything else (uppercase
+start, special characters, spaces) needs single-quote wrapping like
+'X' or '$bar'. Quoting decisions are encapsulated here so call sites
+don't repeat the lexical test.
+@End Reasoning
+
+@Implementation:
+Calls needs_quoting; on true wraps the value in `'...'`. Returns the
+bare value otherwise. No escaping of internal quotes inside the atom
+string — assumes the parser already validated the atom contains no
+unescaped `'` characters.
+@End Implementation
+
 Process called "emit_atom" that takes value as Integer returns Integer:
     Note: Check if atom needs quoting
     If needs_quoting with value:
@@ -515,6 +737,21 @@ Process called "emit_atom" that takes value as Integer returns Integer:
 
     Return value
 End Process
+
+@Reasoning:
+Determines whether an Erlang atom requires single-quote wrapping. An
+unquoted atom must start with a lowercase letter and contain only
+letters, digits, `_`, or `@`. Anything else — empty, uppercase start,
+or any special character — must be quoted.
+@End Reasoning
+
+@Implementation:
+Length 0 returns true (empty atoms must be quoted as `''`). Compares
+the first character against the uppercase A-Z range — returns true
+if uppercase. Then iterates a list of 34 special characters (space,
+punctuation, brackets, operators); if any of them appears anywhere
+in the atom returns true. Otherwise returns false.
+@End Implementation
 
 Process called "needs_quoting" that takes atom as Integer returns Boolean:
     Note: Atom needs quoting if it starts with uppercase or contains special chars
@@ -541,6 +778,21 @@ Process called "needs_quoting" that takes atom as Integer returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+String literals in Erlang use C-style escapes for `"`, `\`, newline,
+and tab. Other control characters survive raw — Erlang strings are
+just integer lists so byte-level content is preserved, but the four
+characters listed must be escaped to avoid breaking string literal
+syntax in the generated source.
+@End Reasoning
+
+@Implementation:
+Iterates the string character by character, comparing each against
+the four escape-required chars. Matches emit the escaped two-byte
+form (\", \\, \n, \t); other characters pass through unchanged.
+Returns the assembled escaped string.
+@End Implementation
+
 Process called "escape_string" that takes str as Integer returns Integer:
     Note: Escape special characters in string
     Let result be ""
@@ -563,6 +815,20 @@ Process called "escape_string" that takes str as Integer returns Integer:
 
     Return result
 End Process
+
+@Reasoning:
+Erlang supports both proper lists `[a, b, c]` and improper lists with
+explicit tails `[a, b | Tail]`. The tail field distinguishes the two —
+when non-null it signals improper-list syntax. Improper lists are
+common in pattern matching where the tail is a variable.
+@End Reasoning
+
+@Implementation:
+Opens `[`, iterates elements emitting each with `, ` separator (no
+trailing comma on last). If tail is non-zero, appends ` | ` followed
+by the recursively-emitted tail expression. Closes with `]`. Empty
+lists produce `[]` exactly.
+@End Implementation
 
 Process called "emit_list" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let elements be expr.expr_data at key "elements"
@@ -589,6 +855,19 @@ Process called "emit_list" that takes expr as ErlangExpression, config as Intege
     Return output
 End Process
 
+@Reasoning:
+Erlang tuples use brace syntax `{a, b, c}` and are heterogeneously
+typed. Empty tuple `{}` is allowed (the unit tuple, sometimes used
+as a sentinel value).
+@End Reasoning
+
+@Implementation:
+Opens `{`, iterates elements with comma-space separators (no trailing
+comma), closes `}`. Each element is recursively emit_expression. No
+single-element special case needed — Erlang tuples don't have the
+comma-disambiguation problem that exists in some other languages.
+@End Implementation
+
 Process called "emit_tuple" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let elements be expr.expr_data at key "elements"
 
@@ -606,6 +885,22 @@ Process called "emit_tuple" that takes expr as ErlangExpression, config as Integ
 
     Return output
 End Process
+
+@Reasoning:
+Erlang binaries `<<a, b:8, c/integer-big>>` are a sequence of segments
+where each segment has a value, optional size, and optional list of
+type specifiers (integer/float/binary/big/little/native/signed/unsigned).
+The slash-separated specifier list and colon-prefixed size encode all
+the bit-level layout info.
+@End Reasoning
+
+@Implementation:
+Opens `<<`. Iterates segments. For each: emits the value through
+emit_expression; if size is non-zero appends `:` + size expression;
+if specifiers list is non-empty appends `/` followed by specifiers
+joined with `-`. Comma-space between segments. Closes `>>`. Empty
+binaries produce `<<>>` exactly.
+@End Implementation
 
 Process called "emit_binary" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let segments be expr.expr_data at key "segments"
@@ -646,6 +941,23 @@ Process called "emit_binary" that takes expr as ErlangExpression, config as Inte
     Return output
 End Process
 
+@Reasoning:
+Most Erlang binary operators (+, -, *, /, ++, --, andalso, etc.) are
+emitted with single spaces around them. The exception is the remote-
+module operator `:` (mod:func), which must NOT have surrounding spaces.
+Distinguishing the colon case keeps generated code lexically valid.
+@End Reasoning
+
+@Implementation:
+Reads operator string and recursively emits left and right operands.
+If operator is `:`, returns `left:right` with no spaces (module:func
+call syntax). Otherwise returns `left OP right` with spaces around
+the operator. No precedence-based parenthesization — the parser is
+expected to have produced sufficiently-parenthesized expressions, or
+the printer will produce ambiguous output that re-parses to a
+different AST.
+@End Implementation
+
 Process called "emit_binary_op" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let operator be expr.expr_data at key "operator"
     Let left be emit_expression with expr.expr_data at key "left" and config
@@ -661,12 +973,43 @@ Process called "emit_binary_op" that takes expr as ErlangExpression, config as I
     Return left joined with " " joined with operator joined with " " joined with right
 End Process
 
+@Reasoning:
+Erlang unary operators (-, +, not, bnot) prefix the operand directly
+without a space. This matches Erlang lexical rules where, e.g.,
+`-X` is the unary-minus expression while `- X` would also parse but
+the canonical form has no space.
+@End Reasoning
+
+@Implementation:
+Reads operator and operand, recursively emits operand, returns
+concatenation `operator + operand`. Word operators like `not` will
+produce `notX` which is wrong — caller is expected to ensure word
+operators have trailing space in the operator string, or the parser
+canonicalizes word operators into prefix-call form before this point.
+@End Implementation
+
 Process called "emit_unary_op" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let operator be expr.expr_data at key "operator"
     Let operand be emit_expression with expr.expr_data at key "operand" and config
 
     Return operator joined with operand
 End Process
+
+@Reasoning:
+Erlang function calls have the form `Function(Arg1, Arg2, ...)` where
+Function can be a local atom, an mfa expression (mod:func), or a
+higher-order value (variable bound to a fun). Recursive emit_expression
+on the function part handles all three cases uniformly — module:func
+will have been emitted as a binary-op with `:` operator producing
+correct mfa syntax.
+@End Reasoning
+
+@Implementation:
+Recursively emits the function expression, then `(`, then comma-space
+separated arguments through emit_expression. Last argument has no
+trailing comma. Closes `)`. Zero-arg calls produce `Function()` which
+is the correct Erlang form.
+@End Implementation
 
 Process called "emit_call" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let function be emit_expression with expr.expr_data at key "function" and config
@@ -687,6 +1030,24 @@ Process called "emit_call" that takes expr as ErlangExpression, config as Intege
 
     Return output
 End Process
+
+@Reasoning:
+Erlang's `fun` expression covers three distinct forms with different
+syntax: `fun mod:func/Arity` (remote reference), `fun func/Arity`
+(local reference), and `fun ... end` (anonymous function with one or
+more pattern-matched clauses). Each requires different emission so
+the fun_type field selects the path.
+@End Reasoning
+
+@Implementation:
+Switches on the `type` key. "remote_ref" returns `fun Mod:Func/Arity`.
+"local_ref" returns `fun Func/Arity`. "anonymous" iterates the
+clauses list emitting each clause's `(patterns) when Guards -> Body`
+form with `;` between clauses, wrapped in `fun ... end`. The fallback
+returns `fun() -> ok end` for malformed fun expressions — a valid
+sentinel rather than an error string so downstream consumers don't
+break on unrecognised input.
+@End Implementation
 
 Process called "emit_fun" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let fun_type be expr.expr_data at key "type"
@@ -758,6 +1119,24 @@ Process called "emit_fun" that takes expr as ErlangExpression, config as Integer
     Return "fun() -> ok end"
 End Process
 
+@Reasoning:
+Erlang case expressions have the form `case Expr of Pattern [when
+Guards] -> Body; ... end`. Bodies are indented relative to the case
+keyword, the `end` aligns with `case`. Multi-clause cases use `;` as
+clause separator; the last clause has no separator before `end`.
+@End Reasoning
+
+@Implementation:
+Emits `case Scrutinee of` followed by newline, increases indent.
+Iterates clauses. Each clause emits at current indent: first pattern
+(patterns[0]; case clauses are single-pattern by Erlang grammar),
+optional ` when Guards`, ` ->`, newline. Body lines emit at a further-
+increased indent with `,` between body expressions. After each clause
+except the last, emits `;` then newline. After all clauses, decreases
+indent twice (clause body, then outer) and emits the indented `end`
+that aligns with the original case statement.
+@End Implementation
+
 Process called "emit_case" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let scrutinee be emit_expression with expr.expr_data at key "scrutinee" and config
     Let clauses be expr.expr_data at key "clauses"
@@ -814,6 +1193,21 @@ Process called "emit_case" that takes expr as ErlangExpression, config as Intege
     Return output
 End Process
 
+@Reasoning:
+Erlang `if Guards -> Body; ... end` has no scrutinee and no patterns;
+only guard sequences. Each clause's guards are emitted through
+emit_guards; semantics are first-matching wins. The structure is
+otherwise identical to case emission.
+@End Reasoning
+
+@Implementation:
+Emits `if` + newline, increases indent. Iterates clauses, each emitted
+at current indent. Clause emits guards (no patterns), ` ->`, newline,
+body at further-increased indent with `,` between body expressions.
+After each clause except the last, emits `;` + newline. After loop
+decreases indent and emits indented `end`.
+@End Implementation
+
 Process called "emit_if" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let clauses be expr.expr_data at key "clauses"
 
@@ -864,6 +1258,25 @@ Process called "emit_if" that takes expr as ErlangExpression, config as Integer 
 
     Return output
 End Process
+
+@Reasoning:
+Erlang `receive` blocks `receive Patterns -> Body; ... after Timeout
+-> Body end` are the message-passing primitive. The optional `after`
+clause runs if no message arrives in Timeout milliseconds. The
+separator between the last receive clause and the after clause is `;`,
+matching the inter-clause separator — the absence-of-after case omits
+that separator on the last clause.
+@End Reasoning
+
+@Implementation:
+Emits `receive` + newline, increases indent. Iterates message-match
+clauses similar to case but the separator decision considers both
+"more clauses follow" and "after clause is present": `;` is emitted
+if either is true. Body emission inside each clause uses an extra
+indent level. After clauses iterate, optionally emits `after Timeout
+-> Body` block also at the inner indent. Then decreases indent and
+emits indented `end`.
+@End Implementation
 
 Process called "emit_receive" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let clauses be expr.expr_data at key "clauses"
@@ -943,6 +1356,26 @@ Process called "emit_receive" that takes expr as ErlangExpression, config as Int
 
     Return output
 End Process
+
+@Reasoning:
+Erlang `try Body [of Patterns -> ...] [catch ExceptionClass:Pattern
+[when Guards] -> ...] [after Body] end` is the exception-handling
+construct. All four sections (body / of / catch / after) are optional
+except body. Catch clauses have a unique two-part pattern (`Class:Pat`)
+distinguishing them from case-style single-pattern clauses.
+@End Reasoning
+
+@Implementation:
+Emits `try` + newline, increases indent. Body section: each expression
+emitted at current indent with `,` between, newline at end. Decreases
+indent. Then conditional `of` section with case-style clause emission
+if of_clauses non-empty. Then conditional `catch` section where each
+catch clause emits optional `Class:` (skipping when exception_class
+is null), then the exception pattern, optional ` when Guards`, then
+` ->` + body. After clause emits its body indented under `after`.
+Finally emits indented `end`. All nested sections maintain proper
+indent depth through paired increase/decrease calls.
+@End Implementation
 
 Process called "emit_try" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let try_body be expr.expr_data at key "try_body"
@@ -1104,6 +1537,19 @@ Process called "emit_try" that takes expr as ErlangExpression, config as Integer
     Return output
 End Process
 
+@Reasoning:
+Erlang's `begin ... end` block sequences expressions and returns the
+last one's value — used wherever a single expression slot needs to
+contain multiple statements (e.g., a case-clause body cannot directly
+hold a comma list in some grammars).
+@End Reasoning
+
+@Implementation:
+Emits `begin` + newline. Increases indent. Iterates body expressions
+emitting each at the current indent with `,` between (no trailing
+comma on last). Decreases indent and emits indented `end`.
+@End Implementation
+
 Process called "emit_begin" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let body be expr.expr_data at key "body"
 
@@ -1130,6 +1576,22 @@ Process called "emit_begin" that takes expr as ErlangExpression, config as Integ
 
     Return output
 End Process
+
+@Reasoning:
+Erlang list comprehensions `[Template || Pat <- List, Filter, ...]`
+have a template expression and a list of qualifiers. Qualifiers are
+either generators (pattern <- source list) or filters (boolean
+expressions). Multiple qualifiers are evaluated left to right.
+@End Reasoning
+
+@Implementation:
+Opens `[`, emits the template expression, then ` || `. Iterates
+qualifiers. For each: "generator" emits `Pat <- List` (both
+recursively emit_expression); "filter" emits just the boolean
+expression. Comma-space between qualifiers. Closes `]`. The qualifier
+type field is required — unknown types produce empty output but the
+list is still validly bracketed.
+@End Implementation
 
 Process called "emit_list_comprehension" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let template be emit_expression with expr.expr_data at key "template" and config
@@ -1161,6 +1623,22 @@ Process called "emit_list_comprehension" that takes expr as ErlangExpression, co
 
     Return output
 End Process
+
+@Reasoning:
+Erlang binary comprehensions `<<Template || Qualifiers>>` produce
+binaries instead of lists. They support an additional qualifier kind
+"binary_generator" using `<=` arrow (versus `<-` for list generators).
+The template is itself a binary segment so it also has size and
+specifier components.
+@End Reasoning
+
+@Implementation:
+Opens `<<`, emits template's value via emit_expression. If template
+has a size (size != 0), emits `:size`. Then ` || ` and qualifier loop.
+Three qualifier kinds: "generator" emits `Pat <- Source`,
+"binary_generator" emits `Pat <= Source`, "filter" emits expression.
+Comma-space between qualifiers. Closes `>>`.
+@End Implementation
 
 Process called "emit_binary_comprehension" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let template be expr.expr_data at key "template"
@@ -1206,6 +1684,22 @@ Process called "emit_binary_comprehension" that takes expr as ErlangExpression, 
     Return output
 End Process
 
+@Reasoning:
+Erlang record creation `#Name{field = Value, ...}` or record update
+`Base#Name{field = Value, ...}`. The `base` field distinguishes the
+two — when non-null the syntax includes `BaseExpr |` after the opening
+brace. Fields not mentioned in an update inherit values from base;
+fields not mentioned in a create get the default from the record
+declaration.
+@End Reasoning
+
+@Implementation:
+Emits `#Name{`. If base is non-zero, emits the base expression followed
+by ` | `. Then iterates fields emitting `name = Value` for each with
+`, ` between entries. Closes `}`. Record field names are atoms but
+emitted bare here since record field syntax doesn't quote them.
+@End Implementation
+
 Process called "emit_record_create" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let name be expr.expr_data at key "name"
     Let fields be expr.expr_data at key "fields"
@@ -1237,12 +1731,40 @@ Process called "emit_record_create" that takes expr as ErlangExpression, config 
     Return output
 End Process
 
+@Reasoning:
+Erlang record field access syntax `Record#field` reads a single field
+value. The `#` immediately follows the record expression with no
+spaces; the field name is a bare atom.
+@End Reasoning
+
+@Implementation:
+Recursively emits the record expression, concatenates `#`, then the
+field name. Single-line output, no indentation involved.
+@End Implementation
+
 Process called "emit_record_access" that takes expr as ErlangExpression, config as Integer returns Integer:
     Let record be emit_expression with expr.expr_data at key "record" and config
     Let field be expr.expr_data at key "field"
 
     Return record joined with "#" joined with field
 End Process
+
+@Reasoning:
+Used by attribute emission for the generic-value fallback when the
+attribute type isn't `module`/`export`/`import`. Erlang attribute
+values can be arbitrary terms (atoms, integers, lists, nested terms)
+so this helper covers the three common term shapes with a default
+catchall.
+@End Reasoning
+
+@Implementation:
+Three-way dispatch on Runa runtime type predicates: String -> emit
+literally, Integer -> string-of-int, List -> recursive emission of
+each element wrapped in `[...]` with `, ` separators. Falls through
+to `"ok"` for any other type — a defensive sentinel rather than an
+error string so attribute output remains lexically valid Erlang even
+if a structurally-invalid term sneaks through.
+@End Implementation
 
 Process called "emit_term" that takes term as Any returns Integer:
     Note: Emit arbitrary Erlang term
@@ -1277,6 +1799,19 @@ End Process
 Note: ============================================================================
 Note: EMISSION ENTRY POINT
 Note: ============================================================================
+
+@Reasoning:
+Public entry point used by the rest of the compiler when it needs to
+turn an ErlangModule AST back into source text. Creates a default
+config so callers don't have to know about indentation settings.
+@End Reasoning
+
+@Implementation:
+Calls create_emitter_config to get default formatting, then delegates
+to emit_module which does the actual work. No config disposal needed
+because ErlangEmitterConfig is a plain value type with no owned heap
+resources.
+@End Implementation
 
 Process called "emit_erlang_module" that takes module as ErlangModule returns Integer:
     Let config be create_emitter_config

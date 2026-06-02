@@ -31,6 +31,18 @@ Note: ==========================================================================
 Note: Backend State
 Note: ============================================================================
 
+@Reasoning:
+Backend state is intentionally minimal: only a latched error message and a
+flag indicating whether the backend is in an error state. The translator is
+stateless across calls; error propagation is the only state worth keeping.
+@End Reasoning
+
+@Implementation:
+Two heap-allocated fields packed at offsets 0 (error_message string) and 8
+(has_error flag) for a total of 16 bytes. Layout matches the manual
+memory_set_string/memory_set_int64 calls in create_backend.
+@End Implementation
+
 Type called "HIRToDockerfileBackend":
     error_message as String
     has_error as Integer
@@ -39,6 +51,19 @@ End Type
 Note: ============================================================================
 Note: Backend Creation
 Note: ============================================================================
+
+@Reasoning:
+Factory for a HIRToDockerfileBackend record returned as an opaque pointer so
+the rest of the translator can pass it through the call/return chain without
+exposing the field layout. Allocation is heap (not arena) because backend
+state outlives any single translate_* invocation.
+@End Reasoning
+
+@Implementation:
+Allocates exactly 16 bytes for the two-field record, zero-initializes
+error_message to the empty string and has_error to 0 via Layout primitives
+so subsequent reads see a defined value even before any error is recorded.
+@End Implementation
 
 Process called "create_backend" returns Integer:
     @Reasoning
@@ -57,6 +82,13 @@ Process called "create_backend" returns Integer:
     Return backend_ptr
 End Process
 
+@Reasoning:
+Backend ownership is single-rooted: the caller that invoked create_backend
+is responsible for releasing it. Since the only embedded resource is the
+inline error_message String (no nested heap pointers), a single deallocate
+is sufficient — no recursive free required.
+@End Reasoning
+
 Process called "free_backend" that takes backend_ptr as Integer returns Integer:
     @Reasoning
     Free the backend structure.
@@ -69,6 +101,13 @@ Process called "free_backend" that takes backend_ptr as Integer returns Integer:
     proc deallocate from Layout with backend_ptr
     Return 1
 End Process
+
+@Reasoning:
+Error recording is latched, not cumulative: the most recent message wins and
+has_error becomes 1. The translator's outer loop polls has_error after each
+translate_* call to short-circuit when the input is malformed, so multiple
+overwrites are intentional (last error in chain is most actionable).
+@End Reasoning
 
 Process called "set_backend_error" that takes backend_ptr as Integer, message as String returns Integer:
     @Reasoning
@@ -87,6 +126,19 @@ End Process
 Note: ============================================================================
 Note: HIR Helper Functions
 Note: ============================================================================
+
+@Reasoning:
+Defensive extractor: returns the empty string for both a null pointer and a
+node of an unexpected type. This is the only safe behaviour because the
+caller (translate_*_call) uses the empty string as its sentinel for
+"argument absent / unrepresentable" and would otherwise dereference garbage.
+@End Reasoning
+
+@Implementation:
+The HIR node layout begins with the type tag at offset 0; HIR_LITERAL stores
+its string payload at offset 40. Both offsets must match hir.runa's
+declaration or the translator will silently produce wrong Dockerfile output.
+@End Implementation
 
 Process called "extract_string_literal" that takes hir_node_ptr as Integer returns String:
     @Reasoning
@@ -111,6 +163,18 @@ Process called "extract_string_literal" that takes hir_node_ptr as Integer retur
     Return ""
 End Process
 
+@Reasoning:
+Integer counterpart to extract_string_literal. 0 is the safe sentinel for
+malformed input because EXPOSE / STOPSIGNAL / similar Dockerfile fields
+treat 0 as "not specified" downstream.
+@End Reasoning
+
+@Implementation:
+Reads the int64 payload at offset 40 of a HIR_LITERAL node — the same offset
+the string extractor uses because HIR_LITERAL aliases its payload field by
+node subtype rather than by separate storage.
+@End Implementation
+
 Process called "extract_integer_literal" that takes hir_node_ptr as Integer returns Integer:
     @Reasoning
     Extract integer value from HIR_LITERAL node.
@@ -134,6 +198,13 @@ Process called "extract_integer_literal" that takes hir_node_ptr as Integer retu
     Return 0
 End Process
 
+@Reasoning:
+Booleans are stored in HIR as int64 with value 0 or 1; this helper exists
+distinct from extract_integer_literal solely so the call sites at COPY/ADD
+keep_link translation read as documentation of intent, not because the
+representation differs.
+@End Reasoning
+
 Process called "extract_boolean_literal" that takes hir_node_ptr as Integer returns Integer:
     @Reasoning
     Extract boolean value from HIR_LITERAL node.
@@ -156,6 +227,20 @@ Process called "extract_boolean_literal" that takes hir_node_ptr as Integer retu
 
     Return 0
 End Process
+
+@Reasoning:
+HIR_ARRAY_LITERAL stores its elements as a List of HIR child nodes, but
+Dockerfile instructions (LABEL keys, EXPOSE ports, COPY sources, RUN exec
+args) want a flat List[String]. This helper performs that flatten in one
+pass so each translate_* call site doesn't reinvent it.
+@End Reasoning
+
+@Implementation:
+Offset 24 holds the child-list pointer, offset 32 the precomputed count.
+Iterates children, applies extract_string_literal to each (returning "" for
+non-literal children rather than aborting), and appends to a fresh List
+which becomes the caller's owned result.
+@End Implementation
 
 Process called "extract_array_elements" that takes hir_array_ptr as Integer returns Integer:
     @Reasoning
@@ -193,6 +278,13 @@ Process called "extract_array_elements" that takes hir_array_ptr as Integer retu
     Return strings_list
 End Process
 
+@Reasoning:
+Tuples encode positional pairs (e.g., LABEL key/value pairs) where the
+caller already knows the arity. Unlike arrays, the elements stay as raw HIR
+nodes — the caller is responsible for invoking the appropriate literal
+extractor on each, because position determines expected type.
+@End Reasoning
+
 Process called "extract_tuple_elements" that takes hir_tuple_ptr as Integer returns Integer:
     @Reasoning
     Extract list of element HIR nodes from HIR_TUPLE_LITERAL node.
@@ -215,6 +307,13 @@ Process called "extract_tuple_elements" that takes hir_tuple_ptr as Integer retu
     Let elements_ptr be proc memory_get_int64 from Layout with hir_tuple_ptr, 24
     Return elements_ptr
 End Process
+
+@Reasoning:
+The dispatcher in translate_hir_call needs the callee identifier to pick the
+correct translate_*_call handler. HIR_CALL_EXPRESSION stores its callee as
+a child HIR_IDENTIFIER node, not as an inline string, so this helper walks
+that one hop while returning "" if the callee is computed (non-identifier).
+@End Reasoning
 
 Process called "get_function_name" that takes hir_call_ptr as Integer returns String:
     @Reasoning
@@ -251,6 +350,12 @@ Process called "get_function_name" that takes hir_call_ptr as Integer returns St
     Return ""
 End Process
 
+@Reasoning:
+HIR_CALL_EXPRESSION stores its argument list pointer at offset 32 (offset
+24 is the callee). Centralising this access here means a future schema
+change only edits one place rather than every translate_*_call site.
+@End Reasoning
+
 Process called "get_call_arguments" that takes hir_call_ptr as Integer returns Integer:
     @Reasoning
     Extract argument list from HIR_CALL_EXPRESSION node.
@@ -277,6 +382,21 @@ End Process
 Note: ============================================================================
 Note: Instruction Translation Functions
 Note: ============================================================================
+
+@Reasoning:
+FROM is the only Dockerfile instruction with five orthogonal optional parts
+(image, tag, digest, stage_name, platform). The HIR encoding fixes a
+positional argument count of exactly 5 so the reverse translation can
+expect a stable shape — any arity mismatch is a fatal lowering bug, not a
+user error, so it sets backend error rather than negotiating defaults.
+@End Reasoning
+
+@Implementation:
+Allocates a 64-byte FromInstruction record matching the layout in
+dockerfile_parser.runa: tag (0), image (8), tag (16), digest (24),
+stage_name (32), platform (40), line (48), column (56). Source position
+is carried from the HIR call so error reports point at the original input.
+@End Implementation
 
 Process called "translate_from_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -331,6 +451,14 @@ Process called "translate_from_call" that takes backend_ptr as Integer, hir_call
     Return from_ptr
 End Process
 
+@Reasoning:
+RUN has two distinct surface forms (shell and exec) which the HIR encodes
+as separate function calls so the reverse translation can recover the
+original surface choice without inference. Shell form takes exactly one
+String argument (the command line); the args field of the AST node stays
+null because there is no argv vector.
+@End Reasoning
+
 Process called "translate_run_shell_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_run_shell HIR call back to RUN instruction AST (shell form).
@@ -371,6 +499,13 @@ Process called "translate_run_shell_call" that takes backend_ptr as Integer, hir
 
     Return run_ptr
 End Process
+
+@Reasoning:
+Exec form of RUN bypasses the shell entirely: argv is the canonical
+representation. The HIR encodes that as a single Array argument whose
+elements become the argv vector. The command field of the AST stays empty
+because there is no implicit /bin/sh -c wrapper in this mode.
+@End Reasoning
 
 Process called "translate_run_exec_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -413,6 +548,13 @@ Process called "translate_run_exec_call" that takes backend_ptr as Integer, hir_
     Return run_ptr
 End Process
 
+@Reasoning:
+CMD shell-form is the default container command parsed by /bin/sh -c.
+Layout mirrors translate_run_shell_call (same 48-byte record with
+NODE_CMD/SHELL_FORM tag) because Dockerfile parser intentionally reuses
+the same record shape between RUN and CMD to simplify formatters.
+@End Reasoning
+
 Process called "translate_cmd_shell_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_cmd_shell HIR call back to CMD instruction AST (shell form).
@@ -447,6 +589,12 @@ Process called "translate_cmd_shell_call" that takes backend_ptr as Integer, hir
     Return cmd_ptr
 End Process
 
+@Reasoning:
+CMD exec-form is preferred for production images (no shell signal-handling
+quirks). Same encoding logic as RUN exec, but produces a NODE_CMD-tagged
+record so the formatter emits "CMD" not "RUN".
+@End Reasoning
+
 Process called "translate_cmd_exec_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_cmd_exec HIR call back to CMD instruction AST (exec form).
@@ -480,6 +628,13 @@ Process called "translate_cmd_exec_call" that takes backend_ptr as Integer, hir_
 
     Return cmd_ptr
 End Process
+
+@Reasoning:
+LABEL aggregates an arbitrary number of key/value pairs in a single AST
+node. The HIR encoding wraps them in a single array of 2-tuples; this
+helper unrolls the array, extracts each (key, value) tuple, and builds a
+List of allocated KeyValuePair records the formatter can iterate.
+@End Reasoning
 
 Process called "translate_label_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -537,6 +692,13 @@ Process called "translate_label_call" that takes backend_ptr as Integer, hir_cal
     Return label_ptr
 End Process
 
+@Reasoning:
+EXPOSE pairs each port with its protocol ("tcp"/"udp"). The HIR encoding
+mirrors LABEL's tuple-of-pairs structure, but the per-tuple PortSpec
+record holds an int64 port (offset 0) and a String protocol (offset 8) —
+the port is numeric, not string, so it uses extract_integer_literal.
+@End Reasoning
+
 Process called "translate_expose_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_expose HIR call back to EXPOSE instruction AST.
@@ -592,6 +754,13 @@ Process called "translate_expose_call" that takes backend_ptr as Integer, hir_ca
 
     Return expose_ptr
 End Process
+
+@Reasoning:
+ENV uses the same pair encoding as LABEL; the only structural difference
+is the destination AST tag (NODE_ENV) and that the formatter treats ENV
+specially (no quoting heuristics, value spans to end-of-line). Keeping the
+two helpers separate makes future divergence (e.g., escape rules) trivial.
+@End Reasoning
 
 Process called "translate_env_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -649,6 +818,19 @@ Process called "translate_env_call" that takes backend_ptr as Integer, hir_call_
     Return env_ptr
 End Process
 
+@Reasoning:
+COPY has the richest modifier set: from_stage (multi-stage builds), chown
+ownership, chmod permissions, and the --link flag. Strict arity 6 lets a
+single allocation lay them out at fixed offsets without a discriminated
+flags field, simplifying both backend and formatter.
+@End Reasoning
+
+@Implementation:
+CopyInstruction is 72 bytes: tag (0), sources list (8), dest (16), from
+(24), chown (32), chmod (40), link flag (48), line (56), col (64). Booleans
+go through extract_boolean_literal so the field is canonically 0/1.
+@End Implementation
+
 Process called "translate_copy_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_copy HIR call back to COPY instruction AST.
@@ -703,6 +885,13 @@ Process called "translate_copy_call" that takes backend_ptr as Integer, hir_call
 
     Return copy_ptr
 End Process
+
+@Reasoning:
+ADD extends COPY with two ADD-specific modifiers — keep_git_dir for git
+URL sources and checksum for remote URL verification — bumping the arity
+to 7 and the record size to 80 bytes. The split between COPY and ADD is
+preserved through the round trip because the BuildKit semantics differ.
+@End Reasoning
 
 Process called "translate_add_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -762,6 +951,13 @@ Process called "translate_add_call" that takes backend_ptr as Integer, hir_call_
     Return add_ptr
 End Process
 
+@Reasoning:
+ENTRYPOINT shell-form is wrapped by /bin/sh -c at container start. It is
+explicitly distinguished from CMD shell-form because Docker layers
+ENTRYPOINT and CMD differently (CMD becomes positional args to
+ENTRYPOINT), so the surface choice must survive the HIR round trip.
+@End Reasoning
+
 Process called "translate_entrypoint_shell_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_entrypoint_shell HIR call back to ENTRYPOINT instruction AST (shell form).
@@ -795,6 +991,13 @@ Process called "translate_entrypoint_shell_call" that takes backend_ptr as Integ
 
     Return entrypoint_ptr
 End Process
+
+@Reasoning:
+Exec-form ENTRYPOINT is the recommended production form because PID 1 is
+the actual process (no shell wrapper to swallow SIGTERM). The args array
+becomes argv directly; the AST command field stays empty so the formatter
+emits the JSON-array bracketed surface syntax.
+@End Reasoning
 
 Process called "translate_entrypoint_exec_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -830,6 +1033,13 @@ Process called "translate_entrypoint_exec_call" that takes backend_ptr as Intege
     Return entrypoint_ptr
 End Process
 
+@Reasoning:
+VOLUME accepts an arbitrary number of mount-point paths in a single
+instruction. The HIR encoding wraps them as one Array argument so the
+empty-list case is representable (caller intent: declare zero volumes is
+ill-formed; the parser still emits one Array to keep arity uniform).
+@End Reasoning
+
 Process called "translate_volume_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_volume HIR call back to VOLUME instruction AST.
@@ -861,6 +1071,13 @@ Process called "translate_volume_call" that takes backend_ptr as Integer, hir_ca
 
     Return volume_ptr
 End Process
+
+@Reasoning:
+USER may carry an optional group spec ("user:group"); the HIR encoding
+always passes both as separate string arguments and uses "" for the
+group when absent. Arity is fixed at 2 to avoid an optional-argument
+discriminator at the call site.
+@End Reasoning
 
 Process called "translate_user_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -905,6 +1122,13 @@ Process called "translate_user_call" that takes backend_ptr as Integer, hir_call
     Return user_ptr
 End Process
 
+@Reasoning:
+WORKDIR is single-argument and absolutely critical: the next layer's CWD
+depends on it. Empty path is permitted at HIR level because the validator
+upstream may have already flagged it; the backend's job is faithful
+reconstruction, not re-validation.
+@End Reasoning
+
 Process called "translate_workdir_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_workdir HIR call back to WORKDIR instruction AST.
@@ -936,6 +1160,13 @@ Process called "translate_workdir_call" that takes backend_ptr as Integer, hir_c
 
     Return workdir_ptr
 End Process
+
+@Reasoning:
+ARG declares a build-time variable, optionally with a default. The arity-
+2 contract pairs the name with a possibly empty default; the formatter
+distinguishes "no default" from "empty default" via downstream conventions
+since both can be represented by the empty string at this layer.
+@End Reasoning
 
 Process called "translate_arg_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -980,6 +1211,15 @@ Process called "translate_arg_call" that takes backend_ptr as Integer, hir_call_
     Return arg_ptr
 End Process
 
+@Reasoning:
+ONBUILD wraps another instruction that fires when this image is used as a
+base. The nested instruction is itself a HIR call, so this translator
+recurses through translate_hir_call — the only translate_*_call in this
+file that does so. Nesting depth is bounded because ONBUILD-of-ONBUILD is
+forbidden by Docker, but the recursion is unguarded here on purpose
+(any nesting violation is the upstream validator's responsibility).
+@End Reasoning
+
 Process called "translate_onbuild_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_onbuild HIR call back to ONBUILD instruction AST.
@@ -1015,6 +1255,13 @@ Process called "translate_onbuild_call" that takes backend_ptr as Integer, hir_c
     Return onbuild_ptr
 End Process
 
+@Reasoning:
+STOPSIGNAL is single-string: the symbolic name (SIGTERM) or numeric value
+("9"). Kept as a String rather than parsed to an integer because Docker
+accepts both forms and the formatter should round-trip whichever the
+original Dockerfile used.
+@End Reasoning
+
 Process called "translate_stopsignal_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_stopsignal HIR call back to STOPSIGNAL instruction AST.
@@ -1047,6 +1294,14 @@ Process called "translate_stopsignal_call" that takes backend_ptr as Integer, hi
     Return stopsignal_ptr
 End Process
 
+@Reasoning:
+HEALTHCHECK NONE explicitly disables any inherited healthcheck from the
+base image. It carries no parameters but still allocates the full 88-byte
+HealthcheckInstruction record so the formatter can use a single emission
+path keyed on is_none (offset 8). Zero-filling the unused fields keeps
+the record well-defined for later debug-dumps.
+@End Reasoning
+
 Process called "translate_healthcheck_none_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_healthcheck_none HIR call back to HEALTHCHECK NONE instruction AST.
@@ -1076,6 +1331,20 @@ Process called "translate_healthcheck_none_call" that takes backend_ptr as Integ
 
     Return healthcheck_ptr
 End Process
+
+@Reasoning:
+HEALTHCHECK CMD packs every probe knob into a flat 7-tuple: three duration
+strings (interval, timeout, start_period) kept as strings to preserve
+"30s"/"1m" surface units, an int retries count, the shell-vs-exec form
+flag, the shell command, and the exec args array. Empty duration strings
+encode "use Docker default" — no separate optional flag needed.
+@End Reasoning
+
+@Implementation:
+88-byte HealthcheckInstruction record shared with the NONE variant; is_none
+(offset 8) is 0 here. cmd_form (offset 48) discriminates SHELL_FORM vs
+EXEC_FORM and selects which of cmd_command/cmd_args is meaningful.
+@End Implementation
 
 Process called "translate_healthcheck_cmd_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -1136,6 +1405,12 @@ Process called "translate_healthcheck_cmd_call" that takes backend_ptr as Intege
     Return healthcheck_ptr
 End Process
 
+@Reasoning:
+SHELL overrides the implicit shell used by RUN/CMD/ENTRYPOINT shell-forms
+for the rest of the stage (e.g., ["powershell", "-Command"] on Windows
+builds). One Array argument lists the executable plus its standard flags.
+@End Reasoning
+
 Process called "translate_shell_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
     Translate dockerfile_shell HIR call back to SHELL instruction AST.
@@ -1167,6 +1442,13 @@ Process called "translate_shell_call" that takes backend_ptr as Integer, hir_cal
 
     Return shell_ptr
 End Process
+
+@Reasoning:
+MAINTAINER is officially deprecated in favour of LABEL maintainer=, but
+existing Dockerfiles still use it and the formatter is expected to preserve
+the surface choice. Single-string argument carries the maintainer literal
+verbatim (no parsing into name/email).
+@End Reasoning
 
 Process called "translate_maintainer_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -1203,6 +1485,19 @@ End Process
 Note: ============================================================================
 Note: Main Translation Functions
 Note: ============================================================================
+
+@Reasoning:
+Centralised dispatcher keyed on the canonical "dockerfile_*" prefix of the
+HIR call's callee identifier. Linear-chain dispatch is correct here
+because the number of Dockerfile instructions is fixed and small; a hash
+table would add allocation overhead with no measurable benefit.
+@End Reasoning
+
+@Implementation:
+Single function_name lookup (no per-comparison re-extraction). Empty name
+short-circuits with backend error; unrecognised name falls through to the
+final error path which preserves the offending name for diagnostics.
+@End Implementation
 
 Process called "translate_hir_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
     @Reasoning
@@ -1335,6 +1630,22 @@ Process called "translate_hir_call" that takes backend_ptr as Integer, hir_call_
     proc set_backend_error with backend_ptr, "Unknown Dockerfile function"
     Return 0
 End Process
+
+@Reasoning:
+Top-level driver for the backend: walks the HIR block (the only encoding
+shape the lowering produces for a whole Dockerfile), unwraps each
+expression-statement to its inner HIR_CALL, and accumulates translated
+instructions into a fresh Dockerfile AST root. First call failure
+short-circuits the whole walk so a corrupted partial AST is never
+returned upward.
+@End Reasoning
+
+@Implementation:
+HIR block layout: type (0), line (8), col (16), statements list (24),
+statement count (32). Each statement is HIR_EXPRESSION_STATEMENT with its
+inner call at offset 24. Dockerfile AST root layout: tag (0),
+instructions list (8), line (16), col (24).
+@End Implementation
 
 Process called "translate_hir_to_dockerfile" that takes backend_ptr as Integer, hir_block_ptr as Integer returns Integer:
     @Reasoning

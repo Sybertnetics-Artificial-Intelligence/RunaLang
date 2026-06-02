@@ -19,6 +19,29 @@ Note: ===================================================================
 Note: SEMANTIC ANALYZER STRUCTURE
 Note: ===================================================================
 
+@Reasoning:
+Aggregates every cross-reference table the Solidity semantic phase
+needs. Solidity is structurally complex: contracts inherit (with C3
+linearisation), state variables and functions live qualified by
+contract name, and security/gas analysis must walk every function
+again after declaration collection. Storing all registries on a
+single analyzer object lets each pass be a simple top-level Process
+call rather than threading dictionaries through every function.
+@End Reasoning
+
+@Implementation:
+26 i64-sized fields, occupying 208 bytes total at offsets 0..200.
+Declaration registries (contracts/interfaces/libraries/structs/
+enums/state_variables/functions/modifiers/events/errors) are
+Dictionaries keyed by qualified name. imports/pragma_directives are
+Lists. inheritance_graph maps contract_name -> List of parents.
+function_signatures and state_mutability and visibility_modifiers
+map qualified_name -> attribute. security_issues, gas_warnings,
+reentrancy_risks, overflow_risks, access_control_issues,
+validation_errors, validation_warnings are Lists of message strings.
+compiler_version stores the pragma value pointer; error_message and
+has_error are the fatal-error flag/pointer pair.
+@End Implementation
 Type called "SoliditySemanticAnalyzer":
     contracts as Integer
     interfaces as Integer
@@ -52,20 +75,26 @@ Note: ===================================================================
 Note: ANALYZER CREATION
 Note: ===================================================================
 
+@Reasoning:
+Zero-arg factory because the Solidity analyzer is a per-translation-unit
+worker: each call mints a fresh 208-byte record so concurrent translations
+cannot collide on shared registries, and partial-failure cleanup is just a
+single deallocate. Returning 0 on the Layout.allocate failure path (instead
+of aborting) keeps the analyzer construction non-fatal — the driver decides
+how to react to OOM.
+@End Reasoning
+
+@Implementation:
+Allocates a 208-byte block matching the SoliditySemanticAnalyzer slot map
+(26 i64 slots, offsets 0..200). Creates one Dict/List per registry slot
+(0..168), then initialises pragma_directives at 184. Slot 176
+(compiler_version), 192 (error_message), and 200 (has_error) are written
+as 0 — they are populated lazily by collect_solidity_pragmas and
+set_solidity_semantic_error. Slot order in memory_set_int64 calls MUST
+match the Type declaration above; any reordering corrupts every accessor.
+@End Implementation
 Process called "create_solidity_semantic_analyzer" returns Integer:
     Note: Create Solidity semantic analyzer for smart contract validation
-
-    @Reasoning:
-    Initialize comprehensive semantic analyzer for Solidity including contract
-    validation, security analysis, gas optimization, type checking, and
-    Ethereum Virtual Machine compatibility verification.
-    @End Reasoning
-
-    @Implementation:
-    Allocate analyzer structure with registries for contracts, functions,
-    state variables, security tracking, and gas analysis. Initialize all
-    registries for comprehensive Solidity smart contract analysis.
-    @End Implementation
 
     Let analyzer_size be 208
     Let analyzer be proc allocate from Layout with analyzer_size
@@ -132,6 +161,18 @@ Note: ===================================================================
 Note: MAIN ANALYSIS ENTRY POINT
 Note: ===================================================================
 
+@Implementation:
+Null-guards analyzer and solidity_ast. On null AST, calls
+set_solidity_semantic_error with "Null Solidity AST" and returns 0.
+Otherwise runs six pipeline phases in order:
+  1. collect_solidity_pragmas - pragmas and imports
+  2. collect_solidity_declarations - all contracts/libs/interfaces
+  3. validate_solidity_contracts - inheritance and overrides
+  4. analyze_solidity_security - reentrancy/overflow/access control
+  5. analyze_solidity_gas_usage - gas optimisation advisories
+  6. validate_solidity_types - type compatibility
+Finally checks has_error @200 - returns 0 if set, otherwise 1.
+@End Implementation
 Process called "analyze_solidity_contract" takes analyzer as Integer, solidity_ast as Integer returns Integer:
     Note: Perform complete semantic analysis on Solidity contract
 
@@ -186,6 +227,16 @@ Note: ===================================================================
 Note: PRAGMA AND IMPORT COLLECTION
 Note: ===================================================================
 
+@Implementation:
+Two parallel sweeps on the AST:
+  Pragmas: get_solidity_pragma_statements. For each, appends to the
+    pragma_directives list @184 and calls
+    check_solidity_version_pragma.
+  Imports: get_solidity_import_statements. For each, appends to the
+    imports list @80 and calls validate_solidity_import.
+Both null-check the AST accessor results because pragmas and
+imports are optional in a Solidity source file.
+@End Implementation
 Process called "collect_solidity_pragmas" takes analyzer as Integer, solidity_ast as Integer:
     Note: Collect pragma directives and import statements
 
@@ -230,6 +281,13 @@ Process called "collect_solidity_pragmas" takes analyzer as Integer, solidity_as
     End If
 End Process
 
+@Implementation:
+Reads pragma_type and pragma_value from the AST. Calls string_equals
+to test if pragma_type is "solidity". If yes, stores pragma_value
+into analyzer @176 (the compiler_version field) and calls
+validate_solidity_version_format. Non-solidity pragmas (e.g.
+"experimental") are silently ignored at this layer.
+@End Implementation
 Process called "check_solidity_version_pragma" takes analyzer as Integer, pragma_stmt as Integer:
     Note: Check Solidity compiler version pragma
 
@@ -255,6 +313,15 @@ Note: ===================================================================
 Note: DECLARATION COLLECTION
 Note: ===================================================================
 
+@Implementation:
+Reads the contract_definitions list from the AST. Iterates each
+definition, reading its contract_type. Match on the type string:
+"contract" -> collect_solidity_contract,
+"interface" -> collect_solidity_interface,
+"library" -> collect_solidity_library,
+otherwise registers a warning "Unknown contract type: <type>" via
+add_solidity_validation_warning.
+@End Implementation
 Process called "collect_solidity_declarations" takes analyzer as Integer, solidity_ast as Integer:
     Note: Collect all Solidity contract declarations
 
@@ -288,6 +355,14 @@ Process called "collect_solidity_declarations" takes analyzer as Integer, solidi
     End While
 End Process
 
+@Implementation:
+Reads contract_name from the AST node. Looks up contracts_registry
+@0. If the name is already present, registers a "Duplicate contract
+definition" error and returns. Otherwise sets the dictionary entry
+and runs five collection sub-passes: inheritance, state variables,
+functions, modifiers, events/errors. Each sub-pass populates the
+corresponding analyzer-level registries with qualified names.
+@End Implementation
 Process called "collect_solidity_contract" takes analyzer as Integer, contract_def as Integer:
     Note: Collect contract definition
 
@@ -326,6 +401,14 @@ Process called "collect_solidity_contract" takes analyzer as Integer, contract_d
     proc collect_contract_events_errors with analyzer, contract_name, contract_def
 End Process
 
+@Implementation:
+Calls get_solidity_contract_inheritance on contract_def. If the
+inheritance list is null (contract declared no parents), returns.
+Otherwise reads inheritance_graph @88 and sets contract_name ->
+inheritance_list on the dictionary. Then calls
+validate_inheritance_hierarchy for early sanity checks (each parent
+name resolves to a known contract).
+@End Implementation
 Process called "collect_contract_inheritance" takes analyzer as Integer, contract_name as Integer, contract_def as Integer:
     Note: Collect contract inheritance relationships
 
@@ -347,6 +430,15 @@ Process called "collect_contract_inheritance" takes analyzer as Integer, contrac
     proc validate_inheritance_hierarchy with analyzer, contract_name, inheritance_list
 End Process
 
+@Implementation:
+Calls get_solidity_contract_state_variables. If null returns. Reads
+state_variables @40, visibility_modifiers @112, state_mutability
+@104. Iterates each state_var: extracts var_name, var_type,
+var_visibility, var_mutability via parser accessors. Builds
+qualified_var_name as "ContractName.varName" via two string_concat
+calls. Sets the dictionary entries on all three registries. Then
+calls validate_state_variable_declaration for the syntactic checks.
+@End Implementation
 Process called "collect_contract_state_variables" takes analyzer as Integer, contract_name as Integer, contract_def as Integer:
     Note: Collect contract state variable declarations
 
@@ -388,6 +480,16 @@ Process called "collect_contract_state_variables" takes analyzer as Integer, con
     End While
 End Process
 
+@Implementation:
+Calls get_solidity_contract_functions. If null returns. Reads four
+registries: functions_registry @48, function_signatures @96,
+visibility_modifiers @112, state_mutability @104. Iterates each
+function_def, calling parser accessors to extract func_name,
+func_signature, func_visibility, func_mutability. Builds
+qualified_func_name as "ContractName.funcName". Sets all four
+registries on that key. Calls validate_function_declaration for
+the per-function syntactic checks.
+@End Implementation
 Process called "collect_contract_functions" takes analyzer as Integer, contract_name as Integer, contract_def as Integer:
     Note: Collect contract function declarations
 
@@ -431,6 +533,14 @@ Process called "collect_contract_functions" takes analyzer as Integer, contract_
     End While
 End Process
 
+@Implementation:
+Calls get_solidity_contract_modifiers. If null returns. Reads
+modifiers_registry @56. Iterates each modifier_def, calls
+get_solidity_modifier_name, builds qualified_modifier_name as
+"ContractName.modifierName" via string_concat, and sets that key on
+the dictionary. Calls validate_modifier_declaration for per-modifier
+checks.
+@End Implementation
 Process called "collect_contract_modifiers" takes analyzer as Integer, contract_name as Integer, contract_def as Integer:
     Note: Collect contract modifier declarations
 
@@ -465,6 +575,18 @@ Process called "collect_contract_modifiers" takes analyzer as Integer, contract_
     End While
 End Process
 
+@Implementation:
+Two separate sub-loops sharing the same skeleton:
+  Events: get_solidity_contract_events. If non-null, reads events
+    registry @64. Iterates each event_def, gets its event_name,
+    builds "ContractName.EventName" via string concat, and sets the
+    dictionary entry.
+  Errors: get_solidity_contract_errors. If non-null, reads errors
+    registry @72. Same iteration pattern producing
+    "ContractName.ErrorName" keys.
+Both null-check the list pointers because events and errors are
+optional in a contract definition.
+@End Implementation
 Process called "collect_contract_events_errors" takes analyzer as Integer, contract_name as Integer, contract_def as Integer:
     Note: Collect contract events and error declarations
 
@@ -519,6 +641,15 @@ Note: ===================================================================
 Note: CONTRACT VALIDATION
 Note: ===================================================================
 
+@Implementation:
+Sequentially calls four validation sub-passes:
+  1. validate_inheritance_linearization - C3 linearization check
+  2. validate_function_overrides - override signature compatibility
+  3. validate_interface_implementations - contracts must implement all
+     declared interface methods
+  4. check_contract_naming_conventions - Solidity naming style
+Each sub-pass registers any failures via add_solidity_validation_error.
+@End Implementation
 Process called "validate_solidity_contracts" takes analyzer as Integer:
     Note: Validate contract structure and inheritance
 
@@ -534,6 +665,14 @@ Process called "validate_solidity_contracts" takes analyzer as Integer:
     proc check_contract_naming_conventions from analyzer
 End Process
 
+@Implementation:
+Reads inheritance_graph @88. Lists its keys (one per contract that
+declared parents). For each contract_name, calls
+validate_contract_linearization which runs the per-contract C3 check.
+Contracts with no recorded parents are not in the graph and so do
+not enter this loop - which is correct because a contract with no
+parents has trivial linearisation.
+@End Implementation
 Process called "validate_inheritance_linearization" takes analyzer as Integer:
     Note: Validate contract inheritance linearization (C3 linearization)
 
@@ -555,6 +694,16 @@ Process called "validate_inheritance_linearization" takes analyzer as Integer:
     End While
 End Process
 
+@Implementation:
+Looks up parent_list in inheritance_graph @88 for contract_name. If
+non-null, allocates two scratch Lists (visited and visiting) and
+calls detect_circular_inheritance with the contract_name as the
+starting node. Then calls compute_linearization_order which
+implements the C3 algorithm proper. The visited/visiting separation
+matches the standard DFS cycle-detection idiom: a node in 'visiting'
+that is re-entered is a cycle, a node already in 'visited' is just
+a shared ancestor.
+@End Implementation
 Process called "validate_contract_linearization" takes analyzer as Integer, contract_name as Integer:
     Note: Validate specific contract's inheritance linearization
 
@@ -578,6 +727,13 @@ Process called "validate_contract_linearization" takes analyzer as Integer, cont
     End If
 End Process
 
+@Implementation:
+Reads contracts_registry @0 and iterates each contract by name.
+For each contract, delegates to validate_contract_function_overrides
+which inspects functions marked virtual/override and verifies that
+the override matches the virtual's signature, visibility, and
+state mutability.
+@End Implementation
 Process called "validate_function_overrides" takes analyzer as Integer:
     Note: Validate function override specifications
 
@@ -603,6 +759,16 @@ Note: ===================================================================
 Note: SECURITY ANALYSIS
 Note: ===================================================================
 
+@Implementation:
+Sequentially calls five security sub-passes:
+  1. detect_reentrancy_vulnerabilities
+  2. check_integer_overflow_underflow
+  3. analyze_access_control
+  4. check_unchecked_external_calls
+  5. validate_input_validation
+Each populates its corresponding list on the analyzer
+(reentrancy_risks, overflow_risks, access_control_issues, etc.).
+@End Implementation
 Process called "analyze_solidity_security" takes analyzer as Integer:
     Note: Perform comprehensive security analysis
 
@@ -619,6 +785,14 @@ Process called "analyze_solidity_security" takes analyzer as Integer:
     proc validate_input_validation from analyzer
 End Process
 
+@Implementation:
+Reads functions_registry @48 and reentrancy_risks @136. Iterates the
+function names. For each, looks up the function_def and calls
+analyze_function_reentrancy_risk to do the per-function analysis.
+This is a flat sweep - cross-function call graph analysis is the
+job of a later, deeper pass that consumes the per-function flags
+this populates.
+@End Implementation
 Process called "detect_reentrancy_vulnerabilities" takes analyzer as Integer:
     Note: Detect reentrancy attack vulnerabilities
 
@@ -644,6 +818,20 @@ Process called "detect_reentrancy_vulnerabilities" takes analyzer as Integer:
     End While
 End Process
 
+@Implementation:
+Reads function_body via the parser accessor. If null returns early.
+Calls contains_external_calls and contains_state_changes. Only when
+BOTH are true does it then check
+external_calls_before_state_changes; if that returns 1, builds a
+"Potential reentrancy vulnerability in function: <name>" message
+and appends to reentrancy_risks @136.
+@End Implementation
+
+@Security_Scope:
+Detects the classic checks-effects-interactions violation. Does NOT
+detect reentrancy guards (modifier nonReentrant) - that suppression
+logic lives in the modifier-aware pass that consumes this advisory.
+@End Security_Scope
 Process called "analyze_function_reentrancy_risk" takes analyzer as Integer, function_name as Integer, function_def as Integer:
     Note: Analyze individual function for reentrancy risk
 
@@ -673,6 +861,14 @@ Process called "analyze_function_reentrancy_risk" takes analyzer as Integer, fun
     End If
 End Process
 
+@Implementation:
+Reads functions_registry @48 and overflow_risks @144. Lists function
+names and iterates. For each function_def, calls
+analyze_function_arithmetic_safety which inspects the body for
+arithmetic in unchecked { } blocks (which skip Solidity 0.8+ default
+checks), pre-0.8 contracts without SafeMath, and unbounded integer
+casts that could truncate.
+@End Implementation
 Process called "check_integer_overflow_underflow" takes analyzer as Integer:
     Note: Check for integer overflow/underflow vulnerabilities
 
@@ -698,6 +894,19 @@ Process called "check_integer_overflow_underflow" takes analyzer as Integer:
     End While
 End Process
 
+@Implementation:
+Reads functions_registry @48 and access_control_issues @152. Lists
+function names and iterates. For each function_def, calls
+analyze_function_access_control which checks for missing modifiers
+on privileged operations, ownership pattern correctness, and
+delegatecall/selfdestruct guards.
+@End Implementation
+
+@Security_Scope:
+Operates on already-parsed AST nodes. No untrusted byte parsing
+here. The downstream analyze_function_access_control is the actual
+security-detection logic.
+@End Security_Scope
 Process called "analyze_access_control" takes analyzer as Integer:
     Note: Analyze access control patterns and vulnerabilities
 
@@ -727,6 +936,14 @@ Note: ===================================================================
 Note: GAS ANALYSIS
 Note: ===================================================================
 
+@Implementation:
+Sequentially calls four gas sub-passes:
+  1. analyze_storage_gas_usage - storage layout efficiency
+  2. check_loop_gas_limits - loop bound and complexity issues
+  3. identify_gas_optimizations - general optimisation patterns
+  4. validate_gas_estimates - check explicit gas hints are sensible
+Each appends advisories to gas_warnings.
+@End Implementation
 Process called "analyze_solidity_gas_usage" takes analyzer as Integer:
     Note: Analyze gas usage and optimization opportunities
 
@@ -742,6 +959,14 @@ Process called "analyze_solidity_gas_usage" takes analyzer as Integer:
     proc validate_gas_estimates from analyzer
 End Process
 
+@Implementation:
+Reads state_variables @40 and gas_warnings list @128. Iterates the
+qualified variable names. For each state_var, calls
+analyze_storage_variable_gas which checks for packable layout (multiple
+sub-32-byte fields that could share a slot), expensive types (mappings
+of structs, dynamic arrays), and missing 'immutable'/'constant' on
+write-once configuration.
+@End Implementation
 Process called "analyze_storage_gas_usage" takes analyzer as Integer:
     Note: Analyze storage variable gas usage
 
@@ -767,6 +992,13 @@ Process called "analyze_storage_gas_usage" takes analyzer as Integer:
     End While
 End Process
 
+@Implementation:
+Reads the functions_registry from @48 and gas_warnings list from
+@128. Iterates the function names, fetching each function_def. For
+each, calls check_function_loop_gas_limits which inspects the
+function body for unbounded loops, loops over storage arrays
+(SLOAD per iteration is expensive), and deeply nested loops.
+@End Implementation
 Process called "check_loop_gas_limits" takes analyzer as Integer:
     Note: Check for potential gas limit issues in loops
 
@@ -796,6 +1028,15 @@ Note: ===================================================================
 Note: TYPE VALIDATION
 Note: ===================================================================
 
+@Implementation:
+Sequentially calls four sub-passes:
+  1. validate_function_signatures - signature consistency
+  2. check_type_compatibility - assignment/expression type checking
+  3. validate_type_conversions - explicit cast validity
+  4. check_abi_encoding_compatibility - external function ABI rules
+Each sub-pass owns its own iteration and registers any failures via
+add_solidity_validation_error.
+@End Implementation
 Process called "validate_solidity_types" takes analyzer as Integer:
     Note: Validate type compatibility and function signatures
 
@@ -811,6 +1052,13 @@ Process called "validate_solidity_types" takes analyzer as Integer:
     proc check_abi_encoding_compatibility from analyzer
 End Process
 
+@Implementation:
+Reads the function_signatures Dictionary from @96. Lists its keys
+(qualified function names like "ContractName.functionName") and
+iterates calling validate_individual_function_signature on each. The
+inner pass owns the actual signature comparison (parameter type
+mismatches, return type mismatches against any override target).
+@End Implementation
 Process called "validate_function_signatures" takes analyzer as Integer:
     Note: Validate function signature consistency
 
@@ -839,6 +1087,15 @@ Note: ===================================================================
 Note: UTILITY FUNCTIONS
 Note: ===================================================================
 
+@Implementation:
+Reads the first byte of version_spec. If '^' (94), strips the
+caret prefix and calls validate_version_number_format on the
+remainder (caret-range "compatible with X.Y.Z"). If '~' (126),
+strips the tilde prefix and calls the same checker (tilde-range
+"approximate X.Y.Z"). Otherwise treats the input as an exact
+version or comparison range and calls validate_version_number_format
+on the whole string.
+@End Implementation
 Process called "validate_solidity_version_format" takes analyzer as Integer, version_spec as Integer:
     Note: Validate Solidity version specification format
 
@@ -867,6 +1124,21 @@ Process called "validate_solidity_version_format" takes analyzer as Integer, ver
     End If
 End Process
 
+@Reasoning:
+Validates that a version number string has the major.minor.patch
+form expected by Solidity's semver. Implemented as a dot-count
+check (must contain exactly two dots). Numeric validation of the
+individual components is intentionally not performed here - Solidity
+permits comparison operators like ^0.8 (no patch) elsewhere in the
+range string, so a stricter check would reject valid pragmas.
+@End Reasoning
+
+@Implementation:
+Calls count_character_occurrences_in_string with text = version_number
+and char = ".". If the count is not exactly 2, builds an "Invalid
+version format (expected major.minor.patch): <value>" message and
+appends via add_solidity_validation_error.
+@End Implementation
 Process called "validate_version_number_format" takes analyzer as Integer, version_number as Integer:
     Note: Validate version number format (major.minor.patch)
 
@@ -878,6 +1150,19 @@ Process called "validate_version_number_format" takes analyzer as Integer, versi
     End If
 End Process
 
+@Reasoning:
+Counts how many times a specified character appears in a string.
+Used by validate_version_number_format to count the dot separators
+in a Solidity version pragma value like "0.8.20" (must contain
+exactly two dots for major.minor.patch).
+@End Reasoning
+
+@Implementation:
+Treats char_to_count as a single-character string and reads its
+first byte via string_char_at(.,0) as target_char. Iterates through
+text by index, incrementing count each time string_char_at(text,i)
+equals target_char. Returns the final count.
+@End Implementation
 Process called "count_character_occurrences_in_string" takes text as Integer, char_to_count as Integer returns Integer:
     Note: Count occurrences of character in string
 
@@ -897,6 +1182,21 @@ Process called "count_character_occurrences_in_string" takes text as Integer, ch
     Return count
 End Process
 
+@Reasoning:
+Runs per-state-variable validation: visibility specifier (state
+variables can be public/private/internal but not external) and
+naming convention check (typically camelCase for non-constants,
+SCREAMING_SNAKE for constants).
+@End Reasoning
+
+@Implementation:
+Reads var_name, var_type, var_visibility from the parser. Calls
+validate_solidity_visibility with element_type = "state variable"
+and check_solidity_naming_conventions. The type validation
+(checking that var_type is a defined struct/enum/primitive) is done
+by a later cross-reference pass against the analyzer's structs and
+enums registries.
+@End Implementation
 Process called "validate_state_variable_declaration" takes analyzer as Integer, contract_name as Integer, state_var as Integer:
     Note: Validate state variable declaration
 
@@ -917,6 +1217,22 @@ Process called "validate_state_variable_declaration" takes analyzer as Integer, 
     proc check_solidity_naming_conventions with analyzer, var_name, "state variable"
 End Process
 
+@Reasoning:
+Runs the per-function validation suite: visibility, state mutability,
+and special-function naming rules (constructor, receive, fallback
+have specific syntactic requirements). The body-level analyses
+(reentrancy, overflow, access control) run from analyze_solidity_security
+later in the pipeline.
+@End Reasoning
+
+@Implementation:
+Reads func_name, func_visibility, func_mutability via the parser's
+get_solidity_function_* accessors. Calls
+validate_solidity_visibility (with "function" as element type),
+then validate_solidity_state_mutability, then
+validate_special_function_rules for handling the constructor/
+receive/fallback edge cases.
+@End Implementation
 Process called "validate_function_declaration" takes analyzer as Integer, contract_name as Integer, function_def as Integer:
     Note: Validate function declaration
 
@@ -940,6 +1256,22 @@ Process called "validate_function_declaration" takes analyzer as Integer, contra
     proc validate_special_function_rules with analyzer, func_name, function_def
 End Process
 
+@Reasoning:
+Validates a visibility specifier against Solidity's allowed set
+{public, private, internal, external}. The element_type parameter
+(e.g. "state variable", "function") is interpolated into the error
+message but does not narrow the allowed set here - element-specific
+restrictions (state variables can't be external; constructors can't
+be private) are checked by separate passes that have richer
+context.
+@End Reasoning
+
+@Implementation:
+Builds a List of the four valid visibility strings. Iterates,
+calling string_equals against the input. If no match, builds an
+"Invalid visibility for <element_type>: <visibility>" message and
+adds it via add_solidity_validation_error.
+@End Implementation
 Process called "validate_solidity_visibility" takes analyzer as Integer, visibility as Integer, element_type as Integer:
     Note: Validate Solidity visibility modifier
 
@@ -977,6 +1309,21 @@ Process called "validate_solidity_visibility" takes analyzer as Integer, visibil
     End If
 End Process
 
+@Reasoning:
+Validates a function's state-mutability declaration against the
+Solidity-allowed set {pure, view, payable, nonpayable}. The set is
+position-independent (any of the four is valid for any function in
+isolation) so this check is a simple membership test; cross-field
+consistency (e.g. pure functions touching storage) is done by a
+separate pass.
+@End Reasoning
+
+@Implementation:
+Builds a List of the four valid mutability strings. Iterates with
+string_equals against the input. If no match, appends an
+"Invalid state mutability: <value>" message via
+add_solidity_validation_error.
+@End Implementation
 Process called "validate_solidity_state_mutability" takes analyzer as Integer, mutability as Integer:
     Note: Validate Solidity state mutability modifier
 
@@ -1016,6 +1363,17 @@ Note: ===================================================================
 Note: ERROR HANDLING
 Note: ===================================================================
 
+@Reasoning:
+Records a fatal semantic error and flips the has_error flag. Used
+when the analyzer hits a condition that should stop the pipeline
+(null AST input, malformed input, internal invariant violation).
+@End Reasoning
+
+@Implementation:
+Writes error_message pointer to analyzer @192 and writes 1 to
+analyzer @200 (the has_error flag). analyze_solidity_contract
+checks @200 at the end and returns 0 if set.
+@End Implementation
 Process called "set_solidity_semantic_error" takes analyzer as Integer, error_message as Integer:
     Note: Set semantic analysis error
 
@@ -1023,6 +1381,18 @@ Process called "set_solidity_semantic_error" takes analyzer as Integer, error_me
     proc memory_set_int64 from Layout with analyzer, 200, 1
 End Process
 
+@Reasoning:
+Appends a message to validation_errors. Unlike
+set_solidity_semantic_error, this does NOT flip the has_error flag -
+it accumulates a non-fatal error that the analyzer will report
+alongside others at the end. set_solidity_semantic_error is
+reserved for fatal cases that should abort the pipeline.
+@End Reasoning
+
+@Implementation:
+Reads validation_errors @160 and calls List.add to push the message
+pointer onto the list.
+@End Implementation
 Process called "add_solidity_validation_error" takes analyzer as Integer, error_message as Integer:
     Note: Add validation error to error list
 
@@ -1030,6 +1400,16 @@ Process called "add_solidity_validation_error" takes analyzer as Integer, error_
     proc add from List with errors, error_message
 End Process
 
+@Reasoning:
+Appends a message to validation_warnings. Warnings are non-fatal -
+they do NOT flip has_error and the analysis continues to completion.
+@End Reasoning
+
+@Implementation:
+Reads validation_warnings @168 and calls List.add. Used by passes
+that detect quality issues but want to allow the contract to
+proceed to later phases.
+@End Implementation
 Process called "add_solidity_validation_warning" takes analyzer as Integer, warning_message as Integer:
     Note: Add validation warning to warning list
 
@@ -1037,6 +1417,17 @@ Process called "add_solidity_validation_warning" takes analyzer as Integer, warn
     proc add from List with warnings, warning_message
 End Process
 
+@Reasoning:
+Appends a message to the security_issues List. Used by general
+security analysis passes when an issue doesn't fit the more
+specific reentrancy/overflow/access-control buckets.
+@End Reasoning
+
+@Implementation:
+Reads security_issues @120 and calls List.add to push the message
+pointer onto the list. No null-guard on the list because it is
+guaranteed populated by create_solidity_semantic_analyzer.
+@End Implementation
 Process called "add_solidity_security_issue" takes analyzer as Integer, issue_message as Integer:
     Note: Add security issue to security issues list
 
@@ -1048,6 +1439,21 @@ Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
 
+@Reasoning:
+External one-call entry point. Creates an analyzer, runs the full
+analysis pipeline against the given AST, and returns the analyzer
+so the caller can interrogate it via the get_* accessors. The
+return is the analyzer pointer regardless of analysis success - the
+caller uses solidity_semantic_has_errors to check status.
+@End Reasoning
+
+@Implementation:
+Calls create_solidity_semantic_analyzer. If allocation failed (0
+returned), returns 0. Otherwise calls analyze_solidity_contract
+(its return value is captured into result but not propagated
+because the analyzer itself is what callers need). Returns the
+analyzer pointer.
+@End Implementation
 Process called "solidity_semantic_analyze" takes solidity_ast as Integer returns Integer:
     Note: Perform semantic analysis on Solidity AST
 
@@ -1060,6 +1466,16 @@ Process called "solidity_semantic_analyze" takes solidity_ast as Integer returns
     Return analyzer
 End Process
 
+@Reasoning:
+Public accessor for the validation_errors List populated via
+add_solidity_validation_error. Each entry is a string message about
+a contract-, function-, or pragma-level error.
+@End Reasoning
+
+@Implementation:
+Null-guards analyzer (returns 0). Reads validation_errors @160 and
+returns the List pointer.
+@End Implementation
 Process called "solidity_semantic_get_errors" takes analyzer as Integer returns Integer:
     Note: Get validation errors from semantic analysis
 
@@ -1070,6 +1486,16 @@ Process called "solidity_semantic_get_errors" takes analyzer as Integer returns 
     Return proc memory_get_int64 from Layout with analyzer, 160
 End Process
 
+@Reasoning:
+Public accessor for the validation_warnings List populated via
+add_solidity_validation_warning. Warnings are non-fatal advisories;
+errors live in a separate list via get_errors.
+@End Reasoning
+
+@Implementation:
+Null-guards analyzer (returns 0). Reads validation_warnings @168 and
+returns the List pointer.
+@End Implementation
 Process called "solidity_semantic_get_warnings" takes analyzer as Integer returns Integer:
     Note: Get validation warnings from semantic analysis
 
@@ -1080,6 +1506,16 @@ Process called "solidity_semantic_get_warnings" takes analyzer as Integer return
     Return proc memory_get_int64 from Layout with analyzer, 168
 End Process
 
+@Reasoning:
+Public accessor for the security_issues List populated by
+analyze_solidity_security and add_solidity_security_issue. Carries
+issues that don't fit a more specific category.
+@End Reasoning
+
+@Implementation:
+Null-guards analyzer (returns 0). Reads security_issues @120 and
+returns the List pointer.
+@End Implementation
 Process called "solidity_semantic_get_security_issues" takes analyzer as Integer returns Integer:
     Note: Get security issues found during analysis
 
@@ -1090,6 +1526,16 @@ Process called "solidity_semantic_get_security_issues" takes analyzer as Integer
     Return proc memory_get_int64 from Layout with analyzer, 120
 End Process
 
+@Reasoning:
+Public accessor for the gas_warnings List populated by
+analyze_solidity_gas_usage. Entries are message strings flagging
+expensive storage patterns and unbounded loops.
+@End Reasoning
+
+@Implementation:
+Null-guards analyzer (returns 0). Reads gas_warnings @128 and
+returns the List pointer.
+@End Implementation
 Process called "solidity_semantic_get_gas_warnings" takes analyzer as Integer returns Integer:
     Note: Get gas optimization warnings from analysis
 
@@ -1100,6 +1546,17 @@ Process called "solidity_semantic_get_gas_warnings" takes analyzer as Integer re
     Return proc memory_get_int64 from Layout with analyzer, 128
 End Process
 
+@Reasoning:
+Public accessor for the reentrancy_risks List populated by
+detect_reentrancy_vulnerabilities. Entries are message strings
+naming functions that perform external calls before state changes
+without reentrancy guards.
+@End Reasoning
+
+@Implementation:
+Null-guards analyzer (returns 0). Reads reentrancy_risks @136 and
+returns the List pointer.
+@End Implementation
 Process called "solidity_semantic_get_reentrancy_risks" takes analyzer as Integer returns Integer:
     Note: Get reentrancy vulnerability risks from analysis
 
@@ -1110,6 +1567,16 @@ Process called "solidity_semantic_get_reentrancy_risks" takes analyzer as Intege
     Return proc memory_get_int64 from Layout with analyzer, 136
 End Process
 
+@Reasoning:
+Public accessor for the overflow_risks List populated by
+check_integer_overflow_underflow. Each entry is a message string
+identifying a function with potentially unchecked arithmetic.
+@End Reasoning
+
+@Implementation:
+Null-guards analyzer (returns 0). Reads overflow_risks @144 and
+returns the List pointer.
+@End Implementation
 Process called "solidity_semantic_get_overflow_risks" takes analyzer as Integer returns Integer:
     Note: Get integer overflow/underflow risks from analysis
 
@@ -1120,6 +1587,16 @@ Process called "solidity_semantic_get_overflow_risks" takes analyzer as Integer 
     Return proc memory_get_int64 from Layout with analyzer, 144
 End Process
 
+@Reasoning:
+Public accessor for the access-control issues List populated by
+analyze_access_control. Exposes pointer to the underlying List so
+external callers can iterate without copying.
+@End Reasoning
+
+@Implementation:
+Null-guards analyzer (returns 0). Reads access_control_issues @152
+and returns the List pointer.
+@End Implementation
 Process called "solidity_semantic_get_access_control_issues" takes analyzer as Integer returns Integer:
     Note: Get access control issues from analysis
 
@@ -1130,6 +1607,17 @@ Process called "solidity_semantic_get_access_control_issues" takes analyzer as I
     Return proc memory_get_int64 from Layout with analyzer, 152
 End Process
 
+@Reasoning:
+Public flag accessor: returns the has_error sentinel set by
+set_solidity_semantic_error. Distinct from the per-error List
+accessors because callers often want a single boolean "did the
+analyzer fail fatally" check without iterating the lists.
+@End Reasoning
+
+@Implementation:
+Null-guards analyzer. Reads has_error @200 (1 = error, 0 = clean)
+and returns the value directly.
+@End Implementation
 Process called "solidity_semantic_has_errors" takes analyzer as Integer returns Integer:
     Note: Check if semantic analysis found any errors
 

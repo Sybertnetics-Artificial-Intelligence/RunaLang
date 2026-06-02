@@ -49,6 +49,18 @@ Note: ==========================================================================
 Note: JavaScript Code Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Code-generation state for the JavaScript backend bundles four references:
+the emitter (which owns the output character buffer), the current indent
+level, an arena handle for short-lived allocations during emission, and an
+error list. Keeping them together lets every generate_* helper take a single
+opaque context handle.
+@End Reasoning
+@Implementation:
+32-byte layout: emitter@0, indent_level@8, arena@16, errors@24. CONTEXT_SIZE
+constant below documents the size; all per-field accesses use these offsets
+explicitly.
+@End Implementation
 Type called "JavaScriptGenContext":
     emitter as Integer         Note: JavaScript emitter for output
     indent_level as Integer    Note: Current indentation level
@@ -58,6 +70,16 @@ End Type
 
 Constant CONTEXT_SIZE as Integer is 32
 
+@Reasoning:
+Factory pattern is used so the emitter (a separate sub-component) is created
+and bound to the context atomically. If emitter creation fails, the context
+memory is freed before returning 0 to keep failure paths leak-free.
+@End Reasoning
+@Implementation:
+Allocate 32 bytes via Layout, then create_javascript_emitter; on emitter
+failure, deallocate the context and return 0. Otherwise store emitter@0,
+zero indent_level@8, store arena@16, create errors list and store @24.
+@End Implementation
 Process called "create_javascript_gen_context" takes arena as Integer returns Integer:
     Note: Create JavaScript code generation context
 
@@ -89,6 +111,17 @@ Process called "create_javascript_gen_context" takes arena as Integer returns In
     Return context
 End Process
 
+@Reasoning:
+Unlike the shared code_generation.runa context (where the caller owns
+allocation), this backend's context owns its emitter and errors list, so
+destruction is responsible for releasing them. Arena is borrowed and not
+freed here.
+@End Reasoning
+@Implementation:
+Null context returns 1 (success/no-op). Otherwise destroy emitter@0 if non-
+null, destroy errors list@24 if non-null, then deallocate the context
+block. Arena (offset 16) is left alone - it belongs to the caller.
+@End Implementation
 Process called "destroy_javascript_gen_context" takes context as Integer returns Integer:
     Note: Destroy JavaScript code generation context
 
@@ -116,6 +149,16 @@ Process called "destroy_javascript_gen_context" takes context as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+Distinct from the shared code_generation.runa increase_indent because this
+file's context has indent_level at offset 8 of a private 32-byte layout, not
+the 72-byte shared layout. Keeping a backend-local helper avoids cross-import
+coupling with the common module's offsets.
+@End Reasoning
+@Implementation:
+Read offset 8, add 1, write back. No upper clamp - pathological depth would
+just widen output, never overflow.
+@End Implementation
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -129,6 +172,14 @@ Process called "increase_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Zero-clamp matches the shared common-backend behavior so unbalanced
+increase/decrease pairs at the backend level still produce visually
+parseable output rather than negative indents corrupting later emits.
+@End Reasoning
+@Implementation:
+Read offset 8, decrement only if greater than 0, write back. Saturates at 0.
+@End Implementation
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
 
@@ -150,6 +201,18 @@ Note: ==========================================================================
 Note: Main Generation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+The driver-facing entry point: takes a HIR dictionary plus the caller's arena
+and returns the assembled JavaScript source string. The context is created
+and destroyed within this scope so external callers never see the internal
+JavaScriptGenContext type.
+@End Reasoning
+@Implementation:
+Null HIR returns 0. Otherwise create context (returns 0 on alloc failure),
+generate_node(root), retrieve output from emitter, destroy context, return
+output. Output is allocated before destroy_javascript_gen_context so it
+survives the context teardown.
+@End Implementation
 Process called "generate_javascript_from_hir" takes hir as Integer, arena as Integer returns Integer:
     Note: Generate JavaScript code from HIR dictionary
 
@@ -183,6 +246,17 @@ Note: ==========================================================================
 Note: Node Generation Dispatcher
 Note: ============================================================================
 
+@Reasoning:
+The HIR is keyed by a "_type" string field (e.g. "js_function", "js_if") so
+dispatch is by string-equality on that field rather than a numeric tag. This
+matches the upstream HIR builder's convention and lets new node kinds be
+added by string convention without touching enum constants.
+@End Reasoning
+@Implementation:
+Null hir returns 1 (no-op success). Read "_type" via get_dict_string_value;
+null _type returns 1. Then a flat chain of strings_equal checks against
+each known js_* tag dispatching to its generate_<kind> helper.
+@End Implementation
 Process called "generate_node" takes context as Integer, hir as Integer returns Integer:
     Note: Dispatch node generation based on HIR type
 
@@ -418,6 +492,16 @@ Note: ==========================================================================
 Note: Program and Module Generation
 Note: ============================================================================
 
+@Reasoning:
+A js_program node holds its top-level statements under the "statements"
+dictionary key as a list. We iterate and recurse; no inter-statement blank
+lines are emitted because each generate_<kind> helper terminates its line(s)
+itself.
+@End Reasoning
+@Implementation:
+Read statements list; null returns 1. Iterate by index, dispatch each to
+generate_node.
+@End Implementation
 Process called "generate_program" takes context as Integer, hir as Integer returns Integer:
     Note: Generate JavaScript program (top-level statements)
 
@@ -444,6 +528,17 @@ Process called "generate_program" takes context as Integer, hir as Integer retur
     Return 1
 End Process
 
+@Reasoning:
+ES6 default-import form `import name from "source";` is emitted when both
+name and source are present. Source is wrapped in double quotes (ASCII 34)
+emitted directly rather than via a quoted-string helper because nothing in
+the source string is currently escaped here.
+@End Reasoning
+@Implementation:
+Emit indent + "import "; if name field present emit it followed by " from ";
+if source field present emit it surrounded by char(34); finish with
+semicolon and newline.
+@End Implementation
 Process called "generate_import" takes context as Integer, hir as Integer returns Integer:
     Note: Generate import statement
 
@@ -476,6 +571,16 @@ Process called "generate_import" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+ES6 `export <declaration>` form. The declaration is recursed through
+generate_node so it can be any js_* node (function, class, var_decl). This
+intentionally does NOT terminate with a newline because the recursed
+declaration's emitter already does.
+@End Reasoning
+@Implementation:
+Emit indent + "export ", then recurse generate_node on the declaration if
+present.
+@End Implementation
 Process called "generate_export" takes context as Integer, hir as Integer returns Integer:
     Note: Generate export statement
 
@@ -501,6 +606,16 @@ Note: ==========================================================================
 Note: Declaration Generation
 Note: ============================================================================
 
+@Reasoning:
+JS supports three binding forms (var/let/const) chosen by the "kind" string
+field. Multiple declarators (let x = 1, y = 2;) share one keyword so the
+keyword is emitted once and declarators are comma-separated.
+@End Reasoning
+@Implementation:
+Emit indent + kind + space. Iterate declarators list: each has "name" and
+optional "init". Emit name, " = " + init expression if present, and ", "
+between consecutive declarators. Finish with semicolon + newline.
+@End Implementation
 Process called "generate_var_decl" takes context as Integer, hir as Integer returns Integer:
     Note: Generate variable declaration (var, let, const)
 
@@ -554,6 +669,17 @@ Process called "generate_var_decl" takes context as Integer, hir as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+Function declaration `[async] function name(p1, p2) { body }`. The async
+prefix is opt-in via the "async" string field being non-null (truthy in JS
+sense). Parameters list emits just names; default values and destructuring
+must come from the parser as nested HIR (not handled by this minimal pass).
+@End Reasoning
+@Implementation:
+Emit indent, optional "async " prefix, "function ", name if present, "(", then
+iterate params emitting names separated by ", ", ")", space, body via
+generate_node, newline.
+@End Implementation
 Process called "generate_function" takes context as Integer, hir as Integer returns Integer:
     Note: Generate function declaration
 
@@ -615,6 +741,15 @@ Process called "generate_function" takes context as Integer, hir as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+js_async_function is a distinct HIR tag for clarity but emits identically to
+js_function when the async flag is set; we therefore delegate to
+generate_function which already handles the async prefix.
+@End Reasoning
+@Implementation:
+Tail call to generate_function. The async flag in the HIR drives the prefix
+inside generate_function.
+@End Implementation
 Process called "generate_async_function" takes context as Integer, hir as Integer returns Integer:
     Note: Generate async function declaration
 
@@ -626,6 +761,17 @@ Process called "generate_async_function" takes context as Integer, hir as Intege
     Return proc generate_function with context, hir
 End Process
 
+@Reasoning:
+Arrow form `(p1, p2) => body` is used in expression position so this helper
+emits NO leading indent (the enclosing expression already placed the cursor)
+and NO trailing newline. Single-parameter unparenthesized form is not
+emitted - always wrap to be unambiguous in expression contexts.
+@End Reasoning
+@Implementation:
+Emit "(", iterate params emitting names with ", " separators, ")", " => ",
+then recurse body via generate_node (which can be either an expression or a
+brace block).
+@End Implementation
 Process called "generate_arrow_function" takes context as Integer, hir as Integer returns Integer:
     Note: Generate arrow function expression
 
@@ -669,6 +815,17 @@ Process called "generate_arrow_function" takes context as Integer, hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+ES6 class form `class Name [extends Base] { methods }`. The body lives one
+indent level deeper; the closing brace returns to the parent column. extends
+is emitted only if non-null - omitting it produces an inheritance-free class.
+@End Reasoning
+@Implementation:
+Emit indent + "class " + name. If extends present, emit " extends " + base.
+Open " {" + newline; increase_indent; iterate methods list dispatching each
+to generate_node (which routes to generate_method via the js_method tag);
+decrease_indent; emit closing "}" + newline.
+@End Implementation
 Process called "generate_class" takes context as Integer, hir as Integer returns Integer:
     Note: Generate class declaration
 
@@ -719,6 +876,16 @@ Process called "generate_class" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+Class method form `[static] name(params) { body }`. The static prefix is
+opt-in via the "static" flag. Unlike free-standing functions, methods do
+NOT use the `function` keyword inside a class body.
+@End Reasoning
+@Implementation:
+Emit indent + optional "static " + name + "(" + params + ")" + space +
+body. Trailing newline closes the method's last line; the enclosing class's
+loop will then position the next method.
+@End Implementation
 Process called "generate_method" takes context as Integer, hir as Integer returns Integer:
     Note: Generate class method
 
@@ -781,6 +948,17 @@ Note: ==========================================================================
 Note: Statement Generation
 Note: ============================================================================
 
+@Reasoning:
+The brace block opens INLINE (no indent before `{`) because the caller is
+expected to have positioned the cursor already (e.g. `if (...) { ... }`).
+Body statements get one indent level deeper; the closing brace returns to
+the parent indent.
+@End Reasoning
+@Implementation:
+Emit "{" + newline, increase_indent, iterate statements list dispatching to
+generate_node, decrease_indent, emit indent + "}" (no trailing newline so
+constructs like else/finally can be appended on the same line).
+@End Implementation
 Process called "generate_block" takes context as Integer, hir as Integer returns Integer:
     Note: Generate block statement
 
@@ -816,6 +994,15 @@ Process called "generate_block" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+JS `if (cond) then [else alt]`. The "else" branch is recursed through
+generate_node so chained else-if forms a tree of nested ifs naturally
+(`else { if(...) ... }`). No special else-if folding is done here.
+@End Reasoning
+@Implementation:
+Emit indent + "if (" + cond + ") "; recurse then-branch; if else present
+emit " else " + recurse else-branch. Trailing newline.
+@End Implementation
 Process called "generate_if" takes context as Integer, hir as Integer returns Integer:
     Note: Generate if statement
 
@@ -852,6 +1039,16 @@ Process called "generate_if" takes context as Integer, hir as Integer returns In
     Return 1
 End Process
 
+@Reasoning:
+C-style for-loop: `for (init; test; update) body`. Each of the three header
+parts is optional independently (e.g. `for (;;)` is valid JS); each is
+recursed only if present, and the semicolons are emitted unconditionally to
+preserve the empty-section syntax.
+@End Reasoning
+@Implementation:
+Emit indent + "for ("; optional init; ";" + space; optional test; ";" +
+space; optional update; ") "; recurse body; trailing newline.
+@End Implementation
 Process called "generate_for" takes context as Integer, hir as Integer returns Integer:
     Note: Generate for loop
 
@@ -898,6 +1095,15 @@ Process called "generate_for" takes context as Integer, hir as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+`for (left in right) body` iterates property KEYS (strings). The "left"
+typically carries a let/var declaration; we just recurse it as a node since
+the upstream HIR already shaped it correctly.
+@End Reasoning
+@Implementation:
+Emit indent + "for ("; recurse left; " in "; recurse right; ") "; recurse
+body; newline.
+@End Implementation
 Process called "generate_for_in" takes context as Integer, hir as Integer returns Integer:
     Note: Generate for-in loop
 
@@ -935,6 +1141,13 @@ Process called "generate_for_in" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+`for (left of right) body` iterates VALUES of an iterable. Identical shape
+to for-in except the keyword between left and right is "of" instead of "in".
+@End Reasoning
+@Implementation:
+Same scaffolding as generate_for_in with " of " substituted for " in ".
+@End Implementation
 Process called "generate_for_of" takes context as Integer, hir as Integer returns Integer:
     Note: Generate for-of loop
 
@@ -972,6 +1185,14 @@ Process called "generate_for_of" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+`while (test) body`. The test is required by JS grammar; we still guard the
+recursion for defensive HIR consumption.
+@End Reasoning
+@Implementation:
+Emit indent + "while ("; recurse test if present; ") "; recurse body if
+present; newline.
+@End Implementation
 Process called "generate_while" takes context as Integer, hir as Integer returns Integer:
     Note: Generate while loop
 
@@ -1002,6 +1223,15 @@ Process called "generate_while" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+`do body while (test);` is the only JS loop that requires a trailing
+semicolon. We emit the closing paren as char(41) rather than ") " because
+the semicolon follows immediately with no space.
+@End Reasoning
+@Implementation:
+Emit indent + "do "; recurse body; " while ("; recurse test; ")" via
+emit_char(41); semicolon; newline.
+@End Implementation
 Process called "generate_do_while" takes context as Integer, hir as Integer returns Integer:
     Note: Generate do-while loop
 
@@ -1034,6 +1264,17 @@ Process called "generate_do_while" takes context as Integer, hir as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+`switch (discriminant) { cases }`. Each case is a js_case node handled by
+generate_case; we just iterate. The switch body indent matches a brace
+block but is emitted inline to keep the discriminant on the same line as
+the opening brace.
+@End Reasoning
+@Implementation:
+Emit indent + "switch ("; recurse discriminant; ") {" + newline;
+increase_indent; iterate cases dispatching to generate_node (which routes
+to generate_case via js_case); decrease_indent; emit closing "}" + newline.
+@End Implementation
 Process called "generate_switch" takes context as Integer, hir as Integer returns Integer:
     Note: Generate switch statement
 
@@ -1078,6 +1319,17 @@ Process called "generate_switch" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+Two forms: `case value:` and `default:`. The "default" flag distinguishes
+them. Consequent statements (the body) are emitted one indent deeper so
+they visually align under the case label.
+@End Reasoning
+@Implementation:
+Emit indent. If "default" flag truthy, emit "default:". Otherwise emit
+"case " + recurse test + ":". Newline. increase_indent; iterate consequent
+list dispatching each to generate_node; decrease_indent. No closing newline
+because the switch body's iteration handles spacing between cases.
+@End Implementation
 Process called "generate_case" takes context as Integer, hir as Integer returns Integer:
     Note: Generate case clause
 
@@ -1124,6 +1376,17 @@ Process called "generate_case" takes context as Integer, hir as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+`try block [catch] [finally]`. JS allows either catch or finally to be
+omitted but not both; we emit whichever is present. The handler is read as
+a LIST (matching what some HIR producers do for legacy multi-catch dialects)
+and we take only its first element since JS only permits one catch clause.
+@End Reasoning
+@Implementation:
+Emit indent + "try "; recurse block. If handler list present and non-empty,
+emit " " then recurse handler[0]. If finalizer present, emit " finally " +
+recurse finalizer. Trailing newline.
+@End Implementation
 Process called "generate_try" takes context as Integer, hir as Integer returns Integer:
     Note: Generate try-catch-finally statement
 
@@ -1163,6 +1426,15 @@ Process called "generate_try" takes context as Integer, hir as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+`catch (param) body`. param is a HIR node with a "name" field. Optional
+catch binding (ES2019 `catch { ... }`) is NOT emitted here because the
+upstream HIR always provides a param; producers that want binding-less
+catch must extend this routine.
+@End Reasoning
+@Implementation:
+Emit "catch (" + param.name (if present) + ") "; recurse body.
+@End Implementation
 Process called "generate_catch" takes context as Integer, hir as Integer returns Integer:
     Note: Generate catch clause
 
@@ -1192,6 +1464,15 @@ Process called "generate_catch" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+`return [value];`. Whitespace before value matters: writing `return\nvalue`
+would trigger ASI and silently change behavior. We emit a single space
+before the value to keep it on the same line as `return`.
+@End Reasoning
+@Implementation:
+Emit indent + "return"; if value present, emit space then recurse value;
+semicolon; newline.
+@End Implementation
 Process called "generate_return" takes context as Integer, hir as Integer returns Integer:
     Note: Generate return statement
 
@@ -1217,6 +1498,13 @@ Process called "generate_return" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+`throw argument;`. Unlike return, throw REQUIRES an argument by JS grammar;
+we still tolerate a missing argument defensively rather than asserting.
+@End Reasoning
+@Implementation:
+Emit indent + "throw "; recurse argument if present; semicolon; newline.
+@End Implementation
 Process called "generate_throw" takes context as Integer, hir as Integer returns Integer:
     Note: Generate throw statement
 
@@ -1241,6 +1529,15 @@ Process called "generate_throw" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+`break [label];`. Label is optional - bare break targets the nearest
+enclosing loop or switch. ASI hazards apply (no newline between `break`
+and label), so we emit a space rather than a line break.
+@End Reasoning
+@Implementation:
+Emit indent + "break"; if label present, emit space + label; semicolon;
+newline.
+@End Implementation
 Process called "generate_break" takes context as Integer, hir as Integer returns Integer:
     Note: Generate break statement
 
@@ -1266,6 +1563,14 @@ Process called "generate_break" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+`continue [label];`. Same ASI considerations as break - label must follow on
+the same line.
+@End Reasoning
+@Implementation:
+Emit indent + "continue"; if label present, emit space + label; semicolon;
+newline.
+@End Implementation
 Process called "generate_continue" takes context as Integer, hir as Integer returns Integer:
     Note: Generate continue statement
 
@@ -1295,6 +1600,14 @@ Note: ==========================================================================
 Note: Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+Identifier emission is a pure name lookup; no quoting, no escaping, no
+keyword check. Reserved-word collision (a HIR node literally named `class`)
+would emit invalid JS but is the producer's responsibility to avoid.
+@End Reasoning
+@Implementation:
+Read "name" from hir; if non-null emit it as a raw string.
+@End Implementation
 Process called "generate_identifier" takes context as Integer, hir as Integer returns Integer:
     Note: Generate identifier
 
@@ -1312,6 +1625,22 @@ Process called "generate_identifier" takes context as Integer, hir as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Literals (numbers, strings, booleans, null, undefined) are stored
+pre-formatted as Strings by the upstream HIR builder, including any
+necessary quotes and escapes for string literals. This emitter therefore
+passes them through verbatim.
+@End Reasoning
+@Implementation:
+Read "value" string; emit as-is if non-null.
+@End Implementation
+@Security_Scope:
+Because string literals come pre-quoted from the HIR producer, this emitter
+trusts the producer to have properly escaped any embedded quotes or
+backslashes. Untrusted input that becomes a string literal MUST be escaped
+upstream; emitting unescaped user data here would enable code injection
+into the generated JavaScript.
+@End Security_Scope
 Process called "generate_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate literal value
 
@@ -1329,6 +1658,14 @@ Process called "generate_literal" takes context as Integer, hir as Integer retur
     Return 1
 End Process
 
+@Reasoning:
+Infix form `left OP right` with single-space padding. No parenthesization is
+added; the producer is responsible for inserting parentheses where
+precedence ambiguity would change semantics.
+@End Reasoning
+@Implementation:
+Recurse left; emit space + operator string + space; recurse right.
+@End Implementation
 Process called "generate_binary" takes context as Integer, hir as Integer returns Integer:
     Note: Generate binary expression
 
@@ -1360,6 +1697,18 @@ Process called "generate_binary" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+JS unary operators come in prefix (!, -, typeof) and postfix (rare in
+practice, but exposed here for symmetry with update expressions) forms. The
+"postfix" flag chooses position; no whitespace between operator and argument
+because most JS unary operators are token-glued (`typeof x` is the one
+exception and the producer must include the space within the operator
+string).
+@End Reasoning
+@Implementation:
+If NOT postfix: emit operator. Always recurse argument. If postfix: emit
+operator after recursion. Same operator string used in both branches.
+@End Implementation
 Process called "generate_unary" takes context as Integer, hir as Integer returns Integer:
     Note: Generate unary expression
 
@@ -1394,6 +1743,16 @@ Process called "generate_unary" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+js_update is distinct from js_unary because ++/-- have side effects and
+specific lvalue requirements - separating the HIR tag makes static analysis
+easier upstream. The "prefix" flag is stored as the literal string "true"
+rather than a boolean, so we compare with strings_equal.
+@End Reasoning
+@Implementation:
+Read prefix string and compare with "true". If prefix: emit operator then
+recurse argument. Otherwise recurse argument then emit operator.
+@End Implementation
 Process called "generate_update" takes context as Integer, hir as Integer returns Integer:
     Note: Generate update expression
 
@@ -1429,6 +1788,16 @@ Process called "generate_update" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+Assignment shares the binary infix shape (`left OP right`) but is its own
+HIR tag because LHS must be an lvalue and producer-side validation cares
+about that distinction.
+@End Reasoning
+@Implementation:
+Recurse left; emit space + operator + space; recurse right. operator
+typically "=" but compound forms ("+=", "-=", etc.) are emitted verbatim
+from the operator field.
+@End Implementation
 Process called "generate_assign" takes context as Integer, hir as Integer returns Integer:
     Note: Generate assignment expression
 
@@ -1460,6 +1829,15 @@ Process called "generate_assign" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+`callee(arg1, arg2, ...)`. Callee may itself be a complex expression
+(member access, parenthesized arrow, etc.); we recurse it through
+generate_node so any required parenthesization comes from the producer.
+@End Reasoning
+@Implementation:
+Recurse callee; emit "("; iterate arguments emitting each via recursion
+with ", " separator between; emit ")".
+@End Implementation
 Process called "generate_call" takes context as Integer, hir as Integer returns Integer:
     Note: Generate call expression
 
@@ -1499,6 +1877,17 @@ Process called "generate_call" takes context as Integer, hir as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Two forms: dot access `obj.prop` (when property name is a valid identifier)
+and bracket access `obj[expr]` (when computed at runtime or the key isn't a
+valid identifier). The "computed" flag chooses. property_expr holds the
+HIR expression for the bracket form; property holds the static string for
+the dot form.
+@End Reasoning
+@Implementation:
+Recurse object. If "computed" truthy: emit "[" + recurse property_expr +
+"]". Otherwise: emit "." + property string.
+@End Implementation
 Process called "generate_member" takes context as Integer, hir as Integer returns Integer:
     Note: Generate member access expression
 
@@ -1535,6 +1924,17 @@ Process called "generate_member" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+NOTE: this emitter currently only emits `new Callee` without the argument
+list. If the upstream HIR shapes `new Foo(a, b)` as js_call wrapping a
+js_new, the call's argument emission would be applied AFTER `new Foo`,
+yielding correct output. If the producer puts arguments directly inside
+js_new, this emitter would drop them - that is a producer-side contract,
+not a bug here.
+@End Reasoning
+@Implementation:
+Emit "new " then recurse callee. No argument emission.
+@End Implementation
 Process called "generate_new" takes context as Integer, hir as Integer returns Integer:
     Note: Generate new expression
 
@@ -1554,6 +1954,15 @@ Process called "generate_new" takes context as Integer, hir as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+`[elem1, elem2, ...]`. Holes (elided slots in sparse arrays) would be
+emitted as `, ,` if the producer placed null entries in the elements list -
+that's the producer's responsibility.
+@End Reasoning
+@Implementation:
+Emit "["; iterate elements with recursion for each and ", " separator
+between; emit "]".
+@End Implementation
 Process called "generate_array" takes context as Integer, hir as Integer returns Integer:
     Note: Generate array literal
 
@@ -1588,6 +1997,17 @@ Process called "generate_array" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+`{ key1: value1, key2: value2 }`. Keys are emitted as raw identifiers
+without quoting - so the producer must ensure either a valid identifier
+key OR shape the HIR with a quoted/computed key form (a feature not
+emitted by this minimal pass).
+@End Reasoning
+@Implementation:
+Emit "{"; iterate properties: emit key + ": " + recurse value, with ", "
+separator between properties; emit "}". No surrounding newlines so object
+literals stay inline.
+@End Implementation
 Process called "generate_object" takes context as Integer, hir as Integer returns Integer:
     Note: Generate object literal
 
@@ -1633,6 +2053,14 @@ Process called "generate_object" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+ES6 spread `...expr`. Used inside array, object, and call argument
+contexts. The enclosing emitter is responsible for the surrounding `[`/`{`/
+`(` brackets; this routine only emits the spread itself.
+@End Reasoning
+@Implementation:
+Emit "..."; recurse argument if present.
+@End Implementation
 Process called "generate_spread" takes context as Integer, hir as Integer returns Integer:
     Note: Generate spread operator
 
@@ -1652,6 +2080,20 @@ Process called "generate_spread" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+NOTE: this emitter handles only the literal-text portion of template
+strings; embedded `${expr}` interpolations would need a separate
+"expressions" list and a quasi/expr interleaving algorithm. The value field
+holds the raw text including any backslash-escape sequences placed by the
+producer.
+@End Reasoning
+@Implementation:
+Emit backtick (char 96), the literal value if present, closing backtick.
+@End Implementation
+@Security_Scope:
+Like other string-literal emitters, this trusts the producer to have
+properly escaped backticks and `${` sequences embedded in the value.
+@End Security_Scope
 Process called "generate_template" takes context as Integer, hir as Integer returns Integer:
     Note: Generate template literal
 
@@ -1673,6 +2115,14 @@ Process called "generate_template" takes context as Integer, hir as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+Ternary `test ? consequent : alternate`. Single-space padding around `?`
+and `:` matches widely-used style guides and avoids visual confusion with
+optional chaining (`?.`) or label syntax.
+@End Reasoning
+@Implementation:
+Recurse test; emit " ? "; recurse consequent; emit " : "; recurse alternate.
+@End Implementation
 Process called "generate_conditional" takes context as Integer, hir as Integer returns Integer:
     Note: Generate conditional (ternary) expression
 
@@ -1704,6 +2154,14 @@ Process called "generate_conditional" takes context as Integer, hir as Integer r
     Return 1
 End Process
 
+@Reasoning:
+`await arg`. The argument is required; we still tolerate a missing argument
+defensively. ASI does NOT apply between `await` and its argument (it's a
+prefix operator) so a space is safe.
+@End Reasoning
+@Implementation:
+Emit "await "; recurse argument if present.
+@End Implementation
 Process called "generate_await" takes context as Integer, hir as Integer returns Integer:
     Note: Generate await expression
 
@@ -1723,6 +2181,15 @@ Process called "generate_await" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+Three forms: bare `yield`, `yield arg`, and delegating `yield* iterable`.
+The "delegate" flag selects between yield and yield*; argument is optional.
+ASI hazards apply (no newline between `yield` and arg).
+@End Reasoning
+@Implementation:
+Emit "yield"; if "delegate" flag truthy emit char(42) (`*`); if argument
+present emit space then recurse argument.
+@End Implementation
 Process called "generate_yield" takes context as Integer, hir as Integer returns Integer:
     Note: Generate yield expression
 
@@ -1748,6 +2215,16 @@ Process called "generate_yield" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+The comma-operator sequence `(e1, e2, e3)` evaluates left-to-right and
+returns the last value. The outer parens are emitted unconditionally
+because bare sequences are valid only in specific contexts and parens
+make the construct work everywhere as an expression.
+@End Reasoning
+@Implementation:
+Emit "("; iterate expressions list with recursion and ", " separator
+between; emit ")".
+@End Implementation
 Process called "generate_sequence" takes context as Integer, hir as Integer returns Integer:
     Note: Generate sequence expression
 

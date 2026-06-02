@@ -55,6 +55,21 @@ Note: ==========================================================================
 Note: Code Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Codegen context owns the emitter (the actual text-output engine) plus the
+mutable formatter knobs the generators thread through every recursive
+call: indent depth, expression-context flag, and a latched error pair.
+Keeping in_expression here (rather than as a parameter) preserves it
+across the multi-step expression-statement boundary where statement
+generators temporarily clear it for child generation.
+@End Reasoning
+
+@Implementation:
+40 bytes = 5 * 8. Field offsets: emitter (0), indent_level (8),
+in_expression (16), error_message (24), has_error (32). All fields
+zero-initialised by create_codegen_context.
+@End Implementation
+
 Type called "RunaGenContext":
     emitter as Integer           Note: Runa code emitter
     indent_level as Integer      Note: Current indentation level
@@ -66,6 +81,14 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Builds a RunaGenContext and its owned Runa emitter atomically: if the
+emitter allocation fails after the context is allocated, the context is
+freed first to avoid a leak. This is the only place the two-step
+allocation is performed; every other operation works on a fully-formed
+context.
+@End Reasoning
 
 Process called "create_codegen_context" returns Integer:
     Note: Create code generation context
@@ -92,6 +115,13 @@ Process called "create_codegen_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Tear-down counterpart of create_codegen_context: releases the embedded
+emitter first (it owns its own buffers), then the context record. Null
+context is a no-op success because the caller may invoke destroy in a
+finally-style path even after a failed create.
+@End Reasoning
 
 Process called "destroy_codegen_context" takes context as Integer returns Integer:
     Note: Destroy code generation context
@@ -121,6 +151,13 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Single error-latch hook used by every generator on a failure path. Sets
+has_error to 1 (offset 32) and stores the message pointer at offset 24
+without freeing any previous message — the caller owns message lifetime
+since messages are typically string literals from .rodata.
+@End Reasoning
+
 Process called "set_codegen_error" takes context as Integer, message as Integer returns Integer:
     Note: Set code generation error message
 
@@ -144,6 +181,12 @@ Process called "set_codegen_error" takes context as Integer, message as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Poll helper the driver uses after generate_program to decide whether to
+emit or discard the produced source. Returning the raw int means the
+caller can use it directly as a boolean predicate without a comparison.
+@End Reasoning
+
 Process called "has_codegen_error" takes context as Integer returns Integer:
     Note: Check if code generation has error
 
@@ -151,6 +194,11 @@ Process called "has_codegen_error" takes context as Integer returns Integer:
 
     Return has_error
 End Process
+
+@Reasoning:
+Companion accessor for error_message; separate from has_codegen_error so
+the caller can format-and-throw without needing to test the flag twice.
+@End Reasoning
 
 Process called "get_codegen_error" takes context as Integer returns Integer:
     Note: Get code generation error message
@@ -164,6 +212,13 @@ Note: ==========================================================================
 Note: Indentation Management
 Note: ============================================================================
 
+@Reasoning:
+Writes 4 spaces per indent_level — Runa canonical formatting uses spaces,
+not tabs. Called from every statement generator before any line content.
+A dedicated helper avoids each generator inlining the multiplication
+and tightens consistency.
+@End Reasoning
+
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit indentation at current level
 
@@ -175,6 +230,13 @@ Process called "emit_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Pairs with decrease_indent across the open/close of every block-bearing
+construct (If, While, For Each, Process). Strict pairing is the
+generators' responsibility — there is no scope-guard wrapper because
+Runa lacks RAII at this layer.
+@End Reasoning
+
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -183,6 +245,13 @@ Process called "increase_indent" takes context as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Guards against negative indentation: a malformed HIR could in principle
+cause double decrements; clamping at 0 keeps the output well-formed even
+in that case (the rest of the file will be at column 0 instead of mis-
+nested). The error is still recorded for the caller to inspect.
+@End Reasoning
 
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
@@ -199,6 +268,13 @@ End Process
 Note: ============================================================================
 Note: HIR Dictionary Access Helpers
 Note: ============================================================================
+
+@Reasoning:
+HIR carries language-agnostic generic dictionaries with named fields
+(e.g., {"_type": "BinaryExpression", "operator": "+", ...}). This helper
+reads a String-typed field directly, hiding the dict_get + type-check
+boilerplate so the per-construct generators read at a higher altitude.
+@End Reasoning
 
 Process called "get_dict_string_value" takes hir_node as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary
@@ -220,6 +296,12 @@ Process called "get_dict_string_value" takes hir_node as Integer, key as Integer
     Return value_str
 End Process
 
+@Reasoning:
+Mirror of get_dict_string_value for fields whose value is itself a nested
+HIR node (e.g., the "lhs" and "rhs" of a binary expression). Returned
+pointer is borrowed — the parent dict still owns it.
+@End Reasoning
+
 Process called "get_dict_hir_value" takes hir_node as Integer, key as Integer returns Integer:
     Note: Get HIR value from dictionary
 
@@ -231,6 +313,15 @@ End Process
 Note: ============================================================================
 Note: Type Translation
 Note: ============================================================================
+
+@Reasoning:
+Lossy name mapping across the source-language polyglot HIR can produce.
+"int"/"i32"/"i64" all collapse to Integer because Runa's Integer is
+machine-word width; "float"/"double" both become Float (Runa Float is 64-
+bit); "bool"/"boolean"/"void" become Integer because Runa lacks distinct
+bool/void types at the source layer. Unknown names pass through verbatim
+so user-defined types survive.
+@End Reasoning
 
 Process called "map_type_to_runa" takes type_name as Integer returns Integer:
     Note: Map foreign type names to Runa types
@@ -306,6 +397,14 @@ Process called "map_type_to_runa" takes type_name as Integer returns Integer:
     Return type_name
 End Process
 
+@Reasoning:
+Handles four type-HIR shapes the universal translator can produce: null
+(emits Integer as the universal default), string (the simple case
+forwarded to map_type_to_runa), dict with "_type" tag, and anything else
+which falls through to Integer. Pointer and array dict forms also collapse
+to Integer because Runa heap allocations are always Integer-typed handles.
+@End Reasoning
+
 Process called "generate_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate Runa type from HIR
 
@@ -363,6 +462,15 @@ End Process
 Note: ============================================================================
 Note: Expression Generation
 Note: ============================================================================
+
+@Reasoning:
+Expression dispatcher: handles bare-string and bare-integer HIR
+(language-agnostic literals), then falls through to a dict-tag dispatch
+covering literal/identifier/binary/unary/call/assignment subkinds. Six
+distinct subkinds are recognised; any other tag silently emits nothing
+(safe because the parent generator's structural surrounding context will
+make the missing expression obvious in the output).
+@End Reasoning
 
 Process called "generate_expression" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate Runa expression from HIR
@@ -446,6 +554,13 @@ Process called "generate_expression" takes context as Integer, expr_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Literal subkind: emits the "value" field's string verbatim. The HIR
+producer is responsible for any string quoting/escaping; this generator
+treats the value as opaque so e.g., emitting "3.14" for a Float or
+"\"hello\"" for a String round-trips without secondary processing.
+@End Reasoning
+
 Process called "generate_literal_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate literal expression
 
@@ -460,6 +575,13 @@ Process called "generate_literal_expr" takes context as Integer, expr_hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Identifier subkind: emits the "name" field. No renaming or scoping logic
+applied here because the universal HIR is expected to have already done
+any necessary identifier munging (e.g., reserved-word avoidance) during
+its own lowering pass.
+@End Reasoning
+
 Process called "generate_identifier_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate identifier expression
 
@@ -473,6 +595,14 @@ Process called "generate_identifier_expr" takes context as Integer, expr_hir as 
 
     Return 1
 End Process
+
+@Reasoning:
+Runa's canonical syntax replaces every C-family symbolic operator with an
+English phrase: && -> and, == -> is equal to, < -> is less than, etc.
+This mapping is one-to-one (no operator has multiple Runa surface forms),
+which is exactly why it lives as a flat string equality chain — a hash
+table would only matter if the set grew significantly.
+@End Reasoning
 
 Process called "map_operator_to_runa" takes operator as Integer returns Integer:
     Note: Map foreign operators to Runa syntax
@@ -563,6 +693,14 @@ Process called "map_operator_to_runa" takes operator as Integer returns Integer:
     Return operator
 End Process
 
+@Reasoning:
+Infix emission as left + operator-phrase + right. The operator phrase
+already carries its surrounding spaces (e.g., " is equal to "), so no
+extra whitespace insertion is needed. No parenthesisation here — the
+HIR producer is responsible for representing precedence by structural
+nesting, since Runa canonical syntax does not require parentheses.
+@End Reasoning
+
 Process called "generate_binary_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate binary expression
 
@@ -584,6 +722,13 @@ Process called "generate_binary_expr" takes context as Integer, expr_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Prefix emission. Same operator mapping as binary (e.g., "!" -> " not "),
+which intentionally leaves the leading space — Runa's "not X" reads as a
+unit. The mapping function returns the operator unchanged if unrecognised,
+giving graceful degradation for novel HIR operator names.
+@End Reasoning
+
 Process called "generate_unary_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate unary expression
 
@@ -601,6 +746,14 @@ Process called "generate_unary_expr" takes context as Integer, expr_hir as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+Function calls render in Runa as `proc NAME from MODULE with arg1, arg2`.
+When the function is an identifier we emit the "proc NAME from " prefix
+and rely on the caller having injected the module name into the
+identifier's "name" field upstream. Arguments are comma-separated; an
+empty argument list omits the "with " keyword entirely.
+@End Reasoning
 
 Process called "generate_call_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate function call expression
@@ -656,6 +809,13 @@ Process called "generate_call_expr" takes context as Integer, expr_hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Assignment renders as Runa's "Set LHS to RHS" idiom rather than the
+foreign "lhs = rhs". The HIR producer is expected to ensure LHS is a
+valid l-value expression — this generator does no validation because
+HIR is the contract layer where that check belongs.
+@End Reasoning
+
 Process called "generate_assignment_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate assignment expression (Set statement in Runa)
 
@@ -675,6 +835,13 @@ End Process
 Note: ============================================================================
 Note: Statement Generation
 Note: ============================================================================
+
+@Reasoning:
+Statement dispatcher covering eight subkinds: compound, expression_stmt,
+if, while, for, return, break, continue. Break and Continue are emitted
+inline here because they need no per-kind setup — only the indent + the
+keyword + newline. Everything else delegates to a dedicated generator.
+@End Reasoning
 
 Process called "generate_statement" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate Runa statement from HIR
@@ -762,6 +929,14 @@ Process called "generate_statement" takes context as Integer, stmt_hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+A block ("{...}" in foreign languages) is unwrapped into its statement
+list — Runa canonical syntax uses keyword/End pairs rather than braces, so
+the block boundary itself contributes nothing to the output. Children
+are walked in order without intervening separators (each statement
+generator emits its own trailing newline).
+@End Reasoning
+
 Process called "generate_compound_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate compound statement (block)
 
@@ -790,6 +965,13 @@ Process called "generate_compound_stmt" takes context as Integer, stmt_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Statement-level expression wrapper: indent + expression + newline. Used
+for top-level effects (function calls, assignments) that don't need any
+surrounding keyword. The expression generator is responsible for any
+"Set ... to ..." prefix when the inner expression is an assignment.
+@End Reasoning
+
 Process called "generate_expr_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate expression statement
 
@@ -803,6 +985,13 @@ Process called "generate_expr_stmt" takes context as Integer, stmt_hir as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Renders the Runa idiom "If COND:\n  THEN\nOtherwise:\n  ELSE\nEnd If".
+Critically uses "Otherwise" (Runa keyword) rather than "Else" (foreign).
+Else branch is optional; when absent the Otherwise block is suppressed
+entirely. Indent management is symmetric across both branches.
+@End Reasoning
 
 Process called "generate_if_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate if statement
@@ -844,6 +1033,12 @@ Process called "generate_if_stmt" takes context as Integer, stmt_hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+While loop emits the "While COND:\n BODY\nEnd While" idiom. No special
+handling for break/continue inside the body — those are statements in
+their own right and surface through generate_statement's dispatch.
+@End Reasoning
+
 Process called "generate_while_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate while statement
 
@@ -871,6 +1066,15 @@ Process called "generate_while_stmt" takes context as Integer, stmt_hir as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+Runa lacks a C-style three-part for loop, so this generator desugars
+init/condition/increment into init + while-condition with the increment
+appended to the body. Missing condition becomes "1 is equal to 1" (the
+canonical infinite-loop sentinel). The init is emitted before the loop;
+the increment becomes the loop's last body statement, matching C
+for-loop semantics exactly.
+@End Reasoning
 
 Process called "generate_for_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate for statement (converted to While in Runa)
@@ -930,6 +1134,13 @@ Process called "generate_for_stmt" takes context as Integer, stmt_hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+"Return" alone is valid Runa for a void-style early exit; with a value
+it becomes "Return EXPR". Emits a single space between keyword and
+expression (emit_space) so the result doesn't get the "Returnvalue"
+artifact a bare emit_string would produce.
+@End Reasoning
+
 Process called "generate_return_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate return statement
 
@@ -953,6 +1164,14 @@ End Process
 Note: ============================================================================
 Note: Declaration Generation
 Note: ============================================================================
+
+@Reasoning:
+Emits "Let NAME be VALUE". When the initialiser is absent (declaration
+without assignment in the source language), defaults to 0 — Runa requires
+every Let to have an initial value, and 0 is the safe universal default
+across Integer-typed variables (which is what every translated value
+ultimately is after map_type_to_runa).
+@End Reasoning
 
 Process called "generate_variable_declaration" takes context as Integer, var_hir as Integer returns Integer:
     Note: Generate variable declaration (Let statement in Runa)
@@ -984,6 +1203,15 @@ Process called "generate_variable_declaration" takes context as Integer, var_hir
 
     Return 1
 End Process
+
+@Reasoning:
+Renders a function as Runa's `Process called "NAME" takes ARGS returns
+TYPE: BODY End Process`. Quotes around the name are emitted as raw chr 34
+because the surrounding emit_string would re-quote. Empty parameter lists
+omit "takes"; missing return type defaults to Integer through
+generate_type's null-handling branch. Two trailing newlines separate
+adjacent declarations.
+@End Reasoning
 
 Process called "generate_function_declaration" takes context as Integer, func_hir as Integer returns Integer:
     Note: Generate function declaration (Process in Runa)
@@ -1073,6 +1301,15 @@ Note: ==========================================================================
 Note: Program Generation
 Note: ============================================================================
 
+@Reasoning:
+Top-level driver: emits a single Note: header banner identifying the
+output as machine-generated, then walks the program's "declarations"
+list. Each declaration is generated via generate_function_declaration
+or generate_variable_declaration based on its "_type" tag. Null program
+HIR is a hard error (latched via set_codegen_error) because the driver
+should never be invoked without a parsed HIR root.
+@End Reasoning
+
 Process called "generate_program" takes context as Integer, program_hir as Integer returns Integer:
     Note: Generate complete Runa program from HIR
 
@@ -1156,6 +1393,13 @@ End Process
 Note: ============================================================================
 Note: Top-Level Generation Entry Point
 Note: ============================================================================
+
+@Reasoning:
+End-to-end one-shot: create a context, generate, harvest the emitter's
+buffer string, destroy the context, return the string. Encapsulates the
+context lifecycle so callers in the universal-translation pipeline can
+treat HIR-to-Runa as a single pure function call from outside.
+@End Reasoning
 
 Process called "generate_runa_from_hir" takes hir_ast as Integer returns Integer:
     Note: Generate Runa code from HIR (top-level entry point)

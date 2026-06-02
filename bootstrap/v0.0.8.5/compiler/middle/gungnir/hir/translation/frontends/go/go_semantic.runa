@@ -14,6 +14,25 @@ Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
+@Reasoning:
+Go semantic analysis needs separate registries because Go distinguishes
+named types, interface types, and packages at the type-system level.
+Conflating them would force lookups to disambiguate after the fact.
+The scope stack handles block-scoped name resolution; the registries
+serve as the always-visible top-level namespace partitioned by kind.
+@End Reasoning
+
+@Implementation:
+Eight 8-byte slots, total 64 bytes:
+- global_scope (0): package-level Dict of name -> declaration
+- current_scope (8): innermost block scope, top of scope_stack
+- scope_stack (16): List of block Dicts
+- type_registry (24): Dict of type_name -> type AST node
+- interface_registry (32): Dict of interface_name -> interface node
+- package_registry (40): Dict of package_path -> package descriptor
+- error_message (48): owned diagnostic StringCore or 0
+- has_error (56): sticky 0/1 flag
+@End Implementation
 Type called "GoSemanticAnalyzer":
     global_scope as Integer
     current_scope as Integer
@@ -25,14 +44,24 @@ Type called "GoSemanticAnalyzer":
     has_error as Integer
 End Type
 
+@Reasoning:
+Allocates 64 bytes of raw memory for the eight-slot
+GoSemanticAnalyzer struct rather than a typed value because the
+caller-side ABI here treats the analyzer as an opaque pointer and
+all field access goes through fixed byte offsets. global_scope is
+aliased into current_scope (slot 8) so an empty function returns
+to package scope without an explicit pop.
+@End Reasoning
+
+@Implementation:
+allocate(64); on failure returns 0. Creates five collection
+helpers (Dict for the four registries, List for scope_stack).
+Writes offsets 0=global_scope, 8=current_scope=global_scope,
+16=scope_stack, 24=type_registry, 32=interface_registry,
+40=package_registry, 48=error_message=null, 56=has_error=0.
+@End Implementation
 Process called "create_go_semantic_analyzer" returns Integer:
     Note: Create Go semantic analyzer with type checking and interface verification
-
-    @Reasoning:
-    Initialize comprehensive semantic analyzer for Go including type checking,
-    interface satisfaction verification, package resolution, and goroutine
-    safety analysis following Go's semantic rules.
-    @End Reasoning
 
     Let analyzer_size be 64
     Let analyzer be proc allocate from Layout with analyzer_size
@@ -59,14 +88,23 @@ Process called "create_go_semantic_analyzer" returns Integer:
     Return analyzer
 End Process
 
+@Reasoning:
+Three-phase pipeline: (1) collect declarations into registries
+so forward references resolve, (2) type resolution and interface
+satisfaction (requires complete type registry), (3) function-body
+analysis (requires fully resolved types). The phase split avoids
+needing speculative resolution or per-node forward-reference
+markers.
+@End Reasoning
+
+@Implementation:
+Null-guards both inputs. Calls collect_go_declarations, then
+resolve_go_types, then analyze_go_functions in sequence. After
+the final phase, reads has_error (offset 56) and returns 0 if
+any phase reported an error, otherwise 1.
+@End Implementation
 Process called "analyze_go_program" takes analyzer as Integer, program_node as Integer returns Integer:
     Note: Perform complete semantic analysis on Go program
-
-    @Reasoning:
-    Comprehensive analysis including package resolution, type checking,
-    interface satisfaction verification, goroutine safety analysis,
-    and Go-specific semantic validation.
-    @End Reasoning
 
     If analyzer is equal to 0:
         Return 0
@@ -94,14 +132,24 @@ Process called "analyze_go_program" takes analyzer as Integer, program_node as I
     Return 1
 End Process
 
+@Reasoning:
+Single-pass walk of the program's top-level children, dispatching
+each to a registry-specific collector based on the GO_* node kind
+tag at child offset 0. Variables and constants both go into
+global_scope while types/interfaces/packages have their own
+dedicated registries. This split lets later phases query by
+declaration kind without walking the full AST.
+@End Reasoning
+
+@Implementation:
+Reads program_node's children list at offset 32. For each child,
+checks the node-type tag (offset 0) and calls the matching
+collector. Order of declarations is preserved in the registries
+(Dict insertion order) so diagnostics can replay source order
+during phase 2/3 reporting.
+@End Implementation
 Process called "collect_go_declarations" takes analyzer as Integer, program_node as Integer:
     Note: Collect all declarations for type resolution
-
-    @Reasoning:
-    Phase 1 must collect all type definitions, interface declarations,
-    function signatures, and variable declarations before detailed analysis
-    to handle forward references and interface embedding.
-    @End Reasoning
 
     If program_node is equal to 0:
         Return
@@ -136,6 +184,12 @@ Process called "collect_go_declarations" takes analyzer as Integer, program_node
     End If
 End Process
 
+@Reasoning:
+Registers a named type in type_registry keyed by its name (offset
+8). Skips nodes with null name (only generated by parser
+error-recovery). Does not validate the declaration body - that's
+phase 2's job.
+@End Reasoning
 Process called "collect_type_declaration" takes analyzer as Integer, type_node as Integer:
     Note: Collect type declaration for later resolution
 
@@ -147,6 +201,12 @@ Process called "collect_type_declaration" takes analyzer as Integer, type_node a
     End If
 End Process
 
+@Reasoning:
+Interfaces go in their own registry (offset 32) because Go's
+"interface satisfaction" check is a separate algorithm from type
+identity. Keeping them apart lets phase 2's check_interface_*
+helpers iterate only interface declarations, not every named type.
+@End Reasoning
 Process called "collect_interface_declaration" takes analyzer as Integer, interface_node as Integer:
     Note: Collect interface declaration for satisfaction checking
 
@@ -158,6 +218,12 @@ Process called "collect_interface_declaration" takes analyzer as Integer, interf
     End If
 End Process
 
+@Reasoning:
+Functions land in global_scope (not a function-specific registry)
+because Go treats functions as first-class values; name resolution
+for "f()" uses the same lookup path as for variables. The function
+node itself carries the signature for type-check use later.
+@End Reasoning
 Process called "collect_function_declaration" takes analyzer as Integer, func_node as Integer:
     Note: Collect function signature for type checking
 
@@ -169,6 +235,11 @@ Process called "collect_function_declaration" takes analyzer as Integer, func_no
     End If
 End Process
 
+@Reasoning:
+Top-level "var x = ..." goes into the same global_scope dict as
+functions. Shadowing within nested scopes is handled by the scope
+stack, not by mutating this top-level dict.
+@End Reasoning
 Process called "collect_variable_declaration" takes analyzer as Integer, var_node as Integer:
     Note: Collect variable declaration for scope analysis
 
@@ -180,6 +251,12 @@ Process called "collect_variable_declaration" takes analyzer as Integer, var_nod
     End If
 End Process
 
+@Reasoning:
+"const X = ..." goes into global_scope alongside vars. Go's
+constants have compile-time-known values; type-checking handles
+implicit typing (untyped constants take on the type required by
+context) downstream in phase 3.
+@End Reasoning
 Process called "collect_constant_declaration" takes analyzer as Integer, const_node as Integer:
     Note: Collect constant declaration for type analysis
 
@@ -191,14 +268,16 @@ Process called "collect_constant_declaration" takes analyzer as Integer, const_n
     End If
 End Process
 
+@Reasoning:
+Phase 2 orchestrator. Three sub-steps in order: (a) resolve every
+type-definition's structure into concrete representations,
+(b) compute which concrete types satisfy which interfaces (Go's
+structural typing requires every-type-vs-every-interface check),
+(c) validate method sets per receiver. Each sub-step is idempotent
+so re-running phase 2 after errors does not corrupt state.
+@End Reasoning
 Process called "resolve_go_types" takes analyzer as Integer, program_node as Integer:
     Note: Resolve all types and check interface satisfaction
-
-    @Reasoning:
-    Phase 2 performs type resolution, interface satisfaction checking,
-    and method set verification. This must happen after declaration
-    collection to handle embedded interfaces and type aliases.
-    @End Reasoning
 
     Let type_registry be proc memory_get_int64 from Layout with analyzer, 24
     Let interface_registry be proc memory_get_int64 from Layout with analyzer, 32
@@ -213,6 +292,14 @@ Process called "resolve_go_types" takes analyzer as Integer, program_node as Int
     proc validate_method_sets with analyzer, program_node
 End Process
 
+@Reasoning:
+Iterates type_registry keys (insertion order) and dispatches each
+type to resolve_individual_type. Uses keys-list because Dict
+iteration uses a separate "keys" view rather than iterator state.
+Type-alias chains are resolved in declaration order; cyclic
+aliases are detected by the per-individual resolver via a visited
+set.
+@End Reasoning
 Process called "resolve_type_definitions" takes analyzer as Integer, type_registry as Integer:
     Note: Resolve all type definitions and aliases
 
@@ -229,6 +316,14 @@ Process called "resolve_type_definitions" takes analyzer as Integer, type_regist
     End If
 End Process
 
+@Reasoning:
+Reads the type definition node at offset 16 (the right-hand side of
+"type X = ...") and dispatches by its Go kind to a specialized
+resolver. Covers struct, interface, slice, map, channel, and
+function types. Anonymous/aliased types fall through to no
+resolver but the type_registry still keeps the AST node so
+downstream uses can still reference it by name.
+@End Reasoning
 Process called "resolve_individual_type" takes analyzer as Integer, type_node as Integer:
     Note: Resolve individual type definition
 
@@ -252,14 +347,16 @@ Process called "resolve_individual_type" takes analyzer as Integer, type_node as
     End If
 End Process
 
+@Reasoning:
+Outer loop over every interface in the registry; the inner work
+(check_interface_implementations) does the per-interface scan.
+We do this O(I*T) check up front rather than lazily per use-site
+because Go's compiler emits "type T implements I" tables for the
+runtime; centralizing the computation here lets us emit those
+tables in one pass.
+@End Reasoning
 Process called "check_interface_satisfaction" takes analyzer as Integer, interface_registry as Integer:
     Note: Check that all types properly implement interfaces
-
-    @Reasoning:
-    Interface satisfaction in Go is implicit - a type implements an interface
-    if it has all the required methods with correct signatures. This includes
-    checking embedded interfaces and pointer receiver methods.
-    @End Reasoning
 
     Let interface_keys be proc keys from Dict with interface_registry
     If interface_keys is not equal to 0:
@@ -274,6 +371,13 @@ Process called "check_interface_satisfaction" takes analyzer as Integer, interfa
     End If
 End Process
 
+@Reasoning:
+For a given interface, walks every type in type_registry and tests
+whether it has the required method set. type_implements_interface
+returns 1 on success, and we record the relationship via
+register_interface_implementation so the runtime has a fast O(1)
+lookup at the eventual type-assert site.
+@End Reasoning
 Process called "check_interface_implementations" takes analyzer as Integer, interface_node as Integer:
     Note: Check which types implement this interface
 
@@ -298,14 +402,14 @@ Process called "check_interface_implementations" takes analyzer as Integer, inte
     End If
 End Process
 
+@Reasoning:
+Phase 3 entry: walks top-level children and for each Function or
+Method node, descends into its body for type-checking. Other top-
+level decls (types, vars, consts) are skipped here because their
+analysis happened in phase 1/2.
+@End Reasoning
 Process called "analyze_go_functions" takes analyzer as Integer, program_node as Integer:
     Note: Analyze function bodies and expressions
-
-    @Reasoning:
-    Phase 3 performs detailed analysis of function bodies including
-    type checking expressions, validating assignments, checking goroutine
-    safety, and validating channel operations.
-    @End Reasoning
 
     Let children be proc memory_get_int64 from Layout with program_node, 32
     If children is not equal to 0:
@@ -326,14 +430,15 @@ Process called "analyze_go_functions" takes analyzer as Integer, program_node as
     End If
 End Process
 
+@Reasoning:
+Bracketed by enter_function_scope / exit_function_scope so any
+locals declared inside the body are popped on exit. Parameters are
+registered in scope first via analyze_function_parameters so they
+shadow any like-named globals. Statements are then analyzed in
+source order.
+@End Reasoning
 Process called "analyze_function_body" takes analyzer as Integer, func_node as Integer:
     Note: Analyze function body for type correctness
-
-    @Reasoning:
-    Function body analysis must check parameter types, return type consistency,
-    variable declarations, assignments, control flow, and Go-specific features
-    like defer statements, goroutines, and channel operations.
-    @End Reasoning
 
     proc enter_function_scope from analyzer
 
@@ -355,6 +460,12 @@ Process called "analyze_function_body" takes analyzer as Integer, func_node as I
     proc exit_function_scope from analyzer
 End Process
 
+@Reasoning:
+Reads the params_node at offset 16 (the parenthesized list right
+of the function name). Walks each parameter child and validates
+its declaration via analyze_parameter_declaration. Null params
+node means a parameterless function; we simply return.
+@End Reasoning
 Process called "analyze_function_parameters" takes analyzer as Integer, func_node as Integer:
     Note: Analyze function parameters and register in scope
 
@@ -373,6 +484,13 @@ Process called "analyze_function_parameters" takes analyzer as Integer, func_nod
     End If
 End Process
 
+@Reasoning:
+Reads name (offset 8) and type (offset 16). Validates the type
+reference; on failure records an error and bails (the parameter
+is not registered in scope, which will likely cascade into
+"undefined identifier" diagnostics in the body - that's fine
+because the first error already identified the root cause).
+@End Reasoning
 Process called "analyze_parameter_declaration" takes analyzer as Integer, param_node as Integer:
     Note: Analyze individual parameter declaration
 
@@ -390,6 +508,13 @@ Process called "analyze_parameter_declaration" takes analyzer as Integer, param_
     End If
 End Process
 
+@Reasoning:
+Dispatches a single Go statement to its analyzer based on the
+node kind tag at offset 0. Covers all of Go's statement forms
+including the concurrency primitives (go, defer, select) which
+need their own validation rules around goroutine safety and
+deferred-call evaluation. Null stmt_node is a no-op (defensive).
+@End Reasoning
 Process called "analyze_statement" takes analyzer as Integer, stmt_node as Integer:
     Note: Analyze Go statements for semantic correctness
 
@@ -422,6 +547,12 @@ Process called "analyze_statement" takes analyzer as Integer, stmt_node as Integ
     End If
 End Process
 
+@Reasoning:
+A bare expression in statement position (e.g. function call with
+discarded result). Just delegates to analyze_expression on the
+inner expression at offset 8. The expression's resulting type is
+ignored - Go allows this only for calls with side effects.
+@End Reasoning
 Process called "analyze_expression_statement" takes analyzer as Integer, expr_stmt as Integer:
     Note: Analyze expression statement
 
@@ -431,14 +562,16 @@ Process called "analyze_expression_statement" takes analyzer as Integer, expr_st
     End If
 End Process
 
+@Reasoning:
+Expression-kind dispatcher returning the inferred type. Specialized
+analyzers exist for each Go expression kind because Go's type rules
+differ significantly per construct (channel ops, type asserts,
+slice expressions, etc.). Default-falls-through with no return
+when an unknown kind is seen; the caller treats absence of
+analysis as "unknown type" and propagates accordingly.
+@End Reasoning
 Process called "analyze_expression" takes analyzer as Integer, expr_node as Integer:
     Note: Analyze expressions and return their types
-
-    @Reasoning:
-    Expression analysis must determine the type of each expression,
-    validate operations between compatible types, check method calls,
-    validate channel operations, and ensure type safety.
-    @End Reasoning
 
     If expr_node is equal to 0:
         Return 0
@@ -472,6 +605,12 @@ Process called "analyze_expression" takes analyzer as Integer, expr_node as Inte
     Return 0
 End Process
 
+@Reasoning:
+Creates a fresh empty Dict, appends it to scope_stack, and updates
+current_scope (offset 8) to point at it. We do NOT preserve the
+previous current_scope pointer here - exit_function_scope
+reconstructs it from the stack on pop.
+@End Reasoning
 Process called "enter_function_scope" takes analyzer as Integer:
     Note: Enter new scope for function analysis
 
@@ -482,6 +621,13 @@ Process called "enter_function_scope" takes analyzer as Integer:
     proc memory_set_int64 from Layout with analyzer, 8, new_scope
 End Process
 
+@Reasoning:
+Pops the top scope. If the stack still has another nested scope
+under it, current_scope falls back to that one; if the stack is
+now empty, current_scope reverts to global_scope (the function
+just exited was at the package level). Stack underflow (empty on
+entry) is silently ignored to make this safe to over-call.
+@End Reasoning
 Process called "exit_function_scope" takes analyzer as Integer:
     Note: Exit current function scope
 
@@ -502,6 +648,11 @@ Process called "exit_function_scope" takes analyzer as Integer:
     End If
 End Process
 
+@Reasoning:
+Writes name -> type into current_scope. Caller is responsible for
+checking redeclaration (Go forbids "redeclared in this block")
+before calling because Dict.set silently overwrites.
+@End Reasoning
 Process called "register_variable_in_scope" takes analyzer as Integer, var_name as Integer, var_type as Integer:
     Note: Register variable in current scope
 
@@ -511,14 +662,15 @@ Process called "register_variable_in_scope" takes analyzer as Integer, var_name 
     End If
 End Process
 
+@Reasoning:
+Two-tier check: built-in types are checked via is_builtin_type
+(fast, name-only lookup against a fixed list), then user-defined
+types via type_registry has_key. We check builtins first because
+they're vastly more common in typical Go code and the registry
+lookup is more expensive. Returns 1 on valid, 0 on invalid.
+@End Reasoning
 Process called "validate_type_reference" takes analyzer as Integer, type_ref as Integer returns Integer:
     Note: Validate that a type reference is valid
-
-    @Reasoning:
-    Type validation must check that referenced types exist in the type registry,
-    handle built-in types (int, string, bool, etc.), validate generic type
-    parameters, and ensure proper type composition.
-    @End Reasoning
 
     If type_ref is equal to 0:
         Return 0
@@ -541,6 +693,20 @@ Process called "validate_type_reference" takes analyzer as Integer, type_ref as 
     Return has_type
 End Process
 
+@Reasoning:
+Hard-coded list of Go's predeclared types. Allocates a List per
+call (slightly wasteful but acceptable on a non-hot path) and
+linearly searches via StringCore.equals. Includes the platform-
+sized aliases (int, uint, byte=uint8, rune=int32) which Go treats
+as distinct named types even when they're the same width.
+@End Reasoning
+
+@Performance_Hints:
+The builtin list is rebuilt per call rather than memoized in the
+analyzer state. For typical Go programs this is called a few
+hundred times during validation, so the overhead is bounded but
+noticeable. A cache could be added if profiling shows it matters.
+@End Performance_Hints
 Process called "is_builtin_type" takes analyzer as Integer, type_name as Integer returns Integer:
     Note: Check if type is a Go built-in type
 
@@ -578,6 +744,14 @@ Process called "is_builtin_type" takes analyzer as Integer, type_name as Integer
     Return 0
 End Process
 
+@Reasoning:
+Sticky error sentinel: writes has_error=1 (offset 56) and stores
+a defensive copy of the message string at offset 48. The copy
+isolates the analyzer's error buffer from the caller's transient
+string lifetime. Subsequent set_go_semantic_error calls overwrite
+the message (last error wins) but the sticky flag stays set so
+the program-level check still reports failure.
+@End Reasoning
 Process called "set_go_semantic_error" takes analyzer as Integer, message as Integer:
     Note: Set semantic analyzer error state
 

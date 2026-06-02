@@ -188,6 +188,23 @@ Note: ==========================================================================
 Note: Parser Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Allocates the 48-byte CppParser record and constructs the underlying
+CppLexer. The parser stays decoupled from any global lexer state so
+multiple parsers may run concurrently against different sources.
+template_depth and current_class are zero-initialised so first-level
+declarations behave as non-template, no-enclosing-class context.
+@End Reasoning
+
+@Implementation:
+Layout.allocate(48); OOM returns 0. Calls Lexer.create_cpp_lexer with
+the source; if that fails the partially-built parser is freed and 0 is
+returned so the caller observes a single failure point. Writes the
+lexer handle (offset 0), zero current_token (refreshed by the priming
+advance_token below), 0 error_message/has_error (clean state), 0
+current_class (top-level), 0 template_depth. Calling advance_token at
+the end primes the cursor so peek_token_type works immediately.
+@End Implementation
 Process called "create_cpp_parser" takes source as Integer returns Integer:
     Note: Create C++ parser from source code
 
@@ -223,6 +240,21 @@ Process called "create_cpp_parser" takes source as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+Symmetric teardown for create_cpp_parser. Owns the lexer (created during
+create) and any error_message string allocated by set_parse_error; the
+caller never frees those resources directly. AST nodes produced by the
+parser are independent of this lifetime - they survive parser
+destruction.
+@End Reasoning
+
+@Implementation:
+Null parser handle short-circuits with success so paired create/destroy
+is safe after an OOM-failed create. Reads lexer handle from offset 0
+and delegates to Lexer.destroy_cpp_lexer if non-zero. Reads
+error_message from offset 16; frees only if non-zero so a clean parser
+doesn't double-free. Finally releases the 48-byte record. Returns 1.
+@End Implementation
 Process called "destroy_cpp_parser" takes parser as Integer returns Integer:
     Note: Destroy C++ parser and free resources
 
@@ -412,6 +444,23 @@ Note: ==========================================================================
 Note: Main Parsing Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Top-level recursive-descent dispatch. C++ admits a wide menu of file-
+scope productions: namespace, class, struct, template, using/typedef,
+preprocessor passthrough, function, and global variable. This driver
+keeps consuming until TOKEN_EOF and aborts on the first sticky error so
+the AST never contains noise after a fatal parse failure.
+@End Reasoning
+
+@Implementation:
+Creates the program root via create_cpp_ast_node(CPP_PROGRAM). Loop
+peeks the cursor: TOKEN_EOF breaks. Branches by token kind to the
+specialist parse_* routine; non-null child nodes are appended to the
+program root via add_child_to_cpp_ast_node. After each iteration
+has_parse_error is checked; on error the entire production is
+discarded by returning 0 so the caller does not consume a half-built
+tree. Returns the populated program node on clean EOF.
+@End Implementation
 Process called "parse_cpp_program" takes parser as Integer returns Integer:
     Note: Parse entire C++ program (top-level entry point)
 
@@ -522,6 +571,28 @@ Note: ==========================================================================
 Note: Class Declaration Parsing
 Note: ============================================================================
 
+@Reasoning:
+Parses 'class Name [<template-args>] [: base-list] { member-list }' or
+'class Name;'. The class-access default is private (C++11 9.2/14
+explicitly distinguishes class default-private from struct default-
+public). Forward declarations short-circuit immediately on a semicolon
+after the optional inheritance, distinguishing them from definitions.
+The proc saves and restores parser.current_class to support nested
+classes, where the inner class needs its own "this is the class being
+parsed" context for constructor/destructor recognition.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_CLASS, creates a CPP_CLASS node, captures the identifier
+into name. Optional template-arg list (TOKEN_LESS) and inheritance
+(TOKEN_COLON) become child sub-trees. Semicolon -> forward-decl path
+returns immediately. Otherwise '{' is expected; old_class is saved
+from parser offset 32 and the new class node is stored there so
+parse_class_member can identify constructors by name match.
+current_access tracks default-private/protected/public via 0/1/2; each
+access-specifier label flips it. Loop terminates on TOKEN_RBRACE.
+Restores parser.current_class before returning the class node.
+@End Implementation
 Process called "parse_class_declaration" takes parser as Integer returns Integer:
     Note: Parse C++ class declaration with inheritance and access specifiers
 
@@ -616,6 +687,26 @@ Process called "parse_class_declaration" takes parser as Integer returns Integer
     Return class_node
 End Process
 
+@Reasoning:
+Dispatches a single member declaration inside a class body. Five
+member kinds need bespoke handling because they cannot be reduced to
+the generic parse_declaration path: constructor (identifier matching
+the class name), destructor (TOKEN_TILDE), operator overload
+(TOKEN_OPERATOR), friend (TOKEN_FRIEND), and template member
+(TOKEN_TEMPLATE). The remainder falls through to parse_declaration.
+Each path stamps access_level onto the produced node so later passes
+can apply C++ access control without re-deriving the section context.
+@End Reasoning
+
+@Implementation:
+Reads the current_class handle from offset 32 and pulls its name for
+constructor recognition. Peek-and-compare the cursor token against the
+five special-case token kinds. For each special path, returns the
+specialist's result directly so dispatch stays a single branch deep.
+For template members, the produced node is stamped with the access
+level only if it's non-null (graceful on inner parse failure). The
+fallback parse_declaration also has its access_level stamped.
+@End Implementation
 Process called "parse_class_member" takes parser as Integer, access_level as Integer returns Integer:
     Note: Parse class member (function, variable, constructor, destructor, etc.)
 
@@ -677,6 +768,27 @@ Note: ==========================================================================
 Note: Template Declaration Parsing
 Note: ============================================================================
 
+@Reasoning:
+Parses 'template <param-list> declaration'. The template parameter
+list is itself a CPP_TEMPLATE_PARAM node containing child parameter
+nodes; the templated declaration becomes a child of the template node.
+template_depth is bumped before recursion so the lexer/parser can
+disambiguate '>' as either greater-than or template close based on
+nesting, then restored on exit to keep tracking accurate across
+sibling templates.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_TEMPLATE; creates a CPP_TEMPLATE node. Reads the current
+template_depth from offset 40, writes depth+1 back to track the open
+angle bracket. Expects TOKEN_LESS. Creates a CPP_TEMPLATE_PARAM list
+node, loops parse_template_parameter and appends, consuming optional
+commas between entries; loop exits when peek returns TOKEN_GREATER
+(which is also consumed). The collected param list is stored via
+set_cpp_ast_node_template_params. Then parse_declaration recurses to
+build the templated entity; its non-null result is appended as the
+template body. Restores template_depth to the original value on exit.
+@End Implementation
 Process called "parse_template_declaration" takes parser as Integer returns Integer:
     Note: Parse template declaration with parameters and specializations
 
@@ -734,6 +846,28 @@ Process called "parse_template_declaration" takes parser as Integer returns Inte
     Return template_node
 End Process
 
+@Reasoning:
+Recognises the three template-parameter grammars from the C++ standard:
+type parameter ('typename T' / 'class T'), non-type parameter
+('int N'), and template template parameter ('template <...> class C').
+The 'value' slot of the produced CPP_TEMPLATE_PARAM stores the
+declarator keyword (TOKEN_TYPENAME / TOKEN_CLASS) so later passes can
+discriminate without re-tokenising. Default-argument support is
+handled inline: a trailing '= default-type' subtree is appended as a
+child of the parameter node.
+@End Reasoning
+
+@Implementation:
+Branches by first token. TOKEN_TEMPLATE -> consume, recursively parse
+a nested parameter list (template template parameter), expect
+'class'/'typename', then identifier; build node and return.
+TOKEN_TYPENAME -> consume, capture identifier, stamp value with
+TOKEN_TYPENAME, optionally parse '= type-specifier'. TOKEN_CLASS
+mirrors the TYPENAME path with TOKEN_CLASS as the value tag. Fallback:
+delegate to parse_declaration for non-type parameters; this also
+handles defaulted non-type params because parse_declaration recognises
+the trailing '=' initialiser.
+@End Implementation
 Process called "parse_template_parameter" takes parser as Integer returns Integer:
     Note: Parse individual template parameter (type, non-type, or template template)
 
@@ -813,6 +947,27 @@ Note: ==========================================================================
 Note: Error Handling and Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Sticky error setter used by every recursive-descent expectation. Stores
+a parser-owned copy of the diagnostic so the caller's StringCore handle
+is not aliased; the parser frees this copy in destroy_cpp_parser. Sets
+the has_error flag so combinators can short-circuit instead of
+producing a corrupt AST.
+@End Reasoning
+
+@Implementation:
+Writes has_error=1 at offset 24. Copies the supplied message via
+StringCore.copy_string and stores the new handle at offset 16. If a
+prior error_message existed, that slot is overwritten without an
+explicit free; callers must only call set_parse_error once per parse
+to avoid leaks, which is the recursive-descent contract here (sticky
+flag prevents subsequent error reporting).
+@End Implementation
+
+@Security_Scope:
+Message text is parser-internal; no untrusted input reaches this proc.
+Length-bounded copy is provided by StringCore.copy_string.
+@End Security_Scope
 Process called "set_parse_error" takes parser as Integer, message as Integer:
     Note: Set parser error state with message
 

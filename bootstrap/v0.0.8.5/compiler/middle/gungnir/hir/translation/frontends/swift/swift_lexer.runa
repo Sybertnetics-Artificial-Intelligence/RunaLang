@@ -154,6 +154,23 @@ Note: ==========================================================================
 Note: LEXER STRUCTURE
 Note: ============================================================================
 
+@Reasoning:
+Minimal Swift lexer state: source pointer, byte position into it,
+1-based line/column for diagnostics, and the produced tokens list.
+The tokens slot is stored at offset 32 but the structure is
+allocated with 32 bytes (via arena_alloc) and the tokens field is
+written separately by tokenize_swift after it creates the list -
+so allocations stay tight while still providing a single state
+record threaded through every helper.
+@End Reasoning
+
+@Implementation:
+40-byte record (declared as 5 fields × 8 bytes) accessed via
+memory_get/set_int64 at offsets 0/8/16/24/32 for source, position,
+line, column, tokens respectively. create_swift_lexer initially
+allocates 32 bytes covering source through column; tokens is
+populated lazily once tokenize_swift creates the output list.
+@End Implementation
 Type called "SwiftLexer":
     source as Integer           Note: Source code string
     position as Integer         Note: Current position
@@ -162,6 +179,20 @@ Type called "SwiftLexer":
     tokens as Integer           Note: List of tokens
 End Type
 
+@Reasoning:
+Per-token record carrying type, original textual lexeme, source
+position for diagnostics, and a value slot reserved for literals
+that need an out-of-band parsed representation (e.g. interpolated
+strings, custom numeric literals). Token values are kept opaque at
+this layer.
+@End Reasoning
+
+@Implementation:
+40-byte record laid out as token_type @0, lexeme @8, line @16,
+column @24, value @32. Allocated by create_token via arena_alloc;
+value is initialized to 0 and populated only by literal-specific
+paths.
+@End Implementation
 Type called "SwiftToken":
     token_type as Integer       Note: Token type constant
     lexeme as Integer           Note: Token text
@@ -174,12 +205,17 @@ Note: ==========================================================================
 Note: LEXER INITIALIZATION
 Note: ============================================================================
 
+@Reasoning:
+The lexer is a 32-byte flat record holding (source ptr, position, line,
+column) at offsets 0/8/16/24. Position starts at 0 because string_char_at is
+0-indexed, but line and column start at 1 because that matches every editor
+and diagnostic convention. Allocation goes through arena_alloc rather than
+plain allocate because lexer state is naturally lifetime-bound to a single
+parse pass; the arena owning the lexer also owns the eventual token list
+attached at offset 32, so destruction is a single arena reset.
+@End Reasoning
 Process called "create_swift_lexer" takes source as Integer returns Integer:
     Note: Create new Swift lexer
-
-    @Reasoning:
-    Initialize lexer with source code and prepare for tokenization.
-    @End Reasoning
 
     Let lexer be proc arena_alloc from Layout with 32
     proc memory_set_int64 from Layout with lexer, 0, source
@@ -190,13 +226,17 @@ Process called "create_swift_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+The top-level tokenisation loop alternates skip_whitespace with next_token and
+appends every produced token (including the final EOF) to the list stored at
+offset 32 of the lexer struct. EOF is appended rather than just used as a loop
+exit so downstream parsers can treat the token stream uniformly without a
+separate end-of-stream check. The whitespace skip is called before each
+next_token, so leading whitespace (including newlines that drive line/column
+counting in advance_char) is handled outside the per-token lexers.
+@End Reasoning
 Process called "tokenize_swift" takes lexer as Integer returns Integer:
     Note: Tokenize entire Swift source
-
-    @Reasoning:
-    Read source character by character and produce token stream.
-    Handle all Swift tokens including keywords, operators, literals, punctuation.
-    @End Reasoning
 
     Let tokens be proc create_list from ListOps
     proc memory_set_int64 from Layout with lexer, 32, tokens
@@ -234,6 +274,18 @@ Note: ==========================================================================
 Note: CHARACTER HANDLING
 Note: ============================================================================
 
+@Reasoning:
+Bounded character lookahead. Returns 0 at EOF rather than throwing
+so callers can use 0 as a "no character" sentinel and avoid an
+extra at_eof helper.
+@End Reasoning
+
+@Implementation:
+Reads source pointer (offset 0) and position (offset 8). Reads
+source length via string_length. If position >= len, returns 0
+(EOF). Otherwise returns string_char_at(source, position) - a
+single byte (codepoint) as Integer.
+@End Implementation
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Look at current character without advancing
 
@@ -248,6 +300,20 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return proc string_char_at from StringCore with source, position
 End Process
 
+@Reasoning:
+Consumes one character and updates position plus line/column
+tracking. Detecting newline (ASCII 10) here means every consumer
+gets accurate line/column for free without having to handle line
+counting locally.
+@End Reasoning
+
+@Implementation:
+Peeks current via peek_char; returns 0 if at EOF. Increments
+position by 1. If the consumed char was 10 (newline), increments
+line and resets column to 1. Otherwise increments column. Returns
+the consumed character so callers can branch on the returned
+value if needed.
+@End Implementation
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Move to next character
 
@@ -276,6 +342,23 @@ Process called "advance_char" takes lexer as Integer returns Integer:
     Return ch
 End Process
 
+@Reasoning:
+Swift treats newlines as statement separators (`\n` is meaningful
+to the grammar), so this routine deliberately stops at LF rather
+than swallowing it. It also handles line comments (`//`) and
+nested block comments (`/* ... */`) inline so the main dispatch
+loop doesn't need separate trivia-skipping passes.
+@End Reasoning
+
+@Implementation:
+Loop: peek_char. On 0 returns 1 (EOF). On space (32), tab (9), or
+CR (13), advances and continues. On LF (10), returns 1 without
+consuming so the main loop can emit a newline token. On '/' (47),
+peeks_next_char; if '/' calls skip_line_comment and continues, if
+'*' calls skip_block_comment and continues, otherwise returns 1
+(slash is the start of an operator). Any other character returns
+1 without advancing.
+@End Implementation
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
@@ -330,6 +413,17 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Two-step lookahead used by multi-character operator and comment
+detection. Returns 0 past EOF for the same sentinel-friendly
+reason as peek_char.
+@End Reasoning
+
+@Implementation:
+Reads source and position. Computes len = string_length(source);
+if position + 1 >= len returns 0. Otherwise returns
+string_char_at(source, position + 1).
+@End Implementation
 Process called "peek_next_char" takes lexer as Integer returns Integer:
     Note: Look ahead one character
 
@@ -344,6 +438,17 @@ Process called "peek_next_char" takes lexer as Integer returns Integer:
     Return proc string_char_at from StringCore with source, position plus 1
 End Process
 
+@Reasoning:
+Swift `//` line comments run to the end of the line. The
+terminating newline is left for the dispatcher so the line counter
+increments via the normal advance_char path.
+@End Reasoning
+
+@Implementation:
+Advances twice to consume both slashes. Loops: peek_char; on 0
+(EOF) returns 1; on 10 (newline) returns 1 without consuming it;
+otherwise advances and continues.
+@End Implementation
 Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Note: Skip // comment until end of line
 
@@ -366,6 +471,25 @@ Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Swift block comments NEST (unlike C-family languages), so a depth
+counter is required. Encountering `/*` increments depth and `*/`
+decrements it; the comment ends only when depth returns to 0. EOF
+inside an unclosed comment returns 0 so the caller can recognize
+the malformed comment.
+@End Reasoning
+
+@Implementation:
+Advances past the opening `/*` (two chars). Sets depth = 1. Loops
+while depth > 0:
+- peek_char; on 0 (EOF) returns 0 (unclosed comment).
+- on '/' (47), peek_next; if '*' (42), nested-comment-open:
+  increment depth, advance twice. Otherwise advance once.
+- on '*' (42), peek_next; if '/' (47), comment-close: decrement
+  depth, advance twice. Otherwise advance once.
+- on any other character, advance once.
+Returns 1 when depth reaches 0.
+@End Implementation
 Process called "skip_block_comment" takes lexer as Integer returns Integer:
     Note: Skip /* */ comment (can be nested in Swift)
 
@@ -416,6 +540,20 @@ Note: ==========================================================================
 Note: TOKEN CREATION
 Note: ============================================================================
 
+@Reasoning:
+Allocates a 40-byte SwiftToken from the arena and snapshots the
+lexer's current line and column so the token records the position
+where its first character started. value is zero-initialized;
+specialized literal tokenizers may overwrite it later (currently
+none do, but the slot is reserved for that use).
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes via arena_alloc. Stores token_type @0, lexeme
+@8. Reads lexer.line (offset 16) and lexer.column (offset 24),
+stores at token offsets 16 and 24 respectively. Zeroes value at
+offset 32. Returns the token pointer.
+@End Implementation
 Process called "create_token" takes lexer as Integer, token_type as Integer, lexeme as Integer returns Integer:
     Note: Create token structure
 
@@ -437,13 +575,18 @@ Note: ==========================================================================
 Note: NEXT TOKEN
 Note: ============================================================================
 
+@Reasoning:
+The per-token dispatcher uses a single character of lookahead at peek_char to
+decide which sub-tokeniser to invoke. NEWLINE is emitted as a distinct token
+rather than silently consumed because Swift uses newlines as statement
+separators in many contexts (it has no required semicolons between top-level
+statements). Identifier and number tests dispatch to dedicated tokenisers that
+handle multi-character runs; punctuation is recognised inline because each
+character maps directly to a unique token and an inline branch is faster than
+a sub-routine call.
+@End Reasoning
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
-
-    @Reasoning:
-    Dispatch to appropriate tokenizer based on current character.
-    Handle all Swift token types.
-    @End Reasoning
 
     Let ch be proc peek_char from lexer
     If ch is equal to 0:
@@ -687,13 +830,17 @@ Note: ==========================================================================
 Note: IDENTIFIER AND KEYWORD TOKENIZATION
 Note: ============================================================================
 
+@Reasoning:
+Identifier scanning records the start position, consumes a run of
+alphanumerics and underscores (Swift's identifier continuation set), then
+slices the lexeme out of the source string. The same routine handles both
+identifiers and reserved words because Swift keywords are syntactically
+identifiers - they are differentiated only by lexeme comparison. We delegate
+keyword recognition to check_keyword so the tokeniser does not have to know
+which strings happen to be reserved; new keywords can be added there alone.
+@End Reasoning
 Process called "tokenize_identifier" takes lexer as Integer returns Integer:
     Note: Tokenize identifier or keyword
-
-    @Reasoning:
-    Collect alphanumeric characters, then check if it's a keyword.
-    Swift identifiers can contain underscores and Unicode characters.
-    @End Reasoning
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
@@ -744,13 +891,17 @@ Process called "tokenize_identifier" takes lexer as Integer returns Integer:
     Return proc create_token with lexer, TOKEN_IDENTIFIER, lexeme
 End Process
 
+@Reasoning:
+Keyword recognition is a linear sequence of string_equals comparisons rather
+than a hash-table lookup because Swift's keyword set is small (~50 entries)
+and modern compilers can branch-predict the sequence efficiently, while the
+hashtable would require an extra allocation and would force a hash on every
+identifier. Returning 0 (the conventional "not a keyword" sentinel) on the
+no-match fallthrough means the caller can use a plain int comparison instead
+of a boolean wrapper.
+@End Reasoning
 Process called "check_keyword" takes lexeme as Integer returns Integer:
     Note: Check if identifier is a Swift keyword
-
-    @Reasoning:
-    Compare lexeme against all Swift keywords.
-    Return appropriate token type or 0 if not a keyword.
-    @End Reasoning
 
     Note: Declaration keywords
     If proc string_equals from StringCore with lexeme, "let":
@@ -968,13 +1119,18 @@ Note: ==========================================================================
 Note: NUMBER TOKENIZATION
 Note: ============================================================================
 
+@Reasoning:
+The number tokeniser handles a 2-character lookahead for radix prefixes
+(0x/0b/0o) before falling through to the decimal/float scanner. The decimal
+loop distinguishes '.' followed by a digit (decimal point) from '.' followed
+by another '.' or any non-digit (the range operator '..<' or '...') by
+peeking two characters; this is critical because '1...5' must lex as
+INT(1) RANGE INT(5), NOT FLOAT(1.) error. The is_float flag is set when a
+decimal point is consumed so the final create_token call can emit the
+correct numeric token type.
+@End Reasoning
 Process called "tokenize_number" takes lexer as Integer returns Integer:
     Note: Tokenize number literal (integer or float)
-
-    @Reasoning:
-    Swift supports decimal, binary (0b), octal (0o), and hexadecimal (0x) integers.
-    Also supports float literals with decimal point and exponent.
-    @End Reasoning
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
@@ -1064,6 +1220,21 @@ Process called "tokenize_number" takes lexer as Integer returns Integer:
     Return proc create_token with lexer, TOKEN_INT_LITERAL, lexeme
 End Process
 
+@Reasoning:
+Hex literals start with `0x` (already consumed by the caller) and
+allow `_` between digits as a readability separator. The lexer
+keeps underscores in the lexeme verbatim - they are stripped only
+during semantic parsing.
+@End Reasoning
+
+@Implementation:
+Loop:
+- peek_char; if is_hex_digit, advance and continue
+- on `_` (95), advance (digit separator)
+- otherwise break.
+After the loop, captures the lexeme via string_substring(source,
+start_pos, end_pos) and emits TOKEN_INT_LITERAL.
+@End Implementation
 Process called "tokenize_hex_number" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize hexadecimal number
 
@@ -1094,6 +1265,17 @@ Process called "tokenize_hex_number" takes lexer as Integer, start_pos as Intege
     Return proc create_token with lexer, TOKEN_INT_LITERAL, lexeme
 End Process
 
+@Reasoning:
+Binary literals start with `0b`. Only 0, 1, and `_` are accepted
+inside. Like hex literals, the underscore separator is preserved
+in the lexeme for later semantic processing.
+@End Reasoning
+
+@Implementation:
+Loop on peek_char: 48 ('0') -> advance, 49 ('1') -> advance, 95
+('_') -> advance, any other character breaks. Captures the lexeme
+via string_substring and emits TOKEN_INT_LITERAL.
+@End Implementation
 Process called "tokenize_binary_number" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize binary number
 
@@ -1129,6 +1311,21 @@ Process called "tokenize_binary_number" takes lexer as Integer, start_pos as Int
     Return proc create_token with lexer, TOKEN_INT_LITERAL, lexeme
 End Process
 
+@Reasoning:
+Octal literals start with `0o` and contain digits 0-7 plus
+optional `_` separators. The two-level if structure with both
+upper and lower octal checks keeps each branch single-purpose.
+@End Reasoning
+
+@Implementation:
+Loop on peek_char:
+- if ch in [48..55] ('0'..'7'), advance
+- else if ch == 95 ('_'), advance
+- else break.
+Note the implementation nests these checks so the structure
+matches the surface logic: digit-range first, then underscore,
+then break. Emits TOKEN_INT_LITERAL with the substring lexeme.
+@End Implementation
 Process called "tokenize_octal_number" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize octal number
 
@@ -1178,13 +1375,19 @@ Note: ==========================================================================
 Note: STRING TOKENIZATION
 Note: ============================================================================
 
+@Reasoning:
+After consuming the opening quote we peek for a second and third quote to
+decide between single-line and triple-quoted (multi-line) forms; triple-quoted
+strings have very different termination and escape rules so we delegate to
+tokenize_multiline_string. The single-line scanner treats backslash-escapes
+as a two-char sequence (advance for the backslash, advance for whatever
+follows) without attempting to decode the escape - decoding happens later when
+the token's lexeme is materialised for HIR. An unterminated string returns a
+TOKEN_ERROR rather than panicking so the parser can surface a diagnostic and
+keep scanning the rest of the file.
+@End Reasoning
 Process called "tokenize_string" takes lexer as Integer returns Integer:
     Note: Tokenize string literal
-
-    @Reasoning:
-    Swift strings support escape sequences and string interpolation \(expr).
-    Handle multi-line strings with triple quotes.
-    @End Reasoning
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
@@ -1236,6 +1439,31 @@ Process called "tokenize_string" takes lexer as Integer returns Integer:
     Return proc create_token with lexer, TOKEN_ERROR, "Unterminated string"
 End Process
 
+@Reasoning:
+Swift multi-line strings use triple double-quotes `"""..."""`.
+Detection of the closing triple uses a quote_count counter that
+increments on each `"` and resets on any non-quote character; a
+count of 3 indicates the close. This approach handles strings that
+contain runs of one or two quote characters without false matches.
+@End Reasoning
+
+@Implementation:
+Sets quote_count = 0. Loops on peek_char:
+- 0 (EOF) returns TOKEN_ERROR "Unterminated multi-line string"
+- 34 ('"'): increments quote_count, advances. If quote_count
+  reaches 3, captures the lexeme via string_substring from
+  start_pos to current end_pos and emits TOKEN_STRING_LITERAL.
+- any other char: resets quote_count to 0. If 92 ('\\') advances
+  to consume the escape character and the next character. Otherwise
+  advances one.
+@End Implementation
+
+@Security_Scope:
+Operates on untrusted source. The unclosed-string path emits
+TOKEN_ERROR rather than crashing or producing an unbounded lexeme,
+and escape consumption never reads past EOF because peek_char
+returns 0 there.
+@End Security_Scope
 Process called "tokenize_multiline_string" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize multi-line string literal (triple quotes)
 
@@ -1280,6 +1508,22 @@ Note: ==========================================================================
 Note: DOT TOKENIZATION (and range operators)
 Note: ============================================================================
 
+@Reasoning:
+Swift has three dot-leading tokens: `.` (member access), `...`
+(closed range), `..<` (half-open range). The lexer recognizes
+them at lex time so the parser doesn't have to disambiguate.
+Plain `..` is invalid in Swift; if seen it emits TOKEN_ERROR
+rather than producing a wrong-but-plausible token.
+@End Reasoning
+
+@Implementation:
+Advances past the first `.`. peek_char:
+- 46 ('.'): advances past second `.`, peek_char:
+  - 46: advances past third `.`, emits TOKEN_DOT_DOT_DOT "..."
+  - 60 ('<'): advances past `<`, emits TOKEN_DOT_DOT_LESS "..<"
+  - otherwise: emits TOKEN_ERROR "Invalid operator '..'"
+- otherwise: emits TOKEN_DOT "."
+@End Implementation
 Process called "tokenize_dot" takes lexer as Integer returns Integer:
     Note: Tokenize dot, range operators (..., ..<)
 
@@ -1308,6 +1552,18 @@ Note: ==========================================================================
 Note: CHARACTER CLASSIFICATION
 Note: ============================================================================
 
+@Reasoning:
+Identifier-friendly alpha predicate. Includes ASCII upper, lower,
+and `_` because Swift identifiers start with these. Unicode
+identifier characters that Swift formally supports are not yet
+handled here (the lexer is ASCII-only at present); the underscore
+is included so swift identifier-start works uniformly.
+@End Reasoning
+
+@Implementation:
+Returns 1 if ch in [65..90] ('A'..'Z'), [97..122] ('a'..'z'), or
+ch == 95 ('_'). Otherwise 0.
+@End Implementation
 Process called "is_alpha" takes ch as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -1330,6 +1586,16 @@ Process called "is_alpha" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Decimal digit predicate used by number tokenizers and the
+fractional/exponent parts of float literals. Restricted to ASCII
+0-9 because Swift numeric literals don't accept other digit
+shapes.
+@End Reasoning
+
+@Implementation:
+Returns 1 if ch in [48..57] ('0'..'9'). Otherwise 0.
+@End Implementation
 Process called "is_digit" takes ch as Integer returns Integer:
     Note: Check if character is digit
 
@@ -1342,6 +1608,17 @@ Process called "is_digit" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Hex predicate used inside 0x... literals. Calls is_digit first
+(so 0-9 short-circuit), then tests A-F and a-f ranges. Case
+preservation is the parser's concern; this predicate accepts
+either.
+@End Reasoning
+
+@Implementation:
+Returns 1 if is_digit(ch), ch in [65..70] ('A'..'F'), or ch in
+[97..102] ('a'..'f'). Otherwise 0.
+@End Implementation
 Process called "is_hex_digit" takes ch as Integer returns Integer:
     Note: Check if character is hexadecimal digit
 

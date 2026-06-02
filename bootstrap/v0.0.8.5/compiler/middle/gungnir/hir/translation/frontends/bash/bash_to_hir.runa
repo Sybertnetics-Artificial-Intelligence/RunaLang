@@ -51,6 +51,22 @@ Note: ==========================================================================
 Note: HIR Dictionary and List Operations (REAL IMPLEMENTATIONS)
 Note: ============================================================================
 
+@Reasoning:
+HIR nodes are represented as untyped hashtables keyed by string field
+names ("type", "children", "command_name", etc.) and the bash frontend
+needs a single entry point so callers do not have to know which hashtable
+implementation is currently wired in. Wrapping the primitive lets the
+HIR storage backend be swapped (e.g., from open-addressing to chaining)
+without touching the dozens of frontend walkers that build HIR nodes.
+@End Reasoning
+
+@Implementation:
+Delegates directly to hashtable_create from the Dict primitive. Returns
+the new hashtable handle as an Integer pointer; the caller takes
+ownership and must release the dictionary via hashtable_destroy when the
+HIR node is freed. No fields are pre-populated because HIR construction
+fills keys lazily based on the node kind detected during walking.
+@End Implementation
 Process called "create_hir_dict" returns Integer:
     Note: Create HIR dictionary using real hashtable
 
@@ -62,42 +78,82 @@ Process called "create_hir_dict" returns Integer:
     Return proc hashtable_create from Dict
 End Process
 
+@Reasoning:
+Mirror of create_hir_dict but for ordered sequences. HIR uses lists for
+children, arguments, pipeline stages, and any other position-significant
+collection; using the production list_create implementation gives us
+amortised O(1) append and O(1) indexed access.
+@End Reasoning
 Process called "create_hir_list" returns Integer:
     Note: Create HIR list using real dynamic list
 
     Return proc list_create from List
 End Process
 
+@Reasoning:
+Thin wrapper over hashtable_set so the bash frontend can use its own
+domain vocabulary (set_dict_value reads more naturally than hashtable_set
+in walker code) while still leveraging the production hashtable
+implementation underneath. The wrapper is intentionally not inlined to
+keep the universal-translation HIR helpers consistent across frontends.
+@End Reasoning
 Process called "set_dict_value" takes dict as Integer, key as Integer, value as Integer returns Integer:
     Note: Set dictionary value using real hashtable_set
 
     Return proc hashtable_set from Dict with dict, key, value
 End Process
 
+@Reasoning:
+Thin alias over list_push. Named "append" rather than "push" because the
+HIR walker code reads more naturally with "append to children" than
+"push children". Identity behaviour is preserved by direct delegation.
+@End Reasoning
 Process called "list_append" takes list as Integer, item as Integer returns Integer:
     Note: Append item to list using real list_push
 
     Return proc list_push from List with list, item
 End Process
 
+@Reasoning:
+Reader counterpart to set_dict_value. The "string" in the name is a
+convention reflecting that the value is interpreted as a string handle
+at the call site; the underlying hashtable_get is type-agnostic.
+@End Reasoning
 Process called "get_dict_string_value" takes dict as Integer, key as Integer returns Integer:
     Note: Get string value from dictionary using real hashtable_get
 
     Return proc hashtable_get from Dict with dict, key
 End Process
 
+@Reasoning:
+Sibling of get_dict_string_value, kept distinct because the call sites
+that retrieve nested HIR nodes prefer the explicit naming. The underlying
+hashtable_get behaviour is identical; the distinction is documentation
+not behaviour.
+@End Reasoning
 Process called "get_dict_hir_value" takes dict as Integer, key as Integer returns Integer:
     Note: Get HIR value from dictionary using real hashtable_get
 
     Return proc hashtable_get from Dict with dict, key
 End Process
 
+@Reasoning:
+Domain-specific alias for list_length used by the HIR walker. The "count"
+naming matches how the walker code thinks about node children
+(child_count) versus generic list operations elsewhere in the codebase.
+@End Reasoning
 Process called "get_list_count" takes list as Integer returns Integer:
     Note: Get list count using real list_length
 
     Return proc list_length from List with list
 End Process
 
+@Reasoning:
+Domain-specific alias over list_get. Used by the translation walkers
+when extracting children; the wrapping keeps the bash-frontend code free
+from primitive-list naming so future swap to a different storage shape
+remains a local change.
+@End Reasoning
 Process called "get_list_item" takes list as Integer, index as Integer returns Integer:
     Note: Get list item using real list_get
 
@@ -108,6 +164,16 @@ Note: ==========================================================================
 Note: AST → HIR Translation
 Note: ============================================================================
 
+@Reasoning:
+The three AST atom kinds (word=51, string=52, number=53) all carry their
+textual payload at offset 8 in the AST node; translating to HIR means
+selecting the canonical HIR node_type tag for each. AST_WORD maps to
+HIR "word" rather than "identifier" because bash words can be filenames,
+glob patterns, or command names depending on position, and we preserve
+that ambiguity in the HIR for downstream targets that may resolve it
+differently. Returning the bare dict for unknown types preserves the
+HIR shape so the dispatcher does not crash on novel AST kinds.
+@End Reasoning
 Process called "translate_word" takes ast as Integer returns Integer:
     Note: Translate word/string/number to HIR
 
@@ -144,6 +210,12 @@ Process called "translate_word" takes ast as Integer returns Integer:
     Return hir_node
 End Process
 
+@Reasoning:
+Bash variable references ($var, ${var}) carry only the name; the HIR
+"variable_reference" node stores that name verbatim so the downstream
+emitter can decide whether to render it as a load, a string expansion,
+or a default-substitution depending on the target language's semantics.
+@End Reasoning
 Process called "translate_variable" takes ast as Integer returns Integer:
     Note: Translate variable reference to HIR
 
@@ -160,6 +232,14 @@ Process called "translate_variable" takes ast as Integer returns Integer:
     Return hir_var
 End Process
 
+@Reasoning:
+Bash redirections (>, >>, <, 2>&1) appear in the AST as nodes whose
+first child is the target. We model them in HIR as a "redirection" dict
+with a target field; the bash parser already separates the redirection
+operator from the target, so the operator details are recorded in the
+AST node's attribute slots (not handled here in v0.0.8.5 - the emitter
+side tracks operator preservation via metadata).
+@End Reasoning
 Process called "translate_redirection" takes ast as Integer returns Integer:
     Note: Translate redirection to HIR
 
@@ -183,6 +263,15 @@ Process called "translate_redirection" takes ast as Integer returns Integer:
     Return hir_redirect
 End Process
 
+@Reasoning:
+Simple commands in bash split children into the command name (always
+first), the argument words, and any redirections interleaved between
+them. The translator partitions children into argument and redirection
+lists based on the child's AST kind (40 = AST_REDIRECTION) so both sets
+are accessible as separate HIR fields. Indexing by 'i multiplied by 8'
+reflects the v0.0.8.5 layout where children is a pointer table of 8-byte
+slots.
+@End Reasoning
 Process called "translate_command" takes ast as Integer returns Integer:
     Note: Translate simple command to HIR
 
@@ -230,6 +319,13 @@ Process called "translate_command" takes ast as Integer returns Integer:
     Return hir_cmd
 End Process
 
+@Reasoning:
+Bash pipelines are sequences of commands joined by '|' where stdout of
+each stage becomes stdin of the next. The HIR "pipeline" node holds the
+ordered command list directly; the runtime semantics (forking processes,
+wiring fds) are the responsibility of the target emitter since most
+languages cannot model true pipe semantics inline.
+@End Reasoning
 Process called "translate_pipeline" takes ast as Integer returns Integer:
     Note: Translate pipeline to HIR
 
@@ -258,6 +354,15 @@ Process called "translate_pipeline" takes ast as Integer returns Integer:
     Return hir_pipeline
 End Process
 
+@Reasoning:
+The central dispatcher routes each AST node kind to its specialised
+translator. Kinds 1-26 cover bash's structural and expansion nodes; the
+51-53 range catches the atom kinds (word, string, number) via a single
+range check rather than three separate If branches, which is the
+v0.0.8.5 convention for contiguous tag ranges. Returning 0 for unknown
+kinds is the silent-skip behaviour expected by the universal translator
+when the bash parser is extended with new node types.
+@End Reasoning
 Process called "translate_node" takes ast as Integer returns Integer:
     Note: Main translation dispatcher
 
@@ -362,6 +467,13 @@ Process called "translate_node" takes ast as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+$(cmd) and `cmd` both lower to AST_COMMAND_SUBSTITUTION nodes whose
+payload is the embedded command. We preserve the raw command text rather
+than its substituted result because the HIR must round-trip back through
+universal translation - the substitution is performed at the target
+language's runtime, not at HIR construction time.
+@End Reasoning
 Process called "translate_command_substitution" takes ast as Integer returns Integer:
     Note: Translate command substitution to HIR
 
@@ -378,6 +490,13 @@ Process called "translate_command_substitution" takes ast as Integer returns Int
     Return hir_node
 End Process
 
+@Reasoning:
+$((expr)) lowers to AST_ARITHMETIC_EXPANSION with the expression text
+stored at offset 8. The HIR carries the expression verbatim because
+bash's arithmetic grammar is C-like but the target may need to lower it
+differently (e.g., to a let binding plus integer evaluation, or to a
+target-specific eval call).
+@End Reasoning
 Process called "translate_arithmetic_expansion" takes ast as Integer returns Integer:
     Note: Translate arithmetic expansion to HIR
 
@@ -394,6 +513,13 @@ Process called "translate_arithmetic_expansion" takes ast as Integer returns Int
     Return hir_node
 End Process
 
+@Reasoning:
+Bash parameter expansions ${var}, ${var:-default}, ${var#pattern},
+${var/from/to} etc. carry rich semantics that not every target language
+can express. The HIR stores the raw expansion text and a generic
+"parameter_expansion" tag; backend-specific lowering decides whether to
+emit a target-native equivalent or a fallback function call.
+@End Reasoning
 Process called "translate_parameter_expansion" takes ast as Integer returns Integer:
     Note: Translate parameter expansion to HIR
 
@@ -410,6 +536,14 @@ Process called "translate_parameter_expansion" takes ast as Integer returns Inte
     Return hir_node
 End Process
 
+@Reasoning:
+Bash command lists span the boolean composition operators (&&, ||) and
+the sequence/background operators (;, &). The HIR lowers all of these
+into a generic "command_list" node since the per-item operator is
+already known to the bash parser and is recorded in each child node's
+metadata. The target emitter chooses how to map each composition to its
+language (e.g., && may become an if-statement or a logical short-circuit).
+@End Reasoning
 Process called "translate_list" takes ast as Integer returns Integer:
     Note: Translate command list (&&, ||, ;, &) to HIR
 
@@ -438,6 +572,13 @@ Process called "translate_list" takes ast as Integer returns Integer:
     Return hir_list
 End Process
 
+@Reasoning:
+Bash compound commands { ...; } group statements without creating a
+subshell - they share the parent's variable environment. The HIR
+distinguishes compound_command from subshell so emitters can choose the
+correct semantics (a JavaScript backend can emit a plain block; a Python
+backend may need to wrap in a try/finally for trap propagation).
+@End Reasoning
 Process called "translate_compound_command" takes ast as Integer returns Integer:
     Note: Translate compound command { commands; } to HIR
 
@@ -460,6 +601,13 @@ Process called "translate_compound_command" takes ast as Integer returns Integer
     Return hir_compound
 End Process
 
+@Reasoning:
+Subshells (...) execute in a fresh process whose environment changes are
+isolated from the parent. The HIR records the isolated execution intent
+via the distinct "subshell" tag, allowing emitters to fork a child
+process, spawn an isolated function call, or use language-specific
+context managers as appropriate to the target.
+@End Reasoning
 Process called "translate_subshell" takes ast as Integer returns Integer:
     Note: Translate subshell ( commands ) to HIR
 
@@ -482,6 +630,14 @@ Process called "translate_subshell" takes ast as Integer returns Integer:
     Return hir_subshell
 End Process
 
+@Reasoning:
+Bash if-statements always have a condition (child 0) and a then-body
+(child 1); additional children represent elif/else branches in
+declaration order. We expose the branches as a List so the emitter can
+walk them sequentially, matching how bash itself evaluates them. The
+field naming ("condition", "then_body", "branches") matches the canonical
+HIR if-statement schema shared by all frontends.
+@End Reasoning
 Process called "translate_if_statement" takes ast as Integer returns Integer:
     Note: Translate if-then-else-fi to HIR
 
@@ -527,6 +683,13 @@ Process called "translate_if_statement" takes ast as Integer returns Integer:
     Return hir_if
 End Process
 
+@Reasoning:
+Bash while loops iterate while the condition command's exit status is
+zero (success). The HIR captures this as a generic "while_loop" with
+condition and body fields; the target emitter is responsible for the
+exit-status-vs-boolean coercion if the destination language uses a
+different truthiness model.
+@End Reasoning
 Process called "translate_while_statement" takes ast as Integer returns Integer:
     Note: Translate while-do-done to HIR
 
@@ -557,6 +720,13 @@ Process called "translate_while_statement" takes ast as Integer returns Integer:
     Return hir_while
 End Process
 
+@Reasoning:
+Until loops are the inverse of while: they iterate while the condition's
+exit status is non-zero (failure). We give them a distinct HIR
+"until_loop" tag rather than rewriting to a while-with-negation because
+preserving the source intent simplifies bidirectional translation and
+matches what tools like shellcheck expect.
+@End Reasoning
 Process called "translate_until_statement" takes ast as Integer returns Integer:
     Note: Translate until-do-done to HIR
 
@@ -587,6 +757,13 @@ Process called "translate_until_statement" takes ast as Integer returns Integer:
     Return hir_until
 End Process
 
+@Reasoning:
+Bash for-loops bind a variable to each word in a list. The translator
+treats the last child as the body and every preceding child as a word
+in the iterable - this matches the bash parser's layout. The loop
+variable name itself lives in the AST node's value slot (offset 8) and
+is copied directly into the HIR's "variable" field.
+@End Reasoning
 Process called "translate_for_statement" takes ast as Integer returns Integer:
     Note: Translate for-do-done to HIR
 
@@ -627,6 +804,13 @@ Process called "translate_for_statement" takes ast as Integer returns Integer:
     Return hir_for
 End Process
 
+@Reasoning:
+A case item is a "pattern[|pattern]) commands ;;" entry. The translator
+treats the final child as the command body and every preceding child as
+a pattern. Patterns flow through translate_word because they are
+syntactically just words at the bash AST level - their glob semantics
+are preserved verbatim for the target emitter to interpret.
+@End Reasoning
 Process called "translate_case_item" takes ast as Integer returns Integer:
     Note: Translate case pattern item to HIR
 
@@ -665,6 +849,14 @@ Process called "translate_case_item" takes ast as Integer returns Integer:
     Return hir_item
 End Process
 
+@Reasoning:
+Case statements pair a scrutinee word (first child) with a list of case
+items (remaining children). Splitting them into separate "word" and
+"items" fields rather than treating them uniformly lets the emitter
+preserve glob semantics on the scrutinee versus exact-match semantics on
+each item's patterns. The items list is built via translate_case_item
+which handles the per-arm pattern/body split.
+@End Reasoning
 Process called "translate_case_statement" takes ast as Integer returns Integer:
     Note: Translate case-in-esac to HIR
 
@@ -701,6 +893,13 @@ Process called "translate_case_statement" takes ast as Integer returns Integer:
     Return hir_case
 End Process
 
+@Reasoning:
+Bash functions have no formal parameter list - $1..$N positional
+arguments are accessed by the body directly. So the HIR function node
+only carries name and body fields, with the body lowered via
+translate_node so any nested control flow inside the function is
+processed by the same dispatcher.
+@End Reasoning
 Process called "translate_function_definition" takes ast as Integer returns Integer:
     Note: Translate function definition to HIR
 
@@ -726,6 +925,12 @@ Process called "translate_function_definition" takes ast as Integer returns Inte
     Return hir_func
 End Process
 
+@Reasoning:
+Bash variable assignments (NAME=VALUE) bind the value to the variable
+in the current shell scope. The HIR captures the name in the node's
+value slot (offset 8) and the assigned expression in the first child;
+target emitters render this as 'let' / 'var' / declaration as needed.
+@End Reasoning
 Process called "translate_variable_assignment" takes ast as Integer returns Integer:
     Note: Translate variable assignment to HIR
 
@@ -751,6 +956,13 @@ Process called "translate_variable_assignment" takes ast as Integer returns Inte
     Return hir_assign
 End Process
 
+@Reasoning:
+The bash script root holds an ordered list of top-level statements. The
+HIR "script" / "program" wrapper preserves the order so the target
+emitter can produce a faithful linear output. The wrapping is necessary
+even for single-statement scripts because the universal translator's
+dispatcher expects a uniform root shape.
+@End Reasoning
 Process called "translate_script" takes ast as Integer returns Integer:
     Note: Translate script (top-level) to HIR
 
@@ -779,6 +991,25 @@ Process called "translate_script" takes ast as Integer returns Integer:
     Return hir_script
 End Process
 
+@Reasoning:
+Single public entry point keeps the universal-translation pipeline
+uniform: every frontend exposes one translate_<lang>_to_hir function so
+the driver can dispatch without per-language knowledge. The actual
+recursion is hidden behind translate_node, which performs tag-based
+dispatch on Bash AST kinds; that internal split avoids leaking the
+Bash-specific AST node types out to the orchestration layer.
+@End Reasoning
+
+@Implementation:
+Delegates the entire walk to translate_node, which is the polymorphic
+Bash AST dispatcher built earlier in this file. ast is expected to be
+the root Bash AST handle returned by bash_parser; translate_node reads
+its type tag, fans out to the appropriate per-kind handler (command,
+pipeline, function definition, if, while, case, etc.), and returns the
+freshly allocated HIR hashtable representing the whole script. Caller
+takes ownership of the returned HIR root and is responsible for
+freeing it via the HIR destructor when downstream translation finishes.
+@End Implementation
 Process called "translate_bash_to_hir" takes ast as Integer returns Integer:
     Note: Main translation entry point
 

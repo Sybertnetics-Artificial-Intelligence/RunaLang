@@ -21,6 +21,23 @@ Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 Import "compiler/frontend/primitives/collections/list.runa" as List
 
+@Reasoning:
+Entry point: drives the JSX/TSX parser to build an AST then dispatches
+the root node into HIR via translate_node. Returns 0 on parse failure
+so the caller can surface a single diagnostic rather than producing a
+half-built HIR tree.
+@End Reasoning
+
+@Implementation:
+Calls Parser.parse_jsx with (source, length). Parse failure (0
+return) short-circuits with 0. Otherwise translates the root AST node
+via translate_node, which recurses on the entire tree.
+@End Implementation
+
+@Security_Scope:
+Source is untrusted; bounded by Parser's own validation. This proc
+performs no direct buffer access.
+@End Security_Scope
 Process called "translate_jsx_to_hir" takes source as Integer, length as Integer returns Integer:
     Let ast be proc parse_jsx from Parser with source, length
 
@@ -33,6 +50,24 @@ Process called "translate_jsx_to_hir" takes source as Integer, length as Integer
     Return hir
 End Process
 
+@Reasoning:
+Polymorphic translator: discriminates by node_type at offset 0 and
+delegates to the specialist translator for that node kind. Numbering
+schema mirrors the parser: 100-199 are JSX-specific kinds (program,
+element, fragment, attribute, text, expression container, identifier,
+member access); 200-210 are JavaScript-side host AST kinds (variable
+decl, function decl, arrow function, call, binary, literal, identifier,
+return, block, object, array). Unknown kinds return 0 so the caller
+can elide them rather than crash on a future parser extension.
+@End Reasoning
+
+@Implementation:
+Null-node short-circuits to 0. Single memory_get_int64 from offset 0
+yields the discriminator. Sequential equality tests dispatch to the
+corresponding translate_* proc; this beats a dictionary lookup at this
+size and remains branch-predictor friendly because most JSX corpora
+exercise only a few kinds (jsx_element, jsx_text, identifier, literal).
+@End Implementation
 Process called "translate_node" takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
@@ -119,6 +154,22 @@ Process called "translate_node" takes node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+The Program node is the AST root; HIR shape is {type:"program",
+body:[stmt...]}. The body is a flat List of translated child HIR
+dicts; non-translatable children (translate_node returning 0) are
+silently dropped so a partially translatable program still produces
+useful HIR for downstream tools.
+@End Reasoning
+
+@Implementation:
+Creates the dict, stamps the literal "program" type marker, then walks
+the parser's children array (offset 24) of length child_count (offset
+32). Each child slot is an 8-byte aligned pointer; child_slot+0 yields
+the child node. Translated children with non-zero HIR result are
+appended to body_list. The intermediate StringCore keys are freed
+after dict_set copies them; the values transfer ownership to the dict.
+@End Implementation
 Process called "translate_program" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -152,6 +203,23 @@ Process called "translate_program" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+JSX elements are <Tag attr={val}>...</Tag>. The AST encodes the tag as
+the first child and interleaves attributes (type 103) with content
+children (anything else). HIR splits them into separate "attributes"
+and "children" lists so backends don't need to re-classify; tag is
+hoisted to its own slot.
+@End Reasoning
+
+@Implementation:
+Stamps "jsx_element" marker, then reads children/child_count. If at
+least one child exists, the first is treated as the tag (e.g. an
+identifier or member expression) and stored under "tag". Pre-allocates
+empty attributes_list and children_list so downstream code never sees
+a missing slot. Iterates children from index 1; node_type 103 (jsx
+attribute) routes to attributes_list, anything else routes to
+children_list.
+@End Implementation
 Process called "translate_jsx_element" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -208,6 +276,19 @@ Process called "translate_jsx_element" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+JSX fragments (<>...</>) carry no tag or attributes - only a child
+sequence. HIR shape is {type:"jsx_fragment", children:[...]}. Treated
+distinctly from elements so backends can decide whether to emit
+React.Fragment or strip the wrapper entirely.
+@End Reasoning
+
+@Implementation:
+Creates the dict with the "jsx_fragment" type marker, pre-allocates an
+empty children list, then walks all parser children from index 0 (no
+tag at index 0 unlike jsx_element). Each translated child with
+non-zero HIR is appended.
+@End Implementation
 Process called "translate_jsx_fragment" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -241,6 +322,19 @@ Process called "translate_jsx_fragment" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+JSX attributes are name={value} pairs. The AST stores name at child[0]
+and value at child[1]; valueless attributes (HTML-style 'disabled')
+have only one child. HIR shape is {type:"jsx_attribute", name:..., value:...}
+where value may be absent for boolean attributes.
+@End Reasoning
+
+@Implementation:
+Stamps the attribute type marker, then conditionally extracts name
+(child_count >= 1) and value (child_count >= 2). Each subtree is
+translated via translate_node before being attached. The value slot
+offset is computed as 1*8 to access children[1].
+@End Implementation
 Process called "translate_jsx_attribute" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -275,6 +369,19 @@ Process called "translate_jsx_attribute" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+JSX text nodes carry literal character data between tags. The AST
+stores the raw text pointer at offset 8 and its byte length at offset
+16. HIR shape is {type:"jsx_text", value:"..."} so backends can emit
+the text verbatim (HTML escaping is a backend concern).
+@End Reasoning
+
+@Implementation:
+Creates the dict with the type marker. Both text pointer and length
+are null-checked before allocating the value string; an empty text run
+yields {type:"jsx_text"} with no "value" key, which downstream tools
+treat as a whitespace-only node.
+@End Implementation
 Process called "translate_jsx_text" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -299,6 +406,18 @@ Process called "translate_jsx_text" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+JSX expression containers ({expr}) embed arbitrary JS expressions
+inside markup. The AST stores the wrapped expression at child[0].
+HIR shape is {type:"jsx_expression", expression:<expr-hir>} so the
+expression survives as a first-class HIR subtree for further analysis.
+@End Reasoning
+
+@Implementation:
+Stamps the type marker; if any child exists, the first child is
+translated and stored under "expression". Empty {} containers yield a
+bare {type:"jsx_expression"} which downstream tools treat as a no-op.
+@End Implementation
 Process called "translate_jsx_expression" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -322,6 +441,20 @@ Process called "translate_jsx_expression" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+JSX identifiers appear as tag names ('div'), attribute names ('href'),
+and namespace prefixes. They share the HIR "identifier" type with
+regular JS identifiers so backends need only one identifier handler.
+The AST stores the raw identifier text at offset 8 with length at
+offset 16.
+@End Reasoning
+
+@Implementation:
+Creates the dict with "identifier" type marker. Defensively null/zero-
+length-checks the text pointer before allocating; this keeps the proc
+safe against any zero-length identifier that might leak from a
+malformed parser path.
+@End Implementation
 Process called "translate_jsx_identifier" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -346,6 +479,20 @@ Process called "translate_jsx_identifier" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+JSX member tags (e.g. <Module.SubComponent.Inner/>) encode the receiver
+as child[0] and successive property identifiers as children[1..].
+Flattening this list to {object, properties:[id, id, ...]} keeps the
+HIR uniform regardless of how many dots appear in the chain.
+@End Reasoning
+
+@Implementation:
+Stamps "member_expression" type. child[0] becomes the "object";
+remaining children (index 1..child_count) are translated and pushed
+into the properties list. An empty properties list is the legal HIR
+encoding of a bare receiver such as <X/>; member chains have one or
+more entries.
+@End Implementation
 Process called "translate_jsx_member_expression" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -388,6 +535,19 @@ Process called "translate_jsx_member_expression" takes node as Integer returns I
     Return hir
 End Process
 
+@Reasoning:
+JavaScript variable declarations carry kind (var/let/const), name, and
+optional initialiser. The parser flattens them to three positional
+children; HIR re-keys to {kind, name, init} so the call site doesn't
+need positional knowledge.
+@End Reasoning
+
+@Implementation:
+Stamps the type marker; the three optional positional children map to
+keys "kind", "name", "init" via incrementing offsets. Each subtree
+is fully recursed via translate_node. Declarations without an
+initialiser ('let x;') produce HIR without an "init" key.
+@End Implementation
 Process called "translate_variable_declaration" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -433,6 +593,20 @@ Process called "translate_variable_declaration" takes node as Integer returns In
     Return hir
 End Process
 
+@Reasoning:
+JS function declarations carry a name identifier and a body block. The
+parser stores name at child[0] and body at child[1]. Function
+parameters are not yet emitted by the JSX parser (which is focused on
+React function components and arrow forms); when parameter handling
+becomes necessary this translator gains a "params" key alongside
+name/body.
+@End Reasoning
+
+@Implementation:
+Stamps "function_declaration" type. child[0] -> "name", child[1] ->
+"body". Both are recursively translated; missing positions are
+tolerated so the dict has only the keys for present children.
+@End Implementation
 Process called "translate_function_declaration" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -467,6 +641,19 @@ Process called "translate_function_declaration" takes node as Integer returns In
     Return hir
 End Process
 
+@Reasoning:
+Arrow functions ((args) => body) translate as {type:"arrow_function",
+body:<expr-or-block>}. The parser places the body at child[0]; the
+parameter list is currently elided by the JSX subset's parser scope.
+This is the canonical React functional component shape.
+@End Reasoning
+
+@Implementation:
+Stamps the type marker; if any child exists the first is the body. The
+body may be either an expression (implicit return) or a block; both
+forms travel through translate_node so the discrimination is recorded
+in the inner HIR type field rather than here.
+@End Implementation
 Process called "translate_arrow_function" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -490,6 +677,20 @@ Process called "translate_arrow_function" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+Function calls f(a,b,c) translate to {type:"call_expression",
+callee:..., arguments:[...]}. child[0] is the callee; children[1..]
+are arguments. Splitting them out into separate keys matches both
+React's createElement contract and downstream HIR consumers expecting
+a fixed-arity record.
+@End Reasoning
+
+@Implementation:
+Stamps the type marker; child[0] -> "callee". An empty arguments_list
+is pre-allocated so callers needn't null-check. Iterates from index 1
+appending non-zero translated children to the arguments list. Zero-
+arg calls (f()) produce an empty arguments list.
+@End Implementation
 Process called "translate_call_expression" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -532,6 +733,21 @@ Process called "translate_call_expression" takes node as Integer returns Integer
     Return hir
 End Process
 
+@Reasoning:
+Binary expressions are stored as (left, right) children with operator
+text on the parent. HIR shape {type:"binary_expression", left, right}
+preserves the operands but elides the operator key here; the operator
+is typically encoded via the AST's text slot which a richer backend
+would extract separately. The minimal shape is sufficient for the JSX
+subset which uses binary expressions only inside expression containers.
+@End Reasoning
+
+@Implementation:
+Stamps the type marker. child[0] -> "left", child[1] -> "right".
+Both subtrees are translated via translate_node so nested expressions
+recurse correctly. Missing operands leave the corresponding key
+absent rather than emitting a null placeholder.
+@End Implementation
 Process called "translate_binary_expression" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -566,6 +782,21 @@ Process called "translate_binary_expression" takes node as Integer returns Integ
     Return hir
 End Process
 
+@Reasoning:
+JS literal tokens (numbers, strings, true/false/null) survive
+translation as their lexeme text in the "value" slot; type distinction
+(number vs string) is deferred to downstream passes that can apply
+the JSON-like parsing rules. The HIR record is intentionally narrow
+since all type-aware analysis must consult the source-language type
+system.
+@End Reasoning
+
+@Implementation:
+Stamps "literal" type. The literal text is taken from offsets 8 and
+16 (pointer, length); empty literals leave the "value" key absent.
+The buffer is copied into a new StringCore so the dict's ownership
+is independent of the AST node's lifetime.
+@End Implementation
 Process called "translate_literal" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -590,10 +821,33 @@ Process called "translate_literal" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+JS identifiers and JSX identifiers share the same HIR encoding (both
+are {type:"identifier", name:...}), so this proc forwards to the JSX
+implementation. Keeping the dispatch entry separate from
+translate_jsx_identifier means future divergence (e.g., adding JS-
+specific scope info) only requires editing this forwarder.
+@End Reasoning
+
+@Implementation:
+Tail-calls translate_jsx_identifier with the same node argument.
+@End Implementation
 Process called "translate_identifier" takes node as Integer returns Integer:
     Return proc translate_jsx_identifier from node
 End Process
 
+@Reasoning:
+'return expr;' translates to {type:"return_statement", argument:...};
+bare 'return;' drops the argument key. The choice of "argument" as
+the key matches ESTree convention, easing interop with JS tooling that
+consumes the HIR.
+@End Reasoning
+
+@Implementation:
+Stamps the type marker; if any child exists, child[0] is the return
+argument and is translated and stored. Argumentless returns produce a
+bare {type:"return_statement"} record.
+@End Implementation
 Process called "translate_return_statement" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -617,6 +871,18 @@ Process called "translate_return_statement" takes node as Integer returns Intege
     Return hir
 End Process
 
+@Reasoning:
+{ stmts... } blocks translate to {type:"block_statement", body:[...]}.
+This mirrors translate_program's shape but with a different type
+discriminator so the parent context is preserved through later passes.
+@End Reasoning
+
+@Implementation:
+Stamps "block_statement" type and pre-allocates an empty body list.
+Walks all children from index 0; non-zero translated children are
+pushed into body_list. An empty block produces {type:"block_statement",
+body:[]} which downstream tools treat as a no-op.
+@End Implementation
 Process called "translate_block_statement" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -650,6 +916,23 @@ Process called "translate_block_statement" takes node as Integer returns Integer
     Return hir
 End Process
 
+@Reasoning:
+Object literals { k1: v1, k2: v2 } are stored as a flat alternating
+sequence of (key, value) children in the parser. HIR re-pairs them
+into a properties list of {key, value} dicts so each property is a
+self-contained record. Odd-length children arrays (malformed input)
+break out of the loop after the dangling key without producing a
+property record, avoiding null-value HIR entries.
+@End Reasoning
+
+@Implementation:
+Stamps the "object_expression" type. Pre-allocates an empty
+properties list. Two-step iteration: reads children[index] as key,
+advances index, breaks if child_count exhausted (dangling key); reads
+children[index] as value, advances. Constructs a property dict with
+"key" and "value" keys, both populated by recursive translate_node,
+appends to properties list. Continues until children are exhausted.
+@End Implementation
 Process called "translate_object_expression" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 
@@ -703,6 +986,20 @@ Process called "translate_object_expression" takes node as Integer returns Integ
     Return hir
 End Process
 
+@Reasoning:
+Array literals [a, b, c] translate to {type:"array_expression",
+elements:[...]}. Elements preserve order; null-translated entries
+(translate_node returning 0) are dropped which loses sparse-array
+semantics, but the JSX subset's array literals never use elisions
+("[,a]") because the parser rejects them earlier.
+@End Reasoning
+
+@Implementation:
+Stamps the type marker; pre-allocates an empty elements list. Walks
+children from index 0; each non-zero translated child is appended.
+Empty arrays produce {type:"array_expression", elements:[]} which
+backends emit as a literal [].
+@End Implementation
 Process called "translate_array_expression" takes node as Integer returns Integer:
     Let hir be proc dict_create from Dict
 

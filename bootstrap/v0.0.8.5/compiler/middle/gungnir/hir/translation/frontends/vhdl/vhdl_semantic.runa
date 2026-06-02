@@ -19,6 +19,24 @@ Note: ===================================================================
 Note: SEMANTIC ANALYZER STRUCTURE
 Note: ===================================================================
 
+@Reasoning:
+VHDL semantic analysis must track many independent design entities at once:
+entity/architecture pairs, packages, signals/variables/constants, processes,
+sensitivity lists, clock and reset domains. Splitting them into named slots
+(rather than one big Dict keyed by kind) lets each analysis pass query its
+working set in O(1) and keeps synthesis vs. validation diagnostics in
+separate streams so the reporter can apply different severity rules.
+@End Reasoning
+
+@Implementation:
+29 x i64 record (232 bytes, offsets 0..224). Slots 0..136 are design-element
+registries (List/Dict); 144..168 are synthesis-specific (clock_domains,
+reset_signals, sensitivity_lists); 176..208 are diagnostic streams
+(validation_errors/warnings, type_errors, synthesis_warnings); 216..224 are
+the sticky first-error pair (error_message + has_error) matching the
+cmake/dockerfile analyzer convention.
+@End Implementation
+
 Type called "VHDLSemanticAnalyzer":
     entities as Integer
     architectures as Integer
@@ -55,20 +73,28 @@ Note: ===================================================================
 Note: ANALYZER CREATION
 Note: ===================================================================
 
+@Reasoning:
+VHDL analyzers are heavyweight (29 registries spanning declarations,
+synthesis state, and four diagnostic streams) so we build them in a single
+factory rather than lazily growing slots. This guarantees every downstream
+pass sees the same record shape and lets the Type declaration above act as
+the canonical layout contract — any new pass just adds another offset
+rather than discovering missing slots at runtime.
+@End Reasoning
+
+@Implementation:
+Allocates 232 bytes matching the VHDLSemanticAnalyzer Type (29 i64 slots,
+offsets 0..224). Builds Dicts for keyed-by-name registries
+(entities/architectures/packages/types/signals/...) and Lists for ordered
+streams (processes, libraries, sensitivity_lists, validation_errors, etc.).
+Writes are issued in field order so a slot reorder in the Type declaration
+must be mirrored here. Slots 216 (error_message) and 224 (has_error)
+remain 0 — they are set by set_vhdl_semantic_error only on the first
+fatal error, matching the sticky-error convention used by the cmake and
+dockerfile analyzers.
+@End Implementation
 Process called "create_vhdl_semantic_analyzer" returns Integer:
     Note: Create VHDL semantic analyzer for HDL validation
-
-    @Reasoning:
-    Initialize comprehensive semantic analyzer for VHDL including entity/
-    architecture validation, type checking, signal analysis, process
-    validation, and VHDL language compliance verification.
-    @End Reasoning
-
-    @Implementation:
-    Allocate analyzer structure with registries for entities, architectures,
-    packages, types, signals, processes, and validation tracking. Initialize
-    all registries for comprehensive VHDL semantic analysis.
-    @End Implementation
 
     Let analyzer_size be 232
     Let analyzer be proc allocate from Layout with analyzer_size
@@ -142,20 +168,31 @@ Note: ===================================================================
 Note: MAIN ANALYSIS ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+VHDL design semantics cannot be checked in a single pass — signal drivers
+reference architectures that reference entities, and process sensitivity
+lists reference signals declared in any visible architecture or package.
+The fixed six-phase pipeline below is the minimal dependency ordering:
+declarations must exist before design-unit validation, types must be
+resolved before signal-driver analysis, and processes can only be
+validated after signal usage is known. Reordering phases produces false
+"unknown identifier" errors.
+@End Reasoning
+
+@Implementation:
+Two early null guards: analyzer null returns 0 silently (caller bug);
+vhdl_ast null records "Null VHDL AST" via set_vhdl_semantic_error and
+returns 0. The six phases (collect_vhdl_declarations,
+validate_vhdl_design_units, analyze_vhdl_types, analyze_vhdl_signals,
+validate_vhdl_processes, validate_vhdl_libraries) each accumulate
+diagnostics into the analyzer's streams rather than aborting, so a single
+analysis run reports every issue it finds. Final has_error read at offset
+224 mirrors the convention used by every other Gungnir frontend analyzer:
+1 means a fatal error fired during any phase, return 0 to fail; 0 means
+warnings only, return 1.
+@End Implementation
 Process called "analyze_vhdl_design" takes analyzer as Integer, vhdl_ast as Integer returns Integer:
     Note: Perform complete semantic analysis on VHDL design
-
-    @Reasoning:
-    Comprehensive analysis including entity/architecture validation, type
-    checking, signal analysis, process validation, library usage, and VHDL
-    language compliance verification for robust hardware designs.
-    @End Reasoning
-
-    @Implementation:
-    Multi-phase analysis: collect declarations, validate types, analyze
-    signals, check processes, validate connectivity, and enforce VHDL
-    conventions for synthesizable and simulation-ready designs.
-    @End Implementation
 
     If analyzer is equal to 0:
         Return 0
@@ -196,6 +233,14 @@ Note: ===================================================================
 Note: DECLARATION COLLECTION
 Note: ===================================================================
 
+@Implementation:
+Reads design_units list from AST. Iterates each, matching its
+unit_type string against entity/architecture/package/package_body/
+configuration and dispatching to the corresponding collect_vhdl_*
+helper. Unknown unit types raise a "Unknown design unit type"
+warning via add_vhdl_validation_warning. After the main loop, calls
+collect_vhdl_library_clauses to harvest library and use clauses.
+@End Implementation
 Process called "collect_vhdl_declarations" takes analyzer as Integer, vhdl_ast as Integer:
     Note: Collect all VHDL design units and declarations
 
@@ -236,6 +281,13 @@ Process called "collect_vhdl_declarations" takes analyzer as Integer, vhdl_ast a
     proc collect_vhdl_library_clauses with analyzer, vhdl_ast
 End Process
 
+@Implementation:
+Reads entity_name from the AST node. Looks up entities_registry
+@0. If the name is already present, raises a "Duplicate entity
+declaration" error and returns early. Otherwise sets the dictionary
+entry and dispatches to collect_entity_ports and
+collect_entity_generics for the per-section work.
+@End Implementation
 Process called "collect_vhdl_entity" takes analyzer as Integer, entity_unit as Integer:
     Note: Collect entity declaration
 
@@ -265,6 +317,15 @@ Process called "collect_vhdl_entity" takes analyzer as Integer, entity_unit as I
     proc collect_entity_generics with analyzer, entity_name, entity_unit
 End Process
 
+@Implementation:
+Reads architecture_name and entity_name (the entity this architecture
+binds to). Forms arch_key = "<entity_name>.<architecture_name>" so
+multiple architectures of the same entity coexist with distinct keys.
+Looks up architectures_registry @8; on duplicate raises "Duplicate
+architecture" error. Otherwise sets the entry and dispatches to
+collect_architecture_signals, collect_architecture_components,
+collect_architecture_processes.
+@End Implementation
 Process called "collect_vhdl_architecture" takes analyzer as Integer, architecture_unit as Integer:
     Note: Collect architecture declaration
 
@@ -301,6 +362,14 @@ Process called "collect_vhdl_architecture" takes analyzer as Integer, architectu
     proc collect_architecture_processes with analyzer, arch_key, architecture_unit
 End Process
 
+@Implementation:
+Reads package_name from the AST node. Looks up packages_registry
+@16. On duplicate raises "Duplicate package declaration". Otherwise
+sets the entry and dispatches to collect_package_types,
+collect_package_constants, collect_package_subprograms. These
+helpers populate the analyzer's types/constants/functions/procedures
+registries with qualified names like "PackageName.TypeName".
+@End Implementation
 Process called "collect_vhdl_package" takes analyzer as Integer, package_unit as Integer:
     Note: Collect package declaration
 
@@ -332,6 +401,15 @@ Process called "collect_vhdl_package" takes analyzer as Integer, package_unit as
     proc collect_package_subprograms with analyzer, package_name, package_unit
 End Process
 
+@Implementation:
+Calls get_vhdl_entity_ports. If null returns. Reads signals_registry
+@40. Iterates each port: gets port_name, port_direction (in/out/
+inout/buffer), port_type. Builds qualified_port_name =
+"<entity_name>.<port_name>" via string_concat. Creates a port_info
+record via create_vhdl_port_info and sets it under the qualified
+name in the signals registry. Calls validate_vhdl_port_direction
+to flag illegal direction declarations.
+@End Implementation
 Process called "collect_entity_ports" takes analyzer as Integer, entity_name as Integer, entity_unit as Integer:
     Note: Collect entity port declarations
 
@@ -369,6 +447,15 @@ Process called "collect_entity_ports" takes analyzer as Integer, entity_name as 
     End While
 End Process
 
+@Implementation:
+Calls get_vhdl_entity_generics. If null returns. Reads
+constants_registry @56 (VHDL generics are conceptually compile-time
+constants and share registry space with explicit CONSTANT
+declarations). Iterates: gets generic_name, generic_type,
+generic_default. Builds qualified_generic_name as
+"<entity_name>.<generic_name>". Creates generic_info via
+create_vhdl_generic_info and sets it in constants_registry.
+@End Implementation
 Process called "collect_entity_generics" takes analyzer as Integer, entity_name as Integer, entity_unit as Integer:
     Note: Collect entity generic declarations
 
@@ -403,6 +490,14 @@ Process called "collect_entity_generics" takes analyzer as Integer, entity_name 
     End While
 End Process
 
+@Implementation:
+Calls get_vhdl_architecture_signals. If null returns. Reads
+signals_registry @40 (shared with entity ports). Iterates each
+signal: gets signal_name and signal_type. Builds
+qualified_signal_name = "<arch_key>.<signal_name>" so signals from
+different architectures of the same entity stay separate. Creates
+signal_info via create_vhdl_signal_info and sets it in the registry.
+@End Implementation
 Process called "collect_architecture_signals" takes analyzer as Integer, arch_key as Integer, architecture_unit as Integer:
     Note: Collect architecture signal declarations
 
@@ -436,6 +531,15 @@ Process called "collect_architecture_signals" takes analyzer as Integer, arch_ke
     End While
 End Process
 
+@Implementation:
+Calls get_vhdl_architecture_processes. If null returns. Reads
+processes_registry @96 (a List rather than Dict because process
+identity is positional, not name-keyed - VHDL allows multiple
+unnamed processes in the same architecture). For each process_stmt:
+appends to the list, calls analyze_process_sensitivity_list to
+populate the analyzer's sensitivity_lists list, and calls
+collect_process_variables for the per-process locals.
+@End Implementation
 Process called "collect_architecture_processes" takes analyzer as Integer, arch_key as Integer, architecture_unit as Integer:
     Note: Collect architecture process statements
 
@@ -472,6 +576,17 @@ Note: ===================================================================
 Note: DESIGN UNIT VALIDATION
 Note: ===================================================================
 
+@Implementation:
+Sequentially calls four validation sub-passes:
+  1. validate_entity_architecture_bindings - architectures reference
+     existing entities
+  2. validate_package_dependencies - use clauses resolve to known
+     packages
+  3. validate_configuration_specifications - configuration bindings
+     pick valid architecture variants
+  4. check_design_unit_consistency - top-level cross-checks
+Each sub-pass registers any failures via add_vhdl_validation_error.
+@End Implementation
 Process called "validate_vhdl_design_units" takes analyzer as Integer:
     Note: Validate entity/architecture relationships and design units
 
@@ -487,6 +602,15 @@ Process called "validate_vhdl_design_units" takes analyzer as Integer:
     proc check_design_unit_consistency from analyzer
 End Process
 
+@Implementation:
+Reads architectures_registry @8 and entities_registry @0. Lists
+the architecture keys (each "entity_name.arch_name"). For each:
+gets the architecture_unit, reads its entity_name target via
+get_vhdl_architecture_entity, checks entities_registry contains it.
+If absent, raises "Architecture references undefined entity"
+error. Otherwise calls validate_architecture_port_usage to verify
+the architecture uses the entity's ports correctly.
+@End Implementation
 Process called "validate_entity_architecture_bindings" takes analyzer as Integer:
     Note: Validate entity/architecture bindings
 
@@ -523,6 +647,14 @@ Process called "validate_entity_architecture_bindings" takes analyzer as Integer
     End While
 End Process
 
+@Implementation:
+Reads entities_registry @0 and looks up entity_unit by name. Calls
+get_vhdl_entity_ports - if null returns. Iterates each port:
+extracts port_name and port_direction, calls
+validate_port_usage_in_architecture which checks that the
+architecture neither reads from output-only ports nor writes to
+input-only ports.
+@End Implementation
 Process called "validate_architecture_port_usage" takes analyzer as Integer, arch_key as Integer, entity_name as Integer:
     Note: Validate architecture uses entity ports consistently
 
@@ -556,6 +688,17 @@ Note: ===================================================================
 Note: TYPE ANALYSIS
 Note: ===================================================================
 
+@Implementation:
+Sequentially calls four type sub-passes:
+  1. collect_all_types - build type_registry with built-ins +
+     user-defined
+  2. validate_type_compatibility - signal/variable assignment type
+     matching
+  3. check_subtype_constraints - subtype range and resolution
+     consistency
+  4. validate_type_conversions - explicit type conversions are valid
+Each sub-pass registers any failures via add_vhdl_type_error.
+@End Implementation
 Process called "analyze_vhdl_types" takes analyzer as Integer:
     Note: Perform type checking and resolution
 
@@ -571,6 +714,14 @@ Process called "analyze_vhdl_types" takes analyzer as Integer:
     proc validate_type_conversions from analyzer
 End Process
 
+@Implementation:
+Reads type_registry @144. First calls add_vhdl_builtin_types to
+seed the registry with the IEEE.std_logic_1164 family (bit, boolean,
+integer, std_logic, etc.). Then collect_package_defined_types walks
+all packages and registers TYPE declarations; finally
+collect_local_type_definitions walks entities and architectures for
+their local TYPE declarations.
+@End Implementation
 Process called "collect_all_types" takes analyzer as Integer:
     Note: Collect all type definitions from design units
 
@@ -592,6 +743,16 @@ Process called "collect_all_types" takes analyzer as Integer:
     proc collect_local_type_definitions from analyzer
 End Process
 
+@Implementation:
+Builds a List of 14 built-in type names: bit, bit_vector, boolean,
+character, integer, natural, positive, string, time, real, std_logic,
+std_logic_vector, signed, unsigned. For each name, calls
+create_builtin_type_info to make a type_info record (carrying kind
+and base type) and sets it in the type_registry under the name. The
+std_logic family is included as a built-in even though it is
+technically in IEEE.std_logic_1164 - virtually all VHDL designs use
+this library so treating it as built-in simplifies type resolution.
+@End Implementation
 Process called "add_vhdl_builtin_types" takes type_registry as Integer:
     Note: Add VHDL built-in types to registry
 
@@ -628,6 +789,16 @@ Process called "add_vhdl_builtin_types" takes type_registry as Integer:
     End While
 End Process
 
+@Implementation:
+Sequentially calls three sub-passes:
+  1. validate_signal_assignment_types - checks every signal
+     assignment 's <= expr' for type compatibility
+  2. validate_variable_assignment_types - same for ':=' in
+     processes
+  3. validate_subprogram_call_types - actual vs. formal parameter
+     type matching at function/procedure calls
+Each registers failures via add_vhdl_type_error.
+@End Implementation
 Process called "validate_type_compatibility" takes analyzer as Integer:
     Note: Validate type compatibility in expressions and assignments
 
@@ -651,6 +822,14 @@ Note: ===================================================================
 Note: SIGNAL ANALYSIS
 Note: ===================================================================
 
+@Implementation:
+Sequentially calls four signal sub-passes:
+  1. analyze_signal_drivers - populates signal_drivers map
+  2. validate_signal_resolution - multi-driver signals need
+     resolution functions
+  3. check_signal_connectivity - all signals are driven somewhere
+  4. detect_signal_usage_issues - unused signals, redundant drives
+@End Implementation
 Process called "analyze_vhdl_signals" takes analyzer as Integer:
     Note: Validate signal usage and connectivity
 
@@ -666,6 +845,14 @@ Process called "analyze_vhdl_signals" takes analyzer as Integer:
     proc detect_signal_usage_issues from analyzer
 End Process
 
+@Implementation:
+Reads signal_drivers Dictionary @152. Calls four collectors in
+sequence to populate it: collect_concurrent_signal_drivers (top-
+level concurrent assignments), collect_process_signal_drivers
+(process bodies), collect_component_output_drivers (component
+instantiations). Then calls validate_signal_driver_consistency to
+detect multi-driver conflicts.
+@End Implementation
 Process called "analyze_signal_drivers" takes analyzer as Integer:
     Note: Analyze signal driver sources
 
@@ -690,6 +877,14 @@ Process called "analyze_signal_drivers" takes analyzer as Integer:
     proc validate_signal_driver_consistency with analyzer, signal_drivers
 End Process
 
+@Implementation:
+Reads signal_drivers @152. Lists its keys (signal names). For each
+signal, gets its drivers list and counts entries. If driver_count
+> 1, calls validate_signal_resolution_function which verifies the
+signal's declared type carries a resolution function attribute
+(e.g. std_logic via the resolved subtype). Single-driver signals
+are silently accepted.
+@End Implementation
 Process called "validate_signal_resolution" takes analyzer as Integer:
     Note: Validate signal resolution functions
 
@@ -721,6 +916,14 @@ Note: ===================================================================
 Note: PROCESS VALIDATION
 Note: ===================================================================
 
+@Implementation:
+Sequentially calls four process sub-passes:
+  1. validate_process_sensitivity_lists - sensitivity lists must
+     match signals actually read
+  2. validate_process_statements - sequential statement validity
+  3. check_process_variable_usage - variables read before write
+  4. validate_wait_statements - wait on, wait until, wait for syntax
+@End Implementation
 Process called "validate_vhdl_processes" takes analyzer as Integer:
     Note: Validate processes and concurrent statements
 
@@ -736,6 +939,13 @@ Process called "validate_vhdl_processes" takes analyzer as Integer:
     proc validate_wait_statements from analyzer
 End Process
 
+@Implementation:
+Reads processes_registry @96 (a List). Iterates each process_stmt
+and delegates to validate_individual_process_sensitivity. The
+processes_registry is a List because process statements have no
+inherent name to key by - architectures may have multiple unnamed
+processes.
+@End Implementation
 Process called "validate_process_sensitivity_lists" takes analyzer as Integer:
     Note: Validate process sensitivity lists
 
@@ -756,6 +966,16 @@ Process called "validate_process_sensitivity_lists" takes analyzer as Integer:
     End While
 End Process
 
+@Implementation:
+Reads the declared sensitivity_list from the process AST node and
+the body's statements. Calls
+collect_signals_read_in_statements to compute the actual signals
+read. If a sensitivity_list exists, calls
+compare_sensitivity_with_reads to find mismatches (missing reads,
+unnecessary entries). If no sensitivity_list, calls
+check_wait_statement_usage - processes without sensitivity lists
+must use wait statements to suspend execution.
+@End Implementation
 Process called "validate_individual_process_sensitivity" takes analyzer as Integer, process_stmt as Integer:
     Note: Validate individual process sensitivity list
 
@@ -780,6 +1000,15 @@ Process called "validate_individual_process_sensitivity" takes analyzer as Integ
     End If
 End Process
 
+@Implementation:
+Reads sensitivity_list from process AST. If null returns. Reads
+clock_domains @168 and reset_signals @176. Iterates each signal_ref
+in the list: extracts signal_name, calls is_vhdl_clock_signal_name
+to check for clock-name patterns ("clk", "clock", etc.) and
+is_vhdl_reset_signal_name for reset-name patterns. Appends matches
+to the corresponding analyzer list. A single signal can match
+both (e.g. "clk_rst" in synchronous-reset designs).
+@End Implementation
 Process called "analyze_process_sensitivity_list" takes analyzer as Integer, process_stmt as Integer:
     Note: Analyze process sensitivity for clock and reset detection
 
@@ -823,6 +1052,17 @@ Note: ===================================================================
 Note: LIBRARY VALIDATION
 Note: ===================================================================
 
+@Implementation:
+Sequentially calls four library sub-passes:
+  1. validate_library_clauses - each LIBRARY clause references a
+     real library
+  2. validate_use_clauses - each USE clause resolves to a known
+     package
+  3. check_package_visibility - referenced items are actually
+     exposed by the imported package
+  4. validate_standard_library_usage - standard libraries (ieee,
+     std) used correctly
+@End Implementation
 Process called "validate_vhdl_libraries" takes analyzer as Integer:
     Note: Check library usage and dependencies
 
@@ -838,6 +1078,13 @@ Process called "validate_vhdl_libraries" takes analyzer as Integer:
     proc validate_standard_library_usage from analyzer
 End Process
 
+@Implementation:
+Reads libraries List @128. Iterates each library_clause: gets the
+library_name via get_vhdl_library_name. Calls
+validate_vhdl_library_name (general name-validity check) and
+check_standard_library_reference (flags the well-known std/ieee/
+work libraries for special-case handling).
+@End Implementation
 Process called "validate_library_clauses" takes analyzer as Integer:
     Note: Validate library clause declarations
 
@@ -865,6 +1112,12 @@ Process called "validate_library_clauses" takes analyzer as Integer:
     End While
 End Process
 
+@Implementation:
+Reads use_clauses List @136. Iterates each use_clause and
+delegates to validate_individual_use_clause which checks that the
+referenced library is declared, the package exists in that library,
+and the selected items (.all or specific names) resolve correctly.
+@End Implementation
 Process called "validate_use_clauses" takes analyzer as Integer:
     Note: Validate use clause specifications
 
@@ -889,6 +1142,15 @@ Note: ===================================================================
 Note: UTILITY FUNCTIONS
 Note: ===================================================================
 
+@Implementation:
+Builds a List of clock-name patterns: "clk", "clock", "CLK",
+"CLOCK". Loops calling string_contains for each pattern against
+signal_name. Returns 1 on the first match. Returns 0 if no pattern
+matches. Note this is a SUBSTRING check (so "sys_clk" also matches
+"clk"), giving liberal detection of clock signals; downstream
+synthesis can still treat the heuristic match as advisory and
+require an explicit attribute for the authoritative answer.
+@End Implementation
 Process called "is_vhdl_clock_signal_name" takes signal_name as Integer returns Integer:
     Note: Check if signal name indicates a clock signal
 
@@ -919,6 +1181,14 @@ Process called "is_vhdl_clock_signal_name" takes signal_name as Integer returns 
     Return 0
 End Process
 
+@Implementation:
+Builds a List of reset-name patterns: "rst", "reset", "RST",
+"RESET", "resetn", "rst_n". Loops calling string_contains for each
+pattern against signal_name; returns 1 on first match, 0 otherwise.
+The _n variants ("rst_n", "resetn") signal active-low resets - this
+predicate doesn't distinguish polarity (treats both as reset), and
+the downstream synthesiser handles the polarity inference.
+@End Implementation
 Process called "is_vhdl_reset_signal_name" takes signal_name as Integer returns Integer:
     Note: Check if signal name indicates a reset signal
 
@@ -951,6 +1221,14 @@ Process called "is_vhdl_reset_signal_name" takes signal_name as Integer returns 
     Return 0
 End Process
 
+@Implementation:
+Builds a List of the four valid directions: "in", "out", "inout",
+"buffer". Linear-searches via string_equals; sets is_valid = 1 on
+match. If no match, builds an error string
+"Invalid port direction in entity <ent>, port <port>: <direction>"
+via three string_concat calls and appends via
+add_vhdl_validation_error.
+@End Implementation
 Process called "validate_vhdl_port_direction" takes analyzer as Integer, entity_name as Integer, port_name as Integer, port_direction as Integer:
     Note: Validate VHDL port direction specification
 
@@ -990,14 +1268,28 @@ Process called "validate_vhdl_port_direction" takes analyzer as Integer, entity_
     End If
 End Process
 
+@Reasoning:
+VHDL library names are syntactically just identifiers but participate in
+the use_clauses lookup, so a malformed library name silently breaks every
+`use lib.pkg.all` clause that references it. Validating at declaration
+time produces a single targeted error instead of a cascade of unresolved-
+reference diagnostics downstream.
+@End Reasoning
+
+@Implementation:
+Two independent checks, both routed through add_vhdl_validation_error so
+analyze_vhdl_design's has_error read picks them up. (1) First-character
+ASCII range 48..57 detects a leading digit, which VHDL identifier rules
+forbid. (2) is_vhdl_reserved_word does an exact match against the ~97
+reserved-word table; the input is expected to be lower-cased by the
+parser since VHDL is case-insensitive on identifiers. The error string
+is reused via Set on the second branch — this is safe because both
+branches build independent concat chains, but it does mean a malformed
+name that is also reserved emits both errors (intentional: both rule
+violations matter).
+@End Implementation
 Process called "validate_vhdl_library_name" takes analyzer as Integer, library_name as Integer:
     Note: Validate VHDL library name
-
-    @Reasoning:
-    Library names must follow VHDL identifier rules and not conflict
-    with reserved words. Invalid library names cause compilation errors
-    and library resolution failures.
-    @End Reasoning
 
     Note: Check for valid identifier format
     Let first_char be proc string_char_at from StringCore with library_name, 0
@@ -1013,6 +1305,26 @@ Process called "validate_vhdl_library_name" takes analyzer as Integer, library_n
         proc add_vhdl_validation_error with analyzer, error
     End If
 End Process
+
+@Reasoning:
+VHDL-93/2008 reserves ~97 keywords that cannot be used as identifiers
+(library names, signal names, generic labels). This predicate is the single
+source of truth for reserved-word checks across the analyzer and is invoked
+during library/signal/component validation.
+@End Reasoning
+
+@Implementation:
+Builds the full reserved-word list once (abs..xor, lower-case canonical
+spelling), then linear-scans for an exact match via string_equals. VHDL is
+case-insensitive on identifiers but callers are expected to have already
+lower-cased the input. Returns 1 on match, 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+The list is rebuilt every call; for hot paths this can be hoisted to a
+module-scope cached List. Linear scan of ~97 entries is acceptable for the
+current call frequency (per-identifier in declaration validation).
+@End Performance_Hints
 
 Process called "is_vhdl_reserved_word" takes word as Integer returns Integer:
     Note: Check if word is a VHDL reserved keyword
@@ -1135,12 +1447,36 @@ Note: ===================================================================
 Note: ERROR HANDLING
 Note: ===================================================================
 
+@Reasoning:
+Records the first fatal failure that should abort further analysis (null
+AST, malformed top-level unit). Distinct from add_vhdl_validation_error
+which collects recoverable issues; this one flips the sticky has_error flag.
+@End Reasoning
+
+@Implementation:
+Writes the error_message string handle into offset 216 and sets has_error=1
+at offset 224. Single-shot — does not clear an existing entry.
+@End Implementation
+
 Process called "set_vhdl_semantic_error" takes analyzer as Integer, error_message as Integer:
     Note: Set semantic analysis error
 
     proc memory_set_int64 from Layout with analyzer, 216, error_message
     proc memory_set_int64 from Layout with analyzer, 224, 1
 End Process
+
+@Reasoning:
+Recoverable validation issues are accumulated rather than fail-fast: the
+user should see every problem from one analysis pass, not just the first.
+Distinct from set_vhdl_semantic_error which is reserved for fatal AST
+shape failures.
+@End Reasoning
+
+@Implementation:
+Loads the validation_errors list from offset 184 and appends the string
+handle. Caller retains ownership of the string; analyzer's destructor frees
+the list and its contents in bulk.
+@End Implementation
 
 Process called "add_vhdl_validation_error" takes analyzer as Integer, error_message as Integer:
     Note: Add validation error to error list
@@ -1149,12 +1485,35 @@ Process called "add_vhdl_validation_error" takes analyzer as Integer, error_mess
     proc add from List with errors, error_message
 End Process
 
+@Reasoning:
+Non-fatal style/synthesizability concerns flow to a separate stream from
+hard errors so the reporter can show them with lower severity and the
+build can be allowed to proceed when only warnings are present.
+@End Reasoning
+
+@Implementation:
+Appends to the validation_warnings list at offset 192. Same ownership model
+as add_vhdl_validation_error.
+@End Implementation
+
 Process called "add_vhdl_validation_warning" takes analyzer as Integer, warning_message as Integer:
     Note: Add validation warning to warning list
 
     Let warnings be proc memory_get_int64 from Layout with analyzer, 192
     proc add from List with warnings, warning_message
 End Process
+
+@Reasoning:
+Type-system violations (signal-type mismatches, illegal subtype narrowing,
+mismatched array bounds) are kept in their own stream because type-checking
+diagnostics are often more actionable for the user than generic validation
+errors and may need a different display format.
+@End Reasoning
+
+@Implementation:
+Appends to the type_errors list at offset 200. vhdl_semantic_has_errors
+sums this count with validation_errors when reporting overall failure.
+@End Implementation
 
 Process called "add_vhdl_type_error" takes analyzer as Integer, error_message as Integer:
     Note: Add type error to error list
@@ -1166,6 +1525,20 @@ End Process
 Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
+
+@Reasoning:
+Public one-shot driver: callers that don't want to manage the analyzer
+lifecycle get an analyzer handle back containing all diagnostic streams.
+Returning the analyzer rather than the boolean result lets callers query
+errors/warnings/type_errors lists post-analysis.
+@End Reasoning
+
+@Implementation:
+Allocates a fresh analyzer via create_vhdl_semantic_analyzer, returns 0 on
+allocation failure, otherwise runs analyze_vhdl_design and returns the
+populated analyzer regardless of analysis success — diagnostics are queried
+via the dedicated getters.
+@End Implementation
 
 Process called "vhdl_semantic_analyze" takes vhdl_ast as Integer returns Integer:
     Note: Perform semantic analysis on VHDL AST
@@ -1179,6 +1552,16 @@ Process called "vhdl_semantic_analyze" takes vhdl_ast as Integer returns Integer
     Return analyzer
 End Process
 
+@Reasoning:
+Read-only accessor letting reporters and tests iterate the validation
+errors list without poking analyzer internals at offset 184.
+@End Reasoning
+
+@Implementation:
+Null-analyzer guard returns 0 (callers must treat that as "no list"); on
+success reads the validation_errors list handle at offset 184.
+@End Implementation
+
 Process called "vhdl_semantic_get_errors" takes analyzer as Integer returns Integer:
     Note: Get validation errors from semantic analysis
 
@@ -1188,6 +1571,17 @@ Process called "vhdl_semantic_get_errors" takes analyzer as Integer returns Inte
 
     Return proc memory_get_int64 from Layout with analyzer, 184
 End Process
+
+@Reasoning:
+Accessor for the lower-severity warning stream, kept separate from errors
+so the reporter can apply distinct formatting and the build can choose
+to ignore warnings while still treating errors as fatal.
+@End Reasoning
+
+@Implementation:
+Null-analyzer guard returns 0; on success returns the validation_warnings
+list handle at offset 192.
+@End Implementation
 
 Process called "vhdl_semantic_get_warnings" takes analyzer as Integer returns Integer:
     Note: Get validation warnings from semantic analysis
@@ -1199,6 +1593,16 @@ Process called "vhdl_semantic_get_warnings" takes analyzer as Integer returns In
     Return proc memory_get_int64 from Layout with analyzer, 192
 End Process
 
+@Reasoning:
+Exposes the dedicated type-error stream so type-aware tooling (e.g. an IDE
+type panel) can render type diagnostics distinctly from generic errors.
+@End Reasoning
+
+@Implementation:
+Null-analyzer guard returns 0; on success returns the type_errors list
+handle at offset 200.
+@End Implementation
+
 Process called "vhdl_semantic_get_type_errors" takes analyzer as Integer returns Integer:
     Note: Get type errors from semantic analysis
 
@@ -1209,6 +1613,18 @@ Process called "vhdl_semantic_get_type_errors" takes analyzer as Integer returns
     Return proc memory_get_int64 from Layout with analyzer, 200
 End Process
 
+@Reasoning:
+Synthesis warnings are a VHDL-specific concern (latch inferences, missing
+sensitivity entries, non-synthesizable constructs) and live in their own
+stream so synthesis tooling can surface them without mixing in generic
+validation noise.
+@End Reasoning
+
+@Implementation:
+Null-analyzer guard returns 0; on success returns the synthesis_warnings
+list handle at offset 208.
+@End Implementation
+
 Process called "vhdl_semantic_get_synthesis_warnings" takes analyzer as Integer returns Integer:
     Note: Get synthesis warnings from semantic analysis
 
@@ -1218,6 +1634,19 @@ Process called "vhdl_semantic_get_synthesis_warnings" takes analyzer as Integer 
 
     Return proc memory_get_int64 from Layout with analyzer, 208
 End Process
+
+@Reasoning:
+Single boolean check the driver uses to decide whether to proceed with
+later compilation phases. Type errors and validation errors are both
+treated as fatal here; warnings are not — they live in their own streams.
+@End Reasoning
+
+@Implementation:
+Null analyzer is treated as "errored" (returns 1) to fail safe. Otherwise
+sums the sizes of the validation_errors list (offset 184) and type_errors
+list (offset 200). Returns a count rather than 0/1 — callers in this
+analyzer's public API check "is greater than 0".
+@End Implementation
 
 Process called "vhdl_semantic_has_errors" takes analyzer as Integer returns Integer:
     Note: Check if semantic analysis found any errors

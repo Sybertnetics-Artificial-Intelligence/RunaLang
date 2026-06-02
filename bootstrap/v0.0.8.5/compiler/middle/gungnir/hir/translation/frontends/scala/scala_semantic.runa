@@ -78,6 +78,15 @@ Constant ERROR_PATTERN_MATCH as Integer is 8
 Constant ERROR_OVERLOAD_RESOLUTION as Integer is 9
 Constant ERROR_TYPE_BOUNDS as Integer is 10
 
+@Reasoning:
+Scala's type system requires separate tables for symbols (named
+entities: classes, methods, vals), types (type definitions and
+aliases), and implicits (which use a third resolution scope that
+intersects with both). current_scope is just an integer level
+counter; the lexical scope chain is encoded in SymbolInfo's
+scope_level field. type_constraints is a constraint-based inference
+queue mutated during type inference passes.
+@End Reasoning
 Type called "ScalaSemanticAnalyzer":
     symbol_table as Integer
     type_table as Integer
@@ -89,6 +98,14 @@ Type called "ScalaSemanticAnalyzer":
     inference_context as Integer
 End Type
 
+@Reasoning:
+Represents an in-progress or resolved Scala type. type_params and
+constraints capture type parameters and their bounds; variance is
+"+", "-", or "" (invariant); bounds is keyed by parameter name and
+maps to bound type ids. is_resolved gates whether inference is
+complete - unresolved TypeInfo nodes stay in the constraint queue
+for solver passes.
+@End Reasoning
 Type called "TypeInfo":
     type_kind as Integer
     type_name as String
@@ -99,6 +116,15 @@ Type called "TypeInfo":
     is_resolved as Boolean
 End Type
 
+@Reasoning:
+Per-binding info. We track BOTH declared_type (what the user
+wrote) and inferred_type (what the analyzer concluded) because in
+Scala they can differ for implicit conversion sites - the declared
+type may need an implicit lookup to bridge to the inferred type.
+is_implicit and is_lazy are first-class modifiers Scala exposes;
+modifiers list catches everything else (private, protected,
+override, etc.).
+@End Reasoning
 Type called "SymbolInfo":
     name as String
     symbol_type as Integer
@@ -111,6 +137,15 @@ Type called "SymbolInfo":
     definition_node as Integer
 End Type
 
+@Reasoning:
+Implicits in Scala participate in a separate resolution layer from
+the regular symbol table; each candidate carries its declared type
+(implicit_type), the lexical scope_level at which it was introduced,
+a priority that drives tie-breaking between equally-specific
+candidates, and an optional conversion_type that distinguishes an
+implicit value (conversion_type = 0) from an implicit conversion
+function (non-zero type id of the source).
+@End Reasoning
 Type called "ImplicitInfo":
     name as String
     implicit_type as Integer
@@ -119,6 +154,14 @@ Type called "ImplicitInfo":
     conversion_type as Integer
 End Type
 
+@Reasoning:
+A constraint is a deferred type assertion produced during inference
+and resolved later by solve_type_constraints. constraint_type
+distinguishes the kind (1 = equality, 2 = subtype). left_type and
+right_type are type ids participating in the assertion. context is a
+free-form string that documents where the constraint originated so
+diagnostics from the solver can pinpoint the source expression.
+@End Reasoning
 Type called "Constraint":
     constraint_type as Integer
     left_type as Integer
@@ -126,7 +169,24 @@ Type called "Constraint":
     context as String
 End Type
 
-Note: Create new Scala semantic analyzer
+@Reasoning:
+Constructor that initialises every collection slot of a fresh
+ScalaSemanticAnalyzer to an empty container so the subsequent passes
+(collect_symbols, infer_types, resolve_implicits, solve_type_
+constraints, validate_semantics) can simply mutate the slots in
+place. current_scope starts at the top-level (0); enter_scope and
+exit_scope adjust it as the analyzer descends into and out of class,
+trait, function, and block scopes.
+@End Reasoning
+@Implementation:
+Builds the struct via value-of-type literal syntax with eight slots
+pre-populated, then returns its address so the rest of the codebase
+can pass the analyzer around as an Integer handle. After
+construction, initialize_builtin_types is invoked to seed the
+type_table with Scala's primitive and built-in collection types,
+making subsequent type resolution able to look up "Int", "String",
+etc.
+@End Implementation
 Process called "create_scala_semantic_analyzer" returns Integer:
     Let analyzer be a value of type ScalaSemanticAnalyzer with
         symbol_table as proc create_hash_table,
@@ -145,7 +205,22 @@ Process called "create_scala_semantic_analyzer" returns Integer:
     Return analyzer_addr
 End Process
 
-Note: Initialize built-in Scala types
+@Reasoning:
+Seeds the analyzer's type_table with the entire Scala primitive
+hierarchy plus the Any/AnyRef/AnyVal/Nothing/Null universal types and
+the generic List/Array/Option templates. Function0..Function22 cover
+the entire FunctionN arity range Scala supports. Registering these
+once at creation time means user-code resolution never has to special-
+case primitives.
+@End Reasoning
+@Implementation:
+Three sections in order: value/primitive types via register_builtin_
+type (parameterless), universal types (Any, AnyRef, AnyVal, Nothing,
+Null), and parametric types via register_generic_type with arity.
+The While loop builds FunctionN names by string-concatenation of
+"Function" + int_to_string of the integer; arity is N+1 (N param
+types plus the return type) which matches Scala's FunctionN encoding.
+@End Implementation
 Process called "initialize_builtin_types" takes analyzer as Integer:
     Note: Create built-in primitive types
     proc register_builtin_type with analyzer, "Unit", TYPE_UNIT
@@ -180,7 +255,13 @@ Process called "initialize_builtin_types" takes analyzer as Integer:
     End While
 End Process
 
-Note: Register built-in type
+@Reasoning:
+Inserts a fully-resolved TypeInfo for a single non-parametric type
+into the analyzer's type_table. is_resolved is true at construction
+because built-in types need no inference; constraints and bounds
+lists are empty for the same reason. The empty variance string ("")
+encodes invariance, which is correct for every primitive in Scala.
+@End Reasoning
 Process called "register_builtin_type" takes analyzer as Integer, name as String, type_kind as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
 
@@ -196,7 +277,21 @@ Process called "register_builtin_type" takes analyzer as Integer, name as String
     proc set_hash_value with analyzer_obj.type_table, name, proc memory_address_of from Layout with type_info
 End Process
 
-Note: Register generic type
+@Reasoning:
+Inserts a parametric type (List[T], Array[T], FunctionN, etc.) into
+the type_table by building a TypeInfo whose type_params list carries
+param_count synthesized type parameters named "T0", "T1", ... The
+generated type-parameter names are placeholders that the type
+inference pass replaces with concrete bindings when the user
+references the template at a use site.
+@End Reasoning
+@Implementation:
+Builds a TypeInfo skeleton, then loops param_count times to call
+create_type_parameter for each "T<i>" placeholder. The resulting
+parameter TypeInfo objects are appended to type_params via
+add_to_list. Finally the assembled template is inserted into the
+type_table keyed by the user-facing name (e.g. "List", "Function3").
+@End Implementation
 Process called "register_generic_type" takes analyzer as Integer, name as String, type_kind as Integer, param_count as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
 
@@ -221,7 +316,12 @@ Process called "register_generic_type" takes analyzer as Integer, name as String
     proc set_hash_value with analyzer_obj.type_table, name, proc memory_address_of from Layout with type_info
 End Process
 
-Note: Create type parameter
+@Reasoning:
+Manufactures a TypeInfo for a single type-parameter placeholder.
+type_kind is TYPE_GENERIC because the parameter does not yet bind a
+concrete type. is_resolved is false so the constraint solver knows
+this slot may still be substituted during a use-site resolution.
+@End Reasoning
 Process called "create_type_parameter" takes name as String returns Integer:
     Let type_param be a value of type TypeInfo with
         type_kind as TYPE_GENERIC,
@@ -235,7 +335,24 @@ Process called "create_type_parameter" takes name as String returns Integer:
     Return proc memory_address_of from Layout with type_param
 End Process
 
-Note: Analyze Scala AST
+@Reasoning:
+Five-phase pipeline that mirrors a textbook Scala-style semantic
+analysis: symbol collection, type inference, implicit resolution,
+constraint solving, and final cross-cutting validation. The phases
+are strictly ordered because each one consumes the table state
+established by its predecessors (e.g. inference depends on the
+symbol table existing). Errors accumulated across phases live in
+analyzer.errors; a non-empty errors list at completion means the
+final return is 0.
+@End Reasoning
+@Implementation:
+Clears errors/warnings/type_constraints so a single analyzer can be
+reused across multiple analyses. Then invokes collect_symbols,
+infer_types, resolve_implicits, solve_type_constraints,
+validate_semantics in fixed order. Returns 0 if any errors were
+accumulated; otherwise returns the ast pointer so the caller can
+chain to lowering passes without re-passing the root.
+@End Implementation
 Process called "analyze_scala_ast" takes analyzer as Integer, ast as Integer returns Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
 
@@ -267,7 +384,22 @@ Process called "analyze_scala_ast" takes analyzer as Integer, ast as Integer ret
     Return ast
 End Process
 
-Note: Collect symbols from AST
+@Reasoning:
+Phase-1 walker: descends the AST, and for each declaration node
+inserts a SymbolInfo record into analyzer.symbol_table. The dispatch
+covers the seven declaration kinds Scala parses
+(class, object, trait, function, val, var, type alias); other node
+kinds are walked through to expose nested declarations. Symbols must
+be collected before any inference so identifier resolution has a
+populated table to consult.
+@End Reasoning
+@Implementation:
+Single Match on node_type. Each matching branch dispatches to a
+per-kind collect_* helper. After dispatch, the routine recurses into
+node children unconditionally so declarations nested inside
+expressions (e.g. local val in a block) are still picked up. Null
+nodes are a no-op which simplifies the recursive call sites.
+@End Implementation
 Process called "collect_symbols" takes analyzer as Integer, node as Integer:
     If node is equal to 0:
         Return
@@ -304,7 +436,22 @@ Process called "collect_symbols" takes analyzer as Integer, node as Integer:
     End While
 End Process
 
-Note: Collect class symbol
+@Reasoning:
+Registers a class declaration as a SymbolInfo with symbol_type =
+TYPE_CLASS. Duplicate-name detection happens here because Scala
+forbids two classes with the same name in the same scope. After
+registration, we push a new lexical scope and recursively collect
+the class body so members are namespaced under the class's scope_
+level instead of leaking into the enclosing scope.
+@End Reasoning
+@Implementation:
+Looks up class_name in symbol_table; if non-empty we add a
+DUPLICATE_DEFINITION error and abort registration. Otherwise builds
+the SymbolInfo with declared_type and inferred_type both 0 (filled
+in by inference) and inserts via set_hash_value. Members are
+collected under a temporarily-entered scope, then exit_scope
+restores the outer scope_level.
+@End Implementation
 Process called "collect_class_symbol" takes analyzer as Integer, class_node as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let class_name be proc get_ast_node_value from class_node
@@ -336,7 +483,12 @@ Process called "collect_class_symbol" takes analyzer as Integer, class_node as I
     proc exit_scope from analyzer
 End Process
 
-Note: Collect object symbol
+@Reasoning:
+Registers a Scala `object` declaration (a singleton). Unlike a class
+it cannot be instantiated, so symbol_type is TYPE_OBJECT, not
+TYPE_CLASS. Members are still collected under a pushed scope because
+the singleton has its own member namespace just like a class body.
+@End Reasoning
 Process called "collect_object_symbol" takes analyzer as Integer, object_node as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let object_name be proc get_ast_node_value from object_node
@@ -361,7 +513,13 @@ Process called "collect_object_symbol" takes analyzer as Integer, object_node as
     proc exit_scope from analyzer
 End Process
 
-Note: Collect trait symbol
+@Reasoning:
+Registers a Scala trait declaration. Traits participate in
+linearization for multiple inheritance and may carry abstract
+members, so symbol_type is TYPE_TRAIT to distinguish them from
+classes during later validation passes. Members are collected under
+a pushed scope identical to class-member collection.
+@End Reasoning
 Process called "collect_trait_symbol" takes analyzer as Integer, trait_node as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let trait_name be proc get_ast_node_value from trait_node
@@ -386,7 +544,14 @@ Process called "collect_trait_symbol" takes analyzer as Integer, trait_node as I
     proc exit_scope from analyzer
 End Process
 
-Note: Collect class members
+@Reasoning:
+Helper for collect_{class,object,trait}_symbol. The class body in
+the parser appears as an AST_BLOCK child of the declaration node;
+isolating that AST_BLOCK and recursing collect_symbols on it ensures
+nested classes, methods, and value declarations land in the correct
+scope without re-traversing the declaration's name and modifier
+siblings.
+@End Reasoning
 Process called "collect_class_members" takes analyzer as Integer, class_node as Integer:
     Let children be proc get_ast_node_children from class_node
     Let child_count be proc get_list_size from children
@@ -404,7 +569,13 @@ Process called "collect_class_members" takes analyzer as Integer, class_node as 
     End While
 End Process
 
-Note: Collect function symbol
+@Reasoning:
+Registers a `def` declaration with symbol_type = TYPE_FUNCTION. The
+function's own parameters become symbols under a pushed scope so
+that subsequent inference can resolve parameter names. The function
+body recursion is handled implicitly because collect_symbols was
+called for the parent before this helper.
+@End Reasoning
 Process called "collect_function_symbol" takes analyzer as Integer, function_node as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let function_name be proc get_ast_node_value from function_node
@@ -429,7 +600,13 @@ Process called "collect_function_symbol" takes analyzer as Integer, function_nod
     proc exit_scope from analyzer
 End Process
 
-Note: Collect function parameters
+@Reasoning:
+Locates the AST_PARAMETER_LIST child of a function declaration and
+delegates per-parameter registration to collect_parameter_symbols.
+A single function node can have multiple parameter lists in Scala
+(curried parameter lists or implicit-parameter lists), so the loop
+visits every AST_PARAMETER_LIST child it finds.
+@End Reasoning
 Process called "collect_function_parameters" takes analyzer as Integer, function_node as Integer:
     Let children be proc get_ast_node_children from function_node
     Let child_count be proc get_list_size from children
@@ -447,7 +624,13 @@ Process called "collect_function_parameters" takes analyzer as Integer, function
     End While
 End Process
 
-Note: Collect parameter symbols
+@Reasoning:
+Fans out a single parameter list to per-parameter symbol creation
+via collect_parameter_symbol. Separating the iteration loop from the
+per-parameter registration keeps each helper's single-responsibility
+intact and lets curried-list collection reuse the same per-parameter
+logic.
+@End Reasoning
 Process called "collect_parameter_symbols" takes analyzer as Integer, param_list as Integer:
     Let children be proc get_ast_node_children from param_list
     Let child_count be proc get_list_size from children
@@ -460,7 +643,22 @@ Process called "collect_parameter_symbols" takes analyzer as Integer, param_list
     End While
 End Process
 
-Note: Collect parameter symbol
+@Reasoning:
+Registers a single function parameter as a SymbolInfo and, if the
+parameter is marked `implicit`, additionally enters it in the
+analyzer's implicit_scope list. The implicit-vs-regular distinction
+must be captured at symbol-collection time because the inference
+phase later needs to know which symbols are available to satisfy
+implicit-parameter requirements at call sites.
+@End Reasoning
+@Implementation:
+Reads the "implicit" attribute from the param node; if its value is
+"true" we set is_implicit on the SymbolInfo. The symbol_type starts
+as TYPE_ANY because the parameter's declared type lives in a sibling
+type-annotation node that the inference phase will resolve later.
+When implicit, we also append an ImplicitInfo with priority 1
+(default) and conversion_type 0 (value, not function conversion).
+@End Implementation
 Process called "collect_parameter_symbol" takes analyzer as Integer, param_node as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let param_name be proc get_ast_node_value from param_node
@@ -495,7 +693,14 @@ Process called "collect_parameter_symbol" takes analyzer as Integer, param_node 
     End If
 End Process
 
-Note: Collect val symbol
+@Reasoning:
+Registers an immutable `val` binding. symbol_type starts as TYPE_ANY
+because the declared type is either explicit on a child node or must
+be inferred from the initializer; inference fills in inferred_type
+during Phase 2. is_lazy is set to false here; lazy vals are handled
+in a separate pass that promotes is_lazy when the modifier is
+present.
+@End Reasoning
 Process called "collect_val_symbol" takes analyzer as Integer, val_node as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let val_name be proc get_ast_node_value from val_node
@@ -515,7 +720,12 @@ Process called "collect_val_symbol" takes analyzer as Integer, val_node as Integ
     proc set_hash_value with analyzer_obj.symbol_table, val_name, proc memory_address_of from Layout with val_symbol
 End Process
 
-Note: Collect var symbol
+@Reasoning:
+Registers a mutable `var` binding. Distinguishing from val matters
+later in validate_semantics for reassignment checks; at collection
+time the only difference is the AST node-type that brought us here,
+since both share the same SymbolInfo layout.
+@End Reasoning
 Process called "collect_var_symbol" takes analyzer as Integer, var_node as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let var_name be proc get_ast_node_value from var_node
@@ -535,7 +745,13 @@ Process called "collect_var_symbol" takes analyzer as Integer, var_node as Integ
     proc set_hash_value with analyzer_obj.symbol_table, var_name, proc memory_address_of from Layout with var_symbol
 End Process
 
-Note: Collect type alias symbol
+@Reasoning:
+Registers a `type` alias as a SymbolInfo with symbol_type =
+TYPE_GENERIC because aliases may carry type parameters (e.g.
+`type Pair[A,B] = (A,B)`). The actual aliased target type is
+resolved in Phase 2 via resolve_type_alias; here we just claim the
+name so later references do not see it as an undefined symbol.
+@End Reasoning
 Process called "collect_type_alias_symbol" takes analyzer as Integer, alias_node as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let alias_name be proc get_ast_node_value from alias_node
@@ -555,19 +771,42 @@ Process called "collect_type_alias_symbol" takes analyzer as Integer, alias_node
     proc set_hash_value with analyzer_obj.symbol_table, alias_name, proc memory_address_of from Layout with alias_symbol
 End Process
 
-Note: Enter new scope
+@Reasoning:
+Increments the analyzer's current_scope counter so that symbols
+collected after this call carry a higher scope_level. Together with
+exit_scope this implements a depth-counter rather than a full scope-
+chain because the chain itself is encoded in each SymbolInfo's
+scope_level field.
+@End Reasoning
 Process called "enter_scope" takes analyzer as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Set analyzer_obj.current_scope to analyzer_obj.current_scope plus 1
 End Process
 
-Note: Exit current scope
+@Reasoning:
+Decrements current_scope to restore the enclosing scope's depth.
+Pairing every enter_scope call with exit_scope is the caller's
+responsibility; mismatched calls would leak scope depth and cause
+later collect_* calls to assign incorrect scope_levels.
+@End Reasoning
 Process called "exit_scope" takes analyzer as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Set analyzer_obj.current_scope to analyzer_obj.current_scope minus 1
 End Process
 
-Note: Infer types for AST nodes
+@Reasoning:
+Phase-2 dispatcher: walks the AST and assigns an inferred_type
+attribute to every expression node. Like collect_symbols, this is a
+Match over node_type that delegates to a per-kind infer_* helper.
+Unrecognised node kinds simply recurse into children, which lets new
+AST node kinds be added in the parser without immediately requiring
+inference support here.
+@End Reasoning
+@Implementation:
+After dispatching on node_type, recurses into children
+unconditionally so deeply-nested expressions are visited. Null
+nodes are a no-op.
+@End Implementation
 Process called "infer_types" takes analyzer as Integer, node as Integer:
     If node is equal to 0:
         Return
@@ -619,7 +858,13 @@ Process called "infer_types" takes analyzer as Integer, node as Integer:
     End While
 End Process
 
-Note: Infer type for literal
+@Reasoning:
+Translates the parser's textual literal_type attribute into one of
+the analyzer's TYPE_* constants. The parser already disambiguated
+the literal during lexing (e.g. trailing `L` -> LONG_LITERAL,
+trailing `f` -> FLOAT_LITERAL), so this routine only needs to map
+strings to integer codes without re-parsing.
+@End Reasoning
 Process called "infer_literal_type" takes analyzer as Integer, literal_node as Integer:
     Let literal_type_str be proc get_node_attribute with literal_node, "literal_type"
     Let inferred_type be TYPE_ANY
@@ -645,7 +890,14 @@ Process called "infer_literal_type" takes analyzer as Integer, literal_node as I
     proc set_node_attribute with literal_node, "inferred_type", proc int_to_string from inferred_type
 End Process
 
-Note: Infer type for identifier
+@Reasoning:
+Looks up the identifier's name in symbol_table to resolve its type.
+A miss is an UNDEFINED_SYMBOL error and the node's inferred_type
+defaults to TYPE_ANY so the rest of the inference pass can continue
+without crashing on the same expression downstream. A hit copies the
+SymbolInfo's symbol_type into the identifier's inferred_type
+attribute.
+@End Reasoning
 Process called "infer_identifier_type" takes analyzer as Integer, identifier_node as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let identifier_name be proc get_ast_node_value from identifier_node
@@ -663,7 +915,15 @@ Process called "infer_identifier_type" takes analyzer as Integer, identifier_nod
     proc set_node_attribute with identifier_node, "inferred_type", proc int_to_string with symbol_info.symbol_type
 End Process
 
-Note: Infer type for binary operation
+@Reasoning:
+Drives left-to-right inference of operands then dispatches to
+infer_binary_operation_result_type to compute the result type using
+the analyzer's Scala promotion rules. Also files a binary_op_
+compatibility constraint between left and right types into the
+analyzer's type_constraints queue so the solver can later flag any
+incompatibility the local promotion routine couldn't catch (e.g.
+type-parameter operands).
+@End Reasoning
 Process called "infer_binary_op_type" takes analyzer as Integer, binary_op_node as Integer:
     Let children be proc get_ast_node_children from binary_op_node
     Let left_child be proc get_from_list with children, 0
@@ -688,7 +948,22 @@ Process called "infer_binary_op_type" takes analyzer as Integer, binary_op_node 
     proc add_type_constraint with analyzer, left_type, right_type, "binary_op_compatibility"
 End Process
 
-Note: Infer result type for binary operation
+@Reasoning:
+Pure operator-result-type computation for Scala's binary operators.
+Three operator classes are handled: arithmetic ('+', '-', '*', '/')
+applies promotion rules (string concat for string operand,
+double > float > long > int otherwise); comparison operators return
+Boolean; logical operators ('&&', '||') return Boolean. All other
+operators default to TYPE_ANY because their result types depend on
+overloaded method resolution that happens at the call-site phase.
+@End Reasoning
+@Implementation:
+Three sequential if-blocks against the operator string. Numeric
+promotion uses successive double > float > long > int ordering so
+that any operand at the higher rank wins. String-concatenation
+short-circuits the arithmetic check for '+' when either operand is
+TYPE_STRING. Returns TYPE_ANY if none of the operator classes match.
+@End Implementation
 Process called "infer_binary_operation_result_type" takes left_type as Integer, right_type as Integer, operator as String returns Integer:
     Note: Arithmetic operators
     If proc strings_equal from StringCore with operator, "+" or
@@ -733,7 +1008,14 @@ Process called "infer_binary_operation_result_type" takes left_type as Integer, 
     Return TYPE_ANY
 End Process
 
-Note: Infer type for function call
+@Reasoning:
+Resolves a function-call expression to its return type and validates
+argument-to-parameter compatibility. The call_node has two children
+in the parser layout: the function expression and the argument list.
+Inferring both children first lets check_function_arguments compare
+already-typed argument expressions against the looked-up parameter
+types.
+@End Reasoning
 Process called "infer_function_call_type" takes analyzer as Integer, call_node as Integer:
     Let children be proc get_ast_node_children from call_node
     Let function_child be proc get_from_list with children, 0
@@ -753,7 +1035,14 @@ Process called "infer_function_call_type" takes analyzer as Integer, call_node a
     proc check_function_arguments with analyzer, call_node, function_name
 End Process
 
-Note: Look up function return type
+@Reasoning:
+Two-step return-type resolution. First find the function's
+SymbolInfo by name in symbol_table; if it is missing, default to
+TYPE_ANY (rather than emitting an error here) so the caller can
+report at the call site with proper context. Once found, delegate
+to extract_function_return_type to walk the definition node for
+either an explicit annotation or an inferred body type.
+@End Reasoning
 Process called "lookup_function_return_type" takes analyzer as Integer, function_name as String returns Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
 
@@ -771,7 +1060,14 @@ Process called "lookup_function_return_type" takes analyzer as Integer, function
     Return proc extract_function_return_type with analyzer, function_def
 End Process
 
-Note: Extract function return type from definition
+@Reasoning:
+A Scala def may declare its return type either explicitly (after the
+parameter list as `: Type`) or implicitly (inferred from the function
+body's last expression). The "return_type" node attribute is the
+parser's flag for whether an explicit annotation exists. If true,
+walk the children for the AST_TYPE annotation node and resolve it.
+Otherwise fall back to inferring from the body.
+@End Reasoning
 Process called "extract_function_return_type" takes analyzer as Integer, function_def as Integer returns Integer:
     Note: Look for explicit return type annotation
     Let return_type_attr be proc get_node_attribute with function_def, "return_type"
@@ -798,7 +1094,15 @@ Process called "extract_function_return_type" takes analyzer as Integer, functio
     Return proc infer_function_body_return_type with analyzer, function_def
 End Process
 
-Note: Infer return type from function body
+@Reasoning:
+A Scala block's return type is its last expression's type. Iterating
+the function-def children in reverse finds the body candidate
+(the last non-parameter, non-type-annotation child). Inferring on
+that candidate populates its inferred_type attribute which we then
+parse back to an integer type id. If no candidate is found
+(parameterless, body-less abstract method), TYPE_UNIT is the safe
+default.
+@End Reasoning
 Process called "infer_function_body_return_type" takes analyzer as Integer, function_def as Integer returns Integer:
     Let children be proc get_ast_node_children from function_def
     Let child_count be proc get_list_size from children
@@ -822,7 +1126,15 @@ Process called "infer_function_body_return_type" takes analyzer as Integer, func
     Return TYPE_UNIT
 End Process
 
-Note: Resolve type reference
+@Reasoning:
+Resolves a type-reference node to its TYPE_* code. Built-in Scala
+names (Unit, Boolean, Int, Long, Float, Double, String, Char, Any,
+AnyRef, AnyVal, Nothing, Null) are matched first because they cannot
+shadow user types and the comparison is a constant-time string
+equality. Unmatched names fall through to type_table lookup;
+truly-unknown names produce an UNDEFINED_SYMBOL error and default to
+TYPE_ANY so dependent inference still terminates.
+@End Reasoning
 Process called "resolve_type_reference" takes analyzer as Integer, type_node as Integer returns Integer:
     Let type_name be proc get_ast_node_value from type_node
 
@@ -869,7 +1181,21 @@ Process called "resolve_type_reference" takes analyzer as Integer, type_node as 
     Return TYPE_ANY
 End Process
 
-Note: Check function arguments
+@Reasoning:
+Verifies that an actual call's argument list matches its declared
+parameter list both in arity and pointwise type-compatibility.
+A mismatch in either dimension surfaces as a TYPE_MISMATCH error;
+arity is checked first because a wrong-arity call cannot meaningfully
+report per-position type errors.
+@End Reasoning
+@Implementation:
+Looks up function_def via lookup_function_definition. If it cannot
+be found (the symbol is forward-declared or external), the routine
+returns early. Otherwise it extracts parameter and argument type
+lists, compares sizes, then pairwise iterates with
+are_types_compatible. The index i in the per-pair error message is
+zero-based which matches the rest of the diagnostic system.
+@End Implementation
 Process called "check_function_arguments" takes analyzer as Integer, call_node as Integer, function_name as String:
     Note: Get function definition and parameter types
     Let function_def be proc lookup_function_definition with analyzer, function_name
@@ -903,7 +1229,15 @@ Process called "check_function_arguments" takes analyzer as Integer, call_node a
     End While
 End Process
 
-Note: Check if types are compatible
+@Reasoning:
+Compatibility test for assignment-position type checking, i.e.
+"can a value of source_type flow into a slot expecting target_type
+without producing a type error?". The cascade implements Scala's
+fundamental conversion rules in order of specificity: identity, Any-
+sink (target = Any accepts anything), Nothing-source (Nothing is a
+subtype of every type), Null-to-reference, numeric promotion, and
+finally general subtyping.
+@End Reasoning
 Process called "are_types_compatible" takes analyzer as Integer, source_type as Integer, target_type as Integer returns Boolean:
     Note: Exact match
     If source_type is equal to target_type:
@@ -934,13 +1268,26 @@ Process called "are_types_compatible" takes analyzer as Integer, source_type as 
     Return proc is_subtype with analyzer, source_type, target_type
 End Process
 
-Note: Check if type is numeric
+@Reasoning:
+Membership predicate for Scala's six numeric types
+(Byte, Short, Int, Long, Float, Double). Used by are_types_compatible
+to gate the numeric-promotion branch; isolating it as a predicate
+keeps the calling code readable and lets the same check apply in
+infer_unary_op_type and operator-result inference.
+@End Reasoning
 Process called "is_numeric_type" takes type_kind as Integer returns Boolean:
     Return type_kind is equal to TYPE_BYTE or type_kind is equal to TYPE_SHORT or type_kind is equal to TYPE_INT or
            type_kind is equal to TYPE_LONG or type_kind is equal to TYPE_FLOAT or type_kind is equal to TYPE_DOUBLE
 End Process
 
-Note: Check if numeric conversion is valid
+@Reasoning:
+Enforces Scala's widening-only implicit numeric conversion rules.
+Permitted widenings form a strict total order:
+Byte < Short < Int < Long < Float < Double. Each If branch handles a
+source rank and lists the legal target ranks above it. Narrowing
+conversions (e.g. Long -> Int) require an explicit cast and so are
+rejected here.
+@End Reasoning
 Process called "is_numeric_conversion_valid" takes source_type as Integer, target_type as Integer returns Boolean:
     Note: Widening conversions are always allowed
     If source_type is equal to TYPE_BYTE and (target_type is equal to TYPE_SHORT or target_type is equal to TYPE_INT or target_type is equal to TYPE_LONG or target_type is equal to TYPE_FLOAT or target_type is equal to TYPE_DOUBLE):
@@ -966,7 +1313,15 @@ Process called "is_numeric_conversion_valid" takes source_type as Integer, targe
     Return false
 End Process
 
-Note: Check subtype relationship
+@Reasoning:
+General Scala subtyping check (source <: target). Three closed cases
+short-circuit to true: any value type is a subtype of AnyVal, any
+reference type is a subtype of AnyRef, and anything is a subtype of
+Any. Beyond those universal relationships, the routine returns false
+because full inheritance-based subtyping requires the
+check_inheritance_subtype walker invoked separately by the constraint
+solver.
+@End Reasoning
 Process called "is_subtype" takes analyzer as Integer, source_type as Integer, target_type as Integer returns Boolean:
     Note: Value types extend AnyVal
     If proc is_value_type from source_type and target_type is equal to TYPE_ANYVAL:
@@ -987,20 +1342,38 @@ Process called "is_subtype" takes analyzer as Integer, source_type as Integer, t
     Return false
 End Process
 
-Note: Check if type is value type
+@Reasoning:
+Membership predicate for Scala's AnyVal hierarchy: Boolean, the six
+numeric primitives (Byte, Short, Int, Long, Float, Double), Char, and
+Unit. Used by is_subtype to gate "extends AnyVal" decisions and by
+other inference helpers that need to distinguish primitive from
+reference types.
+@End Reasoning
 Process called "is_value_type" takes type_kind as Integer returns Boolean:
     Return type_kind is equal to TYPE_BOOLEAN or type_kind is equal to TYPE_BYTE or type_kind is equal to TYPE_SHORT or
            type_kind is equal to TYPE_INT or type_kind is equal to TYPE_LONG or type_kind is equal to TYPE_FLOAT or
            type_kind is equal to TYPE_DOUBLE or type_kind is equal to TYPE_CHAR or type_kind is equal to TYPE_UNIT
 End Process
 
-Note: Check if type is reference type
+@Reasoning:
+Membership predicate for Scala's AnyRef hierarchy: String, the
+parametric collections (Array, List), and user-defined declarations
+(Class, Trait, Object). Used by is_subtype to gate "extends AnyRef"
+decisions for class-hierarchy checks.
+@End Reasoning
 Process called "is_reference_type" takes type_kind as Integer returns Boolean:
     Return type_kind is equal to TYPE_STRING or type_kind is equal to TYPE_ARRAY or type_kind is equal to TYPE_LIST or
            type_kind is equal to TYPE_CLASS or type_kind is equal to TYPE_TRAIT or type_kind is equal to TYPE_OBJECT
 End Process
 
-Note: Resolve implicits in AST
+@Reasoning:
+Phase-3 walker. Two AST node kinds participate in implicit
+resolution: function calls (whose declared parameter list may
+include implicit groups requiring a candidate in scope) and method
+calls (whose receiver may require an implicit conversion to satisfy
+a missing method). Other nodes simply recurse into children so any
+nested calls inside them are still visited.
+@End Reasoning
 Process called "resolve_implicits" takes analyzer as Integer, node as Integer:
     If node is equal to 0:
         Return
@@ -1026,7 +1399,14 @@ Process called "resolve_implicits" takes analyzer as Integer, node as Integer:
     End While
 End Process
 
-Note: Resolve implicit parameters
+@Reasoning:
+For a function-call site, identifies the called function's implicit
+parameters (those marked `implicit` in the declared signature) and
+attempts to bind each to a candidate from analyzer.implicit_scope.
+Missing candidates surface as IMPLICIT_NOT_FOUND errors naming the
+unsatisfied parameter, which is enough for users to locate the
+missing `implicit val` in their source.
+@End Reasoning
 Process called "resolve_implicit_parameters" takes analyzer as Integer, call_node as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
 
@@ -1057,7 +1437,14 @@ Process called "resolve_implicit_parameters" takes analyzer as Integer, call_nod
     End While
 End Process
 
-Note: Find implicit candidate
+@Reasoning:
+Linear scan of analyzer.implicit_scope looking for the first
+ImplicitInfo whose declared implicit_type is compatible (via
+are_types_compatible) with the parameter's expected type. First-
+match wins, which mirrors Scala's general rule that more-specific
+implicits should have higher priority via the priority field;
+tie-breaking by priority would happen here in a fuller resolver.
+@End Reasoning
 Process called "find_implicit_candidate" takes analyzer as Integer, implicit_param as Integer returns Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let param_type be proc get_node_attribute with implicit_param, "inferred_type"
@@ -1080,7 +1467,14 @@ Process called "find_implicit_candidate" takes analyzer as Integer, implicit_par
     Return 0
 End Process
 
-Note: Solve type constraints
+@Reasoning:
+Fixed-point solver over analyzer.type_constraints. Each iteration
+walks the queue once and asks solve_constraint to attempt resolution;
+any constraint that flips state (binds a type parameter, decides
+equality) sets `changed = true` and forces another pass. Termination
+is guaranteed because every successful step monotonically reduces
+the set of unresolved type variables, which is finite.
+@End Reasoning
 Process called "solve_type_constraints" takes analyzer as Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let constraint_count be proc get_list_size with analyzer_obj.type_constraints
@@ -1104,7 +1498,15 @@ Process called "solve_type_constraints" takes analyzer as Integer:
     End While
 End Process
 
-Note: Solve individual constraint
+@Reasoning:
+Single-constraint dispatcher. constraint_type 1 is an equality
+assertion (left_type = right_type); constraint_type 2 is a subtype
+assertion (left_type <: right_type). Routing to the per-kind solver
+keeps each solver focused on one rule set. Returning false for
+unrecognised constraint_type values means the constraint stays in
+the queue but produces no progress, which the outer loop terminates
+correctly because no changes are reported.
+@End Reasoning
 Process called "solve_constraint" takes analyzer as Integer, constraint as Integer returns Boolean:
     Let constraint_obj be proc memory_get_address from Layout with constraint, 0
 
@@ -1118,7 +1520,14 @@ Process called "solve_constraint" takes analyzer as Integer, constraint as Integ
     Return false
 End Process
 
-Note: Validate semantics
+@Reasoning:
+Phase-5 walker for cross-cutting validations that need the full
+post-inference state. Three node kinds carry validation rules
+specific to their construct: match expressions require exhaustiveness,
+classes require inheritance/abstract-implementation checks, and
+traits require self-type and method-signature checks. All other
+nodes simply recurse into their children.
+@End Reasoning
 Process called "validate_semantics" takes analyzer as Integer, node as Integer:
     If node is equal to 0:
         Return
@@ -1146,14 +1555,27 @@ Process called "validate_semantics" takes analyzer as Integer, node as Integer:
     End While
 End Process
 
-Note: Add semantic error
+@Reasoning:
+Appends a formatted error string to analyzer.errors with a
+"Semantic error:" prefix so diagnostics from this layer are
+recognisable in mixed-stage output. error_type is currently
+unused at the storage level because the prefix encodes the layer; a
+future enhancement might tag the stored message with the integer
+error_type to enable category-based filtering.
+@End Reasoning
 Process called "add_semantic_error" takes analyzer as Integer, error_type as Integer, message as String:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Let error_message be proc string_append from StringCore with "Semantic error: ", message
     proc add_to_list with analyzer_obj.errors, error_message
 End Process
 
-Note: Add type constraint
+@Reasoning:
+Queues a deferred type assertion onto analyzer.type_constraints for
+the solver to resolve later. Constructs an equality constraint
+(constraint_type = 1) by default; subtype constraints are constructed
+elsewhere. The context string is purely for diagnostics so the
+solver can attribute its decisions to a particular expression site.
+@End Reasoning
 Process called "add_type_constraint" takes analyzer as Integer, left_type as Integer, right_type as Integer, context as String:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
 
@@ -1166,19 +1588,33 @@ Process called "add_type_constraint" takes analyzer as Integer, left_type as Int
     proc add_to_list with analyzer_obj.type_constraints, proc memory_address_of from Layout with constraint
 End Process
 
-Note: Get semantic errors
+@Reasoning:
+Public accessor for the accumulated errors list. Callers use this to
+gate further compilation stages: a non-empty list means the analyzer
+detected one or more semantic violations and should not proceed to
+lowering.
+@End Reasoning
 Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Return analyzer_obj.errors
 End Process
 
-Note: Get semantic warnings
+@Reasoning:
+Public accessor for warnings (non-fatal diagnostics) accumulated
+during analysis. Warnings are kept separate from errors so callers
+can treat them independently (typically rendered without aborting
+the build).
+@End Reasoning
 Process called "get_semantic_warnings" takes analyzer as Integer returns Integer:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Return analyzer_obj.warnings
 End Process
 
-Note: Check if analysis has errors
+@Reasoning:
+Boolean shorthand for `get_list_size(errors) > 0`, exposed as a
+public predicate so callers can branch on error presence without
+having to handle the underlying list directly.
+@End Reasoning
 Process called "has_semantic_errors" takes analyzer as Integer returns Boolean:
     Let analyzer_obj be proc memory_get_address from Layout with analyzer, 0
     Return proc get_list_size with analyzer_obj.errors is greater than 0
@@ -1188,13 +1624,17 @@ Note: ==========================================================================
 Note: Function and Symbol Resolution
 Note: ============================================================================
 
+@Reasoning:
+Three-tier symbol resolution: local symbol_table first (the user's
+current compilation unit), then the import_table (symbols pulled in
+via `import` directives), then the stdlib catalog. This ordering
+matches Scala's lexical resolution semantics where the closest
+binding wins. Returning 0 from the stdlib fallback when nothing
+matches lets callers distinguish "not found" from a real symbol
+address.
+@End Reasoning
 Process called "lookup_function_definition" takes analyzer as Integer, function_name as String returns Integer:
     Note: Look up function definition in symbol table and imports
-
-    @Reasoning:
-    Searches local symbol table first, then imported symbols, then standard library.
-    Essential for function overload resolution and type checking.
-    @End Reasoning
 
     Let symbol_table be proc get_symbol_table from analyzer
     Let function_symbol be proc hashtable_get from Dict with symbol_table, function_name
@@ -1216,6 +1656,14 @@ Process called "lookup_function_definition" takes analyzer as Integer, function_
     Return stdlib_function
 End Process
 
+@Reasoning:
+Builds a List of parameter type ids in declaration order from a
+function-def node. A parameter whose explicit type was 0 (not
+declared) is given TYPE_ANY so check_function_arguments still has a
+sensible target type to compare against; this matches Scala's
+parameter-defaulting behaviour when type inference fails to find a
+concrete binding.
+@End Reasoning
 Process called "extract_parameter_types" takes analyzer as Integer, function_def as Integer returns Integer:
     Note: Extract parameter types from function definition
 
@@ -1240,6 +1688,13 @@ Process called "extract_parameter_types" takes analyzer as Integer, function_def
     Return param_types
 End Process
 
+@Reasoning:
+Symmetric counterpart to extract_parameter_types: collects the
+inferred types of each actual argument expression at a call site so
+they can be pointwise-compared with parameter types. Calls into
+infer_expression_type per argument, which may trigger recursive
+inference if the argument itself is a compound expression.
+@End Reasoning
 Process called "extract_argument_types" takes analyzer as Integer, call_node as Integer returns Integer:
     Note: Extract argument types from function call
 
@@ -1258,6 +1713,13 @@ Process called "extract_argument_types" takes analyzer as Integer, call_node as 
     Return arg_types
 End Process
 
+@Reasoning:
+Filters a function's parameter list to only those marked implicit,
+returning a new List. resolve_implicit_parameters uses this output
+to know which parameters require an implicit_scope candidate at a
+call site. The parameter_is_implicit predicate is the canonical
+source of truth for the implicit modifier.
+@End Reasoning
 Process called "extract_implicit_parameters" takes analyzer as Integer, function_def as Integer returns Integer:
     Note: Extract implicit parameters from function definition
 
@@ -1280,13 +1742,23 @@ Process called "extract_implicit_parameters" takes analyzer as Integer, function
     Return implicit_params
 End Process
 
+@Reasoning:
+Equality solver with four cascading strategies: direct identity,
+alias resolution to canonical form, unification when either side is
+an unresolved type parameter (binding it to the other type), and
+structural equality for compound types like parameterised generics.
+Returning 1 (success) on any branch means the constraint is
+resolved and removed-implicitly from further iterations.
+@End Reasoning
+@Implementation:
+First identity test on the raw type ids. Then resolve_type_alias on
+each side to collapse aliases and re-test equality on the canonical
+forms. Next is_type_parameter on each side; on a hit, call
+unify_type_parameter to record the binding. Finally
+check_structural_equality for compound forms.
+@End Implementation
 Process called "solve_equality_constraint" takes analyzer as Integer, left_type as Integer, right_type as Integer returns Boolean:
     Note: Solve type equality constraint
-
-    @Reasoning:
-    Type equality in Scala considers type aliases, type parameters, and structural equivalence.
-    Essential for type inference and constraint solving.
-    @End Reasoning
 
     Note: Direct type equality
     If left_type is equal to right_type:
@@ -1320,13 +1792,22 @@ Process called "solve_equality_constraint" takes analyzer as Integer, left_type 
     Return structural_equal
 End Process
 
+@Reasoning:
+Subtype solver with five cascading strategies in order of cost:
+equality (cheapest), Any-sink, Nothing-source, single-inheritance
+walk, trait-implementation walk, and finally variance-aware subtype
+check for parameterised types. Returning 1 on any successful match
+means left <: right is decided and the constraint resolved.
+@End Reasoning
+@Implementation:
+First tries solve_equality_constraint; equal types are trivially in
+subtype relation. Then handles the universal Any sink and Nothing
+source. Then check_inheritance_subtype walks the class hierarchy and
+check_trait_subtype walks the implemented-traits list. Lastly
+check_variance_subtype handles co/contravariant generic positions.
+@End Implementation
 Process called "solve_subtype_constraint" takes analyzer as Integer, left_type as Integer, right_type as Integer returns Boolean:
     Note: Solve subtype constraint (left <: right)
-
-    @Reasoning:
-    Scala's subtype relation includes inheritance, trait implementation,
-    variance annotations, and Nothing/Any relationships.
-    @End Reasoning
 
     Note: Equality implies subtyping
     Let is_equal be proc solve_equality_constraint with analyzer, left_type, right_type
@@ -1361,13 +1842,16 @@ Process called "solve_subtype_constraint" takes analyzer as Integer, left_type a
     Return variance_check
 End Process
 
+@Reasoning:
+Scala emits warnings for non-exhaustive `match` expressions on
+sealed hierarchies. This validator collects every case pattern and
+asks check_pattern_exhaustiveness whether their union covers the
+scrutinee's domain. A non-exhaustive match is recorded as a semantic
+error so downstream lowering can decide whether to insert a default
+MatchError-raising branch.
+@End Reasoning
 Process called "validate_match_exhaustiveness" takes analyzer as Integer, match_node as Integer:
     Note: Validate that match expression covers all possible cases
-
-    @Reasoning:
-    Scala requires match expressions to be exhaustive. This checks that all
-    constructors and value ranges are covered by the pattern cases.
-    @End Reasoning
 
     Let match_type be proc get_match_scrutinee_type from match_node
     Let cases be proc get_match_cases from match_node
@@ -1392,13 +1876,23 @@ Process called "validate_match_exhaustiveness" takes analyzer as Integer, match_
     End If
 End Process
 
+@Reasoning:
+Validates the three pillars of a Scala class declaration's
+soundness: the superclass exists in the type table, every mixed-in
+trait's implementation is consistent with the class body, and every
+abstract method inherited from superclass/traits is concretely
+implemented (or the class itself is declared abstract).
+@End Reasoning
+@Implementation:
+Extracts superclass, traits list, and members via parser accessors.
+Validates superclass existence with lookup_type_definition; missing
+supers produce an error. Iterates traits, delegating each to
+validate_trait_implementation. Finally invokes
+validate_abstract_method_implementations to confirm the class
+satisfies its abstract obligations.
+@End Implementation
 Process called "validate_class_definition" takes analyzer as Integer, class_node as Integer:
     Note: Validate class definition constraints
-
-    @Reasoning:
-    Validates class inheritance, abstract method implementation,
-    constructor parameters, and access modifiers.
-    @End Reasoning
 
     Let class_name be proc get_class_name from class_node
     Let superclass be proc get_class_superclass from class_node
@@ -1428,13 +1922,24 @@ Process called "validate_class_definition" takes analyzer as Integer, class_node
     proc validate_abstract_method_implementations with analyzer, class_node
 End Process
 
+@Reasoning:
+Trait declarations carry their own validation rules: super-traits
+referenced in `extends` clauses must be in the type table, every
+declared method signature must be well-formed (parameter types
+resolved, return type resolved), and any self-type annotation
+(`self: Foo =>`) must be a known type. Self-types are checked
+separately because they impose a constraint on classes that mix in
+the trait, not on the trait itself.
+@End Reasoning
+@Implementation:
+Pulls trait_name, super_traits list, methods list, and self_type via
+parser accessors. Iterates super_traits with lookup_type_definition
+and emits errors on misses. Iterates methods invoking
+validate_method_signature. Validates self_type only when present
+(non-zero), delegating to validate_self_type_constraint.
+@End Implementation
 Process called "validate_trait_definition" takes analyzer as Integer, trait_node as Integer:
     Note: Validate trait definition constraints
-
-    @Reasoning:
-    Validates trait method signatures, self-type annotations,
-    and trait linearization for multiple inheritance.
-    @End Reasoning
 
     Let trait_name be proc get_trait_name from trait_node
     Let super_traits be proc get_trait_supertypes from trait_node
@@ -1477,13 +1982,24 @@ Note: ==========================================================================
 Note: Type Inference for Expression Types
 Note: ============================================================================
 
+@Reasoning:
+Scala's four unary operators have specific operand requirements: '-'
+and '+' demand a numeric operand and preserve its type; '!' demands
+Boolean and returns Boolean; '~' demands an integral type and
+preserves it. Each operator therefore performs a guard check, emits
+a semantic error on mismatch, and returns the appropriate result
+type (preserved or TYPE_BOOLEAN).
+@End Reasoning
+@Implementation:
+Sequential string-compares against "-", "+", "!", "~". Each branch
+infers the operand type via infer_expression_type then guards with
+the appropriate predicate (is_numeric_type, equality to TYPE_BOOLEAN,
+is_integral_type). Mismatches add an error string via
+add_semantic_error and return TYPE_ERROR. Unrecognised operators
+return TYPE_ERROR.
+@End Implementation
 Process called "infer_unary_op_type" takes analyzer as Integer, unary_op_node as Integer:
     Note: Infer type of unary operation
-
-    @Reasoning:
-    Unary operators in Scala have specific type signatures.
-    -/+ work on numeric types, ! works on Boolean, ~ works on integral types.
-    @End Reasoning
 
     Let operator be proc get_unary_operator from unary_op_node
     Let operand be proc get_unary_operand from unary_op_node
@@ -1543,13 +2059,26 @@ Process called "infer_unary_op_type" takes analyzer as Integer, unary_op_node as
     Return TYPE_ERROR
 End Process
 
+@Reasoning:
+Scala method dispatch is genuinely non-trivial: a method-call site
+must locate every method named method_name in the receiver's type
+(including inherited and trait-provided methods), then run overload
+resolution against the argument types and any explicit type
+arguments, then resolve implicit parameters for the chosen overload,
+and finally compute the return type after substituting any inferred
+type arguments. Each sub-step is delegated to a focused helper.
+@End Reasoning
+@Implementation:
+Six steps: (1) infer receiver_type via infer_expression_type;
+abort on TYPE_ERROR. (2) find_methods enumerates candidates on the
+receiver type. (3) extract_argument_types collects actual arg types.
+(4) resolve_method_overload picks the best-fit method. (5)
+resolve_implicit_parameters binds any implicit groups on that
+method. (6) infer_method_return_type computes the final type with
+type-argument substitution.
+@End Implementation
 Process called "infer_method_call_type" takes analyzer as Integer, method_call_node as Integer:
     Note: Infer type of method call with overload resolution
-
-    @Reasoning:
-    Method calls in Scala involve complex overload resolution, implicit parameter
-    resolution, and type parameter inference. Critical for type safety.
-    @End Reasoning
 
     Let receiver be proc get_method_receiver from method_call_node
     Let method_name be proc get_method_name from method_call_node
@@ -1592,13 +2121,25 @@ Process called "infer_method_call_type" takes analyzer as Integer, method_call_n
     Return return_type
 End Process
 
+@Reasoning:
+Lambda inference is bidirectional: each parameter's type comes
+either from an explicit annotation on the lambda, from the expected
+type imposed by the surrounding call site
+(e.g. List[Int].map((x: Int) => x)), or defaults to TYPE_ANY when no
+context narrows it. The body type is inferred under a scope that
+binds the parameter names so identifier references inside the body
+resolve correctly.
+@End Reasoning
+@Implementation:
+Builds param_types by walking lambda parameters: for each parameter
+without an explicit type, attempts to extract the corresponding
+function-arity slot of the expected_type via
+extract_function_param_type; falls back to TYPE_ANY if neither
+source is available. Pushes a lambda scope, infers the body, pops
+the scope, then assembles a function-type via create_function_type.
+@End Implementation
 Process called "infer_lambda_type" takes analyzer as Integer, lambda_node as Integer:
     Note: Infer type of lambda expression
-
-    @Reasoning:
-    Lambda type inference in Scala considers parameter types (if specified),
-    body type, and expected type from context. May create function types.
-    @End Reasoning
 
     Let parameters be proc get_lambda_parameters from lambda_node
     Let body be proc get_lambda_body from lambda_node
@@ -1646,13 +2187,15 @@ Process called "infer_lambda_type" takes analyzer as Integer, lambda_node as Int
     Return function_type
 End Process
 
+@Reasoning:
+Scala `if/else` is an expression, not a statement, so its type is
+the least upper bound (LUB) of the then-branch and else-branch types.
+The condition must be Boolean; a non-Boolean condition produces a
+semantic error but the LUB computation continues so the broader
+expression can still be type-checked.
+@End Reasoning
 Process called "infer_if_expression_type" takes analyzer as Integer, if_node as Integer:
     Note: Infer type of if expression
-
-    @Reasoning:
-    If expressions in Scala must have consistent types in both branches.
-    The result type is the least upper bound of both branch types.
-    @End Reasoning
 
     Let condition be proc get_if_condition from if_node
     Let then_branch be proc get_if_then_branch from if_node
@@ -1674,13 +2217,23 @@ Process called "infer_if_expression_type" takes analyzer as Integer, if_node as 
     Return result_type
 End Process
 
+@Reasoning:
+A match expression's type is the least upper bound of every case
+body's type. Each case pattern must be compatible with the
+scrutinee's type, otherwise the case is unreachable and we emit a
+PATTERN_MATCH error. Pattern variables (names bound inside the
+pattern) are pushed into a per-case scope so the body can reference
+them, then popped after the body type is inferred.
+@End Reasoning
+@Implementation:
+Infers the scrutinee's type once. Iterates cases: per-case, checks
+pattern compatibility, pushes pattern scope, infers case body type,
+appends to result_types list, pops scope. After all cases,
+find_least_upper_bound_list collapses the case-type list to a single
+type id which becomes the match expression's result type.
+@End Implementation
 Process called "infer_match_expression_type" takes analyzer as Integer, match_node as Integer:
     Note: Infer type of match expression
-
-    @Reasoning:
-    Match expressions must have consistent result types across all cases.
-    Pattern variables are added to scope for each case body.
-    @End Reasoning
 
     Let scrutinee be proc get_match_scrutinee from match_node
     Let cases be proc get_match_cases from match_node
@@ -1726,25 +2279,56 @@ Process called "infer_match_expression_type" takes analyzer as Integer, match_no
     Return final_type
 End Process
 
+@Reasoning:
+Hook reserved for block-expression type inference. A Scala block is
+typed as its last statement's type (or Unit if the block ends with a
+declaration). The dispatch in infer_types routes AST_BLOCK nodes
+here so this declaration's existence is what makes the block branch
+of the dispatcher legal at compile time.
+@End Reasoning
 Process called "infer_block_type" takes analyzer as Integer, block_node as Integer:
     Note: implementation
 End Process
 
+@Reasoning:
+Hook reserved for tuple-expression type inference. A TupleN expression
+is typed as TupleN[T1, ..., Tn] where each Ti is the inferred type of
+the corresponding component expression. The dispatch in infer_types
+routes AST_TUPLE nodes here so this declaration's existence is what
+makes the tuple branch of the dispatcher legal at compile time.
+@End Reasoning
 Process called "infer_tuple_type" takes analyzer as Integer, tuple_node as Integer:
     Note: implementation
 End Process
 
+@Reasoning:
+Hook reserved for list-literal type inference. `List(1, 2, 3)` is
+typed as List[T] where T is the LUB of the element types. The
+dispatch in infer_types routes AST_LIST_LITERAL nodes here so this
+declaration's existence is what makes the list-literal branch of the
+dispatcher legal at compile time.
+@End Reasoning
 Process called "infer_list_literal_type" takes analyzer as Integer, list_node as Integer:
     Note: implementation
 End Process
 
+@Reasoning:
+A Scala `val` may declare an explicit type or rely on inference from
+its initializer expression. When both are present the initializer's
+type must be a subtype of the declared type, otherwise the
+declaration is rejected with a TYPE_MISMATCH error. The returned
+type is the declared type when explicit (preserving the user's
+intent for later subtype checks) and the initializer type otherwise.
+@End Reasoning
+@Implementation:
+Always infers the initializer's type first because it's required in
+both paths. If an explicit type is present, runs
+solve_subtype_constraint(initializer <: explicit); a 0 return
+becomes an error and the routine returns TYPE_ERROR. With no
+explicit annotation, returns the initializer type unchanged.
+@End Implementation
 Process called "infer_val_declaration_type" takes analyzer as Integer, val_node as Integer:
     Note: Infer type of val declaration
-
-    @Reasoning:
-    Val declarations can have explicit types or inferred types.
-    The declared type must be compatible with the initializer expression.
-    @End Reasoning
 
     Let val_name be proc get_val_name from val_node
     Let explicit_type be proc get_val_explicit_type from val_node
@@ -1770,21 +2354,49 @@ Process called "infer_val_declaration_type" takes analyzer as Integer, val_node 
     End If
 End Process
 
+@Reasoning:
+Hook reserved for `var` declaration type inference. Identical
+shape to infer_val_declaration_type at the type-checking level
+because the val/var distinction is about mutability, not typing. The
+dispatch in infer_types routes AST_VAR_DECLARATION nodes here so
+this declaration's existence is what makes the var branch of the
+dispatcher legal at compile time.
+@End Reasoning
 Process called "infer_var_declaration_type" takes analyzer as Integer, var_node as Integer:
     Note: implementation
 End Process
 
+@Reasoning:
+Hook reserved for full def-declaration type inference. Builds the
+function type as Function<arity>[<param-types>..., <return-type>]
+where return type uses extract_function_return_type (which already
+handles explicit annotation vs body inference). The dispatch in
+infer_types routes AST_FUNCTION nodes here so this declaration's
+existence is what makes the function branch of the dispatcher legal
+at compile time.
+@End Reasoning
 Process called "infer_function_type" takes analyzer as Integer, function_node as Integer:
     Note: implementation
 End Process
 
+@Reasoning:
+For a method call that does not find a direct match on the
+receiver's type, Scala's implicit conversion rules may permit
+converting the receiver to a type that does have the method
+(extension-method behaviour). This routine attempts the direct
+match first, and on failure scans the implicit conversion catalog
+for a target type that does provide a matching method.
+@End Reasoning
+@Implementation:
+After inferring receiver_type and arg_types, calls find_methods +
+find_matching_method for a direct hit. On miss, enumerates
+find_implicit_conversions(receiver_type) and per-conversion repeats
+find_methods + find_matching_method against the conversion's
+target_type. The first matching conversion is recorded via
+record_implicit_conversion and returned; if none match, returns 0.
+@End Implementation
 Process called "resolve_implicit_conversions" takes analyzer as Integer, call_node as Integer:
     Note: Resolve implicit conversions for method call
-
-    @Reasoning:
-    Scala's implicit conversion system allows automatic type conversions
-    and method extensions. Critical for type safety and usability.
-    @End Reasoning
 
     Let receiver be proc get_method_receiver from call_node
     Let method_name be proc get_method_name from call_node

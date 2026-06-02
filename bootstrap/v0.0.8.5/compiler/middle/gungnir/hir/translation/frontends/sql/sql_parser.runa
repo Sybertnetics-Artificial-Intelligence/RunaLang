@@ -83,6 +83,22 @@ Note: ==========================================================================
 Note: AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+Single AST node shape used for the entire SQL grammar (statements,
+expressions, identifiers, literals). A flat children-list + metadata
+slot is sufficient because SQL syntax never needs more than positional
+ordering of children plus one auxiliary discriminator (operator type,
+column-list flag, etc) per node.
+@End Reasoning
+
+@Implementation:
+6 x i64 record (48 bytes). offsets: 0 = SQL_* node type, 8 = value
+(string handle for identifiers/literals, op string for binary ops),
+16 = children List handle, 24 = metadata (used as object type in
+parse_drop, op token in binary ops), 32 = line, 40 = column. Children
+list is allocated in create_sql_node so every node is fully initialized.
+@End Implementation
+
 Type called "SQLNode":
     type as Integer           Note: Node type constant
     value as Integer          Note: Value (for literals, identifiers)
@@ -96,6 +112,22 @@ Note: ==========================================================================
 Note: Parser Structure
 Note: ============================================================================
 
+@Reasoning:
+Parser state is tiny: a borrowed lexer handle, the cached current token
+(populated by advance_token), and a sticky first-error pair. SQL
+parsing is statement-scoped so there is no need to carry deeper
+context (block scopes, type environments) at this layer.
+@End Reasoning
+
+@Implementation:
+4 x i64 record (32 bytes). offsets: 0 = lexer handle (borrowed,
+caller-owned), 8 = current token (also borrowed; tokens are owned by
+the lexer's stream), 16 = error_message (owned heap copy, freed in
+destroy_sql_parser), 24 = has_error bool. The current_token slot is
+populated once at construction and bumped by advance_token after each
+consumption.
+@End Implementation
+
 Type called "SQLParser":
     lexer as Integer          Note: SQL lexer
     current_token as Integer  Note: Current token
@@ -106,6 +138,19 @@ End Type
 Note: ============================================================================
 Note: Parser Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Wraps a borrowed lexer in a parser record and primes the
+current_token slot by consuming the first token immediately. Priming
+upfront means parse_* helpers can always consult current_token without
+a special-case first call.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes via Layout (returns 0 on allocation failure). Sets
+lexer at offset 0, current_token=0/has_error=0 placeholders, then
+calls Lexer.next_token to populate current_token at offset 8.
+@End Implementation
 
 Process called "create_sql_parser" takes lexer as Integer returns Integer:
     Note: Create SQL parser
@@ -130,6 +175,19 @@ Process called "create_sql_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+The parser owns one heap allocation that survives across calls: the
+error_message string copied in set_parser_error. Destruction must free
+it before deallocating the parser record. The lexer is borrowed and
+NOT owned, so it is left intact for the caller to destroy.
+@End Reasoning
+
+@Implementation:
+Null guard returns 1. Reads error_message at offset 16; if non-zero,
+Layout.deallocate releases the heap copy. Finally deallocates the
+parser record. Lexer at offset 0 is intentionally not touched.
+@End Implementation
+
 Process called "destroy_sql_parser" takes parser as Integer returns Integer:
     Note: Destroy SQL parser
 
@@ -152,6 +210,20 @@ End Process
 Note: ============================================================================
 Note: AST Node Creation
 Note: ============================================================================
+
+@Reasoning:
+Single constructor for every node kind keeps allocation, children-list
+setup, and field initialization centralized. Children must be created
+together with the record so any later add_child can succeed without
+re-checking liveness of the list slot.
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes; on failure returns 0. Allocates an empty children
+List via List.create_empty_list; on failure deallocates the partially
+constructed node and returns 0 to keep the partial-allocation invariant
+clean. Writes all six fields and returns the node handle.
+@End Implementation
 
 Process called "create_sql_node" takes node_type as Integer, value as Integer, metadata as Integer, line as Integer, column as Integer returns Integer:
     Note: Create SQL AST node
@@ -182,6 +254,18 @@ Process called "create_sql_node" takes node_type as Integer, value as Integer, m
     Return node
 End Process
 
+@Reasoning:
+Centralised child-attachment with null-safety on both arguments so
+partial parse failures (which often return 0 for the child) can be
+chained without explicit guards at the call site.
+@End Reasoning
+
+@Implementation:
+Returns 0 if either parent or child is null. Otherwise reads the
+parent's children list at offset 16 and appends the child via
+List.append. Returns 1 on success.
+@End Implementation
+
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Note: Add child node to parent
 
@@ -203,6 +287,18 @@ Note: ==========================================================================
 Note: Token Access
 Note: ============================================================================
 
+@Reasoning:
+Accessor shared by every parse_* helper. Treating a null current_token
+slot as TOKEN_EOF lets callers reach EOF naturally rather than crashing
+on a null pointer if the lexer prematurely returned nothing.
+@End Reasoning
+
+@Implementation:
+Reads current_token at offset 8; if null returns Lexer.TOKEN_EOF
+otherwise reads the i64 token-type field at offset 0 of the token
+record.
+@End Implementation
+
 Process called "current_token_type" takes parser as Integer returns Integer:
     Note: Get current token type
 
@@ -217,6 +313,18 @@ Process called "current_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Single point of token-consumption: every parser helper that consumes a
+token funnels through here so the lexer pull and current_token slot
+update remain atomic.
+@End Reasoning
+
+@Implementation:
+Reads the lexer handle at offset 0, asks Lexer.next_token for the next
+token, and stores it at offset 8. Returns the new token handle so
+callers can capture it without re-reading from offset 8.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -227,6 +335,18 @@ Process called "advance_token" takes parser as Integer returns Integer:
 
     Return new_token
 End Process
+
+@Reasoning:
+Predicate for "is the current token X" used pervasively as the gate for
+optional clauses (WHERE, GROUP BY, comma continuations). Distinct from
+expect_token because it never raises an error — it just answers the
+question.
+@End Reasoning
+
+@Implementation:
+Calls current_token_type and returns 1 if it equals expected_type, else
+0. No side effects, no token consumption.
+@End Implementation
 
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches expected type
@@ -239,6 +359,20 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
 
     Return 0
 End Process
+
+@Reasoning:
+Mandatory-token gate: used at points where grammar requires a specific
+keyword (FROM after SELECT columns, INTO after INSERT). Sets a parser
+error rather than throwing so the caller can choose between error
+recovery and bail-out.
+@End Reasoning
+
+@Implementation:
+Compares current_token_type with expected_type; on mismatch, calls
+set_parser_error with the supplied error message and returns 0. On
+match, returns 1 WITHOUT consuming the token — the caller invokes
+advance_token explicitly so it controls when consumption happens.
+@End Implementation
 
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Note: Expect specific token type, set error if not found
@@ -256,6 +390,20 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Last-error wins behaviour because the most informative diagnostic
+about a failed parse is typically the one closest to the failure
+point. Copying the message into a parser-owned buffer decouples the
+error string's lifetime from the caller's transient diagnostic string.
+@End Reasoning
+
+@Implementation:
+Frees any previously stored error_message (offset 16) before
+overwriting. Allocates msg_length+1 bytes, memcpys the message, writes
+a null terminator, and stores the new handle at offset 16. Sets
+has_error (offset 24) to 1 so callers can short-circuit. Returns 1.
+@End Implementation
 
 Process called "set_parser_error" takes parser as Integer, message as Integer returns Integer:
     Note: Set parser error message
@@ -285,6 +433,25 @@ End Process
 Note: ============================================================================
 Note: Expression Parsing
 Note: ============================================================================
+
+@Reasoning:
+The bottom of the SQL precedence hierarchy. Handles every form that
+can stand on its own: integer/float/string literals, identifiers
+(possibly qualified), parenthesised expressions, function calls,
+NULL/TRUE/FALSE keywords, and the unary `*` (SELECT *). Above this,
+parse_comparison_expression/parse_and_expression/parse_expression
+layer the relational and logical operators.
+@End Reasoning
+
+@Implementation:
+Reads the current token's type, line, and column. Sequentially checks
+TOKEN_INTEGER/FLOAT/STRING (each emits a literal node), TOKEN_IDENTIFIER
+(emits identifier node, with lookahead for `.` -> qualified name and
+`(` -> function call), TOKEN_LEFT_PAREN (recurses into parse_expression
+and consumes the closing paren), TOKEN_NULL/TRUE/FALSE/ASTERISK
+(keyword/wildcard nodes). Returns 0 if nothing matches, signalling
+"not an expression here" to the caller.
+@End Implementation
 
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
     Note: Parse primary expression (literal, identifier, function call, parenthesized expression)
@@ -452,6 +619,24 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Return 0  Note: Not a valid primary expression
 End Process
 
+@Reasoning:
+Implements SQL's relational layer: precedence between primary and AND.
+Returns the left operand untouched when no comparison operator is
+present, so this function acts as a transparent pass-through for
+non-comparison expressions.
+@End Reasoning
+
+@Implementation:
+Parses a primary expression as the left operand; null-checks. Looks at
+the next token; for each of TOKEN_EQUAL, TOKEN_NOT_EQUAL,
+TOKEN_LESS_THAN, TOKEN_GREATER_THAN, TOKEN_LESS_EQUAL,
+TOKEN_GREATER_EQUAL: captures token line/column, consumes the operator,
+parses the right operand, and builds a SQL_BINARY_OP node with the op
+spelling (=, <>, <, >, <=, >=) as value and the lexer token id as
+metadata. If the right operand fails, returns the left unchanged to
+keep partial parse usable.
+@End Implementation
+
 Process called "parse_comparison_expression" takes parser as Integer returns Integer:
     Note: Parse comparison expression (=, <>, <, >, <=, >=)
 
@@ -593,6 +778,20 @@ Process called "parse_comparison_expression" takes parser as Integer returns Int
     Return left
 End Process
 
+@Reasoning:
+SQL precedence: AND binds tighter than OR. This level chains zero or
+more `AND comparison` to the left operand and builds a left-associative
+tree of binary ops, matching standard SQL evaluation order.
+@End Reasoning
+
+@Implementation:
+Parses an initial comparison expression; null check. Loop: stop when
+the current token is not TOKEN_AND. Otherwise capture position,
+consume AND, parse a comparison as right operand (break on failure),
+build a SQL_BINARY_OP node with value="AND" and metadata=TOKEN_AND,
+and rebind left to the new node for left-associativity.
+@End Implementation
+
 Process called "parse_and_expression" takes parser as Integer returns Integer:
     Note: Parse AND expression
 
@@ -631,6 +830,21 @@ Process called "parse_and_expression" takes parser as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Top of the expression precedence ladder for SQL: OR is the lowest-
+precedence boolean connective. Every statement-level expression
+(WHERE clause, ON, HAVING, VALUES item) enters the expression grammar
+through here.
+@End Reasoning
+
+@Implementation:
+Parses an AND expression as left operand; null check. Loop: stop when
+current token is not TOKEN_OR. Otherwise capture position, consume OR,
+parse next AND expression as right (break on failure), build a
+SQL_BINARY_OP node with value="OR" and metadata=TOKEN_OR, rebind left
+to the OR node. Left-associative — mirrors the AND layer.
+@End Implementation
 
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse OR expression (top level)
@@ -674,6 +888,24 @@ End Process
 Note: ============================================================================
 Note: SELECT Statement Parsing
 Note: ============================================================================
+
+@Reasoning:
+SELECT is the most structurally complex SQL statement: SELECT list,
+FROM tables/joins, optional WHERE / GROUP BY / HAVING / ORDER BY /
+LIMIT clauses. Building each clause as a sub-node with a dedicated
+SQL_* type lets downstream passes navigate the AST without re-parsing
+or guessing clause boundaries.
+@End Reasoning
+
+@Implementation:
+Captures position from SELECT token, builds a SQL_SELECT parent. Then
+sequentially: consumes SELECT keyword, parses comma-separated column
+list (each item via parse_expression, supports `*` wildcard), expects
+FROM, parses table list (comma-separated identifiers possibly with
+join syntax), then optionally consumes and parses WHERE/GROUP BY/
+HAVING/ORDER BY/LIMIT in canonical order. Each optional clause is
+wrapped in its own SQL_* node attached as a child of the SELECT.
+@End Implementation
 
 Process called "parse_select" takes parser as Integer returns Integer:
     Note: Parse SELECT statement
@@ -906,6 +1138,23 @@ Note: ==========================================================================
 Note: INSERT Statement Parsing
 Note: ============================================================================
 
+@Reasoning:
+INSERT INTO table (col, col, ...) VALUES (expr, expr, ...). Both the
+column list and the values list are optional in syntax form, but if
+columns are listed the values must match arity. AST tree keeps table
+as first child, then column-name children (if any), then value
+expression children; the count match is checked semantically later.
+@End Reasoning
+
+@Implementation:
+Builds a SQL_INSERT parent at the INSERT token's position. Consumes
+INSERT, expects/consumes INTO, parses table name as a primary
+expression and attaches it. Optional `(col, col, ...)` list: enters
+when current token is `(`, parses comma-separated primary expressions
+until `)`. Mandatory VALUES keyword and `(`. Loop parses comma-
+separated value expressions via parse_expression. Closes with `)`.
+@End Implementation
+
 Process called "parse_insert" takes parser as Integer returns Integer:
     Note: Parse INSERT statement
 
@@ -982,6 +1231,23 @@ Process called "parse_insert" takes parser as Integer returns Integer:
     Return insert_node
 End Process
 
+@Reasoning:
+UPDATE has the same overall shape as INSERT (table + column actions +
+optional WHERE) but each column action is a `col = expr` pair rather
+than a positional value. Each assignment is modelled as a SQL_BINARY_OP
+node so later passes can reuse the binary-op visitor.
+@End Reasoning
+
+@Implementation:
+Builds a SQL_UPDATE parent. Consumes UPDATE, parses table name primary
+expression and attaches. Expects/consumes SET. Loop: parse column name
+(primary expression), expect/consume `=`, parse value expression,
+build a SQL_BINARY_OP assignment node with col_name + value_expr as
+children, attach to update_node. Comma continues the loop; anything
+else breaks. Optional WHERE branch wraps the parsed condition in a
+SQL_WHERE node and attaches it.
+@End Implementation
+
 Process called "parse_update" takes parser as Integer returns Integer:
     Note: Parse UPDATE statement
     Note: Format: UPDATE table SET column = value, ... WHERE condition
@@ -1047,6 +1313,20 @@ Process called "parse_update" takes parser as Integer returns Integer:
     Return update_node
 End Process
 
+@Reasoning:
+DELETE is the simplest mutation: a table and an optional WHERE. We
+model the WHERE the same way as in UPDATE/SELECT — wrapped in a
+SQL_WHERE node — so the same downstream code can handle WHERE
+predicates uniformly.
+@End Reasoning
+
+@Implementation:
+Builds a SQL_DELETE parent at the DELETE position. Consumes DELETE,
+expects/consumes FROM, parses table name primary expression and
+attaches. If current token is WHERE, consumes it, parses the predicate
+expression, wraps it in a SQL_WHERE node, and attaches.
+@End Implementation
+
 Process called "parse_delete" takes parser as Integer returns Integer:
     Note: Parse DELETE statement
     Note: Format: DELETE FROM table WHERE condition
@@ -1086,6 +1366,26 @@ Process called "parse_delete" takes parser as Integer returns Integer:
 
     Return delete_node
 End Process
+
+@Reasoning:
+CREATE TABLE produces a SQL_COLUMN_DEF for each column with the column
+name, type, and a flat list of constraint nodes. Constraints (NOT NULL,
+PRIMARY KEY, UNIQUE, DEFAULT expr) are modelled as SQL_IDENTIFIER nodes
+carrying the constraint name in their value field so the downstream
+translator can dispatch on the string rather than a separate
+constraint-kind enum.
+@End Reasoning
+
+@Implementation:
+Consumes CREATE TABLE, parses table-name primary expression. Inside
+`(...)`: parses column definitions until `)`. Each column def: name +
+type via two primary-expression parses; then a constraint loop that
+matches NOT (followed by NULL), PRIMARY (followed by KEY), UNIQUE,
+DEFAULT (followed by value expression). Each constraint becomes a
+SQL_IDENTIFIER attached as a child of the SQL_COLUMN_DEF; DEFAULT's
+value is attached as a grandchild. Outer loop continues on comma,
+breaks otherwise.
+@End Implementation
 
 Process called "parse_create_table" takes parser as Integer returns Integer:
     Note: Parse CREATE TABLE statement
@@ -1182,6 +1482,23 @@ Process called "parse_create_table" takes parser as Integer returns Integer:
     Return create_node
 End Process
 
+@Reasoning:
+ALTER TABLE in SQL has several variant action shapes. The bootstrap
+implementation supports ADD COLUMN and DROP COLUMN — the most common
+forms. The action is wrapped in a SQL_IDENTIFIER named "ADD" / "DROP"
+to keep dispatch downstream symmetrical with column constraints.
+@End Reasoning
+
+@Implementation:
+Consumes ALTER TABLE then parses the table-name primary expression.
+Looks at the next token: ADD branch consumes ADD plus optional COLUMN
+keyword, parses col_name + col_type into a SQL_COLUMN_DEF, wraps in a
+SQL_IDENTIFIER("ADD") action node, attaches under alter_node. DROP
+branch consumes DROP plus optional COLUMN, parses col_name only,
+wraps in SQL_IDENTIFIER("DROP") action node, attaches. Anything else
+falls through leaving alter_node without an action child.
+@End Implementation
+
 Process called "parse_alter_table" takes parser as Integer returns Integer:
     Note: Parse ALTER TABLE statement
     Note: Format: ALTER TABLE name ADD/DROP/ALTER COLUMN ...
@@ -1252,6 +1569,20 @@ Process called "parse_alter_table" takes parser as Integer returns Integer:
     Return alter_node
 End Process
 
+@Reasoning:
+DROP TABLE / DROP INDEX share the same shape; the object kind is
+stored in the SQL_DROP node's metadata slot rather than as a child
+node so downstream code can switch on a single integer.
+@End Reasoning
+
+@Implementation:
+Builds a SQL_DROP node at the DROP position. After consuming DROP,
+checks for TABLE (sets object_type=1) or INDEX (sets object_type=2);
+unrecognised follow-up leaves object_type=0. Stores object_type at
+the metadata offset (24). Parses the object name as a primary
+expression and attaches it as the only child.
+@End Implementation
+
 Process called "parse_drop" takes parser as Integer returns Integer:
     Note: Parse DROP statement
     Note: Format: DROP TABLE/INDEX name
@@ -1292,6 +1623,30 @@ End Process
 Note: ============================================================================
 Note: Top-Level Parsing
 Note: ============================================================================
+
+@Reasoning:
+Public entry point: takes a raw source string, owns the lexer/parser
+lifecycle internally, and returns the parsed AST. Statement type is
+selected from the leading keyword (SELECT/INSERT/UPDATE/DELETE/CREATE/
+ALTER/DROP) and dispatched to the right parse_* helper.
+@End Reasoning
+
+@Implementation:
+Creates a SQL lexer; bails with 0 on failure. Wraps it in a parser;
+on failure destroys the lexer and bails. Reads current token type and
+dispatches via a chain of Otherwise If branches into parse_select /
+parse_insert / parse_update / parse_delete / parse_create_table /
+parse_alter_table / parse_drop. Any unrecognised leading token leaves
+ast at 0. The function returns the AST handle without destroying
+parser/lexer — that becomes the caller's responsibility once they have
+extracted what they need.
+@End Implementation
+
+@Security_Scope:
+source is untrusted SQL text; the parser tolerates malformed inputs by
+returning partial ASTs and recording errors in the parser, never
+crashing on unexpected tokens.
+@End Security_Scope
 
 Process called "parse_sql" takes source as Integer returns Integer:
     Note: Parse SQL source into AST

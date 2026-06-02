@@ -16,6 +16,17 @@ Note: ===================================================================
 Note: TRANSLATION CONTEXT
 Note: ===================================================================
 
+@Reasoning:
+PHP-to-HIR state tracks the active HIR module being built, plus
+"current" class and function for nested-context tracking (method
+translation needs to know which class it's in for visibility checks),
+plus the active namespace string for qualified-name resolution.
+@End Reasoning
+@Implementation:
+4 fields: hir_module (HIR construction target), current_class (0 when
+not inside a class), current_function (0 when not inside a function),
+namespace_name ("" at file scope).
+@End Implementation
 Type called "TranslationContext":
     hir_module as Integer
     current_class as Integer
@@ -27,12 +38,28 @@ Note: ===================================================================
 Note: MAIN TRANSLATION ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+Primary entry point. Creates a fresh context, walks the program, returns
+the built HIR module. The context is discarded after extracting the
+hir_module pointer.
+@End Reasoning
+@Implementation:
+create_context; translate_program; return ctx.hir_module.
+@End Implementation
 Process called "translate_php_to_hir" takes php_ast as Integer returns Integer:
     Let ctx be proc create_context
     proc translate_program with ctx, php_ast
     Return ctx.hir_module
 End Process
 
+@Reasoning:
+Allocate a fresh TranslationContext with an empty HIR module named
+"php_module" and reset class/function/namespace.
+@End Reasoning
+@Implementation:
+Call hir_create_module; build TranslationContext value with hir_module
+set, others 0/empty.
+@End Implementation
 Process called "create_context" returns Integer:
     Let hir_module be proc hir_create_module from HIR with "php_module"
     
@@ -49,6 +76,15 @@ Note: ===================================================================
 Note: PROGRAM TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Walks the top-level children of the PHP program node and dispatches
+each to translate_declaration. PHP files can contain a mix of
+declarations and statements at top level; this routine treats them
+uniformly via translate_declaration's dispatch.
+@End Reasoning
+@Implementation:
+Get children list; loop by index calling translate_declaration on each.
+@End Implementation
 Process called "translate_program" takes ctx as Integer, program_node as Integer:
     Let children be proc php_ast_node_children from PHPParser with program_node
     Let count be proc list_length from ListCore with children
@@ -65,6 +101,16 @@ Note: ===================================================================
 Note: DECLARATION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Top-level declaration dispatch: namespace, use, class, interface,
+trait, function. Top-level statements (not declarations) are also
+allowed in PHP and route through translate_statement.
+@End Reasoning
+@Implementation:
+Read node_type; switch on PHP_NS / PHP_USE / PHP_CLASS / PHP_INTERFACE /
+PHP_TRAIT / PHP_FUNCTION / PHP_STMT; dispatch to the corresponding
+translator.
+@End Implementation
 Process called "translate_declaration" takes ctx as Integer, node as Integer:
     Let node_type be proc php_ast_node_type from PHPParser with node
     
@@ -100,6 +146,15 @@ Note: ===================================================================
 Note: NAMESPACE TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+`namespace Foo\Bar;` or `namespace Foo\Bar { body }`. Sets the
+active namespace_name on the context so subsequent declarations are
+namespaced.
+@End Reasoning
+@Implementation:
+Read namespace name from node; set ctx.namespace_name; recurse over the
+namespace body if it has block form.
+@End Implementation
 Process called "translate_namespace" takes ctx as Integer, namespace_node as Integer:
     Let namespace_name be proc php_ast_node_value from PHPParser with namespace_node
     Set ctx.namespace_name to namespace_name
@@ -120,6 +175,14 @@ Note: ===================================================================
 Note: USE DECLARATION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+`use Foo\Bar [as Baz];`. Translates to a HIR import directive so the
+HIR module records the symbol it brought into local scope.
+@End Reasoning
+@Implementation:
+Read qualified name and optional alias from use_node; build HIR import
+with both fields.
+@End Implementation
 Process called "translate_use_declaration" takes ctx as Integer, use_node as Integer:
     Let import_name be proc php_ast_node_value from PHPParser with use_node
     
@@ -132,6 +195,16 @@ Note: ===================================================================
 Note: CLASS TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+`class Name extends Base implements I1, I2 { members }`. Builds a HIR
+class and pushes it onto ctx.current_class so nested method/property
+translation knows it's inside this class.
+@End Reasoning
+@Implementation:
+Read name/extends/implements/metadata; build HIR class; save previous
+current_class on the stack; set ctx.current_class = new class; iterate
+members translating each; restore current_class on exit.
+@End Implementation
 Process called "translate_class" takes ctx as Integer, class_node as Integer:
     Let class_name be proc php_ast_node_value from PHPParser with class_node
     
@@ -169,6 +242,15 @@ Process called "translate_class" takes ctx as Integer, class_node as Integer:
     Set ctx.current_class to 0
 End Process
 
+@Reasoning:
+PHP class modifiers (abstract, final, readonly) and attribute lists
+(`#[Attribute]`) come through a separate metadata sub-node. Decoded
+here onto HIR class flag fields.
+@End Reasoning
+@Implementation:
+Read flags from metadata; set is_abstract / is_final / is_readonly on
+hir_class; copy attribute list.
+@End Implementation
 Process called "translate_class_metadata" takes ctx as Integer, hir_class as Integer, metadata as Integer:
     Note: Extract metadata pairs
     Let count be proc list_length from ListCore with metadata
@@ -211,6 +293,15 @@ Note: ===================================================================
 Note: INTERFACE TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+`interface Name extends Other { abstract methods, const X }`. Like
+class but interfaces only contain method signatures (no bodies) and
+constants.
+@End Reasoning
+@Implementation:
+Build HIR interface; iterate members translating each (only methods
+and constants are valid); attach.
+@End Implementation
 Process called "translate_interface" takes ctx as Integer, interface_node as Integer:
     Let interface_name be proc php_ast_node_value from PHPParser with interface_node
     
@@ -246,6 +337,14 @@ Note: ===================================================================
 Note: TRAIT TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+`trait Name { members }`. Traits are PHP's mixin mechanism. Same
+structure as class but the HIR tag distinguishes it so the consumer
+applies trait-specific semantics (e.g. no instantiation).
+@End Reasoning
+@Implementation:
+Build HIR trait; iterate members; attach.
+@End Implementation
 Process called "translate_trait" takes ctx as Integer, trait_node as Integer:
     Let trait_name be proc php_ast_node_value from PHPParser with trait_node
     
@@ -281,6 +380,14 @@ Note: ===================================================================
 Note: CLASS MEMBER TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Class members are methods, properties, or constants. Dispatches by
+node type to the appropriate translator.
+@End Reasoning
+@Implementation:
+Read member_node type; switch on PHP_METHOD / PHP_PROPERTY /
+PHP_CLASS_CONST; dispatch.
+@End Implementation
 Process called "translate_class_member" takes ctx as Integer, member_node as Integer:
     Let node_type be proc php_ast_node_type from PHPParser with member_node
     
@@ -297,6 +404,15 @@ Process called "translate_class_member" takes ctx as Integer, member_node as Int
     End If
 End Process
 
+@Reasoning:
+A class method has the same shape as a free-standing function plus
+visibility (public/private/protected) and modifiers (static, abstract,
+final). Records the HIR method as a child of ctx.current_class.
+@End Reasoning
+@Implementation:
+Build HIR method with name; translate metadata (visibility/modifiers);
+translate parameters; translate body. Attach to ctx.current_class.
+@End Implementation
 Process called "translate_method" takes ctx as Integer, method_node as Integer:
     Let method_name be proc php_ast_node_value from PHPParser with method_node
     
@@ -322,6 +438,14 @@ Process called "translate_method" takes ctx as Integer, method_node as Integer:
     Set ctx.current_function to 0
 End Process
 
+@Reasoning:
+Sets the method-level flags (visibility, static, abstract, final) on
+the HIR method. Default visibility is public per PHP rules.
+@End Reasoning
+@Implementation:
+Read flag bits from metadata; set is_public/is_private/is_protected/
+is_static/is_abstract/is_final.
+@End Implementation
 Process called "translate_method_metadata" takes ctx as Integer, hir_method as Integer, metadata as Integer:
     Let count be proc list_length from ListCore with metadata
     Let i be 0
@@ -336,6 +460,15 @@ Process called "translate_method_metadata" takes ctx as Integer, hir_method as I
     End While
 End Process
 
+@Reasoning:
+PHP property declaration: `[visibility] [type] $name [= default];`.
+Type hints are PHP 7.4+. Default value is constant-expressible per PHP
+spec.
+@End Reasoning
+@Implementation:
+Read name, type hint, default value, visibility flags; build HIR
+property; attach to ctx.current_class.
+@End Implementation
 Process called "translate_property" takes ctx as Integer, property_node as Integer:
     Let property_name be proc php_ast_node_value from PHPParser with property_node
     
@@ -367,6 +500,14 @@ Process called "translate_property" takes ctx as Integer, property_node as Integ
     proc hir_class_add_field from HIR with ctx.current_class, hir_field
 End Process
 
+@Reasoning:
+`const NAME = value;` inside a class body. Distinct from `define()`
+constants (which are global). Constants in interfaces are implicitly
+public.
+@End Reasoning
+@Implementation:
+Read name, value, visibility; build HIR class constant; attach.
+@End Implementation
 Process called "translate_class_constant" takes ctx as Integer, const_node as Integer:
     Let const_name be proc php_ast_node_value from PHPParser with const_node
     
@@ -389,6 +530,16 @@ Note: ===================================================================
 Note: FUNCTION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Top-level (or namespaced) function: `function name(params): return_type
+{ body }`. Updates ctx.current_function while translating the body so
+nested constructs know they're inside a function.
+@End Reasoning
+@Implementation:
+Build HIR function; translate metadata; translate parameters; save
+previous current_function; set ctx.current_function; translate body;
+restore.
+@End Implementation
 Process called "translate_function" takes ctx as Integer, function_node as Integer:
     Let function_name be proc php_ast_node_value from PHPParser with function_node
     
@@ -421,6 +572,14 @@ Process called "translate_function" takes ctx as Integer, function_node as Integ
     Set ctx.current_function to 0
 End Process
 
+@Reasoning:
+For free-standing functions: return type, references, attributes. PHP
+attributes (`#[...]`) on functions are carried through to the HIR.
+@End Reasoning
+@Implementation:
+Set return_type on hir_function; copy attribute list; record byref
+return if applicable.
+@End Implementation
 Process called "translate_function_metadata" takes ctx as Integer, hir_function as Integer, metadata as Integer:
     Let count be proc list_length from ListCore with metadata
     Let i be 0
@@ -441,6 +600,14 @@ Process called "translate_function_metadata" takes ctx as Integer, hir_function 
     End While
 End Process
 
+@Reasoning:
+Iterate parameter list and attach each translated parameter HIR to the
+function. Order is preserved (positional matters).
+@End Reasoning
+@Implementation:
+Loop over params list; translate_parameter on each; append to
+hir_function's parameter list.
+@End Implementation
 Process called "translate_parameters" takes ctx as Integer, hir_function as Integer, params as Integer:
     Let count be proc list_length from ListCore with params
     Let i be 0
@@ -453,6 +620,15 @@ Process called "translate_parameters" takes ctx as Integer, hir_function as Inte
     End While
 End Process
 
+@Reasoning:
+A single PHP parameter: `[type] [&]$name [= default]`. Supports
+by-reference parameters (the `&` prefix) and default values.
+Constructor promotion (PHP 8.0+) is detected via visibility flags.
+@End Reasoning
+@Implementation:
+Read name, type hint, default value, is_byref, is_variadic, visibility
+flags; build HIR parameter; return it.
+@End Implementation
 Process called "translate_parameter" takes ctx as Integer, param_node as Integer returns Integer:
     Note: Extract parameter metadata
     Let metadata be proc php_ast_node_metadata from PHPParser with param_node
@@ -491,6 +667,15 @@ Note: ===================================================================
 Note: STATEMENT TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+Central statement dispatcher: blocks, if/while/do/for/foreach/switch,
+return, try, throw, echo, expression statements. Routes each to its
+dedicated translator.
+@End Reasoning
+@Implementation:
+Read stmt_node type; switch through every PHP_STMT_* tag dispatching
+to translate_<kind>_statement; default treats as expression statement.
+@End Implementation
 Process called "translate_statement" takes ctx as Integer, stmt_node as Integer returns Integer:
     Let node_type be proc php_ast_node_type from PHPParser with stmt_node
     
@@ -558,6 +743,14 @@ Process called "translate_statement" takes ctx as Integer, stmt_node as Integer 
     Return 0
 End Process
 
+@Reasoning:
+`{ stmt; stmt; ... }`. Builds a HIR block and recurses each child as
+a statement. Preserves source order.
+@End Reasoning
+@Implementation:
+Build HIR block; iterate block_node children; translate_statement
+each; append to block.
+@End Implementation
 Process called "translate_block" takes ctx as Integer, block_node as Integer returns Integer:
     Let hir_block be proc hir_create_block from HIR
     
@@ -577,6 +770,14 @@ Process called "translate_block" takes ctx as Integer, block_node as Integer ret
     Return hir_block
 End Process
 
+@Reasoning:
+`if (cond) then [elseif ...] [else alt]`. PHP's elseif chains are
+expanded to nested HIR if-else nodes.
+@End Reasoning
+@Implementation:
+Translate cond and then; if elseif clauses exist, recursively build
+nested if-elses; finally translate optional else.
+@End Implementation
 Process called "translate_if_statement" takes ctx as Integer, if_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with if_node
     Let count be proc list_length from ListCore with children
@@ -600,6 +801,12 @@ Process called "translate_if_statement" takes ctx as Integer, if_node as Integer
     Return proc hir_create_if from HIR with hir_condition, hir_then, hir_else
 End Process
 
+@Reasoning:
+`while (cond) body`. Cond is tested before each iteration.
+@End Reasoning
+@Implementation:
+Translate cond and body; build HIR while node.
+@End Implementation
 Process called "translate_while_statement" takes ctx as Integer, while_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with while_node
     
@@ -612,6 +819,13 @@ Process called "translate_while_statement" takes ctx as Integer, while_node as I
     Return proc hir_create_while from HIR with hir_condition, hir_body
 End Process
 
+@Reasoning:
+`do body while (cond);`. Cond tested AFTER each iteration, so body runs
+at least once.
+@End Reasoning
+@Implementation:
+Translate body and cond; build HIR do-while node.
+@End Implementation
 Process called "translate_do_while_statement" takes ctx as Integer, do_while_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with do_while_node
     
@@ -624,6 +838,15 @@ Process called "translate_do_while_statement" takes ctx as Integer, do_while_nod
     Return proc hir_create_do_while from HIR with hir_body, hir_condition
 End Process
 
+@Reasoning:
+`for (init; cond; update) body`. Each of init/cond/update is a list
+of expressions in PHP (comma-separated); the HIR uses sequences for
+those to preserve PHP semantics.
+@End Reasoning
+@Implementation:
+Translate init/cond/update lists into HIR sequence expressions;
+translate body; build HIR for-loop node.
+@End Implementation
 Process called "translate_for_statement" takes ctx as Integer, for_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with for_node
     Let count be proc list_length from ListCore with children
@@ -674,6 +897,14 @@ Process called "translate_for_statement" takes ctx as Integer, for_node as Integ
     Return proc hir_create_for from HIR with hir_init, hir_condition, hir_update, hir_body
 End Process
 
+@Reasoning:
+`foreach (expr as [$key =>] $value) body`. Translates to a HIR
+for-each with optional key binding.
+@End Reasoning
+@Implementation:
+Translate iterable expression; read key and value variables;
+translate body; build HIR foreach node.
+@End Implementation
 Process called "translate_foreach_statement" takes ctx as Integer, foreach_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with foreach_node
     
@@ -688,6 +919,15 @@ Process called "translate_foreach_statement" takes ctx as Integer, foreach_node 
     Return hir_foreach
 End Process
 
+@Reasoning:
+`switch (subject) { case_clauses default }`. PHP switch uses loose
+comparison (==) which matters for the executor; the HIR preserves that
+distinction.
+@End Reasoning
+@Implementation:
+Translate subject expression; iterate case clauses translating each;
+build HIR switch node.
+@End Implementation
 Process called "translate_switch_statement" takes ctx as Integer, switch_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with switch_node
     
@@ -710,6 +950,15 @@ Process called "translate_switch_statement" takes ctx as Integer, switch_node as
     Return hir_switch
 End Process
 
+@Reasoning:
+A single case/default clause inside switch. PHP cases fall through
+implicitly unless break/return ends them - the HIR preserves the
+original statement list so the executor handles fall-through.
+@End Reasoning
+@Implementation:
+Read value expression (or is_default flag); translate each statement
+in the clause body; build HIR case node.
+@End Implementation
 Process called "translate_case_clause" takes ctx as Integer, case_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with case_node
     Let count be proc list_length from ListCore with children
@@ -735,6 +984,12 @@ Process called "translate_case_clause" takes ctx as Integer, case_node as Intege
     Return hir_case
 End Process
 
+@Reasoning:
+`return [expr];`. Bare return is allowed in PHP (returns null).
+@End Reasoning
+@Implementation:
+Read optional value; if present translate; build HIR return node.
+@End Implementation
 Process called "translate_return_statement" takes ctx as Integer, return_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with return_node
     Let count be proc list_length from ListCore with children
@@ -749,6 +1004,15 @@ Process called "translate_return_statement" takes ctx as Integer, return_node as
     Return proc hir_create_return from HIR with hir_expr
 End Process
 
+@Reasoning:
+`try block catch (Type1|Type2 $e) { handler } ... finally { cleanup }`.
+Multi-type catch (PHP 8.0+) is supported via the union-type syntax. The
+finally block is optional.
+@End Reasoning
+@Implementation:
+Translate try body; iterate catch clauses translating each (catch type
+union plus handler body); translate finally if present.
+@End Implementation
 Process called "translate_try_statement" takes ctx as Integer, try_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with try_node
     
@@ -776,6 +1040,14 @@ Process called "translate_try_statement" takes ctx as Integer, try_node as Integ
     Return hir_try
 End Process
 
+@Reasoning:
+`throw expr;`. PHP 8 made throw an expression too, but we translate it
+as a statement here; expression-form throws come through
+translate_expression.
+@End Reasoning
+@Implementation:
+Translate the exception expression; build HIR throw node.
+@End Implementation
 Process called "translate_throw_statement" takes ctx as Integer, throw_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with throw_node
     Let expr be proc list_get from ListCore with children, 0
@@ -784,6 +1056,15 @@ Process called "translate_throw_statement" takes ctx as Integer, throw_node as I
     Return proc hir_create_throw from HIR with hir_expr
 End Process
 
+@Reasoning:
+`echo expr, expr, expr;` outputs all expressions concatenated. Lowered
+to a call to a built-in echo helper in HIR with each expression as a
+separate argument.
+@End Reasoning
+@Implementation:
+Iterate echo arguments translating each; build HIR call to "echo"
+builtin with the argument list.
+@End Implementation
 Process called "translate_echo_statement" takes ctx as Integer, echo_node as Integer returns Integer:
     Note: Translate echo as print function call
     Let children be proc php_ast_node_children from PHPParser with echo_node
@@ -808,6 +1089,15 @@ Note: ===================================================================
 Note: EXPRESSION TRANSLATION
 Note: ===================================================================
 
+@Reasoning:
+The central expression dispatcher: literals, variables, binary/unary/
+ternary ops, assignment, function/method calls, new, member access,
+indexing, array literals. Each routes through a dedicated helper.
+@End Reasoning
+@Implementation:
+Read expr_node type; switch through all PHP_EXPR_* tags dispatching
+to translate_<kind>_expr. Default: error/skip.
+@End Implementation
 Process called "translate_expression" takes ctx as Integer, expr_node as Integer returns Integer:
     Let node_type be proc php_ast_node_type from PHPParser with expr_node
     
@@ -891,6 +1181,14 @@ Process called "translate_expression" takes ctx as Integer, expr_node as Integer
     Return 0
 End Process
 
+@Reasoning:
+`left OP right`. PHP operator semantics differ from C in subtle ways
+(== is loose equality, === is strict). The operator string is passed
+through verbatim so the executor applies the correct rules.
+@End Reasoning
+@Implementation:
+Translate left and right; read operator; build HIR binary expression.
+@End Implementation
 Process called "translate_binary_expr" takes ctx as Integer, binary_node as Integer returns Integer:
     Let operator be proc php_ast_node_value from PHPParser with binary_node
     
@@ -904,6 +1202,14 @@ Process called "translate_binary_expr" takes ctx as Integer, binary_node as Inte
     Return proc hir_create_binary_op from HIR with operator, hir_left, hir_right
 End Process
 
+@Reasoning:
+Unary operators: !, -, ~, ++, --. Prefix vs postfix tracked separately
+for ++/--.
+@End Reasoning
+@Implementation:
+Translate operand; read operator and prefix flag; build HIR unary
+expression.
+@End Implementation
 Process called "translate_unary_expr" takes ctx as Integer, unary_node as Integer returns Integer:
     Let operator be proc php_ast_node_value from PHPParser with unary_node
     
@@ -914,6 +1220,15 @@ Process called "translate_unary_expr" takes ctx as Integer, unary_node as Intege
     Return proc hir_create_unary_op from HIR with operator, hir_operand
 End Process
 
+@Reasoning:
+`cond ? then : else`. PHP also supports the short form `cond ?: else`
+(returns cond if truthy else 'else') which arrives with the then
+branch null.
+@End Reasoning
+@Implementation:
+Translate cond, then (or null for short form), else; build HIR
+conditional expression.
+@End Implementation
 Process called "translate_ternary_expr" takes ctx as Integer, ternary_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with ternary_node
     
@@ -928,6 +1243,14 @@ Process called "translate_ternary_expr" takes ctx as Integer, ternary_node as In
     Return proc hir_create_ternary from HIR with hir_condition, hir_then, hir_else
 End Process
 
+@Reasoning:
+`lhs = rhs` or compound forms `+=`, `.=`, etc. Distinct from a binary
+expression because assignment is its own HIR construct (lvalue
+requirements differ).
+@End Reasoning
+@Implementation:
+Translate target and value; read operator; build HIR assignment node.
+@End Implementation
 Process called "translate_assign_expr" takes ctx as Integer, assign_node as Integer returns Integer:
     Let operator be proc php_ast_node_value from PHPParser with assign_node
     
@@ -941,6 +1264,15 @@ Process called "translate_assign_expr" takes ctx as Integer, assign_node as Inte
     Return proc hir_create_assign from HIR with operator, hir_target, hir_value
 End Process
 
+@Reasoning:
+`callee(args...)`. Supports both function calls and method calls
+(callee may be a member-access expression). Named arguments (PHP 8.0+)
+are emitted as named args in the HIR.
+@End Reasoning
+@Implementation:
+Translate callee; iterate args translating each (positional or named);
+build HIR call expression.
+@End Implementation
 Process called "translate_call_expr" takes ctx as Integer, call_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with call_node
     
@@ -972,6 +1304,13 @@ Process called "translate_call_expr" takes ctx as Integer, call_node as Integer 
     Return hir_call
 End Process
 
+@Reasoning:
+`new ClassName(args)`. Constructor invocation. The class name may be a
+qualified name; the HIR carries it as a fully-qualified reference.
+@End Reasoning
+@Implementation:
+Read class name; iterate constructor args; build HIR new expression.
+@End Implementation
 Process called "translate_new_expr" takes ctx as Integer, new_node as Integer returns Integer:
     Let class_name be proc php_ast_node_value from PHPParser with new_node
     
@@ -992,6 +1331,15 @@ Process called "translate_new_expr" takes ctx as Integer, new_node as Integer re
     Return hir_new
 End Process
 
+@Reasoning:
+`obj->member` (instance access) or `Class::member` (static access).
+The HIR distinguishes via a flag because static access is
+semantically different.
+@End Reasoning
+@Implementation:
+Translate base; read member name and is_static flag; build HIR member
+access node.
+@End Implementation
 Process called "translate_member_expr" takes ctx as Integer, member_node as Integer returns Integer:
     Let member_name be proc php_ast_node_value from PHPParser with member_node
     
@@ -1002,6 +1350,14 @@ Process called "translate_member_expr" takes ctx as Integer, member_node as Inte
     Return proc hir_create_member_access from HIR with hir_object, member_name
 End Process
 
+@Reasoning:
+`array[index]` or `array{index}` (deprecated form). PHP arrays are
+associative, so the index may be any expression yielding a value usable
+as a key.
+@End Reasoning
+@Implementation:
+Translate base and index; build HIR index expression.
+@End Implementation
 Process called "translate_index_expr" takes ctx as Integer, index_node as Integer returns Integer:
     Let children be proc php_ast_node_children from PHPParser with index_node
     
@@ -1014,6 +1370,15 @@ Process called "translate_index_expr" takes ctx as Integer, index_node as Intege
     Return proc hir_create_index_access from HIR with hir_array, hir_index
 End Process
 
+@Reasoning:
+`[key => value, value, ...]` or `array(...)`. PHP arrays mix sequential
+and associative entries; the HIR builds an array literal preserving
+both kinds of entries with their explicit-or-implicit keys.
+@End Reasoning
+@Implementation:
+Iterate elements; for each, translate optional key (or null for
+sequential) and required value; build HIR array literal.
+@End Implementation
 Process called "translate_array_expr" takes ctx as Integer, array_node as Integer returns Integer:
     Let hir_array be proc hir_create_array from HIR
     proc hir_set_metadata from HIR with hir_array, "source_language", "php"
@@ -1036,6 +1401,13 @@ Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
 
+@Reasoning:
+Public entry point alias for translate_php_to_hir. Kept for backward
+compatibility with callers using the shorter name.
+@End Reasoning
+@Implementation:
+Delegates to translate_php_to_hir.
+@End Implementation
 Process called "php_to_hir" takes php_ast as Integer returns Integer:
     Return proc translate_php_to_hir from php_ast
 End Process

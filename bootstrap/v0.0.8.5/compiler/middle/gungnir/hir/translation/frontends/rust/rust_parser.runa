@@ -114,6 +114,33 @@ Note: ==========================================================================
 Note: AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+Rust AST nodes need thirteen heterogenous slots because Rust items
+carry orthogonal axes that simpler languages collapse: a function
+needs name, generics, lifetime params, where clause, visibility,
+attributes, return type, and a body in addition to its parameter
+list. Modelling every slot uniformly across node kinds (so an
+identifier node has unused generics/lifetime_params slots) keeps the
+walker AST-agnostic at the cost of 104 bytes per node, which is
+acceptable for a parser tree that gets dropped after HIR lowering.
+@End Reasoning
+
+@Implementation:
+13 pointer-sized fields totalling 104 bytes (offsets 0-96). Layout:
+- 0: node_type (one of the RUST_* constants)
+- 8: name (identifier, may be null)
+- 16: value (operator/literal/path-segments, may be null)
+- 24: type_info (type annotation node)
+- 32: children (List of child nodes)
+- 40: attributes (List of #[...] attribute nodes)
+- 48: generics (generic-parameter list)
+- 56: lifetime_params (lifetime-parameter list)
+- 64: where_clause (where-clause node)
+- 72: visibility (one of VIS_PRIVATE/VIS_PUB/VIS_PUB_*)
+- 80: mutability (0 or 1)
+- 88: line (source line)
+- 96: column (source column)
+@End Implementation
 Type called "RustASTNode":
     node_type as Integer       Note: Node type constant
     name as Integer           Note: Name/identifier (if applicable)
@@ -142,6 +169,23 @@ Note: ==========================================================================
 Note: Parser State
 Note: ============================================================================
 
+@Reasoning:
+Parser state needs six slots: the underlying lexer (offset 0), the
+current_token cache (offset 8), an error_message + has_error pair
+(offsets 16/24) for surfacing parse failures, and two context flags
+(in_async_context at 32, in_unsafe_context at 40) that propagate
+through the recursive descent so suspension and unsafe-block rules
+can be enforced at the lowest level without re-walking parent nodes.
+@End Reasoning
+
+@Implementation:
+Six pointer-sized fields totalling 48 bytes. The in_async_context
+and in_unsafe_context flags are mutated by parse_rust_function and
+parse_rust_unsafe_block respectively as the parser descends into
+their bodies, then reset on exit. The current_token slot is updated
+by advance_rust_token; peek_rust_token_type and
+peek_rust_token_lexeme read it without consuming.
+@End Implementation
 Type called "RustParser":
     lexer as Integer          Note: Rust lexer
     current_token as Integer  Note: Current token type
@@ -155,6 +199,25 @@ Note: ==========================================================================
 Note: Parser Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Constructor must couple the parser with a fresh lexer in one
+operation so callers cannot end up with a parser whose lexer is null
+or stale. Priming the parser with the first token via
+advance_rust_token before returning means the first peek call after
+construction sees a valid current_token rather than the zero initial
+value. Failed lexer creation cascades into freeing the parser struct
+so the caller sees a clean 0 return without a leak.
+@End Reasoning
+
+@Implementation:
+Allocates a 48-byte RustParser struct (6 fields x 8 bytes); returns 0
+on allocation failure. Creates a rust_lexer over the source via
+Lexer.create_rust_lexer; if that fails, deallocates the parser and
+returns 0. Writes the lexer at offset 0, zeros current_token (8),
+error_message (16), has_error (24), in_async_context (32), and
+in_unsafe_context (40). Calls advance_rust_token to load the first
+token into current_token. Returns the parser handle.
+@End Implementation
 Process called "create_rust_parser" takes source as Integer returns Integer:
     Note: Create Rust parser from source code
 
@@ -190,6 +253,21 @@ Process called "create_rust_parser" takes source as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+Releases the lexer and error_message owned by the parser (both
+heap-allocated, both potentially null). Treating a null parser as
+already-freed (returning 1 immediately) makes the destructor
+idempotent so partial-error paths can call it without an extra
+null-check at the call site. The AST nodes built by the parser are
+NOT freed here - they outlive the parser by design.
+@End Reasoning
+
+@Implementation:
+Returns 1 immediately if parser is 0. Reads lexer at offset 0; if
+non-zero calls Lexer.destroy_rust_lexer. Reads error_message at
+offset 16; if non-zero deallocates the copy. Deallocates the 48-byte
+parser struct itself. Returns 1.
+@End Implementation
 Process called "destroy_rust_parser" takes parser as Integer returns Integer:
     Note: Destroy Rust parser and free resources
 
@@ -218,6 +296,24 @@ Note: ==========================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Uniform node constructor for every Rust AST kind, parameterised only
+by node_type. Pre-zeroing every slot (rather than memcpy-ing a
+template) keeps the constructor branchless for the common case where
+most slots stay null. Visibility defaults to VIS_PRIVATE because Rust
+items are private by default - explicit `pub` declarations overwrite
+it via set_rust_ast_node_visibility.
+@End Reasoning
+
+@Implementation:
+Allocates 104 bytes via Layout.allocate; returns 0 on failure. Writes
+node_type at offset 0, zeros offsets 8-64 (name, value, type_info,
+children, attributes, generics, lifetime_params, where_clause).
+Writes VIS_PRIVATE to offset 72 (visibility), zeros offset 80
+(mutability), and zeros line (88) and column (96). Source location
+will be back-filled by the caller if the calling site has access to
+the lexer's current position.
+@End Implementation
 Process called "create_rust_ast_node" takes node_type as Integer returns Integer:
     Note: Create Rust AST node of given type
 
@@ -245,6 +341,21 @@ Process called "create_rust_ast_node" takes node_type as Integer returns Integer
     Return node
 End Process
 
+@Reasoning:
+Children list is allocated lazily because many AST nodes have no
+children (literals, identifiers, lifetimes), and pre-allocating a
+List for each would waste an allocation per leaf. The first call to
+add_child_to_rust_ast_node on a leaf node promotes it to a parent
+by creating the List on demand. Null guards on parent and child make
+the function safe to call from error paths.
+@End Reasoning
+
+@Implementation:
+Returns early on null parent or null child. Reads the children list
+handle from offset 32 of parent. If 0, creates a fresh List via
+List.create and writes it back to offset 32. Pushes the child onto
+the children list via List.push.
+@End Implementation
 Process called "add_child_to_rust_ast_node" takes parent as Integer, child as Integer:
     Note: Add child node to parent's children list
 
@@ -270,6 +381,20 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Advances the lexer one token and caches the new token type in the
+parser struct at offset 8. The cache lets peek_rust_token_type return
+the current token without going back to the lexer, which is the hot
+read path for the recursive-descent dispatch logic.
+@End Reasoning
+
+@Implementation:
+Reads the lexer handle at offset 0. Calls Lexer.next_rust_token to
+advance the lexer and obtain the new token. Writes the result to
+offset 8 of the parser. The lexeme is fetched on demand by
+peek_rust_token_lexeme rather than cached because most dispatch
+decisions only need the token type.
+@End Implementation
 Process called "advance_rust_token" takes parser as Integer:
     Note: Advance to next token
 
@@ -278,12 +403,37 @@ Process called "advance_rust_token" takes parser as Integer:
     proc memory_set_int64 from Layout with parser, 8, next_token
 End Process
 
+@Reasoning:
+Non-destructive read of the cached token type. The recursive-descent
+parser uses this as its primary dispatch input - every parse_rust_*
+function starts with peek_rust_token_type to decide what to parse
+next. The cached form makes the read free of any lexer interaction.
+@End Reasoning
+
+@Implementation:
+Returns the integer at offset 8 of the parser struct, which holds the
+token type most recently written by advance_rust_token.
+@End Implementation
 Process called "peek_rust_token_type" takes parser as Integer returns Integer:
     Note: Get current token type without advancing
 
     Return proc memory_get_int64 from Layout with parser, 8
 End Process
 
+@Reasoning:
+Lexeme retrieval is split from type retrieval because most dispatch
+decisions only need the type - and the lexeme query has to go through
+the lexer (which holds the lexeme buffer), so consolidating it into
+the cached struct would waste work for type-only callers. Identifier
+parsing and error reporting still need lexeme access on the hot path.
+@End Reasoning
+
+@Implementation:
+Reads the lexer handle at offset 0 of the parser and returns
+Lexer.current_rust_lexeme(lexer). The lexer owns the lexeme buffer
+so the returned pointer is borrowed and remains valid until the next
+advance_rust_token call.
+@End Implementation
 Process called "peek_rust_token_lexeme" takes parser as Integer returns Integer:
     Note: Get current token lexeme without advancing
 
@@ -291,6 +441,23 @@ Process called "peek_rust_token_lexeme" takes parser as Integer returns Integer:
     Return proc current_rust_lexeme from Lexer with lexer
 End Process
 
+@Reasoning:
+Combines a token-type assertion with token consumption. This pattern
+shows up dozens of times in the parser (every grammar production
+expects specific punctuation), so consolidating it eliminates a lot
+of duplicated peek/advance/error-emit code at each call site. The
+message argument lets each caller emit a context-appropriate error
+("Expected ')'", "Expected struct name", etc.) without the helper
+needing to introspect the parser state to construct one.
+@End Reasoning
+
+@Implementation:
+Calls peek_rust_token_type to read the current type. On match,
+advances via advance_rust_token. On mismatch, calls
+set_rust_parse_error with the supplied message string. The parser
+flag has_error becomes 1 on the error path, which the program-level
+loop checks to abort early.
+@End Implementation
 Process called "expect_rust_token" takes parser as Integer, expected as Integer, message as Integer:
     Note: Expect specific token type or set error
 
@@ -307,6 +474,24 @@ Note: ==========================================================================
 Note: Main Parsing Entry Point
 Note: ============================================================================
 
+@Reasoning:
+A Rust crate is a flat sequence of top-level items, so the top loop
+simply iterates parsing items until EOF. Hard error short-circuits
+the loop (returning 0) rather than attempting recovery because
+top-level parse errors usually indicate cascading damage that
+recovery cannot meaningfully untangle. The `1 is equal to 1` form is
+the bootstrap idiom for an infinite loop because the parser
+intentionally does not assume support for a bare `True` literal.
+@End Reasoning
+
+@Implementation:
+Creates a RUST_PROGRAM root via create_rust_ast_node. In the main
+loop, reads peek_rust_token_type; on TOKEN_EOF, breaks out. Otherwise
+calls parse_rust_item; if it returned a non-null node, attaches it
+to the program root via add_child_to_rust_ast_node. Checks
+has_rust_parse_error after every iteration; returns 0 to propagate
+hard errors immediately. Returns the populated program_node on EOF.
+@End Implementation
 Process called "parse_rust_program" takes parser as Integer returns Integer:
     Note: Parse entire Rust program (crate)
 
@@ -342,6 +527,29 @@ Process called "parse_rust_program" takes parser as Integer returns Integer:
     Return program_node
 End Process
 
+@Reasoning:
+A Rust item is preceded by an optional attributes block (`#[...]`)
+and an optional visibility marker (`pub`, `pub(crate)`, etc.). Both
+are parsed before peeking at the actual item keyword so the
+visibility and attributes can be attached to whichever item kind
+the upcoming token dispatches to. Eleven item-introducing tokens are
+recognised here (fn, struct, enum, trait, impl, mod, use, type,
+const, static, macro_rules); any other token at item position
+triggers skip_to_rust_recovery_point so the outer loop can resume.
+@End Reasoning
+
+@Implementation:
+Calls parse_rust_attributes and parse_rust_visibility eagerly to
+collect any preceding decorations. Reads peek_rust_token_type. Then
+runs a sequence of If checks against the eleven item-introducing
+tokens; for each match, calls the corresponding parse_rust_<item>,
+and (if the result is non-null) calls
+set_rust_ast_node_attributes/set_rust_ast_node_visibility to attach
+the previously parsed decorations. The matching branch returns its
+constructed node. Unrecognised tokens trigger
+skip_to_rust_recovery_point and return 0 so the outer item loop can
+continue.
+@End Implementation
 Process called "parse_rust_item" takes parser as Integer returns Integer:
     Note: Parse top-level item with attributes and visibility
 
@@ -477,6 +685,32 @@ Note: ==========================================================================
 Note: Struct Parsing
 Note: ============================================================================
 
+@Reasoning:
+Rust structs have three distinct shapes: unit (`struct Name;`),
+tuple (`struct Name(T1, T2);`), and named-field (`struct Name { a: T,
+b: U }`). All three share the same generic-parameters and where-
+clause prefixes, so this routine handles those uniformly and then
+dispatches on the token immediately after the where-clause to pick
+which body parser to run. Returning 0 with a parse error after the
+prefix catches malformed declarations like `struct Foo bar`.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_STRUCT, allocates a RUST_STRUCT node, then:
+1. Reads the struct name as an identifier and stores via
+   set_rust_ast_node_name.
+2. If the next token is TOKEN_LESS, parses generic parameters via
+   parse_rust_generics and attaches via set_rust_ast_node_generics.
+3. If the next token is TOKEN_WHERE, parses the where clause and
+   attaches via set_rust_ast_node_where_clause.
+4. Examines the following token:
+   - TOKEN_SEMICOLON -> unit struct, advance and return.
+   - TOKEN_LPAREN    -> tuple struct: advance, parse_rust_tuple_fields,
+     expect TOKEN_RPAREN, expect TOKEN_SEMICOLON, return.
+   - TOKEN_LBRACE    -> named struct: advance, parse_rust_struct_fields,
+     expect TOKEN_RBRACE, return.
+   - otherwise       -> set_rust_parse_error and return 0.
+@End Implementation
 Process called "parse_rust_struct" takes parser as Integer returns Integer:
     Note: Parse Rust struct definition
 
@@ -547,6 +781,26 @@ Process called "parse_rust_struct" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Struct field bodies allow each field to carry its own attributes
+(`#[serde(default)]` etc.) and visibility modifier. The trailing-
+comma allowance is the standard Rust permissiveness so both
+`{a: T, b: U}` and `{a: T, b: U,}` are accepted; the loop breaks
+when it sees a non-comma after a field, then the caller consumes the
+closing brace.
+@End Reasoning
+
+@Implementation:
+Creates a RUST_PATTERN_STRUCT list node to hold the field nodes. In a
+While 1 loop: peeks next token; if TOKEN_RBRACE, breaks. Otherwise
+parses attributes via parse_rust_attributes, visibility via
+parse_rust_visibility, the field name (TOKEN_IDENTIFIER), and the
+required TOKEN_COLON. Calls parse_rust_type for the field type.
+Constructs a RUST_PATTERN field_node populated with name, type_info,
+attributes, and visibility, and adds it to the fields list. After
+each field, if the next token is TOKEN_COMMA advances and continues;
+otherwise breaks (the caller handles the closing brace).
+@End Implementation
 Process called "parse_rust_struct_fields" takes parser as Integer returns Integer:
     Note: Parse named struct fields
 
@@ -604,6 +858,38 @@ Note: ==========================================================================
 Note: Function Parsing
 Note: ============================================================================
 
+@Reasoning:
+Rust functions have several keyword prefixes (`async`, `unsafe`) that
+precede the `fn` keyword, followed by name, generics, parameters,
+optional return type via `->`, optional where clause, then either a
+semicolon (declaration only) or a block body. Recognising the
+async/unsafe prefixes before the fn keyword means
+parse_rust_function can be called from parse_rust_item without the
+caller pre-stripping the modifiers, keeping the item dispatcher
+simple.
+@End Reasoning
+
+@Implementation:
+1. Checks for and consumes optional TOKEN_ASYNC, setting is_async.
+2. Checks for and consumes optional TOKEN_UNSAFE, setting is_unsafe.
+3. Consumes the required TOKEN_FN.
+4. Creates a RUST_FUNCTION node, calls set_rust_ast_node_async /
+   set_rust_ast_node_unsafe with the flags.
+5. Reads the function name (TOKEN_IDENTIFIER) and attaches via
+   set_rust_ast_node_name.
+6. Optionally parses generics if TOKEN_LESS is next; attaches via
+   set_rust_ast_node_generics.
+7. Consumes TOKEN_LPAREN, parses parameters via
+   parse_rust_function_parameters, attaches as child, consumes
+   TOKEN_RPAREN.
+8. If TOKEN_ARROW is next, advances and parses the return type via
+   parse_rust_type, attaching with set_rust_ast_node_type_info.
+9. Optionally parses where clause via parse_rust_where_clause.
+10. If next token is TOKEN_SEMICOLON, advances (declaration-only
+    form). Otherwise parses the body via parse_rust_block_expression
+    and attaches as child.
+Returns the populated RUST_FUNCTION node.
+@End Implementation
 Process called "parse_rust_function" takes parser as Integer returns Integer:
     Note: Parse Rust function definition
 
@@ -692,6 +978,22 @@ Process called "parse_rust_function" takes parser as Integer returns Integer:
     Return func_node
 End Process
 
+@Reasoning:
+Driver loop over the parameter list. Each entry is built by
+parse_rust_function_parameter, which handles all the kinds of
+parameters (self, &self, &mut self, pat: type with optional mut).
+The comma-separated form with optional trailing comma matches Rust's
+allowance for `(a, b,)` syntactic sugar.
+@End Reasoning
+
+@Implementation:
+Creates a RUST_PATTERN params_list node. In a While 1 loop: peeks
+next token; if TOKEN_RPAREN, breaks. Otherwise calls
+parse_rust_function_parameter; if non-null, adds it as a child of
+params_list. If the following token is TOKEN_COMMA, advances and
+continues; otherwise breaks. The caller (parse_rust_function) is
+responsible for consuming TOKEN_RPAREN after this returns.
+@End Implementation
 Process called "parse_rust_function_parameters" takes parser as Integer returns Integer:
     Note: Parse function parameter list
 
@@ -728,6 +1030,33 @@ Process called "parse_rust_function_parameters" takes parser as Integer returns 
     Return params_list
 End Process
 
+@Reasoning:
+Rust function parameters come in four shapes that need different
+handling: bare `self` (consumed receiver), `&self` / `&mut self`
+(borrowed receivers, distinguished by the optional `mut`), and
+ordinary `pat: type` parameters with their own optional `mut`
+prefix on the pattern side. The self forms are recognised here and
+returned as soon as the keyword is consumed because they have no
+trailing type annotation - reusing the ordinary `pat: type` path
+would emit a spurious "Expected ':'" error.
+@End Reasoning
+
+@Implementation:
+Creates a RUST_PATTERN param_node. Reads the current token:
+- TOKEN_SELF: advances, sets name to "self", returns the bare self
+  parameter immediately.
+- TOKEN_AMP: advances, then checks for an optional TOKEN_MUT and
+  sets mutability on the node if present. Then checks for TOKEN_SELF;
+  if present, advances and sets name to "&self" before returning.
+  (If not self, falls through to the ordinary pattern handling -
+  parse_rust_pattern can still consume the &-prefix from there.)
+- TOKEN_MUT outside the &-branch: advances and marks the pattern as
+  mutable.
+After self/mut handling, calls parse_rust_pattern for the pattern,
+attaches as child, expects TOKEN_COLON, then parses the type via
+parse_rust_type and attaches with set_rust_ast_node_type_info.
+Returns the assembled param_node.
+@End Implementation
 Process called "parse_rust_function_parameter" takes parser as Integer returns Integer:
     Note: Parse individual function parameter
 
@@ -788,6 +1117,30 @@ Note: ==========================================================================
 Note: Type Parsing
 Note: ============================================================================
 
+@Reasoning:
+Rust types form a small dispatch tree off the first token: `&` for
+references, `*` for raw pointers, `[` for arrays/slices, `(` for
+tuples, `fn` for function types, `dyn` for trait objects, and
+anything else falls through to a path type (the most common shape -
+plain identifiers, qualified paths, generic instantiations). The
+dispatch sequence is fixed; each branch hands off to a specialised
+parser that consumes its prefix and recursively parses any nested
+inner type.
+@End Reasoning
+
+@Implementation:
+Reads peek_rust_token_type. Dispatches against six punctuation/
+keyword tokens in order:
+- TOKEN_AMP       -> parse_rust_reference_type
+- TOKEN_STAR      -> parse_rust_pointer_type
+- TOKEN_LBRACKET  -> parse_rust_array_or_slice_type
+- TOKEN_LPAREN    -> parse_rust_tuple_type
+- TOKEN_FN        -> parse_rust_function_type
+- TOKEN_DYN       -> parse_rust_dyn_type
+Falls through to parse_rust_path_type for any other token. The
+fallthrough is deliberate so identifier-led types do not require a
+new dispatch arm.
+@End Implementation
 Process called "parse_rust_type" takes parser as Integer returns Integer:
     Note: Parse Rust type expression
 
@@ -833,6 +1186,22 @@ Process called "parse_rust_type" takes parser as Integer returns Integer:
     Return proc parse_rust_path_type from parser
 End Process
 
+@Reasoning:
+Reference types have four forms (`&T`, `&mut T`, `&'a T`, `&'a mut T`)
+that all share the `&` prefix. Parsing each segment separately
+(lifetime, then mut, then inner type) lets every combination compose
+naturally and stores the lifetime name in the node's `name` slot so
+later HIR lowering can recover the lifetime parameter.
+@End Reasoning
+
+@Implementation:
+Consumes the leading TOKEN_AMP. Creates a RUST_REFERENCE_TYPE node.
+If the next token is TOKEN_LIFETIME, captures its lexeme and stores
+via set_rust_ast_node_name, then advances. If the next token is
+TOKEN_MUT, advances and calls set_rust_ast_node_mutability with 1.
+Recursively parses the referenced type via parse_rust_type and
+attaches as child. Returns the assembled ref_node.
+@End Implementation
 Process called "parse_rust_reference_type" takes parser as Integer returns Integer:
     Note: Parse reference type (&T, &mut T, &'a T, &'a mut T)
 
@@ -862,6 +1231,28 @@ Process called "parse_rust_reference_type" takes parser as Integer returns Integ
     Return ref_node
 End Process
 
+@Reasoning:
+Path types are the workhorse type form - everything from a plain
+`bool` to `std::collections::HashMap<K, V>` is a path type. Building
+the path as a list of segment names (rather than concatenating
+strings with "::") preserves segment boundaries so HIR lowering can
+reason about partial paths. Generic argument lists attach to the
+preceding segment; their handling continues outside the shown core
+loop where they get spliced into the path representation.
+@End Reasoning
+
+@Implementation:
+Creates a RUST_PATH_TYPE node and an empty path_segments List. In a
+While 1 loop:
+- Reads the current lexeme, expects TOKEN_IDENTIFIER, and pushes the
+  lexeme onto path_segments.
+- If the next token is TOKEN_LESS, parses generic arguments via
+  parse_rust_generic_args.
+- If the next token is TOKEN_SCOPE (`::`), advances and continues.
+  Otherwise breaks.
+After the loop, stores path_segments into the path_node's value slot
+via set_rust_ast_node_value. Returns the path_node.
+@End Implementation
 Process called "parse_rust_path_type" takes parser as Integer returns Integer:
     Note: Parse path type (std::vec::Vec<T>, MyStruct, etc.)
 
@@ -906,6 +1297,30 @@ Note: ==========================================================================
 Note: Pattern Parsing
 Note: ============================================================================
 
+@Reasoning:
+Rust patterns dispatch off the first token: `&` for reference
+patterns, `mut` for the rare ident-mutability form, `_` for the
+wildcard, `(` for tuple patterns, `[` for array/slice patterns,
+TOKEN_IDENTIFIER for identifier or qualified-path constructor
+patterns, and anything else falls through to a literal pattern.
+Returning the wildcard node directly (without delegating to a
+specialised parser) is a small optimisation because the wildcard is
+the simplest shape - just an empty RUST_PATTERN.
+@End Reasoning
+
+@Implementation:
+Reads peek_rust_token_type. Dispatches:
+- TOKEN_AMP        -> parse_rust_ref_pattern
+- TOKEN_MUT        -> parse_rust_mut_pattern
+- TOKEN_UNDERSCORE -> advance and return a fresh RUST_PATTERN node
+                       (wildcard).
+- TOKEN_LPAREN     -> parse_rust_tuple_pattern
+- TOKEN_LBRACKET   -> parse_rust_array_pattern
+- TOKEN_IDENTIFIER -> parse_rust_identifier_pattern (which may
+                       further refine into struct/tuple/enum
+                       patterns based on the trailing tokens).
+Falls through to parse_rust_literal_pattern for any other token.
+@End Implementation
 Process called "parse_rust_pattern" takes parser as Integer returns Integer:
     Note: Parse Rust pattern for destructuring
 
@@ -956,6 +1371,21 @@ Note: ==========================================================================
 Note: Error Handling and Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Owns the error_message string slot on the parser. Always copies the
+caller-supplied message so the lifetime of the stored message is
+decoupled from the lifetime of the source string (which may be a
+literal in another translation unit). Sets has_error to 1 sticky so
+subsequent has_rust_parse_error queries reliably reflect failure.
+@End Reasoning
+
+@Implementation:
+Writes 1 to offset 24 (has_error flag) of the parser. Calls
+StringCore.copy_string to duplicate the message and writes the copy
+to offset 16. The previous error_message (if any) is intentionally
+not freed here because the convention is one-error-per-parse - the
+destructor will reclaim the surviving copy.
+@End Implementation
 Process called "set_rust_parse_error" takes parser as Integer, message as Integer:
     Note: Set parser error state with message
 
@@ -965,12 +1395,35 @@ Process called "set_rust_parse_error" takes parser as Integer, message as Intege
     proc memory_set_int64 from Layout with parser, 16, error_copy
 End Process
 
+@Reasoning:
+Read accessor for the has_error sticky flag. Consulted by
+parse_rust_program after every iteration so the top-level loop can
+short-circuit when an item parse fails.
+@End Reasoning
+
+@Implementation:
+Returns the integer at offset 24 of the parser, which is 0 or 1.
+@End Implementation
 Process called "has_rust_parse_error" takes parser as Integer returns Integer:
     Note: Check if parser has encountered an error
 
     Return proc memory_get_int64 from Layout with parser, 24
 End Process
 
+@Reasoning:
+Setter that takes ownership of a defensive copy of the name string.
+Copying decouples the stored name from the lexer's lexeme buffer
+(which gets overwritten on the next advance_rust_token), so the AST
+node's name remains stable for the lifetime of the tree.
+@End Reasoning
+
+@Implementation:
+Returns early on null node. Calls StringCore.copy_string to duplicate
+the supplied name. Writes the copy to offset 8 of the node. Any
+previous name pointer is overwritten without freeing because in
+normal use this setter is called exactly once per node, immediately
+after create_rust_ast_node.
+@End Implementation
 Process called "set_rust_ast_node_name" takes node as Integer, name as Integer:
     Note: Set AST node name
 
@@ -982,6 +1435,17 @@ Process called "set_rust_ast_node_name" takes node as Integer, name as Integer:
     proc memory_set_int64 from Layout with node, 8, name_copy
 End Process
 
+@Reasoning:
+Stores a parsed attributes list onto the node. Unlike
+set_rust_ast_node_name, no copy is made because the attributes list
+is already owned by the AST tree (it was constructed during
+parse_rust_attributes and only this setter holds a reference to it).
+@End Reasoning
+
+@Implementation:
+Returns early on null node. Writes the attributes pointer directly
+to offset 40 of the node.
+@End Implementation
 Process called "set_rust_ast_node_attributes" takes node as Integer, attributes as Integer:
     Note: Set AST node attributes
 
@@ -992,6 +1456,18 @@ Process called "set_rust_ast_node_attributes" takes node as Integer, attributes 
     proc memory_set_int64 from Layout with node, 40, attributes
 End Process
 
+@Reasoning:
+Stores the visibility level (one of the VIS_* integer constants).
+The integer rather than a pointer reflects that visibility is a tag,
+not a richer structure - even VIS_PUB_IN, which conceptually carries
+a module path, stores its path separately on the parsed visibility
+node and only the integer kind lands on the item itself.
+@End Reasoning
+
+@Implementation:
+Returns early on null node. Writes the visibility integer to offset
+72 of the node, overwriting the VIS_PRIVATE default.
+@End Implementation
 Process called "set_rust_ast_node_visibility" takes node as Integer, visibility as Integer:
     Note: Set AST node visibility
 
@@ -1002,6 +1478,18 @@ Process called "set_rust_ast_node_visibility" takes node as Integer, visibility 
     proc memory_set_int64 from Layout with node, 72, visibility
 End Process
 
+@Reasoning:
+Stores the 0/1 mutability flag. Used for `mut` patterns, mutable
+reference types, and parameters declared with `mut`. Storing it as a
+flag on the node (rather than a separate node kind) keeps the AST
+flat enough that walkers do not have to special-case a mutability
+wrapper.
+@End Reasoning
+
+@Implementation:
+Returns early on null node. Writes is_mut (expected 0 or 1) to
+offset 80 of the node.
+@End Implementation
 Process called "set_rust_ast_node_mutability" takes node as Integer, is_mut as Integer:
     Note: Set AST node mutability
 

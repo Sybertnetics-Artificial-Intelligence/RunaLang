@@ -15,12 +15,38 @@ Note: ==========================================================================
 Note: Test Infrastructure
 Note: ============================================================================
 
+@Reasoning:
+Captures a single test case outcome so the suite can aggregate pass/fail counts
+and surface a precise failure message during summary reporting. error_message
+is stored even on pass so that diagnostic flows can attach context without a
+separate side table.
+@End Reasoning
+
+@Implementation:
+Plain triple holding the displayed test name, a 0/1 pass flag (Integer rather
+than Boolean to match the Layout-encoded storage used by record_test_result),
+and the failure detail string. Allocated as a 24-byte record by
+record_test_result: name @0, passed @8, error_message @16.
+@End Implementation
 Type called "TestResult":
     test_name as String
     passed as Integer
     error_message as String
 End Type
 
+@Reasoning:
+Holds the running totals for a Dockerfile round-trip test run. results is a
+list pointer rather than an inline array so individual TestResult records can
+be appended without reallocating the suite header, and the three counters are
+kept independent of list length to allow O(1) summary printing.
+@End Reasoning
+
+@Implementation:
+Allocated as a 32-byte record by create_test_suite with the following layout:
+results pointer @0, total_tests @8, passed_tests @16, failed_tests @24.
+record_test_result mutates the three counters in place via memory_set_int64
+and appends to the list at offset 0.
+@End Implementation
 Type called "TestSuite":
     results as Integer  Note: Pointer to list of TestResult
     total_tests as Integer
@@ -28,15 +54,20 @@ Type called "TestSuite":
     failed_tests as Integer
 End Type
 
+@Reasoning:
+Constructs the TestSuite header that every other test routine mutates in
+place. The list of TestResult records is created up front so subsequent
+record_test_result appends never have to lazily initialise it, which keeps
+that hot path branch-free.
+@End Reasoning
+
+@Implementation:
+Allocates the 32-byte TestSuite header (results @0, total @8, passed @16,
+failed @24), creates an empty List handle for the results slot, and zeroes
+the three counters with explicit memory_set_int64 stores so the header is
+fully initialised before any caller can read it.
+@End Implementation
 Process called "create_test_suite" returns Integer:
-    @Reasoning
-    Create a new test suite to track test results.
-    @End Reasoning
-
-    @Implementation
-    Allocate test suite and initialize counters.
-    @End Implementation
-
     Let suite_ptr be proc allocate from Layout with 32
 
     Let results_list be proc list_create from List
@@ -49,14 +80,20 @@ Process called "create_test_suite" returns Integer:
     Return suite_ptr
 End Process
 
-Process called "record_test_result" that takes suite_ptr as Integer, test_name as String, passed as Integer, error_message as String returns Integer:
-    @Reasoning
-    Record a test result in the test suite.
-    @End Reasoning
+@Reasoning:
+Each test case routes through this single mutation point so that the
+TestSuite invariant (total = passed + failed) is preserved by construction.
+Storing the error_message on every record - including passes - lets the
+summary printer attach diagnostics without a parallel branch.
+@End Reasoning
 
-    @Implementation
-    Create TestResult structure and add to results list, update counters.
-    @End Implementation
+@Implementation:
+Allocates a 24-byte TestResult (name @0, passed @8, error_message @16),
+appends it to the results list at suite_ptr+0, then updates the appropriate
+counter (passed_tests @16 or failed_tests @24) and unconditionally bumps
+total_tests @8 via memory_get/set_int64 pairs.
+@End Implementation
+Process called "record_test_result" that takes suite_ptr as Integer, test_name as String, passed as Integer, error_message as String returns Integer:
 
     Let result_ptr be proc allocate from Layout with 24
     proc memory_set_string from Layout with result_ptr, 0, test_name
@@ -83,15 +120,22 @@ Process called "record_test_result" that takes suite_ptr as Integer, test_name a
     Return 1
 End Process
 
+@Reasoning:
+Renders the final pass/fail report from a fully-recorded TestSuite. Counts
+are read directly from the header rather than re-derived from the list so
+the summary stays O(suite_size) for the counter section and O(n) only for
+the per-test loop. The failure detail line is conditionally emitted to
+avoid noise on successful runs.
+@End Reasoning
+
+@Implementation:
+Reads total/passed/failed from suite_ptr+8/+16/+24, then iterates the
+results list at suite_ptr+0 by index using list_length+list_get. Each
+TestResult is decoded by direct offset reads (name @0, passed @8,
+error_message @16), and a [PASS]/[FAIL] line is emitted; the error
+detail is only printed when passed != 1 and error_message is non-empty.
+@End Implementation
 Process called "print_test_summary" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Print summary of all test results.
-    @End Reasoning
-
-    @Implementation
-    Display total, passed, and failed counts with details.
-    @End Implementation
-
     Let total be proc memory_get_int64 from Layout with suite_ptr, 8
     Let passed be proc memory_get_int64 from Layout with suite_ptr, 16
     Let failed be proc memory_get_int64 from Layout with suite_ptr, 24
@@ -146,15 +190,25 @@ Note: ==========================================================================
 Note: Round-Trip Test Helper
 Note: ============================================================================
 
-Process called "test_round_trip" that takes suite_ptr as Integer, test_name as String, dockerfile_source as String returns Integer:
-    @Reasoning
-    Test complete round-trip: Source → Lexer → Parser → Translator → Backend → Emitter → Source.
-    Verify that the output matches the input (or is semantically equivalent).
-    @End Reasoning
+@Reasoning:
+Every test_xxx case below funnels through this helper, which is the only
+place that exercises the full Lex -> Parse -> HIR -> Backend -> Emit
+pipeline end-to-end. Centralising round-trip validation here keeps the
+per-instruction tests trivial (one source string + one call) and ensures
+identical error-handling and normalisation policy across all 41 cases.
+@End Reasoning
 
-    @Implementation
-    Execute full translation pipeline and compare results.
-    @End Implementation
+@Implementation:
+Drives six sequential stages. After each of the first four stages (lexer,
+parser, HIR translator, HIR-to-Dockerfile backend) the routine reads the
+component's has_error flag at the documented offset (lexer @32, parser
+@32, translator @16, backend @8) and short-circuits with the captured
+error string if set. Stage 5 emits and Stage 6 trims both sides via
+string_trim and compares with string_equals; on mismatch the recorded
+diagnostic contains both Expected and Got so failures are debuggable
+without re-running the pipeline.
+@End Implementation
+Process called "test_round_trip" that takes suite_ptr as Integer, test_name as String, dockerfile_source as String returns Integer:
 
     Note: Step 1: Lex the source
     Let lexer_ptr be proc create_lexer from DockerfileLexer with dockerfile_source
@@ -227,14 +281,18 @@ Note: ==========================================================================
 Note: Test Cases
 Note: ============================================================================
 
-Process called "test_from_basic" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test basic FROM instruction: FROM ubuntu:20.04.
-    @End Reasoning
+@Reasoning:
+Anchors the FROM-instruction coverage at its simplest form (image plus
+tag). The HIR backend must canonicalise this back to exactly one line
+with no AS clause, no platform flag, and no digest, so this test is the
+sentinel that detects accidental injection of those optional fields.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of simple FROM instruction.
-    @End Implementation
+@Implementation:
+Submits "FROM ubuntu:20.04\n" through test_round_trip under the label
+"FROM basic". Pipeline failure surfaces via record_test_result.
+@End Implementation
+Process called "test_from_basic" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "FROM ubuntu:20.04\n"
     proc test_round_trip with suite_ptr, "FROM basic", dockerfile_source
@@ -242,14 +300,16 @@ Process called "test_from_basic" that takes suite_ptr as Integer returns Integer
     Return 1
 End Process
 
-Process called "test_from_with_stage" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test FROM instruction with stage name: FROM ubuntu:20.04 AS builder.
-    @End Reasoning
+@Reasoning:
+Validates that the AS clause survives the round-trip. The HIR encodes the
+stage name as a named field on the FROM node; this test catches regressions
+where the backend drops or reorders that field.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of FROM with AS clause.
-    @End Implementation
+@Implementation:
+Submits "FROM ubuntu:20.04 AS builder\n" via test_round_trip.
+@End Implementation
+Process called "test_from_with_stage" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "FROM ubuntu:20.04 AS builder\n"
     proc test_round_trip with suite_ptr, "FROM with stage", dockerfile_source
@@ -257,14 +317,16 @@ Process called "test_from_with_stage" that takes suite_ptr as Integer returns In
     Return 1
 End Process
 
-Process called "test_from_with_platform" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test FROM instruction with platform flag: FROM --platform=linux/amd64 ubuntu:20.04.
-    @End Reasoning
+@Reasoning:
+Pins the --platform flag placement. Round-tripping must keep the flag
+before the image (Docker CLI requirement) rather than emit it as a
+trailing option.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of FROM with platform flag.
-    @End Implementation
+@Implementation:
+Submits "FROM --platform=linux/amd64 ubuntu:20.04\n" via test_round_trip.
+@End Implementation
+Process called "test_from_with_platform" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "FROM --platform=linux/amd64 ubuntu:20.04\n"
     proc test_round_trip with suite_ptr, "FROM with platform", dockerfile_source
@@ -272,14 +334,16 @@ Process called "test_from_with_platform" that takes suite_ptr as Integer returns
     Return 1
 End Process
 
-Process called "test_from_with_digest" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test FROM instruction with digest: FROM ubuntu@sha256:abc123.
-    @End Reasoning
+@Reasoning:
+Exercises the @sha256 digest form. The "@" separator and the algorithm
+prefix must be preserved exactly; any tag-like rewrite would silently
+change image identity.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of FROM with digest.
-    @End Implementation
+@Implementation:
+Submits "FROM ubuntu@sha256:abc123\n" via test_round_trip.
+@End Implementation
+Process called "test_from_with_digest" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "FROM ubuntu@sha256:abc123\n"
     proc test_round_trip with suite_ptr, "FROM with digest", dockerfile_source
@@ -287,14 +351,17 @@ Process called "test_from_with_digest" that takes suite_ptr as Integer returns I
     Return 1
 End Process
 
-Process called "test_run_shell_form" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test RUN instruction in shell form: RUN apt-get update.
-    @End Reasoning
+@Reasoning:
+Shell-form RUN is the unquoted variant that Docker forwards through
+/bin/sh -c. The HIR distinguishes shell vs exec form by a boolean flag;
+this test ensures the flag round-trips without the backend defaulting
+to exec form.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of RUN shell form.
-    @End Implementation
+@Implementation:
+Submits "RUN apt-get update\n" via test_round_trip.
+@End Implementation
+Process called "test_run_shell_form" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "RUN apt-get update\n"
     proc test_round_trip with suite_ptr, "RUN shell form", dockerfile_source
@@ -302,14 +369,16 @@ Process called "test_run_shell_form" that takes suite_ptr as Integer returns Int
     Return 1
 End Process
 
-Process called "test_run_exec_form" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test RUN instruction in exec form: RUN ["apt-get", "update"].
-    @End Reasoning
+@Reasoning:
+Exec-form RUN is the JSON-array variant that Docker invokes via execve
+without a shell. The argv elements must remain as separate quoted strings;
+the test catches any collapse into a single shell string.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of RUN exec form.
-    @End Implementation
+@Implementation:
+Submits "RUN [\"apt-get\", \"update\"]\n" via test_round_trip.
+@End Implementation
+Process called "test_run_exec_form" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "RUN [\"apt-get\", \"update\"]\n"
     proc test_round_trip with suite_ptr, "RUN exec form", dockerfile_source
@@ -317,14 +386,16 @@ Process called "test_run_exec_form" that takes suite_ptr as Integer returns Inte
     Return 1
 End Process
 
-Process called "test_cmd_shell_form" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test CMD instruction in shell form: CMD python app.py.
-    @End Reasoning
+@Reasoning:
+CMD in shell form sets the container's default command as a single
+sh -c string. Mirrors RUN's shell/exec split; the test guards against
+the backend coercing CMD into exec form when the parser saw shell form.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of CMD shell form.
-    @End Implementation
+@Implementation:
+Submits "CMD python app.py\n" via test_round_trip.
+@End Implementation
+Process called "test_cmd_shell_form" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "CMD python app.py\n"
     proc test_round_trip with suite_ptr, "CMD shell form", dockerfile_source
@@ -332,14 +403,16 @@ Process called "test_cmd_shell_form" that takes suite_ptr as Integer returns Int
     Return 1
 End Process
 
-Process called "test_cmd_exec_form" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test CMD instruction in exec form: CMD ["python", "app.py"].
-    @End Reasoning
+@Reasoning:
+CMD in exec form is the production-preferred variant because it avoids
+the sh wrapper and gives clean PID 1 signal handling. The test verifies
+that the JSON-array argv stays an array.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of CMD exec form.
-    @End Implementation
+@Implementation:
+Submits "CMD [\"python\", \"app.py\"]\n" via test_round_trip.
+@End Implementation
+Process called "test_cmd_exec_form" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "CMD [\"python\", \"app.py\"]\n"
     proc test_round_trip with suite_ptr, "CMD exec form", dockerfile_source
@@ -347,14 +420,16 @@ Process called "test_cmd_exec_form" that takes suite_ptr as Integer returns Inte
     Return 1
 End Process
 
-Process called "test_label_single" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test LABEL instruction with single label: LABEL version=1.0.
-    @End Reasoning
+@Reasoning:
+Smallest LABEL case (one key=value pair). Confirms that the HIR stores
+labels in a structure that preserves a single entry without wrapping it
+into a multi-label aggregate.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of LABEL with single key-value pair.
-    @End Implementation
+@Implementation:
+Submits "LABEL version=1.0\n" via test_round_trip.
+@End Implementation
+Process called "test_label_single" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "LABEL version=1.0\n"
     proc test_round_trip with suite_ptr, "LABEL single", dockerfile_source
@@ -362,14 +437,17 @@ Process called "test_label_single" that takes suite_ptr as Integer returns Integ
     Return 1
 End Process
 
-Process called "test_label_multiple" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test LABEL instruction with multiple labels: LABEL version=1.0 maintainer=user.
-    @End Reasoning
+@Reasoning:
+Multi-pair LABEL exercises the parser's space-separated key=value list.
+Order preservation matters because Docker's image inspect output relies
+on declaration order; this test catches any reordering done by the
+backend when materialising the label dictionary.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of LABEL with multiple key-value pairs.
-    @End Implementation
+@Implementation:
+Submits "LABEL version=1.0 maintainer=user\n" via test_round_trip.
+@End Implementation
+Process called "test_label_multiple" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "LABEL version=1.0 maintainer=user\n"
     proc test_round_trip with suite_ptr, "LABEL multiple", dockerfile_source
@@ -377,14 +455,16 @@ Process called "test_label_multiple" that takes suite_ptr as Integer returns Int
     Return 1
 End Process
 
-Process called "test_expose_single_port" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test EXPOSE instruction with single port: EXPOSE 8080.
-    @End Reasoning
+@Reasoning:
+EXPOSE without an explicit protocol implies TCP. The test verifies that
+the backend does not over-emit "/tcp" - the canonical form keeps the
+default implicit.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of EXPOSE with single port.
-    @End Implementation
+@Implementation:
+Submits "EXPOSE 8080\n" via test_round_trip.
+@End Implementation
+Process called "test_expose_single_port" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "EXPOSE 8080\n"
     proc test_round_trip with suite_ptr, "EXPOSE single port", dockerfile_source
@@ -392,14 +472,16 @@ Process called "test_expose_single_port" that takes suite_ptr as Integer returns
     Return 1
 End Process
 
-Process called "test_expose_with_protocol" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test EXPOSE instruction with protocol: EXPOSE 8080/udp.
-    @End Reasoning
+@Reasoning:
+Uses /udp specifically because UDP is the non-default branch in the
+HIR's protocol field; verifies the backend selects the correct protocol
+string rather than silently substituting tcp.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of EXPOSE with protocol.
-    @End Implementation
+@Implementation:
+Submits "EXPOSE 8080/udp\n" via test_round_trip.
+@End Implementation
+Process called "test_expose_with_protocol" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "EXPOSE 8080/udp\n"
     proc test_round_trip with suite_ptr, "EXPOSE with protocol", dockerfile_source
@@ -407,14 +489,16 @@ Process called "test_expose_with_protocol" that takes suite_ptr as Integer retur
     Return 1
 End Process
 
-Process called "test_expose_multiple_ports" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test EXPOSE instruction with multiple ports: EXPOSE 8080 9090.
-    @End Reasoning
+@Reasoning:
+Multiple space-separated ports verify the HIR represents EXPOSE's port
+list as an ordered collection rather than splitting into multiple EXPOSE
+nodes, which would alter the printed form.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of EXPOSE with multiple ports.
-    @End Implementation
+@Implementation:
+Submits "EXPOSE 8080 9090\n" via test_round_trip.
+@End Implementation
+Process called "test_expose_multiple_ports" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "EXPOSE 8080 9090\n"
     proc test_round_trip with suite_ptr, "EXPOSE multiple ports", dockerfile_source
@@ -422,14 +506,16 @@ Process called "test_expose_multiple_ports" that takes suite_ptr as Integer retu
     Return 1
 End Process
 
-Process called "test_env_single" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test ENV instruction with single variable: ENV NODE_ENV=production.
-    @End Reasoning
+@Reasoning:
+Covers the equals-form ENV (the production-preferred form). The legacy
+space-form is intentionally not tested here because the backend
+canonicalises to equals-form.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of ENV with single variable.
-    @End Implementation
+@Implementation:
+Submits "ENV NODE_ENV=production\n" via test_round_trip.
+@End Implementation
+Process called "test_env_single" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "ENV NODE_ENV=production\n"
     proc test_round_trip with suite_ptr, "ENV single", dockerfile_source
@@ -437,14 +523,16 @@ Process called "test_env_single" that takes suite_ptr as Integer returns Integer
     Return 1
 End Process
 
-Process called "test_env_multiple" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test ENV instruction with multiple variables: ENV NODE_ENV=production PORT=8080.
-    @End Reasoning
+@Reasoning:
+Two-variable ENV exercises the parser's pair list. The backend must
+emit both pairs on a single ENV line (not split into two ENV nodes) to
+match the source exactly.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of ENV with multiple variables.
-    @End Implementation
+@Implementation:
+Submits "ENV NODE_ENV=production PORT=8080\n" via test_round_trip.
+@End Implementation
+Process called "test_env_multiple" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "ENV NODE_ENV=production PORT=8080\n"
     proc test_round_trip with suite_ptr, "ENV multiple", dockerfile_source
@@ -452,14 +540,16 @@ Process called "test_env_multiple" that takes suite_ptr as Integer returns Integ
     Return 1
 End Process
 
-Process called "test_copy_basic" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test COPY instruction: COPY . /app.
-    @End Reasoning
+@Reasoning:
+Baseline COPY (source plus destination, no flags). Establishes that the
+HIR's flag list defaults to empty rather than emitting "--from=" or
+similar with placeholder values.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of basic COPY.
-    @End Implementation
+@Implementation:
+Submits "COPY . /app\n" via test_round_trip.
+@End Implementation
+Process called "test_copy_basic" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "COPY . /app\n"
     proc test_round_trip with suite_ptr, "COPY basic", dockerfile_source
@@ -467,14 +557,16 @@ Process called "test_copy_basic" that takes suite_ptr as Integer returns Integer
     Return 1
 End Process
 
-Process called "test_copy_with_from" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test COPY instruction with --from flag: COPY --from=builder /app /dest.
-    @End Reasoning
+@Reasoning:
+--from is the multi-stage build pivot that pulls files from a previously
+named stage. The test guarantees the stage name survives the round-trip
+since losing it would break stage isolation.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of COPY with --from flag.
-    @End Implementation
+@Implementation:
+Submits "COPY --from=builder /app /dest\n" via test_round_trip.
+@End Implementation
+Process called "test_copy_with_from" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "COPY --from=builder /app /dest\n"
     proc test_round_trip with suite_ptr, "COPY with --from", dockerfile_source
@@ -482,14 +574,17 @@ Process called "test_copy_with_from" that takes suite_ptr as Integer returns Int
     Return 1
 End Process
 
-Process called "test_copy_with_chown" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test COPY instruction with --chown flag: COPY --chown=user:group . /app.
-    @End Reasoning
+@Reasoning:
+--chown sets file ownership inside the image. The "user:group" form
+contains a colon that is also a Dockerfile-significant separator
+elsewhere; the test guards against the parser splitting on the wrong
+colon and losing the group component.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of COPY with --chown flag.
-    @End Implementation
+@Implementation:
+Submits "COPY --chown=user:group . /app\n" via test_round_trip.
+@End Implementation
+Process called "test_copy_with_chown" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "COPY --chown=user:group . /app\n"
     proc test_round_trip with suite_ptr, "COPY with --chown", dockerfile_source
@@ -497,14 +592,16 @@ Process called "test_copy_with_chown" that takes suite_ptr as Integer returns In
     Return 1
 End Process
 
-Process called "test_copy_with_chmod" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test COPY instruction with --chmod flag: COPY --chmod=755 . /app.
-    @End Reasoning
+@Reasoning:
+--chmod takes an octal mode that must be emitted verbatim. Numeric mode
+strings are easy to accidentally re-format (leading zero loss, decimal
+conversion); this test pins the octal-string form.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of COPY with --chmod flag.
-    @End Implementation
+@Implementation:
+Submits "COPY --chmod=755 . /app\n" via test_round_trip.
+@End Implementation
+Process called "test_copy_with_chmod" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "COPY --chmod=755 . /app\n"
     proc test_round_trip with suite_ptr, "COPY with --chmod", dockerfile_source
@@ -512,14 +609,17 @@ Process called "test_copy_with_chmod" that takes suite_ptr as Integer returns In
     Return 1
 End Process
 
-Process called "test_add_basic" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test ADD instruction: ADD archive.tar.gz /app.
-    @End Reasoning
+@Reasoning:
+ADD is COPY's superset (also handles tarball extraction and URLs). The
+test must remain distinct from COPY to prove the HIR encodes the
+opcode discriminant; a backend bug that aliased ADD->COPY would silently
+drop archive semantics.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of basic ADD.
-    @End Implementation
+@Implementation:
+Submits "ADD archive.tar.gz /app\n" via test_round_trip.
+@End Implementation
+Process called "test_add_basic" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "ADD archive.tar.gz /app\n"
     proc test_round_trip with suite_ptr, "ADD basic", dockerfile_source
@@ -527,14 +627,17 @@ Process called "test_add_basic" that takes suite_ptr as Integer returns Integer:
     Return 1
 End Process
 
-Process called "test_entrypoint_shell_form" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test ENTRYPOINT instruction in shell form: ENTRYPOINT python app.py.
-    @End Reasoning
+@Reasoning:
+Shell-form ENTRYPOINT wraps the command in /bin/sh -c, which loses
+proper signal forwarding. Distinct test exists so a regression that
+silently switched the form (changing PID 1 semantics in production
+images) gets caught.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of ENTRYPOINT shell form.
-    @End Implementation
+@Implementation:
+Submits "ENTRYPOINT python app.py\n" via test_round_trip.
+@End Implementation
+Process called "test_entrypoint_shell_form" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "ENTRYPOINT python app.py\n"
     proc test_round_trip with suite_ptr, "ENTRYPOINT shell form", dockerfile_source
@@ -542,14 +645,16 @@ Process called "test_entrypoint_shell_form" that takes suite_ptr as Integer retu
     Return 1
 End Process
 
-Process called "test_entrypoint_exec_form" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test ENTRYPOINT instruction in exec form: ENTRYPOINT ["python", "app.py"].
-    @End Reasoning
+@Reasoning:
+Exec-form ENTRYPOINT is the recommended form because the process runs
+as PID 1 directly. Test pins this form distinctly from the shell-form
+test so the form discriminant is verified in both directions.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of ENTRYPOINT exec form.
-    @End Implementation
+@Implementation:
+Submits "ENTRYPOINT [\"python\", \"app.py\"]\n" via test_round_trip.
+@End Implementation
+Process called "test_entrypoint_exec_form" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "ENTRYPOINT [\"python\", \"app.py\"]\n"
     proc test_round_trip with suite_ptr, "ENTRYPOINT exec form", dockerfile_source
@@ -557,14 +662,16 @@ Process called "test_entrypoint_exec_form" that takes suite_ptr as Integer retur
     Return 1
 End Process
 
-Process called "test_volume_single" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test VOLUME instruction with single path: VOLUME /data.
-    @End Reasoning
+@Reasoning:
+Single-path VOLUME is the shell-form variant (no JSON brackets). The
+test ensures the backend selects the unquoted single-path emission
+instead of always falling back to the JSON-array form.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of VOLUME with single path.
-    @End Implementation
+@Implementation:
+Submits "VOLUME /data\n" via test_round_trip.
+@End Implementation
+Process called "test_volume_single" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "VOLUME /data\n"
     proc test_round_trip with suite_ptr, "VOLUME single", dockerfile_source
@@ -572,14 +679,16 @@ Process called "test_volume_single" that takes suite_ptr as Integer returns Inte
     Return 1
 End Process
 
-Process called "test_volume_multiple" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test VOLUME instruction with multiple paths: VOLUME ["/data", "/logs"].
-    @End Reasoning
+@Reasoning:
+Multi-path VOLUME requires the JSON-array form. The test verifies the
+backend keeps the brackets, double-quoted paths, and comma separator
+identical to the source.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of VOLUME with multiple paths.
-    @End Implementation
+@Implementation:
+Submits "VOLUME [\"/data\", \"/logs\"]\n" via test_round_trip.
+@End Implementation
+Process called "test_volume_multiple" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "VOLUME [\"/data\", \"/logs\"]\n"
     proc test_round_trip with suite_ptr, "VOLUME multiple", dockerfile_source
@@ -587,14 +696,16 @@ Process called "test_volume_multiple" that takes suite_ptr as Integer returns In
     Return 1
 End Process
 
-Process called "test_user_basic" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test USER instruction: USER appuser.
-    @End Reasoning
+@Reasoning:
+Bare USER with no group establishes that the HIR's group slot can be
+empty without forcing the backend to emit "appuser:" with a trailing
+colon.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of basic USER.
-    @End Implementation
+@Implementation:
+Submits "USER appuser\n" via test_round_trip.
+@End Implementation
+Process called "test_user_basic" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "USER appuser\n"
     proc test_round_trip with suite_ptr, "USER basic", dockerfile_source
@@ -602,14 +713,16 @@ Process called "test_user_basic" that takes suite_ptr as Integer returns Integer
     Return 1
 End Process
 
-Process called "test_user_with_group" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test USER instruction with group: USER appuser:appgroup.
-    @End Reasoning
+@Reasoning:
+USER with explicit group exercises the "name:name" form, distinguishing
+it from the numeric "uid:gid" representation that Docker also accepts.
+The test pins the name-form so it is not silently rewritten.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of USER with group.
-    @End Implementation
+@Implementation:
+Submits "USER appuser:appgroup\n" via test_round_trip.
+@End Implementation
+Process called "test_user_with_group" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "USER appuser:appgroup\n"
     proc test_round_trip with suite_ptr, "USER with group", dockerfile_source
@@ -617,14 +730,16 @@ Process called "test_user_with_group" that takes suite_ptr as Integer returns In
     Return 1
 End Process
 
-Process called "test_workdir" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test WORKDIR instruction: WORKDIR /app.
-    @End Reasoning
+@Reasoning:
+WORKDIR holds an absolute path token. Spotted-leading-slash failures
+would break image working directory semantics; the test pins the
+leading "/" preservation.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of WORKDIR.
-    @End Implementation
+@Implementation:
+Submits "WORKDIR /app\n" via test_round_trip.
+@End Implementation
+Process called "test_workdir" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "WORKDIR /app\n"
     proc test_round_trip with suite_ptr, "WORKDIR", dockerfile_source
@@ -632,14 +747,16 @@ Process called "test_workdir" that takes suite_ptr as Integer returns Integer:
     Return 1
 End Process
 
-Process called "test_arg_basic" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test ARG instruction: ARG VERSION.
-    @End Reasoning
+@Reasoning:
+Defaultless ARG declares a build-time variable with no value. The HIR
+must record the absence of a default explicitly so the backend does
+not emit "ARG VERSION=" with a trailing "=".
+@End Reasoning
 
-    @Implementation
-    Test round-trip of basic ARG.
-    @End Implementation
+@Implementation:
+Submits "ARG VERSION\n" via test_round_trip.
+@End Implementation
+Process called "test_arg_basic" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "ARG VERSION\n"
     proc test_round_trip with suite_ptr, "ARG basic", dockerfile_source
@@ -647,14 +764,16 @@ Process called "test_arg_basic" that takes suite_ptr as Integer returns Integer:
     Return 1
 End Process
 
-Process called "test_arg_with_default" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test ARG instruction with default: ARG VERSION=1.0.
-    @End Reasoning
+@Reasoning:
+ARG with default exercises the "name=value" branch. The pair must
+survive verbatim because Docker treats the default as the substitution
+when no --build-arg is passed.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of ARG with default value.
-    @End Implementation
+@Implementation:
+Submits "ARG VERSION=1.0\n" via test_round_trip.
+@End Implementation
+Process called "test_arg_with_default" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "ARG VERSION=1.0\n"
     proc test_round_trip with suite_ptr, "ARG with default", dockerfile_source
@@ -662,14 +781,16 @@ Process called "test_arg_with_default" that takes suite_ptr as Integer returns I
     Return 1
 End Process
 
-Process called "test_stopsignal" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test STOPSIGNAL instruction: STOPSIGNAL SIGTERM.
-    @End Reasoning
+@Reasoning:
+STOPSIGNAL accepts either a numeric signal or a SIGxxx mnemonic. The
+test uses the mnemonic form to verify the lexer keeps the SIG-prefixed
+identifier as a single token rather than splitting on case boundaries.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of STOPSIGNAL.
-    @End Implementation
+@Implementation:
+Submits "STOPSIGNAL SIGTERM\n" via test_round_trip.
+@End Implementation
+Process called "test_stopsignal" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "STOPSIGNAL SIGTERM\n"
     proc test_round_trip with suite_ptr, "STOPSIGNAL", dockerfile_source
@@ -677,14 +798,16 @@ Process called "test_stopsignal" that takes suite_ptr as Integer returns Integer
     Return 1
 End Process
 
-Process called "test_healthcheck_none" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test HEALTHCHECK NONE instruction: HEALTHCHECK NONE.
-    @End Reasoning
+@Reasoning:
+HEALTHCHECK NONE is the cancellation form that disables inherited
+healthchecks. The HIR must keep this as a distinct variant rather than
+representing it as an empty CMD.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of HEALTHCHECK NONE.
-    @End Implementation
+@Implementation:
+Submits "HEALTHCHECK NONE\n" via test_round_trip.
+@End Implementation
+Process called "test_healthcheck_none" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "HEALTHCHECK NONE\n"
     proc test_round_trip with suite_ptr, "HEALTHCHECK NONE", dockerfile_source
@@ -692,14 +815,16 @@ Process called "test_healthcheck_none" that takes suite_ptr as Integer returns I
     Return 1
 End Process
 
-Process called "test_healthcheck_cmd_shell" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test HEALTHCHECK CMD instruction in shell form: HEALTHCHECK CMD curl http://localhost/.
-    @End Reasoning
+@Reasoning:
+HEALTHCHECK CMD in shell form embeds a URL containing "://" which can
+confuse path-aware lexers. The test verifies the URL stays a single
+token through the round-trip.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of HEALTHCHECK CMD shell form.
-    @End Implementation
+@Implementation:
+Submits "HEALTHCHECK CMD curl http://localhost/\n" via test_round_trip.
+@End Implementation
+Process called "test_healthcheck_cmd_shell" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "HEALTHCHECK CMD curl http://localhost/\n"
     proc test_round_trip with suite_ptr, "HEALTHCHECK CMD shell", dockerfile_source
@@ -707,14 +832,17 @@ Process called "test_healthcheck_cmd_shell" that takes suite_ptr as Integer retu
     Return 1
 End Process
 
-Process called "test_healthcheck_cmd_exec" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test HEALTHCHECK CMD instruction in exec form: HEALTHCHECK CMD ["curl", "http://localhost/"].
-    @End Reasoning
+@Reasoning:
+HEALTHCHECK CMD exec form puts the URL inside a JSON-array element.
+The double-quote escaping plus the colon-in-URL combine to stress the
+JSON tokeniser; this is the test that catches off-by-one quote bugs.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of HEALTHCHECK CMD exec form.
-    @End Implementation
+@Implementation:
+Submits "HEALTHCHECK CMD [\"curl\", \"http://localhost/\"]\n" via
+test_round_trip.
+@End Implementation
+Process called "test_healthcheck_cmd_exec" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "HEALTHCHECK CMD [\"curl\", \"http://localhost/\"]\n"
     proc test_round_trip with suite_ptr, "HEALTHCHECK CMD exec", dockerfile_source
@@ -722,14 +850,17 @@ Process called "test_healthcheck_cmd_exec" that takes suite_ptr as Integer retur
     Return 1
 End Process
 
-Process called "test_healthcheck_with_options" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test HEALTHCHECK with options: HEALTHCHECK --interval=30s --timeout=10s CMD curl http://localhost/.
-    @End Reasoning
+@Reasoning:
+HEALTHCHECK with options exercises the option-list-before-CMD grammar.
+Order of --interval and --timeout matters for diff-stability (the
+backend must emit them in declaration order, not sorted).
+@End Reasoning
 
-    @Implementation
-    Test round-trip of HEALTHCHECK with options.
-    @End Implementation
+@Implementation:
+Submits the full HEALTHCHECK --interval=30s --timeout=10s CMD line via
+test_round_trip.
+@End Implementation
+Process called "test_healthcheck_with_options" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "HEALTHCHECK --interval=30s --timeout=10s CMD curl http://localhost/\n"
     proc test_round_trip with suite_ptr, "HEALTHCHECK with options", dockerfile_source
@@ -737,14 +868,16 @@ Process called "test_healthcheck_with_options" that takes suite_ptr as Integer r
     Return 1
 End Process
 
-Process called "test_shell" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test SHELL instruction: SHELL ["/bin/bash", "-c"].
-    @End Reasoning
+@Reasoning:
+SHELL only accepts the JSON-array form (Docker grammar). The test
+verifies the parser rejects the shell-form (no test for shell-form
+exists by design) and the backend keeps the array intact.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of SHELL.
-    @End Implementation
+@Implementation:
+Submits "SHELL [\"/bin/bash\", \"-c\"]\n" via test_round_trip.
+@End Implementation
+Process called "test_shell" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "SHELL [\"/bin/bash\", \"-c\"]\n"
     proc test_round_trip with suite_ptr, "SHELL", dockerfile_source
@@ -752,14 +885,16 @@ Process called "test_shell" that takes suite_ptr as Integer returns Integer:
     Return 1
 End Process
 
-Process called "test_maintainer" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test MAINTAINER instruction: MAINTAINER John Doe <john@example.com>.
-    @End Reasoning
+@Reasoning:
+MAINTAINER is deprecated but still legal Dockerfile syntax. The
+embedded "<...>" email brackets must not be interpreted as redirection
+operators by any layer of the pipeline.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of MAINTAINER (deprecated).
-    @End Implementation
+@Implementation:
+Submits "MAINTAINER John Doe <john@example.com>\n" via test_round_trip.
+@End Implementation
+Process called "test_maintainer" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "MAINTAINER John Doe <john@example.com>\n"
     proc test_round_trip with suite_ptr, "MAINTAINER", dockerfile_source
@@ -767,14 +902,18 @@ Process called "test_maintainer" that takes suite_ptr as Integer returns Integer
     Return 1
 End Process
 
-Process called "test_multi_stage_build" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test multi-stage build Dockerfile with FROM, COPY --from, and multiple stages.
-    @End Reasoning
+@Reasoning:
+Multi-stage build is the integration case that pairs an "AS builder"
+FROM with a downstream "COPY --from=builder". This is the only test
+that verifies cross-instruction references survive the HIR round-trip
+intact.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of multi-stage Dockerfile.
-    @End Implementation
+@Implementation:
+Concatenates four Dockerfile lines (FROM AS builder, RUN, FROM alpine,
+COPY --from=builder) and submits via test_round_trip.
+@End Implementation
+Process called "test_multi_stage_build" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "FROM ubuntu:20.04 AS builder\n"
     Set dockerfile_source to proc string_concat from StringCore with dockerfile_source, "RUN apt-get update\n"
@@ -786,14 +925,20 @@ Process called "test_multi_stage_build" that takes suite_ptr as Integer returns 
     Return 1
 End Process
 
-Process called "test_complex_dockerfile" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test complex Dockerfile with multiple instruction types.
-    @End Reasoning
+@Reasoning:
+The "everything together" integration test. Stacks nine different
+instruction types (FROM, LABEL, ARG, ENV, WORKDIR, COPY, RUN, EXPOSE,
+USER, CMD) in a realistic ordering so that any per-instruction
+regression is amplified by interactions with surrounding instructions.
+@End Reasoning
 
-    @Implementation
-    Test round-trip of complex Dockerfile with various instructions.
-    @End Implementation
+@Implementation:
+Builds a 9-line Dockerfile via successive string_concat calls and
+submits via test_round_trip. Order matters: LABEL/ARG/ENV before
+WORKDIR before COPY before RUN before EXPOSE/USER/CMD mirrors the
+canonical production layering.
+@End Implementation
+Process called "test_complex_dockerfile" that takes suite_ptr as Integer returns Integer:
 
     Let dockerfile_source be "FROM ubuntu:20.04\n"
     Set dockerfile_source to proc string_concat from StringCore with dockerfile_source, "LABEL version=1.0 maintainer=user\n"
@@ -815,14 +960,20 @@ Note: ==========================================================================
 Note: Main Test Runner
 Note: ============================================================================
 
-Process called "run_all_tests" returns Integer:
-    @Reasoning
-    Run all Dockerfile translation tests and report results.
-    @End Reasoning
+@Reasoning:
+Entry point dispatched by the CI harness. The order of test invocation
+mirrors the Dockerfile instruction grammar grouping (FROM first, then
+RUN/CMD, then LABEL/EXPOSE/ENV, then file ops, then meta) so failures
+correlate cleanly to grammar sections in the output log.
+@End Reasoning
 
-    @Implementation
-    Create test suite, run all test cases, print summary.
-    @End Implementation
+@Implementation:
+Creates a fresh TestSuite, invokes all 41 test_xxx routines plus the
+two integration tests, prints the summary, and returns 1 only if
+failed_tests is exactly 0. The return value is the process exit
+discriminant for the CI harness.
+@End Implementation
+Process called "run_all_tests" returns Integer:
 
     Let suite_ptr be proc create_test_suite
 

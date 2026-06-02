@@ -205,6 +205,23 @@ Note: ==========================================================================
 Note: Lexer State
 Note: ============================================================================
 
+@Reasoning:
+Lexer cursor structure: holds the source string plus a position cursor and
+human-readable line/column counters. Tracking line and column separately
+from byte position lets diagnostics report VHDL source coordinates without
+re-scanning, and lets multi-character escapes (newline) update both
+counters atomically. Source length is cached because length-of-string is
+otherwise computed by scanning to NUL.
+@End Reasoning
+
+@Implementation:
+40-byte record (5 x i64): source pointer (offset 0), byte position
+(offset 8), 1-based line counter (offset 16, starts at 1), 1-based
+column counter (offset 24, starts at 1), cached source length in bytes
+(offset 32). All fields are mutated in place by advance/peek as the
+lexer walks the source.
+@End Implementation
+
 Type called "VHDLLexer":
     source as Integer           Note: Source code string
     position as Integer         Note: Current position in source
@@ -216,6 +233,23 @@ End Type
 Note: ============================================================================
 Note: Lexer Creation
 Note: ============================================================================
+
+@Reasoning:
+Constructs the VHDLLexer cursor in a single 40-byte heap allocation. The
+source string is aliased (not copied) so the caller retains ownership of
+the source buffer; the lexer's lifetime must therefore be strictly less
+than the source string's. Initialising line and column to 1 (not 0)
+matches VHDL diagnostics conventions where the first line and column
+are numbered 1.
+@End Reasoning
+
+@Implementation:
+Single allocate call for the 40-byte struct, OOM short-circuit to 0,
+then string_length is invoked once to cache source_length at offset 32.
+Position starts at 0, line at 1, column at 1, source pointer aliased
+at offset 0. No companion destroy_lexer exists — the lexer is owned
+by its caller and freed via Layout's deallocate.
+@End Implementation
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create VHDL lexer
@@ -242,6 +276,20 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII letter test, used as the lead-character classifier for VHDL
+identifiers. VHDL identifiers must start with a letter (per LRM 13.3.1
+basic_identifier ::= letter { [ underline ] letter_or_digit }), so this
+test is the gate that distinguishes identifier-or-keyword from number,
+operator, or punctuation in the dispatch.
+@End Reasoning
+
+@Implementation:
+Two range checks against ASCII codepoints: uppercase 65..90 (A-Z) and
+lowercase 97..122 (a-z). No locale handling — VHDL identifiers are
+strictly ASCII in the base language. Returns 1 for letter, 0 otherwise.
+@End Implementation
+
 Process called "is_letter" takes ch as Integer returns Integer:
     Note: Check if character is letter (A-Z, a-z)
 
@@ -260,6 +308,18 @@ Process called "is_letter" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII digit test. Used both to start integer/real literal scans and to
+continue identifier scans after the first letter (VHDL identifiers
+allow digits after the first character).
+@End Reasoning
+
+@Implementation:
+Single range check 48..57 (ASCII '0' through '9'). Returns 1 for digit,
+0 otherwise. No support for non-ASCII or fullwidth digits — VHDL spec
+restricts numeric literals to ASCII.
+@End Implementation
+
 Process called "is_digit" takes ch as Integer returns Integer:
     Note: Check if character is digit (0-9)
 
@@ -271,6 +331,20 @@ Process called "is_digit" takes ch as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Tests for a hex digit needed inside based literals like 16#FF# where the
+base is 16 and the digits can include A-F. The lexer treats the digits
+permissively (both upper and lower case) — semantic validation of base
+versus actual digit values happens later, not at lex time.
+@End Reasoning
+
+@Implementation:
+Composed test: defer to is_digit first (0-9), then check uppercase
+A-F (65..70) and lowercase a-f (97..102). Returns 1 on any match,
+0 otherwise. Three branches because Runa lacks a short-circuit OR
+combinator on integer comparisons in this position.
+@End Implementation
 
 Process called "is_hex_digit" takes ch as Integer returns Integer:
     Note: Check if character is hexadecimal digit (0-9, A-F, a-f)
@@ -294,6 +368,19 @@ Process called "is_hex_digit" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Whitespace classifier covering the four characters VHDL treats as
+insignificant separators: space, tab, LF, CR. Used by skip_whitespace
+between tokens. Newlines additionally trigger column reset inside
+advance, but at classification level they're just whitespace.
+@End Reasoning
+
+@Implementation:
+Four equality checks against ASCII codepoints 32 (space), 9 (tab),
+10 (LF), 13 (CR). Returns 1 on any match, 0 otherwise. No form-feed
+or vertical-tab handling — VHDL LRM only mandates the four listed.
+@End Implementation
+
 Process called "is_whitespace" takes ch as Integer returns Integer:
     Note: Check if character is whitespace
 
@@ -316,6 +403,23 @@ Process called "is_whitespace" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII-only lowercase folder. VHDL keywords and identifiers are
+case-insensitive (LRM 13.3), so the lexer canonicalises tokens to
+lowercase before keyword matching. This helper is the single point
+of case conversion for the lexer; using string_to_lower from
+StringCore at the token level avoids per-character folding inside
+the hot scan loops.
+@End Reasoning
+
+@Implementation:
+If the character is in 65..90 (uppercase A-Z) returns ch + 32 (the
+ASCII case-bit toggle). Anything else is returned unchanged — digits,
+underscores, and already-lowercase letters all pass through.
+Non-ASCII letters are not folded; they shouldn't appear in standard
+VHDL identifiers.
+@End Implementation
+
 Process called "to_lowercase" takes ch as Integer returns Integer:
     Note: Convert character to lowercase
 
@@ -332,6 +436,22 @@ Note: ==========================================================================
 Note: Lexer Utilities
 Note: ============================================================================
 
+@Reasoning:
+Reads the byte at the current cursor without advancing. Returning 0 at
+EOF lets callers treat NUL/EOF identically — every scan loop has a
+"ch == 0" exit branch that handles both "ran off the end" and the rare
+embedded NUL byte. This conflation is safe because VHDL source must
+not contain embedded NULs.
+@End Reasoning
+
+@Implementation:
+Reads position (offset 8), source (offset 0), source_length (offset 32)
+in that order, EOF-guards by comparing pos >= source_len. On valid
+position invokes string_char_at from StringCore for the indexed byte.
+No bounds-safety beyond the length compare; underlying string is
+assumed to be at least source_length bytes valid.
+@End Implementation
+
 Process called "peek" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -346,6 +466,24 @@ Process called "peek" takes lexer as Integer returns Integer:
     Let ch be proc string_char_at from StringCore with source, pos
     Return ch
 End Process
+
+@Reasoning:
+Consumes one byte from the source stream and returns it. The dual
+duty (read + advance) is intentional: VHDL's hot scan loops want a
+single call that both decides "next char" and "make progress" so that
+forgetting one is a bug visible immediately as an infinite loop. On
+newline, line counter increments and column resets to 1 so subsequent
+diagnostics report the correct row.
+@End Reasoning
+
+@Implementation:
+Pulls pos (8), source (0), len (32), col (24) up-front, EOF-guards
+on pos >= len returning 0 without mutating state. Reads the char via
+string_char_at, post-increments pos and col, writes both back. The
+newline branch checks for LF (10); on LF it loads line from offset 16,
+increments, stores back, and overwrites column with 1 (NOT col+1 —
+the previous increment is intentionally squashed by the reset).
+@End Implementation
 
 Process called "advance" takes lexer as Integer returns Integer:
     Note: Advance position and return current character
@@ -377,6 +515,21 @@ Process called "advance" takes lexer as Integer returns Integer:
     Return ch
 End Process
 
+@Reasoning:
+Drives the cursor past contiguous whitespace before next_token decides
+what to scan. Whitespace must be consumed atomically rather than left
+for the dispatcher because some VHDL tokens (e.g., the `<` vs `<=`
+disambiguation) require lookahead immediately on a non-whitespace byte.
+@End Reasoning
+
+@Implementation:
+Unbounded `While 1 is equal to 1` loop with two exit conditions: peek
+returning 0 (EOF) and is_whitespace returning 0 (non-WS byte). Every
+iteration that doesn't exit calls advance which itself handles newline
+bookkeeping. Returns 1 unconditionally on exit — there is no failure
+path because exceeding EOF is not an error here.
+@End Implementation
+
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
@@ -396,6 +549,23 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Consumes a VHDL line comment which begins with `--` and runs to the end
+of line (LRM 13.8). Block comments do not exist in VHDL-93; VHDL-2008's
+`/* */` form is intentionally NOT supported here — this lexer targets
+the common subset and would need a separate handler if block comments
+are added later.
+@End Reasoning
+
+@Implementation:
+Two unconditional advance calls consume the leading `--` (caller has
+already confirmed the pair via peek and peek_ahead). Then loops with
+peek, exiting on EOF (ch == 0) or newline (LF == 10). The terminating
+newline itself is NOT consumed here — skip_whitespace will eat it on
+the next call, which is correct because the LF triggers line counter
+increment on its own pass.
+@End Implementation
 
 Process called "skip_comment" takes lexer as Integer returns Integer:
     Note: Skip single-line comment (-- to end of line)
@@ -426,6 +596,21 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Allocates the uniform 32-byte token record used everywhere downstream.
+Putting all four fields at fixed offsets means the parser can read them
+without any tag-based shape variation, which is faster than carrying
+a separate field-table per token kind.
+@End Reasoning
+
+@Implementation:
+Single allocate call for 32 bytes (4 x i64). Layout: token_type at
+offset 0, value (string pointer or literal payload) at offset 8, line
+at offset 16, column at offset 24. OOM short-circuits to 0; callers
+must check for null before reading offsets. The value pointer is
+aliased — no copy is made.
+@End Implementation
+
 Process called "create_token" takes token_type as Integer, value as Integer, line as Integer, column as Integer returns Integer:
     Note: Create token
 
@@ -447,6 +632,37 @@ End Process
 Note: ============================================================================
 Note: Keyword Recognition
 Note: ============================================================================
+
+@Reasoning:
+Resolves a scanned identifier against the VHDL keyword set. VHDL has
+~80 reserved words spanning design-unit headers (entity, architecture),
+declarations (signal, variable), control flow (if, when, loop), logical
+and shift operators (and, sll), and common types (std_logic, integer).
+This single dispatch keeps the lexer's keyword table linear-string but
+correctness-stable: adding new keywords only requires extending this
+function.
+@End Reasoning
+
+@Implementation:
+First step folds the input to lowercase via string_to_lower (VHDL is
+case-insensitive). Each subsequent block tests one keyword via
+string_equals; on match returns the corresponding TOKEN_* constant.
+The order of the tests is purely logical-grouping (design units,
+declarations, port modes, control flow, structural, logical operators,
+shift operators, special keywords, type keywords, record/array); it
+does not reflect frequency, so future optimisation could reorder for
+hot-keyword first matching. Falls through to TOKEN_IDENTIFIER if no
+keyword matches — the caller stores the original-case spelling in the
+token's value field, preserving user formatting for diagnostics.
+@End Implementation
+
+@Performance_Hints:
+Linear scan over ~80 keywords per identifier is acceptable for HIR
+translation throughput but would dominate full-source-lex profiles.
+A perfect hash or trie keyed on the first 1-3 characters would cut
+the average comparison count by an order of magnitude; defer until
+profiling shows this as a bottleneck.
+@End Performance_Hints
 
 Process called "match_keyword" takes word as Integer returns Integer:
     Note: Match identifier to keyword (case-insensitive)
@@ -811,6 +1027,27 @@ Note: ==========================================================================
 Note: Token Scanning
 Note: ============================================================================
 
+@Reasoning:
+Scans a maximal-munch VHDL identifier (letter followed by letter, digit,
+or underscore per LRM 13.3.1). The lexer has already confirmed the first
+byte is a letter so this routine begins by capturing the start position
+and then accumulates while the predicate stays true. Identifier
+recognition and keyword classification are fused: once the lexeme is
+isolated, match_keyword decides whether to return a reserved-word token
+or TOKEN_IDENTIFIER.
+@End Reasoning
+
+@Implementation:
+Captures start_pos (offset 8), line (16), column (24) on entry. The
+main loop peeks each byte and exits on either EOF (ch == 0) or first
+non-identifier byte. Underscore (ASCII 95) is treated specially because
+is_letter and is_digit both return 0 for it; the three nested If checks
+mean "exit if NOT letter AND NOT digit AND NOT underscore". On exit
+collects the substring via string_substring, runs match_keyword to get
+the token_type (TOKEN_IDENTIFIER if not a keyword), and constructs the
+token with start-position line/column for diagnostics.
+@End Implementation
+
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Note: Scan identifier or keyword
 
@@ -857,6 +1094,27 @@ Process called "scan_identifier" takes lexer as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Scans the three numeric literal forms VHDL supports under one entry:
+integer (3, 42), real (3.14), and based literals (16#FF#, 2#1010#).
+Distinguishing them at scan time requires tracking two flags: has_dot
+for the integer-vs-real distinction and has_hash for the base-literal
+form. The token type is chosen on exit based on which flags fired,
+not on partial state during the scan.
+@End Reasoning
+
+@Implementation:
+Captures start_pos/line/column at entry, initialises has_dot=0 and
+has_hash=0. Main loop peeks each byte: on ASCII 46 (`.`) sets has_dot
+if not already set (a second dot bails out — VHDL allows only one);
+on ASCII 35 (`#`) sets has_hash and advances; otherwise tests
+is_digit and is_hex_digit. Hex digit acceptance is enabled even
+outside #..#-region because the lexer is permissive: distinguishing
+"valid hex within based literal" from "stray hex" needs the base value
+which is a semantic-level concern, not lexical. Exit assembles the
+substring and picks token kind in priority order: based > real > int.
+@End Implementation
 
 Process called "scan_number" takes lexer as Integer returns Integer:
     Note: Scan number (integer, real, or based literal)
@@ -939,6 +1197,27 @@ Process called "scan_number" takes lexer as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Consumes a VHDL double-quoted string literal. VHDL string literals
+can span multiple characters and represent bit vectors, character
+sequences, or general string values depending on context — that
+distinction is parser/semantic, not lexical. The lexer's job is to
+capture the bytes between the opening and closing quote and emit
+TOKEN_STRING_LITERAL with the raw payload.
+@End Reasoning
+
+@Implementation:
+Reads line/column at entry, advances past the opening quote (ASCII 34),
+records start_pos. Main loop peeks; on EOF returns the token with
+whatever was accumulated so far (silent unterminated-string tolerance —
+parser will reject), on closing quote (34) captures substring before
+consuming the quote, then returns TOKEN_STRING_LITERAL. No escape
+handling here — VHDL strings escape `"` by doubling it, which the
+current implementation does NOT process; that's a known limitation
+for the lexer subset and would be fixed by an "if next char is `"`
+also" check on the close-quote branch.
+@End Implementation
+
 Process called "scan_string" takes lexer as Integer returns Integer:
     Note: Scan string literal (double-quoted)
 
@@ -978,6 +1257,25 @@ Process called "scan_string" takes lexer as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Consumes a single-character VHDL character literal of the form `'X'`.
+The disambiguation between character literal and attribute tick
+(signal'event) is the caller's job — by the time scan_character is
+invoked, tokenize_next has already verified the pattern `'X'` via
+two peek_ahead lookups. This routine is the strict consumer with no
+re-classification.
+@End Reasoning
+
+@Implementation:
+Reads line/column for the token coordinates. Consumes opening
+apostrophe (advance), reads the next byte (advance returns it as ch),
+then peeks the closing apostrophe. On match consumes the closing
+quote and emits TOKEN_CHARACTER_LITERAL with a one-byte string built
+via string_from_char. Mismatch (closing != ASCII 39) returns a
+TOKEN_ERROR with the literal "Invalid character literal" payload;
+the parser will report the position to the user.
+@End Implementation
+
 Process called "scan_character" takes lexer as Integer returns Integer:
     Note: Scan character literal (single-quoted)
 
@@ -1007,6 +1305,25 @@ End Process
 Note: ============================================================================
 Note: Main Tokenization
 Note: ============================================================================
+
+@Reasoning:
+Top-level lexer driver: skip whitespace+comments, emit one token. The
+two-pass structure (this routine handles comment-vs-minus disambiguation,
+tokenize_next handles everything else) exists because comments share
+their leading byte with the minus operator — only by peeking the byte
+after the `-` can we decide between a comment skip (`--`) and emitting
+TOKEN_MINUS. Putting that disambiguation inside the whitespace loop
+means comments are transparent to upstream consumers.
+@End Reasoning
+
+@Implementation:
+Outer loop iterates so consecutive comments collapse into a single
+skip. Each iteration first calls skip_whitespace, then peeks. EOF
+returns TOKEN_EOF with empty string. ASCII 45 (`-`) triggers a
+peek_ahead(1): if also 45 it's a comment (skip_comment, loop again);
+otherwise emit TOKEN_MINUS. Any other byte delegates to tokenize_next
+which never returns null — guarantees forward progress per call.
+@End Implementation
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
@@ -1044,6 +1361,22 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Lookahead probe used wherever the lexer needs to disambiguate
+multi-character operators (`<=`, `:=`, `..`, `=>`, etc.) and the
+`'X'` character-literal-vs-attribute pattern. Keeping the lookahead
+function separate from peek prevents adding a cursor mutation on
+disambiguation paths — peek_ahead is always pure-read.
+@End Reasoning
+
+@Implementation:
+Reads pos (offset 8), source (0), length (32), computes peek_pos =
+pos + offset (caller passes offset 1 for next-char, 2 for two-ahead).
+Bounds-guards on peek_pos >= source_len returning 0; otherwise reads
+the byte via string_char_at. No negative-offset handling — calls are
+always with positive offsets.
+@End Implementation
+
 Process called "peek_ahead" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek ahead by offset characters
 
@@ -1059,6 +1392,31 @@ Process called "peek_ahead" takes lexer as Integer, offset as Integer returns In
     Let ch be proc string_char_at from StringCore with source, peek_pos
     Return ch
 End Process
+
+@Reasoning:
+The bulk dispatcher: given a single non-whitespace byte at the cursor,
+decide which token type to emit. Structured in priority order:
+identifier-or-keyword first (most common), then numeric literals,
+then string/character literals, then multi-character operators (using
+peek_ahead for disambiguation), then single-character operators and
+punctuation. Unknown bytes degrade to TOKEN_ERROR rather than aborting
+so a malformed source still produces a token stream the parser can
+diagnose.
+@End Reasoning
+
+@Implementation:
+First peek determines dispatch. Letters route to scan_identifier (which
+fuses keyword classification), digits to scan_number, double-quote (34)
+to scan_string. Apostrophe (39) splits with two-ahead lookahead: if
+byte at +2 is also 39 it's a `'X'` character literal, otherwise it's
+the attribute tick token. The multi-char operator block handles `<=`
+(also `<>` and bare `<`), `>=`/`>`, `=>`/`=`, `:=`/`:`, `/=`/`/`,
+`**`/`*`, `..`/`.`. Single-char punctuation (parens, brackets, comma,
+semicolon, plus, ampersand, pipe) advance and emit directly. Final
+fallback advances one byte and emits TOKEN_ERROR with "Unknown
+character" payload — guarantees the cursor moves forward every call,
+preventing parser-driven infinite loops on bad input.
+@End Implementation
 
 Process called "tokenize_next" takes lexer as Integer returns Integer:
     Note: Tokenize next token (after whitespace/comments)

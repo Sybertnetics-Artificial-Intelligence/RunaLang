@@ -15,6 +15,21 @@ Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
+@Reasoning:
+Rust-to-HIR translation is stateful: it tracks a scope chain (because Rust's
+lexical scoping affects how Let bindings, generic parameter binders, and
+trait method dispatch resolve), a lifetime annotation context (Rust's `'a`
+parameters must be threaded into HIR's lifetime model), and a trait mapping
+table for resolving method calls back to their trait declarations. Keeping
+these fields in a single heap-resident state struct lets the recursive
+translate_rust_* family pass a single pointer everywhere.
+@End Reasoning
+@Implementation:
+48-byte layout: current_scope@0, scope_stack@8, lifetime_context@16,
+trait_mappings@24, error_message@32, has_error@40. current_scope is the top
+of scope_stack cached at offset 0 for O(1) access in the hot translation
+path; entering/exiting a scope updates both.
+@End Implementation
 Type called "RustToHIRTranslator":
     current_scope as Integer
     scope_stack as Integer
@@ -24,6 +39,17 @@ Type called "RustToHIRTranslator":
     has_error as Integer
 End Type
 
+@Reasoning:
+Factory rather than constructor literal because the translator owns three
+collections (scope stack list, lifetime dictionary, trait dictionary) that
+must be created at allocation time so the recursive translate_rust_*
+routines can blindly read them without null-checks.
+@End Reasoning
+@Implementation:
+Allocate 48 bytes via Layout; on success, create the scope list and two
+dictionaries; zero current_scope, error_message, and has_error. Allocation
+failure returns 0 so callers can fail fast.
+@End Implementation
 Process called "create_rust_to_hir_translator" returns Integer:
     Note: Create Rust to HIR translator with ownership preservation
 
@@ -54,6 +80,20 @@ Process called "create_rust_to_hir_translator" returns Integer:
     Return translator
 End Process
 
+@Reasoning:
+The Rust AST root carries a children list at offset 32 (the parser's
+convention for "container of items"). Translating the program is therefore a
+linear walk over those items, with each result attached to a fresh
+HIR_PROGRAM node. Errors at this level are sentinel HIR error nodes rather
+than nulls so the consumer doesn't have to special-case missing program data.
+@End Reasoning
+@Implementation:
+Null-check both inputs and return a HIR error node on failure. Read children
+list from offset 32, iterate with proc size/get from List, dispatch each to
+translate_rust_item, and attach non-null results to hir_program. Children
+that fail translation (return 0) are silently skipped because translate_rust_item
+already records an HIR error for them.
+@End Implementation
 Process called "translate_rust_program" takes translator as Integer, rust_ast as Integer returns Integer:
     Note: Translate complete Rust program to HIR
 
@@ -88,6 +128,18 @@ Process called "translate_rust_program" takes translator as Integer, rust_ast as
     Return hir_program
 End Process
 
+@Reasoning:
+Top-level item dispatch on the parser's tag value lives here because the
+Rust grammar admits ten distinct item categories (functions, structs, enums,
+traits, impls, modules, use, const, static, type alias). Centralizing the
+fan-out means adding a new item kind is a one-line addition rather than
+edits scattered through translate_rust_program.
+@End Reasoning
+@Implementation:
+Read the type tag from offset 0 of item_node and dispatch via if/Otherwise If
+chain. Unknown tags yield a HIR error node "Unknown Rust item type" so the
+upstream consumer surfaces the gap rather than silently dropping items.
+@End Implementation
 Process called "translate_rust_item" takes translator as Integer, item_node as Integer returns Integer:
     Note: Translate Rust top-level items to HIR
 
@@ -122,6 +174,19 @@ Process called "translate_rust_item" takes translator as Integer, item_node as I
     Return proc create_hir_error_node from HIR with "Unknown Rust item type"
 End Process
 
+@Reasoning:
+Function translation is the dominant entry point for body content: it must
+process parameters (including the receiver `self`, `&self`, `&mut self`),
+return type, generic parameter list, modifiers (async/unsafe/const/extern),
+and finally the body block. Each is wrapped in a presence check because Rust
+omits whichever section is empty (no params, unit return, no generics).
+@End Reasoning
+@Implementation:
+Reads func fields at offsets 8,16,24,32,40,48. Constructs the HIR function
+node first, then populates each sub-component via dedicated setters from HIR.
+Body translation is bracketed by enter_function_scope / exit_function_scope
+so let-bindings inside the body see a fresh scope dictionary.
+@End Implementation
 Process called "translate_rust_function" takes translator as Integer, func_node as Integer returns Integer:
     Note: Translate Rust function to HIR function with ownership semantics
 
@@ -174,6 +239,18 @@ Process called "translate_rust_function" takes translator as Integer, func_node 
     Return hir_function
 End Process
 
+@Reasoning:
+The parameter list is itself a parser node with a children list at offset 32
+(matching the generic "container of items" convention). Building a HIR
+parameter list and appending one HIR parameter per Rust parameter keeps the
+order the user wrote in source, which matters for positional arguments.
+@End Reasoning
+@Implementation:
+Create the HIR parameter list, then iterate children with proc size/get from
+List. Each child is delegated to translate_rust_parameter. Non-null results
+are appended; nulls (which signal a translation failure) are dropped silently
+because the per-parameter translator records its own diagnostic.
+@End Implementation
 Process called "translate_rust_function_params" takes translator as Integer, params_node as Integer returns Integer:
     Note: Translate function parameters preserving ownership patterns
 
@@ -198,6 +275,19 @@ Process called "translate_rust_function_params" takes translator as Integer, par
     Return hir_params
 End Process
 
+@Reasoning:
+A single parameter has up to three components: name, type, and an optional
+destructuring pattern (e.g. `(a, b): (i32, i32)`). The `self`-receiver case
+must additionally tag the HIR parameter with the receiver's outer type so
+downstream method-resolution can find the impl.
+@End Reasoning
+@Implementation:
+Read name@8, type@16, pattern@24. Create HIR parameter; if type is present,
+translate it and check for the special "self" name to set self_type. If a
+destructuring pattern is present, translate and attach it. Both are optional
+because Rust permits `fn f(x)` only inside closure-like sugar paths the
+parser doesn't propagate without a type.
+@End Implementation
 Process called "translate_rust_parameter" takes translator as Integer, param_node as Integer returns Integer:
     Note: Translate individual parameter with ownership semantics
 
@@ -231,6 +321,17 @@ Process called "translate_rust_parameter" takes translator as Integer, param_nod
     Return hir_param
 End Process
 
+@Reasoning:
+Three optional companion sections - fields, generics, and attributes -
+attach to a struct via dedicated HIR setters rather than positional slots so
+adding a future section (e.g. `where` clauses) won't shift existing offsets.
+@End Reasoning
+@Implementation:
+Read name@8, fields@16, generics@24, attributes@32. Create HIR struct node;
+translate and attach each optional section if non-null. Attributes are
+processed via apply_rust_struct_attributes which handles derive(...) macros
+specifically.
+@End Implementation
 Process called "translate_rust_struct" takes translator as Integer, struct_node as Integer returns Integer:
     Note: Translate Rust struct to HIR struct type
 
@@ -267,6 +368,16 @@ Process called "translate_rust_struct" takes translator as Integer, struct_node 
     Return hir_struct
 End Process
 
+@Reasoning:
+Field-list iteration uses the same offset-32 children convention as
+function params. Keeping field order is required because tuple-style structs
+identify fields positionally and even named structs preserve declaration
+order for layout decisions in the backend.
+@End Reasoning
+@Implementation:
+Build a HIR field list; iterate fields_node children; delegate each to
+translate_rust_struct_field; append non-null results.
+@End Implementation
 Process called "translate_rust_struct_fields" takes translator as Integer, fields_node as Integer returns Integer:
     Note: Translate struct fields with visibility and ownership
 
@@ -291,6 +402,17 @@ Process called "translate_rust_struct_fields" takes translator as Integer, field
     Return hir_fields
 End Process
 
+@Reasoning:
+A struct field carries name, type, and visibility. Visibility is stored as
+an integer enum (pub, crate, super, restricted) rather than a string because
+the HIR-side consumer compares it numerically when checking access from
+other crates/modules.
+@End Reasoning
+@Implementation:
+Read name@8, type@16, visibility@24. Construct HIR field; if type is present
+translate and set it; if visibility is present, attach it as-is (no further
+translation needed since the enum codes match between parser and HIR).
+@End Implementation
 Process called "translate_rust_struct_field" takes translator as Integer, field_node as Integer returns Integer:
     Note: Translate individual struct field
 
@@ -314,6 +436,17 @@ Process called "translate_rust_struct_field" takes translator as Integer, field_
     Return hir_field
 End Process
 
+@Reasoning:
+Rust enums are sum types whose variants each carry zero, named, or
+positional fields. Generic parameters apply uniformly across variants. We
+translate variants and generics independently because they reside in
+different containers in the parser AST.
+@End Reasoning
+@Implementation:
+Read name@8, variants@16, generics@24. Build HIR enum, then translate
+variants and generics through their respective helpers and attach via
+set_enum_variants / set_enum_generics.
+@End Implementation
 Process called "translate_rust_enum" takes translator as Integer, enum_node as Integer returns Integer:
     Note: Translate Rust enum to HIR enum type
 
@@ -344,6 +477,15 @@ Process called "translate_rust_enum" takes translator as Integer, enum_node as I
     Return hir_enum
 End Process
 
+@Reasoning:
+Variant order is significant for discriminant assignment when the user did
+not specify explicit discriminants - the first variant gets 0, subsequent
+ones increment. The walk therefore preserves source order.
+@End Reasoning
+@Implementation:
+Build HIR variant list; iterate variants_node children at offset 32;
+delegate each to translate_rust_enum_variant; append non-null results.
+@End Implementation
 Process called "translate_rust_enum_variants" takes translator as Integer, variants_node as Integer returns Integer:
     Note: Translate enum variants with data preservation
 
@@ -368,6 +510,18 @@ Process called "translate_rust_enum_variants" takes translator as Integer, varia
     Return hir_variants
 End Process
 
+@Reasoning:
+A variant can be: unit (`A`), tuple (`A(i32, f64)`), or struct
+(`A { x: i32 }`). The variant_data discriminator at offset 0 of the data
+node distinguishes tuple from struct fields; missing data means unit
+variant.
+@End Reasoning
+@Implementation:
+Read name@8, variant_data@16, variant_discriminant@24. Build HIR variant
+node. If variant_data exists, read its tag and dispatch to either tuple-field
+or struct-field translation. If a discriminant expression is present (e.g.
+`A = 7`), translate and attach it.
+@End Implementation
 Process called "translate_rust_enum_variant" takes translator as Integer, variant_node as Integer returns Integer:
     Note: Translate individual enum variant
 
@@ -399,6 +553,16 @@ Process called "translate_rust_enum_variant" takes translator as Integer, varian
     Return hir_variant
 End Process
 
+@Reasoning:
+A trait declaration aggregates its item list (methods, associated types,
+associated constants), its generic parameters, and its supertrait bounds.
+All three are stored in separate parser containers so we translate each
+through a focused helper rather than overloading one walker.
+@End Reasoning
+@Implementation:
+Read name@8, items@16, generics@24, bounds@32. Construct HIR trait node and
+attach each translated sub-container via dedicated setters.
+@End Implementation
 Process called "translate_rust_trait" takes translator as Integer, trait_node as Integer returns Integer:
     Note: Translate Rust trait to HIR trait definition
 
@@ -436,6 +600,18 @@ Process called "translate_rust_trait" takes translator as Integer, trait_node as
     Return hir_trait
 End Process
 
+@Reasoning:
+An impl block can be inherent (`impl Type`) or trait (`impl Trait for Type`).
+We distinguish by presence of impl_trait at offset 16 rather than by a
+separate tag. Generic parameters are stored last so adding `where` clause
+support later won't shift earlier offsets.
+@End Reasoning
+@Implementation:
+Read impl_type@8, impl_trait@16, impl_items@24, impl_generics@32. Build HIR
+impl; if impl_type is present translate and attach (inherent or trait
+target); if impl_trait is present translate the trait reference; translate
+items and generics through their helpers.
+@End Implementation
 Process called "translate_rust_impl" takes translator as Integer, impl_node as Integer returns Integer:
     Note: Translate Rust impl block to HIR implementation
 
@@ -479,6 +655,19 @@ Process called "translate_rust_impl" takes translator as Integer, impl_node as I
     Return hir_impl
 End Process
 
+@Reasoning:
+A Rust block is a sequence of statements terminated optionally by a tail
+expression that becomes the block's value. The parser flattens both into the
+same children list; the HIR block node distinguishes them via the
+add_block_statement / set_block_tail HIR setters (only the former is used
+here because the parser already encodes the tail as a final expression-
+statement when applicable).
+@End Reasoning
+@Implementation:
+Build HIR block node, iterate children at offset 32 of block_node, dispatch
+each to translate_rust_statement, and append non-null HIR statements via
+add_block_statement.
+@End Implementation
 Process called "translate_rust_block" takes translator as Integer, block_node as Integer returns Integer:
     Note: Translate Rust block expression to HIR block
 
@@ -509,6 +698,17 @@ Process called "translate_rust_block" takes translator as Integer, block_node as
     Return hir_block
 End Process
 
+@Reasoning:
+Statements in Rust come in three flavors: let bindings, expression
+statements, and item statements (inner functions/structs declared inside a
+block). Dispatch is by parser tag at offset 0; unknown tags yield an error
+node so the gap is visible.
+@End Reasoning
+@Implementation:
+Null-check the input. Read tag@0. If/Otherwise If chain to
+translate_rust_let_statement, translate_rust_expression_statement, or
+translate_rust_item_statement. Default branch returns a HIR error node.
+@End Implementation
 Process called "translate_rust_statement" takes translator as Integer, stmt_node as Integer returns Integer:
     Note: Translate Rust statements to HIR statements
 
@@ -529,6 +729,19 @@ Process called "translate_rust_statement" takes translator as Integer, stmt_node
     Return proc create_hir_error_node from HIR with "Unknown statement type"
 End Process
 
+@Reasoning:
+The expression dispatcher fans out to 27 different translators - the largest
+single fan-out in this translator - because Rust's expression grammar covers
+literals, identifiers, calls, indexing, all binary and unary ops, ranges,
+closures, async/unsafe blocks, all forms of control flow, and various
+constructions (struct literals, tuples, arrays). Centralizing the dispatch
+guarantees every new expression kind goes through one chokepoint.
+@End Reasoning
+@Implementation:
+Null-check the input. Read tag@0. Long if/Otherwise If chain dispatching to
+each translate_rust_<kind> helper. Unknown tags return a HIR error node so
+producer-side gaps are surfaced as visible errors rather than silent drops.
+@End Implementation
 Process called "translate_rust_expression" takes translator as Integer, expr_node as Integer returns Integer:
     Note: Translate Rust expressions to HIR expressions
 
@@ -603,6 +816,18 @@ Process called "translate_rust_expression" takes translator as Integer, expr_nod
     Return proc create_hir_error_node from HIR with "Unknown expression type"
 End Process
 
+@Reasoning:
+Type dispatch covers 10 Rust type kinds: path types (Foo::Bar<T>), references
+(&T, &mut T), arrays ([T; N]), slices ([T]), tuples ((T, U)), function types
+(fn(T)->U), generic types, associated types (T::Item), impl-Trait, and
+dyn-Trait. The path-vs-reference distinction is the most important because
+references carry lifetime and mutability that flow into HIR's ownership model.
+@End Reasoning
+@Implementation:
+Null-check input. Read tag@0. Dispatch via if/Otherwise If to the specific
+translate_rust_<kind>_type helper. Default returns a HIR error node "Unknown
+type".
+@End Implementation
 Process called "translate_rust_type" takes translator as Integer, type_node as Integer returns Integer:
     Note: Translate Rust type annotations to HIR types
 
@@ -643,6 +868,17 @@ Process called "translate_rust_type" takes translator as Integer, type_node as I
     Return proc create_hir_error_node from HIR with "Unknown type"
 End Process
 
+@Reasoning:
+Function bodies introduce a fresh lexical scope for let-bindings, named
+loop labels, and generic parameter binders. Pushing a new dictionary onto
+the scope stack and caching its handle in current_scope (offset 0) lets the
+hot translate path read current_scope without walking the stack.
+@End Reasoning
+@Implementation:
+Read scope_stack from offset 8, create a new empty dictionary, append it to
+the stack, then update current_scope at offset 0 to that new dictionary.
+The previous current_scope is recoverable from the stack on exit.
+@End Implementation
 Process called "enter_function_scope" takes translator as Integer:
     Note: Enter new scope for function translation
 
@@ -653,6 +889,17 @@ Process called "enter_function_scope" takes translator as Integer:
     proc memory_set_int64 from Layout with translator, 0, new_scope
 End Process
 
+@Reasoning:
+Exit must rebind current_scope to the previous frame. The previous frame is
+located at stack_size - 2 after removing the topmost element, hence the
+"new_size - 1" expression. When the stack empties, current_scope becomes 0
+to signal "outside any function" rather than dangling at the popped frame.
+@End Reasoning
+@Implementation:
+Read scope_stack@8 and its size. Guard against underflow when stack is
+empty. Remove the last frame; if any remain, set current_scope to the now-
+topmost frame (index new_size - 1); otherwise zero current_scope.
+@End Implementation
 Process called "exit_function_scope" takes translator as Integer:
     Note: Exit current function scope
 
@@ -672,6 +919,18 @@ Process called "exit_function_scope" takes translator as Integer:
     End If
 End Process
 
+@Reasoning:
+Records a translator-level error: both the has_error flag (so cheap branch
+"did anything fail?" checks work) and the message itself. The message is
+COPIED rather than referenced because the caller may free or reuse the
+buffer immediately after this call.
+@End Reasoning
+@Implementation:
+Set has_error@40 to 1; copy_string the message via StringCore (defensive
+ownership); store the copy at error_message@32. Subsequent errors overwrite
+the previous message; first-error-wins semantics would require a presence
+check here.
+@End Implementation
 Process called "set_rust_translator_error" takes translator as Integer, message as Integer:
     Note: Set translator error state
 

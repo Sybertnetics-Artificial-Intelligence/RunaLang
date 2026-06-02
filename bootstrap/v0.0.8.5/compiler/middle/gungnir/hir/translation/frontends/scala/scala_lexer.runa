@@ -167,6 +167,22 @@ Constant TOKEN_STRING_INTERPOLATION_S as Integer is 150
 Constant TOKEN_STRING_INTERPOLATION_F as Integer is 151
 Constant TOKEN_STRING_INTERPOLATION_RAW as Integer is 152
 
+@Reasoning:
+Scala's syntax has rich expressions but a simple lexer state space:
+a source string, byte position, 1-based line/column for diagnostics,
+the current character, and a sticky error_message slot. No layout
+stack is needed (Scala 2 uses braces; Scala 3 indentation is parsed
+post-tokenization by the parser layer).
+@End Reasoning
+
+@Implementation:
+Field-based struct (constructed via the "a value of type" form, not a
+raw byte layout). source is the original program text; position/length
+are byte offsets; line/column are 1-based for human-readable
+diagnostics; current_char is the byte under the cursor (0 means EOF);
+error_message accumulates the first lexer error.
+@End Implementation
+
 Type called "ScalaLexer":
     source as String
     position as Integer
@@ -178,6 +194,20 @@ Type called "ScalaLexer":
 End Type
 
 Note: Create new Scala lexer
+@Reasoning:
+Allocates the ScalaLexer struct and primes the cursor at byte 0 so the
+first call to next_scala_token does not need a special-case initial
+advance. line=1, column=1 follow standard 1-based reporting.
+@End Reasoning
+
+@Implementation:
+Uses the "a value of type" struct constructor to initialise all
+fields, computes source length via StringCore.string_length, and loads
+the first byte via char_at (or 0 if the source is empty). Returns the
+struct address via Layout.memory_address_of for storage as an Integer
+handle.
+@End Implementation
+
 Process called "create_scala_lexer" takes source as String returns Integer:
     Let lexer be a value of type ScalaLexer with
         source as source,
@@ -199,6 +229,21 @@ Process called "create_scala_lexer" takes source as String returns Integer:
 End Process
 
 Note: Advance to next character
+@Reasoning:
+Cursor advance with built-in line tracking. Newlines (ASCII 10)
+reset column to 1 and bump line so diagnostic positions remain
+accurate; every other character just bumps column by 1. EOF clears
+current_char to 0 so callers can compare against the same sentinel
+as create_scala_lexer's empty-source case.
+@End Reasoning
+
+@Implementation:
+Loads the struct via memory_get_address, increments position by 1,
+checks bounds against length (sets current_char to 0 and returns on
+EOF), otherwise reads the new byte via StringCore.char_at and updates
+line/column based on whether the new byte is LF.
+@End Implementation
+
 Process called "advance_char" takes lexer as Integer:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
 
@@ -220,6 +265,19 @@ Process called "advance_char" takes lexer as Integer:
 End Process
 
 Note: Peek at character ahead
+@Reasoning:
+Scala has many multi-character tokens (=>, <-, ::, |||, //, /*) so the
+scanner needs k-character non-consuming lookahead to disambiguate
+before committing. peek_char is the bounds-safe primitive used for
+that.
+@End Reasoning
+
+@Implementation:
+Computes peek_pos = position + offset; returns 0 (EOF sentinel) if
+out of bounds; otherwise reads via StringCore.char_at. Pure read —
+no side effects on the lexer state.
+@End Implementation
+
 Process called "peek_char" takes lexer as Integer, offset as Integer returns Integer:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Let peek_pos be lexer_obj.position plus offset
@@ -232,6 +290,19 @@ Process called "peek_char" takes lexer as Integer, offset as Integer returns Int
 End Process
 
 Note: Skip whitespace characters
+@Reasoning:
+Skips horizontal whitespace (space, tab) and carriage return. Crucially
+does NOT skip LF (newline) because Scala's parser is newline-sensitive:
+some constructs treat newlines as statement terminators and the
+tokenizer emits a TOKEN_NEWLINE for each one.
+@End Reasoning
+
+@Implementation:
+Loop calling advance_char while current_char is one of 32 (space), 9
+(tab), 13 (CR). Stops on LF or any other character so newlines remain
+visible to the main tokenizer.
+@End Implementation
+
 Process called "skip_whitespace" takes lexer as Integer:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
 
@@ -241,6 +312,19 @@ Process called "skip_whitespace" takes lexer as Integer:
 End Process
 
 Note: Skip line comment (// style)
+@Reasoning:
+Scala uses // for line comments. The terminating newline is
+intentionally left unconsumed so the main scanner can still emit a
+TOKEN_NEWLINE for the line transition (important for
+newline-sensitive grammar rules).
+@End Reasoning
+
+@Implementation:
+Consumes the two `//` characters first, then loops calling
+advance_char while current_char is neither 0 (EOF) nor 10 (LF). The
+LF remains under the cursor for skip_whitespace / next_scala_token.
+@End Implementation
+
 Process called "skip_line_comment" takes lexer as Integer:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
 
@@ -255,6 +339,21 @@ Process called "skip_line_comment" takes lexer as Integer:
 End Process
 
 Note: Skip block comment (/* */ style)
+@Reasoning:
+Scala block comments nest, unlike C/Java/JavaScript. The lexer must
+track nesting depth so `/* outer /* inner */ outer */` consumes both
+opening tokens. An unterminated block comment is reported as a hard
+lexer error.
+@End Reasoning
+
+@Implementation:
+Skips the leading `/*` then loops with nesting_level starting at 1.
+On `/*` increments the counter; on `*/` decrements. Any other byte
+just advances. Loop ends when current_char hits EOF (0) or
+nesting_level drops to 0. Returns false (and sets error_message) if
+the loop exits with positive nesting (unterminated), true otherwise.
+@End Implementation
+
 Process called "skip_block_comment" takes lexer as Integer returns Boolean:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
 
@@ -287,21 +386,69 @@ Process called "skip_block_comment" takes lexer as Integer returns Boolean:
 End Process
 
 Note: Check if character is letter
+@Reasoning:
+ASCII identifier-start predicate. Includes underscore (95) because
+Scala treats `_` as a valid identifier-start character (used as
+wildcard, placeholder, default value, etc.).
+@End Reasoning
+
+@Implementation:
+Single boolean expression covering ASCII 65..90 (A-Z), 97..122 (a-z),
+and equality with 95 (underscore). Full Unicode identifier support is
+deferred to a later pass to keep bootstrap lexer ASCII-fast.
+@End Implementation
+
 Process called "is_letter" takes ch as Integer returns Boolean:
     Return (ch is greater than or equal to 65 and ch is less than or equal to 90) or (ch is greater than or equal to 97 and ch is less than or equal to 122) or ch is equal to 95  Note: A-Z, a-z, _
 End Process
 
 Note: Check if character is digit
+@Reasoning:
+ASCII '0'..'9' decimal-digit predicate used by read_number for the
+integer and fractional parts of numeric literals.
+@End Reasoning
+
+@Implementation:
+Single range test against ASCII 48..57. Hex digit recognition lives
+in is_hex_digit, which composes this predicate.
+@End Implementation
+
 Process called "is_digit" takes ch as Integer returns Boolean:
     Return ch is greater than or equal to 48 and ch is less than or equal to 57  Note: 0-9
 End Process
 
 Note: Check if character is hexadecimal digit
+@Reasoning:
+Scala literals support hex integers via 0x/0X prefix; this predicate
+recognises both upper and lower case hex digits in addition to
+decimal digits. Composing is_digit keeps the decimal-digit definition
+in one place.
+@End Reasoning
+
+@Implementation:
+Boolean OR of is_digit, ASCII 65..70 (A-F), and ASCII 97..102 (a-f).
+Used by the hex-literal branch of read_number.
+@End Implementation
+
 Process called "is_hex_digit" takes ch as Integer returns Boolean:
     Return proc is_digit from ch or (ch is greater than or equal to 65 and ch is less than or equal to 70) or (ch is greater than or equal to 97 and ch is less than or equal to 102)  Note: 0-9, A-F, a-f
 End Process
 
 Note: Check if character can start an operator
+@Reasoning:
+Scala allows user-defined infix operators built from a specific set of
+ASCII symbols. This predicate enumerates them so read_operator can
+greedily consume the longest operator token (e.g. `<=:`, `=:=`,
+`->>` are all valid operators in Scala).
+@End Reasoning
+
+@Implementation:
+Single boolean expression listing each valid operator character by
+its ASCII code: !, #, %, &, *, +, -, /, :, <, =, >, ?, @, \, ^, |, ~.
+Returns true on any match. Used by read_operator and by the main
+tokenizer's symbol-dispatch fast path.
+@End Implementation
+
 Process called "is_operator_char" takes ch as Integer returns Boolean:
     Return ch is equal to 33 or ch is equal to 35 or ch is equal to 37 or ch is equal to 38 or ch is equal to 42 or ch is equal to 43 or ch is equal to 45 or ch is equal to 47 or
            ch is equal to 58 or ch is equal to 60 or ch is equal to 61 or ch is equal to 62 or ch is equal to 63 or ch is equal to 64 or ch is equal to 92 or ch is equal to 94 or
@@ -309,6 +456,29 @@ Process called "is_operator_char" takes ch as Integer returns Boolean:
 End Process
 
 Note: Read string literal
+@Reasoning:
+Scala strings can use either " or ' delimiters (the caller has
+verified one of those is at the cursor and passes its byte via the
+current_char field). Standard escape sequences (\n, \t, \r, \\, \",
+\') are decoded inline so the parser receives a fully-resolved string
+value rather than the raw lexeme.
+@End Reasoning
+
+@Implementation:
+Captures quote_char from current_char, advances past opening quote.
+Main loop accumulates into `result` until either EOF (current_char=0)
+or the matching close quote. Backslash consumes the next char,
+producing the decoded byte for known escapes (\n=10, \t=9, \r=13,
+\\=92, \"=34, \'=39); unknown escapes pass the literal byte through.
+On the closing quote, advances past it; on EOF mid-string sets
+"Unterminated string literal" in error_message.
+@End Implementation
+
+@Security_Scope:
+Input is untrusted source text. Unterminated strings are handled via
+EOF detection so the loop cannot run forever on malformed input.
+@End Security_Scope
+
 Process called "read_string_literal" takes lexer as Integer returns String:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Let result be ""
@@ -351,6 +521,20 @@ Process called "read_string_literal" takes lexer as Integer returns String:
 End Process
 
 Note: Read interpolated string literal
+@Reasoning:
+Scala supports interpolators prefixed before the string literal:
+s"..." for simple interpolation, f"..." for format strings, raw"..."
+for unescaped. The bootstrap lexer captures the prefix plus the
+quoted body as one lexeme; interpolation expression parsing is
+deferred to a later pass.
+@End Reasoning
+
+@Implementation:
+Reads the alphabetic prefix (s, f, raw) character-by-character via
+is_letter into `result`, then delegates to read_string_literal for
+the quoted body and appends that to result.
+@End Implementation
+
 Process called "read_interpolated_string" takes lexer as Integer returns String:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Let result be ""
@@ -369,6 +553,20 @@ Process called "read_interpolated_string" takes lexer as Integer returns String:
 End Process
 
 Note: Read character literal
+@Reasoning:
+Scala char literals are single-quoted single-character values with the
+same escape forms as string literals. Stored as a String of length 1
+for uniform downstream handling.
+@End Reasoning
+
+@Implementation:
+Advances past the opening single quote. If current_char is backslash,
+decodes the next byte (n=10, t=9, r=13, \\=92, '=39, default = byte
+itself), advances past it; otherwise records the raw current_char and
+advances. Closing quote check: advances past closing if present,
+otherwise sets "Unterminated character literal" error.
+@End Implementation
+
 Process called "read_char_literal" takes lexer as Integer returns String:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Let result be ""
@@ -406,6 +604,23 @@ Process called "read_char_literal" takes lexer as Integer returns String:
 End Process
 
 Note: Read numeric literal
+@Reasoning:
+Scala numeric literals come in many flavours: hex (0x...), integer
+(123), decimal (1.5), scientific (1e10), with optional type suffix
+(L/Long, F/Float, D/Double). The reader preserves the entire lexeme
+so the parser/type-checker can decide the exact numeric type.
+@End Reasoning
+
+@Implementation:
+First branch: if current_char is `0` and the next char is `x`/`X`,
+records the prefix and consumes hex digits via is_hex_digit. Otherwise
+linear path: consume integer digits, then optional `.digits` (only
+when `.` is followed by a digit so member access stays unambiguous),
+then optional `e`/`E` + optional `+`/`-` + digits, then optional
+type-suffix byte (L, l, F, f, D, d). Returns the lexeme string for
+the caller to wrap in the appropriate token.
+@End Implementation
+
 Process called "read_number" takes lexer as Integer returns String:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Let result be ""
@@ -475,6 +690,22 @@ Process called "read_number" takes lexer as Integer returns String:
 End Process
 
 Note: Read identifier or keyword
+@Reasoning:
+Scala supports two identifier forms: normal (letter or underscore +
+letter/digit/$) and backtick-quoted (`identifier with spaces`) for
+escaping reserved words or non-standard names. Both paths produce a
+plain string lexeme; the caller decides keyword vs identifier via
+get_keyword_token.
+@End Reasoning
+
+@Implementation:
+If current_char is backtick (96), enters the quoted path: consume
+chars until the closing backtick or EOF; advance past the closing
+backtick. Otherwise enters the normal path: consume while is_letter
+OR is_digit OR equality with 36 (dollar sign, allowed for synthetic
+identifiers).
+@End Implementation
+
 Process called "read_identifier" takes lexer as Integer returns String:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Let result be ""
@@ -502,6 +733,21 @@ Process called "read_identifier" takes lexer as Integer returns String:
 End Process
 
 Note: Read operator identifier
+@Reasoning:
+Scala operators are maximal munches of consecutive operator characters
+(per is_operator_char). User-defined operators like `=:=` or `<*>`
+must be tokenized as single units so the parser can resolve precedence
+based on the first character.
+@End Reasoning
+
+@Implementation:
+Greedy consumption: loop appending the current_char while
+is_operator_char returns true, advancing each iteration. Returns the
+full operator lexeme string; the caller maps fixed operators (=, =>,
+<-, etc.) to dedicated token types and any leftover form to
+TOKEN_OPERATOR_IDENTIFIER.
+@End Implementation
+
 Process called "read_operator" takes lexer as Integer returns String:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Let result be ""
@@ -515,6 +761,19 @@ Process called "read_operator" takes lexer as Integer returns String:
 End Process
 
 Note: Read symbol literal
+@Reasoning:
+Scala 2 symbol literals (e.g. `'foo`) are deprecated but still
+recognised by the bootstrap lexer for older codebases. The leading
+single quote is preserved in the returned lexeme so the parser can
+distinguish symbols from identifiers.
+@End Reasoning
+
+@Implementation:
+Records "'" as initial result, advances past the leading single
+quote, then consumes letter/digit/underscore characters. Returns the
+full lexeme including the leading quote.
+@End Implementation
+
 Process called "read_symbol" takes lexer as Integer returns String:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Let result be "'"
@@ -530,6 +789,26 @@ Process called "read_symbol" takes lexer as Integer returns String:
 End Process
 
 Note: Check if identifier is a keyword
+@Reasoning:
+After read_identifier produces a lexeme, the lexer must decide whether
+it is one of Scala's ~40 reserved words. A flat sequence of equality
+checks is used rather than a hash table because cache locality favours
+the linear form at this size and the per-keyword cost is two string
+compares maximum (Otherwise branch + match check).
+@End Reasoning
+
+@Implementation:
+Sequential strings_equal calls in alphabetical order: abstract, case,
+catch, class, def, ..., yield. Each match returns its dedicated TOKEN_*
+constant. Falls through to TOKEN_IDENTIFIER if no keyword matches.
+@End Implementation
+
+@Performance_Hints:
+With 40+ keywords this is the lexer's hottest function on
+identifier-heavy code. A perfect-hash on the first character could
+cut comparisons by ~5x; deferred for readability.
+@End Performance_Hints
+
 Process called "get_keyword_token" takes identifier as String returns Integer:
     If proc strings_equal from StringCore with identifier, "abstract":
         Return TOKEN_ABSTRACT
@@ -615,6 +894,25 @@ Process called "get_keyword_token" takes identifier as String returns Integer:
 End Process
 
 Note: Get next token from Scala source
+@Reasoning:
+Main token dispatcher: skip horizontal whitespace, then sample the
+current character and route to the appropriate scanner. Scala has
+several first-character ambiguities (// vs /* vs / for division;
+identifier-start vs string-prefix s/f/raw) that require peeking
+before committing to a sub-scanner.
+@End Reasoning
+
+@Implementation:
+Calls skip_whitespace, then checks current_char in priority order:
+EOF (returns TOKEN_EOF), LF (consumes, returns TOKEN_NEWLINE), `//`
+(line comment, returns TOKEN_COMMENT_LINE), `/*` (block comment, may
+return TOKEN_ERROR on unterminated), digit (delegates to read_number),
+letter/_ (read_identifier then get_keyword_token), s/f/raw + `"`
+(interpolated string), backtick (quoted identifier), `"` (string),
+`'` (char or symbol depending on follow-up), operator chars
+(read_operator), and a long table of single-byte punctuators.
+@End Implementation
+
 Process called "next_scala_token" takes lexer as Integer returns Integer:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
 
@@ -885,40 +1183,122 @@ Process called "next_scala_token" takes lexer as Integer returns Integer:
 End Process
 
 Note: Get current lexer position
+@Reasoning:
+Public accessor that hides the struct layout from the parser layer.
+Used by the parser to record token start/end byte offsets for source
+spans.
+@End Reasoning
+
+@Implementation:
+Loads the ScalaLexer struct via memory_get_address and returns its
+position field directly.
+@End Implementation
+
 Process called "get_lexer_position" takes lexer as Integer returns Integer:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Return lexer_obj.position
 End Process
 
 Note: Get current line number
+@Reasoning:
+Used by error formatters to print `file:line:column` diagnostic
+prefixes. 1-based per the lexer's initialization convention.
+@End Reasoning
+
+@Implementation:
+Loads the struct via memory_get_address and returns its line field.
+@End Implementation
+
 Process called "get_lexer_line" takes lexer as Integer returns Integer:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Return lexer_obj.line
 End Process
 
 Note: Get current column number
+@Reasoning:
+Companion to get_lexer_line for the column component. Used by
+diagnostic formatters and span recorders. 1-based, reset to 1 on each
+LF by advance_char.
+@End Reasoning
+
+@Implementation:
+Loads the struct via memory_get_address and returns its column field.
+@End Implementation
+
 Process called "get_lexer_column" takes lexer as Integer returns Integer:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Return lexer_obj.column
 End Process
 
 Note: Get lexer error message
+@Reasoning:
+Exposes the sticky error_message that read_string_literal /
+read_char_literal / skip_block_comment / next_scala_token set on
+failure. Callers should check this after a TOKEN_ERROR result to
+diagnose the cause.
+@End Reasoning
+
+@Implementation:
+Loads the struct via memory_get_address and returns its
+error_message field. Empty string indicates no error occurred.
+@End Implementation
+
 Process called "get_lexer_error" takes lexer as Integer returns String:
     Let lexer_obj be proc memory_get_address from Layout with lexer, 0
     Return lexer_obj.error_message
 End Process
 
 Note: Check if token is a literal
+@Reasoning:
+The token type constants are arranged so that all literal token codes
+fall in one contiguous range; checking literal-ness reduces to a
+single range test. Consumers (parser, syntax-highlighter) rely on
+this categorisation.
+@End Reasoning
+
+@Implementation:
+Boolean AND of `token_type >= TOKEN_INTEGER_LITERAL` and
+`token_type <= TOKEN_INTERPOLATED_STRING`. Depends on the constants
+being kept contiguous in the surrounding declarations.
+@End Implementation
+
 Process called "is_literal_token" takes token_type as Integer returns Boolean:
     Return token_type is greater than or equal to TOKEN_INTEGER_LITERAL and token_type is less than or equal to TOKEN_INTERPOLATED_STRING
 End Process
 
 Note: Check if token is a keyword
+@Reasoning:
+Mirror of is_literal_token for keyword tokens: keyword token codes
+are kept contiguous so a single range test resolves the question.
+Used by the syntax-highlighter to bold reserved words.
+@End Reasoning
+
+@Implementation:
+Boolean AND of `token_type >= TOKEN_ABSTRACT` and
+`token_type <= TOKEN_YIELD`. Relies on the alphabetical ordering of
+keyword constants in the surrounding block.
+@End Implementation
+
 Process called "is_keyword_token" takes token_type as Integer returns Boolean:
     Return token_type is greater than or equal to TOKEN_ABSTRACT and token_type is less than or equal to TOKEN_YIELD
 End Process
 
 Note: Check if token is an operator
+@Reasoning:
+Operators are spread across several non-contiguous ranges (arithmetic,
+comparison, logical, bitwise, arrows/colons, custom-operator
+identifier) so the test is a disjunction of multiple range checks.
+@End Reasoning
+
+@Implementation:
+ORs five range tests covering: TOKEN_PLUS..TOKEN_DIVIDE_ASSIGN
+(arithmetic + compound assigns), TOKEN_EQUAL..TOKEN_GREATER_EQUAL
+(comparison), TOKEN_AND..TOKEN_NOT (logical),
+TOKEN_BITWISE_AND..TOKEN_UNSIGNED_RIGHT_SHIFT (bitwise),
+TOKEN_ARROW..TOKEN_CONTEXT_BOUND (arrows/colons), and an explicit
+equality with TOKEN_OPERATOR_IDENTIFIER.
+@End Implementation
+
 Process called "is_operator_token" takes token_type as Integer returns Boolean:
     Return (token_type is greater than or equal to TOKEN_PLUS and token_type is less than or equal to TOKEN_DIVIDE_ASSIGN) or
            (token_type is greater than or equal to TOKEN_EQUAL and token_type is less than or equal to TOKEN_GREATER_EQUAL) or
@@ -929,6 +1309,21 @@ Process called "is_operator_token" takes token_type as Integer returns Boolean:
 End Process
 
 Note: Get token type name for debugging
+@Reasoning:
+Diagnostic helper that prints a human-readable token name. Used by
+the test harness and error reporter so messages like "Expected , got
+class" use real keywords instead of integer constants.
+@End Reasoning
+
+@Implementation:
+Otherwise If chain over common token types. Top of the list covers
+control tokens (EOF, ERROR, IDENTIFIER, literals), then keywords
+(class, def, val, var, if, else, match, ...), then a punctuation
+section (+, -, *, /, =, =>, <-, :, ;, ., ,, parens, brackets, braces).
+Returns "UNKNOWN" as the final fallback so the caller never gets a
+null string.
+@End Implementation
+
 Process called "get_token_name" takes token_type as Integer returns String:
     If token_type is equal to TOKEN_EOF:
         Return "EOF"

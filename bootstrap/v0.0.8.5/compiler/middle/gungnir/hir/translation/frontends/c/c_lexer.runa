@@ -185,6 +185,21 @@ Note: ==========================================================================
 Note: Lexer Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Heap-allocates the 72-byte CLexer record and primes it for first-byte
+consumption: position 0, line 1, column 1 (1-based per editor convention
+for diagnostics). token_start/token_type are cleared so callers can rely
+on a "no token yet" reading; token_lexeme and error_message are null so
+destroy_c_lexer's conditional free is safe.
+@End Reasoning
+
+@Implementation:
+Allocates 72 bytes via Layout.allocate; on OOM returns 0 so the caller
+can short-circuit. Caches the source byte length once (via
+StringCore.string_length) at offset 8 to avoid re-measuring on every
+peek/advance. The nine field writes match the documented layout at
+offsets 0/8/16/24/32/40/48/56/64.
+@End Implementation
 Process called "create_c_lexer" takes source as Integer returns Integer:
     Note: Create C lexer from source code
 
@@ -215,6 +230,20 @@ Process called "create_c_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+Releases the three heap-owned resources a CLexer may have acquired:
+token_lexeme (allocated by get_token_lexeme), error_message (allocated
+on lex failure), and the record itself. Null lexer handle is treated as
+a no-op so paired create/destroy never crashes after an OOM-failed
+create.
+@End Reasoning
+
+@Implementation:
+Null-checks lexer at offset 0 short-circuit. Reads token_lexeme (offset
+56) and error_message (offset 64); each is freed only if non-zero so an
+unused CLexer doesn't double-free. Finally deallocates the 72-byte
+record. Returns 1 to signal success per the boolean-result convention.
+@End Implementation
 Process called "destroy_c_lexer" takes lexer as Integer returns Integer:
     Note: Destroy C lexer and free resources
 
@@ -624,6 +653,27 @@ Process called "check_keyword" takes lexeme as Integer, length as Integer, keywo
     Return 1
 End Process
 
+@Reasoning:
+Maps an identifier lexeme to its C reserved-word TOKEN_* constant or 0
+if it is not a keyword. The C11 reserved-word set is small (37 words);
+bucketing by length lets us reject most identifiers in a single integer
+compare before any string work, which matters because every identifier
+the lexer scans passes through this routine.
+@End Reasoning
+
+@Implementation:
+Length-dispatched cascade. Each branch matches the keywords of that
+length via check_keyword (byte-equal compare). On match the routine
+returns the corresponding TOKEN_* constant directly. Falls through to
+return 0 (meaning "ordinary identifier") if no bucket matches.
+@End Implementation
+
+@Performance_Hints:
+Length bucketing reduces average comparisons from O(K) (K=keyword count)
+to O(K_len) where K_len is the count of keywords of that exact length;
+for typical C source the dominant length-2/length-3 buckets each contain
+2 entries.
+@End Performance_Hints
 Process called "is_c_keyword" takes lexeme as Integer, length as Integer returns Integer:
     Note: Check if identifier is C keyword and return token type
 
@@ -788,6 +838,22 @@ Note: ==========================================================================
 Note: Identifier and Keyword Scanning
 Note: ============================================================================
 
+@Reasoning:
+Scans a C identifier (per C11 6.4.2.1: nondigit followed by any number
+of nondigit/digit). The caller must have verified the first byte is
+is_alpha before entry; this routine consumes the run-of-is_alnum and
+then dispatches to is_c_keyword to upgrade the result to a reserved-word
+token when applicable.
+@End Reasoning
+
+@Implementation:
+Snapshots the cursor into token_start (offset 40) before consuming.
+Loops calling peek_char/is_alnum then advance_char until is_alnum
+fails. Computes lexeme pointer as source+token_start and length as
+position-token_start; passes both to is_c_keyword. If is_c_keyword
+returns non-zero, stamps that token type into offset 48 and returns it;
+otherwise stamps TOKEN_IDENTIFIER.
+@End Implementation
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Note: Scan identifier or keyword
 
@@ -829,6 +895,28 @@ Note: ==========================================================================
 Note: Number Scanning
 Note: ============================================================================
 
+@Reasoning:
+Scans a C numeric literal in one pass. C11 distinguishes integer
+literals (decimal/hex/octal with optional u/l/ll/ul/ull suffixes) from
+floating literals (digits with '.', 'e'/'E' exponent, or f/F/l/L
+suffix); the lexer decides by setting an is_float flag whenever it
+consumes a '.', exponent, or float-only suffix and emits
+TOKEN_FLOAT_LITERAL versus TOKEN_INTEGER accordingly. Caller has
+verified the first byte is is_digit.
+@End Reasoning
+
+@Implementation:
+Records token_start at entry. Hex prefix (0x/0X) is detected up front
+and consumes one or more is_hex_digit bytes; that branch returns
+TOKEN_INTEGER directly (hex floats are not handled, matching the rest
+of the bootstrap C frontend). Falls through to decimal: consumes
+digits, then optional '.'-plus-digits (sets is_float), then optional
+exponent (e/E with optional +/- sign and digits, sets is_float), then
+optional suffix. Suffix handling supports the C11 set: f/F (float),
+l/L (long, with second l/L for long-long), u/U (unsigned, may be
+followed by l/L and a further l/L for ull/ULL). Emits the right
+TOKEN_* constant by inspecting the final is_float flag.
+@End Implementation
 Process called "scan_number" takes lexer as Integer returns Integer:
     Note: Scan integer or floating-point number
 
@@ -1063,6 +1151,27 @@ Note: ==========================================================================
 Note: String and Character Scanning
 Note: ============================================================================
 
+@Reasoning:
+Scans a C character constant 'c' (C11 6.4.4.4). Caller has verified the
+current byte is U+0027. The literal may contain a single character or
+a backslash escape; the lexer accepts any escape sequence syntactically
+(semantic validation belongs to a later pass) and is defensive against
+EOF and embedded newlines, which terminate with TOKEN_ERROR.
+@End Reasoning
+
+@Implementation:
+Snapshots cursor into token_start; consumes the opening single quote.
+Loop body: 0 byte (EOF) returns TOKEN_ERROR; LF (10) returns
+TOKEN_ERROR (newlines inside char literals are illegal); single quote
+(39) consumes and breaks; backslash (92) consumes both itself and the
+following byte to skip the escape; default consumes one byte. Stamps
+TOKEN_CHAR_LITERAL at offset 48.
+@End Implementation
+
+@Security_Scope:
+Source is untrusted; explicit EOF (0) and LF (10) checks bound the loop
+so a malformed unterminated literal cannot run past the source buffer.
+@End Security_Scope
 Process called "scan_char_literal" takes lexer as Integer returns Integer:
     Note: Scan character literal ('c')
 
@@ -1271,6 +1380,33 @@ Note: ==========================================================================
 Note: Token Scanning
 Note: ============================================================================
 
+@Reasoning:
+The lexer's main entry point. Skips inter-token whitespace and both
+comment forms (// to end-of-line, /* ... */ block) in a loop so the
+parser sees only meaningful tokens, then dispatches by first byte to
+the specialist scanners (identifier/keyword, number, char literal,
+string literal, preprocessor directive) or to the operator/delimiter
+classifier for everything else. Returns TOKEN_EOF when the source is
+exhausted.
+@End Reasoning
+
+@Implementation:
+Outer while loop drives whitespace/comment skipping. Reads first
+non-skip byte via peek_char: 0 -> TOKEN_EOF (stamped at offset 48).
+On '/' (47) peek_next_char selects line comment ('/'), block comment
+('*'), or falls through to division. Block-comment failure (unclosed
+/*) returns TOKEN_ERROR. After comment loop exits, dispatches: is_alpha
+-> scan_identifier; is_digit -> scan_number; 39 -> scan_char_literal;
+34 -> scan_string_literal; 35 -> scan_preprocessor; remaining handler
+(continues below) covers operators/delimiters with multi-byte lookahead
+via peek_next_char.
+@End Implementation
+
+@Security_Scope:
+Operates on untrusted source; the comment-skip loop guards against
+runaway by relying on skip_block_comment's EOF-aware termination, and
+the unknown-byte path emits TOKEN_ERROR rather than spinning.
+@End Security_Scope
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Scan and return next token
 
@@ -1661,6 +1797,17 @@ Note: ==========================================================================
 Note: Token Access
 Note: ============================================================================
 
+@Reasoning:
+Read accessor for the most-recently-emitted token type. Used by the
+parser when re-reading the current token without consuming another;
+also used by tests to inspect lexer state. token_type is updated by
+each scan_*/next_token path so this accessor is always current after a
+successful scan.
+@End Reasoning
+
+@Implementation:
+Single memory_get_int64 from offset 48. Constant time, no allocation.
+@End Implementation
 Process called "get_token_type" takes lexer as Integer returns Integer:
     Note: Get current token type
 

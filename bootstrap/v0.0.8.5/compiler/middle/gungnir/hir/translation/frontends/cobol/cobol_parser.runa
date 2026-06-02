@@ -136,6 +136,14 @@ Note: ==========================================================================
 Note: Parser Creation and Initialization
 Note: ============================================================================
 
+@Reasoning:
+Builds a COBOLParser record paired with an owned lexer. The parser
+shares the caller's arena (offset 32) so all AST nodes allocated during
+parsing get freed in one arena tear-down rather than scattered free
+calls. First token is read eagerly so callers can predicate on
+peek_token_type immediately without a separate prime step.
+@End Reasoning
+
 Process called "create_cobol_parser" takes source as Integer, arena as Integer returns Integer:
     Note: Create COBOL parser from source code
 
@@ -170,6 +178,13 @@ Process called "create_cobol_parser" takes source as Integer, arena as Integer r
     Return parser
 End Process
 
+@Reasoning:
+Release the embedded lexer (it owns its own buffers) and deallocate the
+parser record itself. The arena is NOT freed here because it is caller-
+owned — callers commonly outlive a parser instance so the AST can be
+walked after parsing finishes.
+@End Reasoning
+
 Process called "destroy_cobol_parser" takes parser as Integer returns Integer:
     Note: Destroy COBOL parser and cleanup
 
@@ -196,6 +211,14 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Shifts current_token to previous_token (offset 8 → 16) and pulls the
+next from the lexer. Maintaining previous_token is essential for
+error recovery — when an expectation fails, error messages can point
+at the previous token's position (often the relevant one) rather than
+the unexpected current one.
+@End Reasoning
+
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Move to next token
 
@@ -213,6 +236,13 @@ Process called "advance_token" takes parser as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Look-ahead helper: returns the token type at the current position
+without consuming it. A null current_token (lexer drained) is mapped to
+TOKEN_EOF rather than a sentinel zero so callers can use the same
+equality test for natural EOF and an error-state EOF.
+@End Reasoning
 
 Process called "peek_token_type" takes parser as Integer returns Integer:
     Note: Get current token type without advancing
@@ -278,6 +308,14 @@ Process called "check_token_type" takes parser as Integer, expected as Integer r
     Return 0
 End Process
 
+@Reasoning:
+The fundamental shift-on-match parser primitive: if the current token is
+of the expected type, consume it and return 1; otherwise, latch the
+supplied error message and return 0 without advancing. Not advancing on
+failure is what lets the caller's recovery code skim ahead from the same
+point rather than blindly past the offender.
+@End Reasoning
+
 Process called "expect_token" takes parser as Integer, expected as Integer, error_msg as Integer returns Integer:
     Note: Consume token of expected type or report error
 
@@ -297,6 +335,15 @@ Process called "expect_token" takes parser as Integer, expected as Integer, erro
 
     Return 1
 End Process
+
+@Reasoning:
+Records a structured error: increments error_count (offset 24), captures
+the current token's line/column for position reporting, builds a 32-byte
+error_record (message, line, col, raw token), and appends to the parser's
+errors list (allocated lazily on first error at offset 32 of the parser).
+Lazy list allocation matters because most parses run with no errors at
+all and a never-allocated list saves both memory and startup time.
+@End Reasoning
 
 Process called "report_parse_error" takes parser as Integer, message as Integer returns Integer:
     Note: Report parse error
@@ -340,6 +387,13 @@ Note: ==========================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Allocates a fresh AST node with only its type tag populated; child
+fields are zero-initialised so subsequent set_node_* helpers can rely on
+defined initial state. Returns 0 only on allocation failure; otherwise
+the pointer is always valid.
+@End Reasoning
+
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     Note: Create AST node with type
 
@@ -364,6 +418,13 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Attaches the COBOL identifier name (lexeme pointer) to a node's name
+field. Used for nodes representing named entities — paragraphs,
+sections, data items, files. The name slot is at a fixed offset so the
+emitter and validators can read it uniformly across node types.
+@End Reasoning
 
 Process called "set_node_name" takes node as Integer, name as Integer returns Integer:
     Note: Set node name/identifier
@@ -400,6 +461,14 @@ Process called "set_node_value" takes node as Integer, value as Integer returns 
 
     Return 1
 End Process
+
+@Reasoning:
+Appends to the node's children list with lazy growth: the list is
+allocated on first use and doubled when capacity is exceeded. This is
+how every COBOL hierarchical construct (division -> section -> paragraph
+-> statement) is wired structurally — there is no distinct "list" node
+kind, just children of the enclosing parent.
+@End Reasoning
 
 Process called "add_node_child" takes node as Integer, child as Integer returns Integer:
     Note: Add child node to node's children list
@@ -446,6 +515,14 @@ Process called "add_node_child" takes node as Integer, child as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Stores arbitrary key/value attribute pairs on a node — COBOL has many
+optional clauses (USAGE, VALUE, JUSTIFIED, OCCURS depending) that don't
+warrant dedicated AST fields. Each attribute lives in the node's
+attribute dictionary; this helper hides the dict-allocation laziness
+from per-statement parsers.
+@End Reasoning
+
 Process called "set_node_attribute" takes node as Integer, key as Integer, value as Integer returns Integer:
     Note: Set node attribute (metadata)
 
@@ -474,6 +551,15 @@ End Process
 Note: ============================================================================
 Note: Main Program Parsing
 Note: ============================================================================
+
+@Reasoning:
+Top-level entry: takes raw source, creates a parser, parses each of the
+four mandatory COBOL divisions in canonical order (IDENTIFICATION,
+ENVIRONMENT, DATA, PROCEDURE), and returns a COBOL_PROGRAM root with
+those four divisions as children. A missing division is recorded but
+parsing continues to the next so we can produce maximum diagnostics in
+one pass.
+@End Reasoning
 
 Process called "parse_cobol" takes source as Integer returns Integer:
     Note: Parse COBOL source into AST
@@ -533,6 +619,14 @@ End Process
 Note: ============================================================================
 Note: IDENTIFICATION DIVISION Parsing
 Note: ============================================================================
+
+@Reasoning:
+IDENTIFICATION DIVISION holds program metadata: PROGRAM-ID (mandatory),
+AUTHOR, INSTALLATION, DATE-WRITTEN, DATE-COMPILED, SECURITY, REMARKS.
+PROGRAM-ID is the only one we enforce because the rest are documentation
+paragraphs that have no semantic effect — they become attribute children
+of the division node.
+@End Reasoning
 
 Process called "parse_identification_division" takes parser as Integer returns Integer:
     Note: Parse IDENTIFICATION DIVISION
@@ -618,6 +712,15 @@ Note: ==========================================================================
 Note: ENVIRONMENT DIVISION Parsing
 Note: ============================================================================
 
+@Reasoning:
+ENVIRONMENT DIVISION holds two optional sections: CONFIGURATION
+(SOURCE-COMPUTER, OBJECT-COMPUTER, SPECIAL-NAMES) and INPUT-OUTPUT (FILE-
+CONTROL paragraph with SELECT statements pairing logical file names to
+physical assignments). Both sections are optional individually, the
+division itself is optional, but its presence requires at least one
+section.
+@End Reasoning
+
 Process called "parse_environment_division" takes parser as Integer returns Integer:
     Note: Parse ENVIRONMENT DIVISION
 
@@ -670,6 +773,13 @@ Process called "parse_environment_division" takes parser as Integer returns Inte
 
     Return div_node
 End Process
+
+@Reasoning:
+CONFIGURATION SECTION describes target machine and special-name aliases
+(CURRENCY SIGN IS "$", DECIMAL-POINT IS COMMA, etc.). Special names are
+attributes the formatter / code generator must respect — e.g., COMMA as
+decimal point changes how arithmetic literals are emitted.
+@End Reasoning
 
 Process called "parse_configuration_section" takes parser as Integer returns Integer:
     Note: Parse CONFIGURATION SECTION
@@ -735,6 +845,14 @@ Process called "parse_configuration_section" takes parser as Integer returns Int
     Return section_node
 End Process
 
+@Reasoning:
+INPUT-OUTPUT SECTION carries a FILE-CONTROL paragraph populated with
+SELECT statements (one per logical file). Each SELECT pairs a COBOL
+file name with an external assignment (USB:disk path or DD name) and
+optional access modes. The section produces a list of select nodes as
+children of the input-output node.
+@End Reasoning
+
 Process called "parse_input_output_section" takes parser as Integer returns Integer:
     Note: Parse INPUT-OUTPUT SECTION
 
@@ -781,6 +899,14 @@ Process called "parse_input_output_section" takes parser as Integer returns Inte
     Return section_node
 End Process
 
+@Reasoning:
+SELECT statement: SELECT file-name ASSIGN TO assignment [ORGANIZATION ...]
+[ACCESS MODE ...] [FILE STATUS IS ...]. Returns a COBOL_SELECT_STMT node
+with the file name as name field and each optional clause stored as an
+attribute so downstream code-gen can opt into specific behaviours
+without exhaustive switch chains.
+@End Reasoning
+
 Process called "parse_select_statement" takes parser as Integer returns Integer:
     Note: Parse SELECT statement
 
@@ -818,6 +944,14 @@ End Process
 Note: ============================================================================
 Note: DATA DIVISION Parsing
 Note: ============================================================================
+
+@Reasoning:
+DATA DIVISION holds three optional sections: FILE (record schemas per
+file declared in INPUT-OUTPUT), WORKING-STORAGE (program-scope variables
+and constants), LINKAGE (parameters to/from CALL'd subprograms). All
+three use the same level-numbered record format under the hood, only the
+top-level grouping differs.
+@End Reasoning
 
 Process called "parse_data_division" takes parser as Integer returns Integer:
     Note: Parse DATA DIVISION
@@ -882,6 +1016,14 @@ Process called "parse_data_division" takes parser as Integer returns Integer:
     Return div_node
 End Process
 
+@Reasoning:
+FILE SECTION contains one FD (or SD for sort files) entry per file
+declared in the I-O section, followed by the record structure(s) belonging
+to that file. The FD provides file-level attributes (BLOCK CONTAINS,
+RECORD CONTAINS, LABEL RECORDS); the records below it are level-01
+data items.
+@End Reasoning
+
 Process called "parse_file_section" takes parser as Integer returns Integer:
     Note: Parse FILE SECTION
 
@@ -926,6 +1068,13 @@ Process called "parse_file_section" takes parser as Integer returns Integer:
 
     Return section_node
 End Process
+
+@Reasoning:
+WORKING-STORAGE SECTION holds the program's local variables and
+constants. Parses repeatedly until a section terminator or division
+boundary is hit; each iteration handles one top-level data item which
+itself recursively gathers nested level numbers (02-49) as children.
+@End Reasoning
 
 Process called "parse_working_storage_section" takes parser as Integer returns Integer:
     Note: Parse WORKING-STORAGE SECTION
@@ -985,6 +1134,14 @@ Process called "parse_working_storage_section" takes parser as Integer returns I
     Return section_node
 End Process
 
+@Reasoning:
+LINKAGE SECTION declares parameters the program receives from a caller
+via CALL ... USING ... and produces back via PROCEDURE DIVISION USING.
+The data items here have the same shape as WORKING-STORAGE entries but
+their storage is provided by the caller, so they cannot have VALUE
+clauses — we record the items and let the validator enforce that rule.
+@End Reasoning
+
 Process called "parse_linkage_section" takes parser as Integer returns Integer:
     Note: Parse LINKAGE SECTION
 
@@ -1026,6 +1183,23 @@ Process called "parse_linkage_section" takes parser as Integer returns Integer:
 
     Return section_node
 End Process
+
+@Reasoning:
+The recursive data-item parser. A COBOL data item is a level number
+(01-49, 66, 77, 88), a name (or FILLER), and a sequence of clauses
+(PICTURE, USAGE, VALUE, OCCURS, REDEFINES, JUSTIFIED, BLANK WHEN ZERO,
+SIGN, etc.). Nested items at higher level numbers become children;
+parsing stops when the next level number is less than or equal to the
+current level, restoring the parent's iteration.
+@End Reasoning
+
+@Implementation:
+Level numbers drive the tree shape: 01 begins a record, 02-49 nest
+under it, 66 RENAMES creates an alias, 77 is a non-nestable scalar, 88 is
+a condition-name (boolean) on the previous item. PICTURE clauses are
+captured verbatim because column ordering (9 for digit, A for alpha, X
+for alphanumeric, V for implied decimal) is semantically dense.
+@End Implementation
 
 Process called "parse_data_item" takes parser as Integer returns Integer:
     Note: Parse data item (level number + name + PICTURE + VALUE)
@@ -1107,6 +1281,15 @@ Note: ==========================================================================
 Note: PROCEDURE DIVISION Parsing
 Note: ============================================================================
 
+@Reasoning:
+PROCEDURE DIVISION contains the executable statements organised into
+sections, paragraphs, and sentences. The optional USING clause names
+LINKAGE-SECTION items as formal parameters. Parsing alternates between
+paragraph / section detection and direct statement gathering depending
+on whether the next token is a name followed by "." (paragraph header)
+or a verb (loose statement at the file level).
+@End Reasoning
+
 Process called "parse_procedure_division" takes parser as Integer returns Integer:
     Note: Parse PROCEDURE DIVISION
 
@@ -1166,6 +1349,14 @@ Process called "parse_procedure_division" takes parser as Integer returns Intege
 
     Return div_node
 End Process
+
+@Reasoning:
+A leading identifier in PROCEDURE DIVISION is ambiguous between a
+section header (followed by "SECTION.") and a paragraph header
+(followed by ".") until we look ahead. This helper peeks one token past
+the name to decide, and dispatches accordingly so both kinds share
+their statement-gathering loop.
+@End Reasoning
 
 Process called "parse_paragraph_or_section" takes parser as Integer returns Integer:
     Note: Parse paragraph or section
@@ -1281,6 +1472,14 @@ Process called "parse_paragraph_or_section" takes parser as Integer returns Inte
     End If
 End Process
 
+@Reasoning:
+A paragraph is a labelled block of sentences. Reads the paragraph name
+and the trailing period, then accumulates statements until a new
+paragraph/section header or division boundary is reached. Sentences
+within a paragraph are separated by periods but stored flat — sentence
+boundaries are preserved only as metadata, not structural nesting.
+@End Reasoning
+
 Process called "parse_paragraph" takes parser as Integer returns Integer:
     Note: Parse paragraph
 
@@ -1329,6 +1528,16 @@ End Process
 Note: ============================================================================
 Note: Statement Parsing
 Note: ============================================================================
+
+@Reasoning:
+Statement dispatcher keyed on the leading verb token (MOVE, ADD,
+SUBTRACT, MULTIPLY, DIVIDE, COMPUTE, IF, EVALUATE, PERFORM, DISPLAY,
+ACCEPT, OPEN, CLOSE, READ, WRITE, GO, STOP, EXIT, GOBACK, CALL). Each
+verb routes to a verb-specific parser. Unknown verb starts an error
+recovery skim to the next period. The dispatcher is open-coded rather
+than table-driven because verb-specific argument shapes vary too much
+to share a generic frame.
+@End Reasoning
 
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse COBOL statement
@@ -1427,6 +1636,14 @@ Process called "parse_statement" takes parser as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+MOVE source TO target [target...] — copies source value to one or more
+targets with implicit type conversion based on the target's PICTURE.
+The HIR captures the source as first child and the target list as the
+remaining children. Multi-target MOVE is the common one-to-many
+assignment idiom in COBOL.
+@End Reasoning
 
 Process called "parse_move_statement" takes parser as Integer returns Integer:
     Note: Parse MOVE statement (MOVE source TO destination)
@@ -1535,6 +1752,14 @@ Process called "parse_add_statement" takes parser as Integer returns Integer:
     proc skip_to_period from parser
     Return stmt
 End Process
+
+@Reasoning:
+SUBTRACT source FROM target [GIVING result]. Without GIVING, the
+subtraction stores result back to target; with GIVING, target is read-
+only and result receives the difference. Matches the asymmetric pattern
+of ADD/SUBTRACT versus MULTIPLY/DIVIDE: SUBTRACT and DIVIDE name the
+left operand first (target/dividend) while ADD/MULTIPLY name the right.
+@End Reasoning
 
 Process called "parse_subtract_statement" takes parser as Integer returns Integer:
     Note: Parse SUBTRACT statement
@@ -1670,6 +1895,13 @@ Process called "parse_subtract_statement" takes parser as Integer returns Intege
     Return stmt
 End Process
 
+@Reasoning:
+MULTIPLY a BY b [GIVING result]. Without GIVING, b becomes b*a; with
+GIVING, a and b are read and result stores the product. Supports the
+ON SIZE ERROR clause which fires when the result would exceed the
+target's PICTURE precision.
+@End Reasoning
+
 Process called "parse_multiply_statement" takes parser as Integer returns Integer:
     Note: Parse MULTIPLY statement
 
@@ -1771,6 +2003,14 @@ Process called "parse_multiply_statement" takes parser as Integer returns Intege
 
     Return stmt
 End Process
+
+@Reasoning:
+DIVIDE has three variants: DIVIDE a INTO b (b := b/a), DIVIDE a BY b
+GIVING c (c := a/b), and the same with REMAINDER d capturing the
+modulus. INTO and BY differ in operand order, so detecting which
+keyword follows the first identifier picks the variant. SIZE ERROR
+clause handles divide-by-zero or precision overflow.
+@End Reasoning
 
 Process called "parse_divide_statement" takes parser as Integer returns Integer:
     Note: Parse DIVIDE statement
@@ -1894,6 +2134,14 @@ Process called "parse_divide_statement" takes parser as Integer returns Integer:
     Return stmt
 End Process
 
+@Reasoning:
+COMPUTE target = expression — the only COBOL statement that accepts a
+full arithmetic expression rather than per-operation verbs. Delegates to
+parse_arithmetic_expression for the right-hand side; the result feeds a
+single GIVING-style target. Used when the algebraic expression is
+clearer than a chain of ADD/SUBTRACT/MULTIPLY/DIVIDE.
+@End Reasoning
+
 Process called "parse_compute_statement" takes parser as Integer returns Integer:
     Note: Parse COMPUTE statement (COMPUTE result = expression)
 
@@ -1923,6 +2171,14 @@ Process called "parse_compute_statement" takes parser as Integer returns Integer
 
     Return stmt
 End Process
+
+@Reasoning:
+IF condition THEN-clause [ELSE-clause] END-IF. Modern COBOL prefers
+END-IF over the period terminator because nested IFs would otherwise
+all terminate at the first period. The HIR captures the condition as
+first child, the THEN body as second, and the optional ELSE body as
+third — making subsequent walks position-based rather than tag-based.
+@End Reasoning
 
 Process called "parse_if_statement" takes parser as Integer returns Integer:
     Note: Parse IF statement
@@ -2003,6 +2259,22 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
 
     Return stmt
 End Process
+
+@Reasoning:
+EVALUATE is COBOL's switch statement, but with richer semantics: a list
+of subjects across "ALSO" channels, each matched against a list of WHEN
+clauses with values, ranges (THRU), or wildcards (ANY/OTHER). Each WHEN
+has a body of statements. END-EVALUATE terminates. Most flexible
+flow-control construct in standard COBOL.
+@End Reasoning
+
+@Implementation:
+Subjects are stored as ordered children of the EVALUATE node; each WHEN
+becomes a child node with its own children list: first n children are
+the pattern slots (one per subject), remainder are the body statements.
+WHEN OTHER becomes a special-cased node tag so the formatter can emit it
+distinctively.
+@End Implementation
 
 Process called "parse_evaluate_statement" takes parser as Integer returns Integer:
     Note: Parse EVALUATE statement (COBOL's switch/case)
@@ -2191,6 +2463,15 @@ Process called "parse_evaluate_statement" takes parser as Integer returns Intege
     Return stmt
 End Process
 
+@Reasoning:
+PERFORM has many forms: PERFORM paragraph (gosub), PERFORM paragraph
+THRU paragraph (gosub range), PERFORM N TIMES (count loop), PERFORM
+UNTIL condition (while loop), PERFORM VARYING var FROM x BY y UNTIL
+cond (for loop), PERFORM ... END-PERFORM (inline body loop). The parser
+detects which form by inspecting the tokens after PERFORM and routes
+the children list accordingly.
+@End Reasoning
+
 Process called "parse_perform_statement" takes parser as Integer returns Integer:
     Note: Parse PERFORM statement (loop or call paragraph)
 
@@ -2226,6 +2507,14 @@ Process called "parse_perform_statement" takes parser as Integer returns Integer
 
     Return stmt
 End Process
+
+@Reasoning:
+DISPLAY [item ...] [UPON device] [WITH NO ADVANCING] — COBOL's print
+statement. Items are concatenated, optional UPON selects target device
+(CONSOLE/SYSOUT), and NO ADVANCING suppresses the trailing newline. The
+items list becomes children of the DISPLAY node; UPON and ADVANCING are
+attributes for the emitter.
+@End Reasoning
 
 Process called "parse_display_statement" takes parser as Integer returns Integer:
     Note: Parse DISPLAY statement
@@ -2589,6 +2878,14 @@ Process called "parse_expression" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Recursive descent over COBOL arithmetic: precedence is unary +/- < **
+(exponent) < * and / < + and -. Parses leaf operand, then chains
+binary operators left-associative across the same precedence level
+before recursing to the next. The result is a binary expression tree
+ready for evaluation or code generation.
+@End Reasoning
+
 Process called "parse_arithmetic_expression" takes parser as Integer returns Integer:
     Note: Parse arithmetic expression
 
@@ -2644,6 +2941,14 @@ Process called "parse_arithmetic_expression" takes parser as Integer returns Int
     Return left
 End Process
 
+@Reasoning:
+Parses conditional expressions used by IF/WHEN/UNTIL: relational
+(IS [NOT] EQUAL TO, GREATER THAN, LESS THAN, plus the > < = symbolic
+forms), class (IS [NOT] NUMERIC | ALPHABETIC), sign (IS [NOT] POSITIVE
+| NEGATIVE | ZERO), condition-name (88-level reference), and compound
+forms joined with AND/OR. Returns a tree of comparison nodes.
+@End Reasoning
+
 Process called "parse_condition" takes parser as Integer returns Integer:
     Note: Parse condition (for IF, PERFORM UNTIL, etc.)
 
@@ -2694,6 +2999,13 @@ Note: ==========================================================================
 Note: Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Error-recovery skim: discards tokens until the next period is consumed.
+Periods are sentence terminators in COBOL, so they reliably re-sync the
+parser at a natural statement boundary after a malformed statement is
+encountered.
+@End Reasoning
+
 Process called "skip_to_period" takes parser as Integer returns Integer:
     Note: Skip tokens until period is found
 
@@ -2719,6 +3031,14 @@ Process called "skip_to_period" takes parser as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Wider-scope error recovery: skims tokens until either a SECTION header
+or the next division keyword is found. Used when a section-level error
+is so severe that period-recovery alone would leave the parser inside a
+broken construct — abandoning the rest of the section is safer than
+attempting to continue parsing its mangled contents.
+@End Reasoning
 
 Process called "skip_to_next_section" takes parser as Integer returns Integer:
     Note: Skip tokens until next section keyword

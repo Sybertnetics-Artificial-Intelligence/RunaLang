@@ -30,6 +30,22 @@ Note: TYPE-NAME MAPPING TABLE
 Note: ============================================================================
 Note: Map Runa primitive type names to Julia equivalents. Other type identifiers
 Note: pass through unchanged so user-defined types render verbatim.
+@Reasoning:
+Runa's primitive type spelling (Integer, Float, Boolean, Character)
+differs from Julia's (Int64, Float64, Bool, Char). Mapping at code
+emission keeps the HIR canonical while still producing idiomatic
+Julia. Unknown names (user-defined types) pass through unchanged so
+custom types render verbatim.
+@End Reasoning
+
+@Implementation:
+Linear sequence of string_equals comparisons. Integer/Integer64 map to
+Int64; Integer8/16/32 retain their width. Float/Float64 map to
+Float64; Float32 retains. String and Float32 keep their Runa name.
+Boolean -> Bool, Character -> Char, Nothing -> Nothing. Falls through
+to return runa_name on any unrecognised input.
+@End Implementation
+
 Process called "julia_map_basic_type" takes runa_name as String returns String:
     Let eq be 0
 
@@ -103,12 +119,32 @@ Note:   40: value       (Integer or pointer to literal/identifier value)
 Note:   48: value_type  (Integer subtype discriminator)
 Note: ============================================================================
 
+@Reasoning:
+Null-safe accessor for HIRNode.node_type at offset 0. Used by emit_node
+to discriminate which emit_* helper to dispatch to.
+@End Reasoning
+
+@Implementation:
+Null guard returns 0 (no valid HIR_* constant is zero). Otherwise
+reads i64 at offset 0 via MemoryCore.memory_get_integer.
+@End Implementation
+
 Process called "node_type_of" takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
     Return proc memory_get_integer from MemoryCore with node, 0
 End Process
+
+@Reasoning:
+Accessor for the polymorphic value slot at offset 40 — used differently
+per node type: identifier name handle, literal value, operator code,
+etc. Null-safe.
+@End Reasoning
+
+@Implementation:
+Null guard returns 0. Reads i64 at offset 40 of the HIRNode record.
+@End Implementation
 
 Process called "node_value" takes node as Integer returns Integer:
     If node is equal to 0:
@@ -117,6 +153,16 @@ Process called "node_value" takes node as Integer returns Integer:
     Return proc memory_get_integer from MemoryCore with node, 40
 End Process
 
+@Reasoning:
+Accessor for the value-subtype discriminator at offset 48 — used by
+literal nodes to distinguish Integer/Float/String/Boolean values and by
+operator nodes to discriminate +, -, *, etc.
+@End Reasoning
+
+@Implementation:
+Null guard returns 0. Reads i64 at offset 48 of the HIRNode record.
+@End Implementation
+
 Process called "node_value_type" takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
@@ -124,12 +170,35 @@ Process called "node_value_type" takes node as Integer returns Integer:
     Return proc memory_get_integer from MemoryCore with node, 48
 End Process
 
+@Reasoning:
+Accessor for the child_count field at offset 32. Cached alongside the
+children list so iteration code doesn't need to call list_size each
+time.
+@End Reasoning
+
+@Implementation:
+Null guard returns 0. Reads i64 at offset 32 of the HIRNode record.
+@End Implementation
+
 Process called "node_child_count" takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
     Return proc memory_get_integer from MemoryCore with node, 32
 End Process
+
+@Reasoning:
+Indexed child accessor: pulls the children list (offset 24) and looks
+up the requested index. Both null-node and null-children-list are
+handled, so callers can iterate up to node_child_count without
+checking.
+@End Reasoning
+
+@Implementation:
+Null guard on node. Reads children pointer at offset 24; if null
+returns 0 (empty-child case). Otherwise delegates to ListCore.list_get
+with the index. Out-of-range index is the caller's responsibility.
+@End Implementation
 
 Process called "node_child" takes node as Integer, index as Integer returns Integer:
     If node is equal to 0:
@@ -148,6 +217,20 @@ Note: ==========================================================================
 Note: Generate a complete Julia source string for the given HIR module. Returns
 Note: the rendered text. Errors during translation are recorded on the context
 Note: but do not abort - callers can inspect emitter_has_errors after the call.
+@Reasoning:
+Public driver for the Julia backend. Constructs a fresh EmitterContext
+(with 4-space indent matching Julia community style), kicks off the
+recursive node walker, and returns the accumulated output.
+@End Reasoning
+
+@Implementation:
+Calls Emitter.create_emitter_context to allocate output buffer and
+counters. Recurses into emit_node with the module root. Returns
+Emitter.emitter_get_output which exposes the accumulated string.
+Errors are logged on the context rather than thrown so partial output
+is still recoverable.
+@End Implementation
+
 Process called "generate_julia_from_hir" takes hir_module as Integer returns String:
     Note: emitter_common defaults to 4-space indentation which matches the
     Note: Julia community style guide, so no override needed here.
@@ -166,6 +249,17 @@ Note: translation.runa: `Return proc hir_to_julia from JuliaEmitter with hir_roo
 Note: Delegates to generate_julia_from_hir which holds the actual translation
 Note: pipeline. Kept as a separate name so the dispatcher contract stays stable
 Note: even if the internal generator is renamed in the future.
+@Reasoning:
+Stable public entry name used by the central translation dispatcher in
+translation.runa. Keeping this as a thin forwarder lets the internal
+pipeline (generate_julia_from_hir) be renamed without breaking the
+dispatcher contract.
+@End Reasoning
+
+@Implementation:
+Single proc call: returns generate_julia_from_hir(hir_root).
+@End Implementation
+
 Process called "hir_to_julia" takes hir_root as Integer returns String:
     Return proc generate_julia_from_hir with hir_root
 End Process
@@ -176,6 +270,23 @@ Note: ==========================================================================
 Note: Top-level node dispatcher. Branches on node_type to the appropriate
 Note: emit_* helper. Unknown node types emit a "# TODO: HIR_<id>" comment and
 Note: record a warning so the output is still valid Julia.
+
+@Reasoning:
+The universal HIR-node dispatcher: every other emit_* helper visits
+a single node type, while children are recursed via this function.
+Falls back to a TODO comment for unknown node kinds so the output
+stays valid Julia even when the translator hits a node it doesn't
+recognise.
+@End Reasoning
+
+@Implementation:
+Null guard. Reads node_type via node_type_of. Long If/Return chain
+dispatches each HIR_* constant to the matching emit_* helper
+(emit_module, emit_function, emit_struct, emit_import, emit_let,
+emit_set, emit_const, emit_if, emit_match, emit_for, emit_while,
+emit_return, emit_block_children, emit_expression for expression
+nodes). Unrecognised types emit a `# TODO: HIR_<id>` comment.
+@End Implementation
 
 Process called "emit_node" takes ctx as EmitterContext, node as Integer:
     If node is equal to 0:
@@ -259,6 +370,19 @@ Note: ==========================================================================
 Note: MODULE
 Note: ============================================================================
 Note: Wrap children in a Julia `module Name ... end` block.
+@Reasoning:
+Top-level modules emit Julia's `module Name ... end` syntax with a
+`using Base` brought in by default so common operators are available
+without explicit imports.
+@End Reasoning
+
+@Implementation:
+Reads the module name from node_value via julia_string_from_pointer.
+Emits `module <name>`, then `using Base`. Recurses emit_node over
+each child. Emits `end # module <name>` closer with the name in a
+comment to aid readability.
+@End Implementation
+
 Process called "emit_module" takes ctx as EmitterContext, node as Integer:
     Let name_ptr be proc node_value with node
     Let name_str be proc julia_string_from_pointer with name_ptr
@@ -285,6 +409,16 @@ End Process
 Note: ============================================================================
 Note: IMPORTS
 Note: ============================================================================
+@Reasoning:
+Runa imports map directly to Julia's `using` directive. The module
+path string in node_value is preserved verbatim.
+@End Reasoning
+
+@Implementation:
+Pulls path string from node_value via julia_string_from_pointer.
+Emits `using <path>` followed by a newline.
+@End Implementation
+
 Process called "emit_import" takes ctx as EmitterContext, node as Integer:
     Let path_ptr be proc node_value with node
     Let path_str be proc julia_string_from_pointer with path_ptr
@@ -300,6 +434,19 @@ Note:   struct Name
 Note:       field1::Type1
 Note:       field2::Type2
 Note:   end
+@Reasoning:
+Runa Type declarations become Julia immutable structs. Each child node
+of kind HIR_FIELD_DEFINITION renders as `name::Type` indented under
+the struct keyword.
+@End Reasoning
+
+@Implementation:
+Emits `struct <name>` line. Indents one level. Iterates children;
+each one with node_type == HIR_FIELD_DEFINITION is dispatched to
+emit_field. Other child kinds are skipped. Dedents and emits the
+matching `end`, followed by a blank line.
+@End Implementation
+
 Process called "emit_struct" takes ctx as EmitterContext, node as Integer:
     Let name_ptr be proc node_value with node
     Let name_str be proc julia_string_from_pointer with name_ptr
@@ -325,6 +472,17 @@ Process called "emit_struct" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit_newline from Emitter with ctx
 End Process
 
+@Reasoning:
+A struct field renders as `name::Type`, with the type optional (omitted
+emits just the bare name, matching Julia's untyped-field semantics).
+@End Reasoning
+
+@Implementation:
+Reads field name from node_value, emits it. If child 0 (the type
+node) exists, emits `::` then calls emit_type on it. Trailing newline
+to keep one field per line.
+@End Implementation
+
 Process called "emit_field" takes ctx as EmitterContext, node as Integer:
     Let name_ptr be proc node_value with node
     Let name_str be proc julia_string_from_pointer with name_ptr
@@ -347,6 +505,23 @@ Note: Emit:
 Note:   function name(p1::T1, p2::T2)::ReturnT
 Note:       body
 Note:   end
+@Reasoning:
+HIR HIR_PROCESS_DEFINITION nodes carry parameter Lets (typed) and an
+optional return-type node together with a HIR_BLOCK_STATEMENT body
+in their children. The emitter walks the children once,
+distinguishing params, return type, and body by node type and the
+value_type flag (cvt==1 marks the return-type node).
+@End Reasoning
+
+@Implementation:
+Emits `function <name>(`. Walks children: HIR_LET_STATEMENT children
+are parameters — dispatched to emit_param with comma separators
+between them (first_param flag handles the lead). HIR_BLOCK_STATEMENT
+child becomes body_node. Otherwise, cvt==1 marks the return_type_node.
+After the param list emits `)`, optional `::<return>`, newline,
+indented body via emit_block_children, dedent, `end`, blank line.
+@End Implementation
+
 Process called "emit_function" takes ctx as EmitterContext, node as Integer:
     Let name_ptr be proc node_value with node
     Let name_str be proc julia_string_from_pointer with name_ptr
@@ -405,6 +580,18 @@ Process called "emit_function" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit_newline from Emitter with ctx
 End Process
 
+@Reasoning:
+Inline parameter renderer (no trailing newline or comma) used by
+emit_function for each parameter position. Comma between params is
+the caller's responsibility.
+@End Reasoning
+
+@Implementation:
+Reads parameter name from node_value and emits it. If child 0 (type
+annotation) is non-zero, emits `::` then calls emit_type with the
+type node.
+@End Implementation
+
 Process called "emit_param" takes ctx as EmitterContext, node as Integer:
     Let name_ptr be proc node_value with node
     Let name_str be proc julia_string_from_pointer with name_ptr
@@ -420,6 +607,19 @@ End Process
 Note: ============================================================================
 Note: STATEMENTS
 Note: ============================================================================
+
+@Reasoning:
+Runa `Let name [as Type] be value` maps to Julia's
+`name[::Type] = value`. Type is optional and detected via the cvt==1
+discriminator on the child node.
+@End Reasoning
+
+@Implementation:
+Reads variable name from node_value. Iterates children sorting them
+into type_node (cvt==1) and init_node (everything else). If type
+present, emits `::<type>`. If init present, emits ` = <expr>`. Ends
+with a newline.
+@End Implementation
 
 Process called "emit_let" takes ctx as EmitterContext, node as Integer:
     Let name_ptr be proc node_value with node
@@ -453,6 +653,16 @@ Process called "emit_let" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit_newline from Emitter with ctx
 End Process
 
+@Reasoning:
+Runa's `Set target to value` becomes Julia's `target = value`. Both
+operands are arbitrary expressions, dispatched through emit_expression.
+@End Reasoning
+
+@Implementation:
+Reads child 0 as the LHS target and child 1 as the RHS value.
+Emits `<target> = <value>` followed by a newline.
+@End Implementation
+
 Process called "emit_set" takes ctx as EmitterContext, node as Integer:
     Let target be proc node_child with node, 0
     Let value be proc node_child with node, 1
@@ -462,6 +672,18 @@ Process called "emit_set" takes ctx as EmitterContext, node as Integer:
     proc emit_expression with ctx, value
     proc emitter_emit_newline from Emitter with ctx
 End Process
+
+@Reasoning:
+Runa Constant declarations map to Julia's `const` global definition.
+Julia const isn't lexically scoped, but for top-level constants the
+semantics match closely enough.
+@End Reasoning
+
+@Implementation:
+Reads constant name from node_value. Emits `const <name> = ` then
+child 0 (the initializer expression) via emit_expression. Trailing
+newline.
+@End Implementation
 
 Process called "emit_const" takes ctx as EmitterContext, node as Integer:
     Let name_ptr be proc node_value with node
@@ -477,6 +699,18 @@ Process called "emit_const" takes ctx as EmitterContext, node as Integer:
     End If
     proc emitter_emit_newline from Emitter with ctx
 End Process
+
+@Reasoning:
+Standard Julia if/else syntax with `end` closer. The HIR layout puts
+condition at child 0, then-block at child 1, optional else-block at
+child 2.
+@End Reasoning
+
+@Implementation:
+Emits `if `, then the condition expression. Newline + indent. Recurses
+into then-block via emit_block_children. Dedents. If child 2 exists,
+emits `else` keyword, indents, recurses, dedents. Closes with `end`.
+@End Implementation
 
 Process called "emit_if" takes ctx as EmitterContext, node as Integer:
     Note: Layout: child 0 = condition, child 1 = then-block, optional child 2 = else-block
@@ -503,6 +737,22 @@ Process called "emit_if" takes ctx as EmitterContext, node as Integer:
 
     proc emitter_emit_line from Emitter with ctx, "end"
 End Process
+
+@Reasoning:
+Julia's standard library has no built-in match expression; MLStyle.jl
+provides one but requires an external dependency. For portability the
+emitter lowers Runa Match to a chain of if/elseif comparing the subject
+expression against each when-pattern.
+@End Reasoning
+
+@Implementation:
+Reads subject from child 0; child_count tells how many when-clauses
+follow. Emits `let _subject = <subject>` to bind once. Indents.
+Iterates remaining children, expecting HIR_WHEN_CLAUSE: child 0 is
+the pattern, child 1 is the body. First arm emits `if _subject ==
+<pattern>`, subsequent arms emit `elseif _subject == <pattern>`.
+Body is indented under each arm. Closes with `end` for the let.
+@End Implementation
 
 Process called "emit_match" takes ctx as EmitterContext, node as Integer:
     Note: Julia has no first-class match, but Match{} from MLStyle.jl matches
@@ -548,6 +798,19 @@ Process called "emit_match" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit_line from Emitter with ctx, "end"
 End Process
 
+@Reasoning:
+Runa `For Each var in collection` maps to Julia's `for var in
+collection`. The iteration variable is encoded as a Let node so the
+parser can attach an optional type — only the name is used here.
+@End Reasoning
+
+@Implementation:
+Reads child 0 (var Let), child 1 (collection expression), child 2
+(body block). Extracts var name. Emits `for <var> in <collection>`
+with newline. Indents, recurses body via emit_block_children, dedents,
+closes with `end`.
+@End Implementation
+
 Process called "emit_for" takes ctx as EmitterContext, node as Integer:
     Note: For-each: child 0 = iteration variable Let, child 1 = collection expr,
     Note: child 2 = body block.
@@ -573,6 +836,18 @@ Process called "emit_for" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit_line from Emitter with ctx, "end"
 End Process
 
+@Reasoning:
+Runa `While cond` maps directly to Julia's `while cond ... end`. No
+parenthesisation needed because Julia parses the condition as the
+expression following the keyword.
+@End Reasoning
+
+@Implementation:
+Reads condition (child 0) and body (child 1). Emits `while <cond>`
+with newline, indents, recurses into body via emit_block_children,
+dedents, closes with `end`.
+@End Implementation
+
 Process called "emit_while" takes ctx as EmitterContext, node as Integer:
     Let cond be proc node_child with node, 0
     Let body be proc node_child with node, 1
@@ -590,6 +865,17 @@ Process called "emit_while" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit_line from Emitter with ctx, "end"
 End Process
 
+@Reasoning:
+Julia's return is a keyword followed by an optional expression. Bare
+`return` returns `nothing` implicitly. A missing child 0 produces
+exactly that.
+@End Reasoning
+
+@Implementation:
+Emits `return`. Reads child 0; if non-zero, emits a space and the
+expression. Trailing newline.
+@End Implementation
+
 Process called "emit_return" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit from Emitter with ctx, "return"
     Let value be proc node_child with node, 0
@@ -599,6 +885,17 @@ Process called "emit_return" takes ctx as EmitterContext, node as Integer:
     End If
     proc emitter_emit_newline from Emitter with ctx
 End Process
+
+@Reasoning:
+Iteration helper used by every statement that has a body block:
+walks the children list dispatching emit_node on each. Indentation
+and the surrounding braces/keywords are the caller's responsibility.
+@End Reasoning
+
+@Implementation:
+Reads child_count, loops i = 0..count, calls emit_node with each
+child.
+@End Implementation
 
 Process called "emit_block_children" takes ctx as EmitterContext, node as Integer:
     Let count be proc node_child_count with node
@@ -613,6 +910,21 @@ End Process
 Note: ============================================================================
 Note: EXPRESSIONS
 Note: ============================================================================
+
+@Reasoning:
+Companion to emit_node but specialised for expression positions. Every
+HIR expression kind that can appear inside another expression flows
+through here. Null node degrades gracefully to `nothing`.
+@End Reasoning
+
+@Implementation:
+Null-node fast path emits `nothing`. Then long Match on node_type:
+LITERAL/IDENTIFIER/BINARY/UNARY/TERNARY/CALL/MEMBER/INDEX/
+PARENTHESIZED/INTERPOLATED_STRING/RANGE/ARRAY_LITERAL/TUPLE_LITERAL/
+LAMBDA/CAST dispatch to dedicated helpers. Unknown kinds fall through
+to `_HIR_UNKNOWN_` placeholder with a warning recorded on the emitter
+context — keeps output parseable as Julia.
+@End Implementation
 
 Process called "emit_expression" takes ctx as EmitterContext, node as Integer:
     If node is equal to 0:
@@ -694,6 +1006,21 @@ Process called "emit_expression" takes ctx as EmitterContext, node as Integer:
     proc emitter_warning from Emitter with ctx, "unhandled expression node type"
 End Process
 
+@Reasoning:
+Literal nodes carry both the lexeme (value) and a subtype tag
+(value_type) so the emitter knows whether to quote a string, normalise
+a boolean, or emit `nothing` for null. Numeric lexemes pass through
+verbatim because Julia accepts the same notation.
+@End Reasoning
+
+@Implementation:
+Reads value_str via julia_string_from_pointer and vtype via
+node_value_type. vtype dispatch: 2=string (wrap in `"..."`), 3=boolean
+(normalise to literal `true`/`false` via string_equals match),
+4=null (emit `nothing`). Default (covers 0=integer and 1=float)
+emits value_str verbatim.
+@End Implementation
+
 Process called "emit_literal" takes ctx as EmitterContext, node as Integer:
     Let value_ptr be proc node_value with node
     Let value_str be proc julia_string_from_pointer with value_ptr
@@ -725,6 +1052,19 @@ Process called "emit_literal" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit from Emitter with ctx, value_str
 End Process
 
+@Reasoning:
+Binary expressions in Julia use infix syntax. The operator string from
+the HIR may need remapping (e.g. `equals` -> `==`); that's
+julia_map_binary_op's job. Spaces around the operator match Julia
+style.
+@End Reasoning
+
+@Implementation:
+Reads op string, runs julia_map_binary_op for the spelling. Pulls lhs
+(child 0) and rhs (child 1). Emits `<lhs> <op> <rhs>` with single
+spaces around the operator. Both sides recurse via emit_expression.
+@End Implementation
+
 Process called "emit_binary" takes ctx as EmitterContext, node as Integer:
     Let op_ptr be proc node_value with node
     Let op_str be proc julia_string_from_pointer with op_ptr
@@ -740,6 +1080,18 @@ Process called "emit_binary" takes ctx as EmitterContext, node as Integer:
     proc emit_expression with ctx, rhs
 End Process
 
+@Reasoning:
+Unary expressions emit `<op><operand>` with no space (Julia convention).
+Operator remapping handles `not` -> `!` and friends via
+julia_map_unary_op.
+@End Reasoning
+
+@Implementation:
+Reads op string and runs julia_map_unary_op. Pulls operand (child 0).
+Emits mapped op then recurses emit_expression on operand. No space
+between them so `not x` becomes `!x` not `! x`.
+@End Implementation
+
 Process called "emit_unary" takes ctx as EmitterContext, node as Integer:
     Let op_ptr be proc node_value with node
     Let op_str be proc julia_string_from_pointer with op_ptr
@@ -750,6 +1102,18 @@ Process called "emit_unary" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit from Emitter with ctx, mapped
     proc emit_expression with ctx, operand
 End Process
+
+@Reasoning:
+Julia's ternary uses `cond ? then : else` syntax. The whole expression
+is wrapped in parentheses so the result is safe to embed in any
+parent context without precedence ambiguity.
+@End Reasoning
+
+@Implementation:
+Reads cond/then_e/else_e from children 0/1/2. Emits
+`(<cond> ? <then> : <else>)` with each part recursed via
+emit_expression.
+@End Implementation
 
 Process called "emit_ternary" takes ctx as EmitterContext, node as Integer:
     Let cond be proc node_child with node, 0
@@ -764,6 +1128,18 @@ Process called "emit_ternary" takes ctx as EmitterContext, node as Integer:
     proc emit_expression with ctx, else_e
     proc emitter_emit from Emitter with ctx, ")"
 End Process
+
+@Reasoning:
+Function/method call syntax `callee(arg1, arg2, ...)`. Julia
+distinguishes regular calls from member calls only by surface
+syntax — the call expression itself is uniform.
+@End Reasoning
+
+@Implementation:
+Reads child 0 as callee; recurses to emit it. Emits `(`. Loops over
+children 1..n-1 (each is an argument), emitting `, ` separators
+between them via the i>1 check. Closes with `)`.
+@End Implementation
 
 Process called "emit_call" takes ctx as EmitterContext, node as Integer:
     Note: Child 0 = callee, children 1..n-1 = arguments
@@ -785,6 +1161,17 @@ Process called "emit_call" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit from Emitter with ctx, ")"
 End Process
 
+@Reasoning:
+Member access `object.field` directly mirrors Runa's field-access
+syntax. The field name comes from node_value rather than a child node
+because there's only one field per access.
+@End Reasoning
+
+@Implementation:
+Reads object (child 0) and field name string. Emits the object,
+`.`, then the field name.
+@End Implementation
+
 Process called "emit_member" takes ctx as EmitterContext, node as Integer:
     Let object be proc node_child with node, 0
     Let field_name_ptr be proc node_value with node
@@ -795,6 +1182,17 @@ Process called "emit_member" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit from Emitter with ctx, field_name_str
 End Process
 
+@Reasoning:
+Indexing `collection[index]`. Julia uses 1-based indexing by default,
+which the HIR builder is expected to have already normalised — this
+emitter renders the index expression verbatim.
+@End Reasoning
+
+@Implementation:
+Reads collection (child 0) and index (child 1). Emits `<collection>[`,
+the index expression, `]`.
+@End Implementation
+
 Process called "emit_index" takes ctx as EmitterContext, node as Integer:
     Let collection be proc node_child with node, 0
     Let index be proc node_child with node, 1
@@ -804,6 +1202,19 @@ Process called "emit_index" takes ctx as EmitterContext, node as Integer:
     proc emit_expression with ctx, index
     proc emitter_emit from Emitter with ctx, "]"
 End Process
+
+@Reasoning:
+Julia ranges use `start:end` or `start:step:end`. The HIR layout
+puts start at child 0, end at child 1, and optional step at child 2.
+The emitter inverts the conventional ordering at output time so the
+step goes between start and end as Julia expects.
+@End Reasoning
+
+@Implementation:
+Reads start_e/end_e/step_e from children 0/1/2. Emits start; if step
+present emits `:step`; then emits `:end`. Produces `start:end` for
+no-step and `start:step:end` otherwise.
+@End Implementation
 
 Process called "emit_range" takes ctx as EmitterContext, node as Integer:
     Note: Range layout: start, end, optional step
@@ -820,6 +1231,17 @@ Process called "emit_range" takes ctx as EmitterContext, node as Integer:
     proc emit_expression with ctx, end_e
 End Process
 
+@Reasoning:
+Bracketed array literal `[a, b, c]`. Same syntax in Julia and Runa,
+so each child expression is emitted with comma separators.
+@End Reasoning
+
+@Implementation:
+Emits `[`. Loops children, emitting `, ` between adjacent elements
+via the i>0 check. Recurses each element via emit_expression. Closes
+with `]`.
+@End Implementation
+
 Process called "emit_array_literal" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit from Emitter with ctx, "["
     Let count be proc node_child_count with node
@@ -834,6 +1256,17 @@ Process called "emit_array_literal" takes ctx as EmitterContext, node as Integer
     End While
     proc emitter_emit from Emitter with ctx, "]"
 End Process
+
+@Reasoning:
+Julia tuples are parenthesised: `(a, b, c)`. A single-element tuple
+requires a trailing comma `(a,)` to disambiguate from a parenthesised
+expression — the emitter handles that special case.
+@End Reasoning
+
+@Implementation:
+Emits `(`. Loops children with `, ` separators. After the loop, if
+count == 1, emits an extra `,` to mark it as a tuple. Closes with `)`.
+@End Implementation
 
 Process called "emit_tuple_literal" takes ctx as EmitterContext, node as Integer:
     proc emitter_emit from Emitter with ctx, "("
@@ -852,6 +1285,18 @@ Process called "emit_tuple_literal" takes ctx as EmitterContext, node as Integer
     End If
     proc emitter_emit from Emitter with ctx, ")"
 End Process
+
+@Reasoning:
+Julia anonymous functions use `(params) -> body` syntax. Parameters
+come first as Let nodes, the body is always the last child — a layout
+chosen so the body's position is computable from child_count - 1.
+@End Reasoning
+
+@Implementation:
+Computes body_index = child_count - 1. Emits `(`. Loops i = 0..body_index
+emitting each parameter via emit_param with `, ` separators. Emits
+`) -> `. Recurses emit_expression on the body (child at body_index).
+@End Implementation
 
 Process called "emit_lambda" takes ctx as EmitterContext, node as Integer:
     Note: Last child is body, preceding children are param Let nodes.
@@ -873,6 +1318,17 @@ Process called "emit_lambda" takes ctx as EmitterContext, node as Integer:
     proc emit_expression with ctx, body
 End Process
 
+@Reasoning:
+Julia uses type-as-constructor for casts: `Int64(x)` rather than C-style
+`(int)x`. The emitter therefore writes the target type first followed
+by parenthesised value.
+@End Reasoning
+
+@Implementation:
+Reads value (child 0) and target_type (child 1). Emits the target
+type via emit_type, then `(`, then the value expression, then `)`.
+@End Implementation
+
 Process called "emit_cast" takes ctx as EmitterContext, node as Integer:
     Let value be proc node_child with node, 0
     Let target_type be proc node_child with node, 1
@@ -882,6 +1338,25 @@ Process called "emit_cast" takes ctx as EmitterContext, node as Integer:
     proc emit_expression with ctx, value
     proc emitter_emit from Emitter with ctx, ")"
 End Process
+
+@Reasoning:
+Julia interpolated strings use `"prefix $(expr) suffix"`. The HIR
+represents an interpolated string as a sequence of alternating literal
+and expression children; the emitter walks them in order, switching
+between raw output and `$(...)` interpolation.
+@End Reasoning
+
+@Implementation:
+Emits opening `"`. Loops children: if child node_type is HIR_LITERAL,
+emits its value verbatim; otherwise wraps it in `$(...)` and recurses
+emit_expression. Closes with `"`.
+@End Implementation
+
+@Security_Scope:
+Literal chunks are emitted unescaped. Callers must ensure that the
+HIR builder has properly escaped backslashes and double quotes in
+literal segments before reaching this emitter.
+@End Security_Scope
 
 Process called "emit_interpolated_string" takes ctx as EmitterContext, node as Integer:
     Note: Children alternate string-literal nodes and expression nodes.
@@ -908,6 +1383,27 @@ End Process
 Note: ============================================================================
 Note: TYPES
 Note: ============================================================================
+
+@Reasoning:
+Type expressions occur in struct fields, parameter annotations, return
+type annotations, and cast targets. Julia's type syntax differs
+significantly from Runa's (e.g. Optional<T> -> Union{T, Nothing},
+Array<T> -> Vector{T}), so each HIR type kind needs its own rendering
+rule.
+@End Reasoning
+
+@Implementation:
+Null guard emits `Any`. Dispatches on HIR type kind:
+HIR_BASIC_TYPE -> mapped name via julia_map_basic_type;
+HIR_OPTIONAL_TYPE -> `Union{T, Nothing}`;
+HIR_ARRAY_TYPE -> `Vector{T}`;
+HIR_TUPLE_TYPE -> `Tuple{T1, T2, ...}`;
+HIR_GENERIC_TYPE -> `Mapped{arg1, arg2, ...}`;
+HIR_UNION_TYPE -> `Union{T1, T2, ...}`;
+HIR_FUNCTION_TYPE -> bare `Function` (Julia can't express full
+signature in a type annotation without sigtuple objects).
+Unknown kinds fall through to `Any`.
+@End Implementation
 
 Process called "emit_type" takes ctx as EmitterContext, node as Integer:
     If node is equal to 0:
@@ -1001,6 +1497,22 @@ Note: ==========================================================================
 Note: OPERATOR MAPPING
 Note: ============================================================================
 
+@Reasoning:
+Runa uses English-word operators (`plus`, `is equal to`) while Julia
+uses the symbolic forms (`+`, `==`). This mapping table covers the
+common arithmetic, comparison, and logical operators. Unknown opcodes
+pass through unchanged so user-defined operators retain their spelling.
+@End Reasoning
+
+@Implementation:
+Linear sequence of string_equals comparisons covering arithmetic
+(plus, minus, multiplied by, divided by, modulo), comparison (is
+equal to, is not equal to, is less than, is greater than, etc.),
+logical (and, or), and bitwise (bitwise and/or/xor, shifted left/
+right). Returns the mapped symbol on match, or the original op
+string on no match.
+@End Implementation
+
 Process called "julia_map_binary_op" takes runa_op as String returns String:
     Let eq be 0
 
@@ -1080,6 +1592,18 @@ Process called "julia_map_binary_op" takes runa_op as String returns String:
     Return runa_op
 End Process
 
+@Reasoning:
+Unary operator mapping mirrors the binary case but for prefix
+operators. `negate` and `minus` both produce `-`, `not` becomes `!`,
+`bitwise not` becomes `~`. Unknown opcodes pass through unchanged.
+@End Reasoning
+
+@Implementation:
+Four string_equals comparisons: negate -> "-", minus -> "-",
+not -> "!", bitwise not -> "~". Returns the mapped symbol on match,
+or runa_op on no match.
+@End Implementation
+
 Process called "julia_map_unary_op" takes runa_op as String returns String:
     Let eq be 0
 
@@ -1109,6 +1633,21 @@ Note: ==========================================================================
 Note: HIR value fields are Integer-typed pointers to null-terminated strings
 Note: when they carry textual data. This helper centralizes the cast so the
 Note: rest of the file reads as if value() always returned a String.
+@Reasoning:
+HIR.value slots are Integer-typed because the IR pre-dates a unified
+string handle type. Centralising the Integer->String coercion in one
+helper keeps the rest of this file readable, and gives one place to
+add a null guard for safe traversal of nodes whose value happens to
+be 0.
+@End Reasoning
+
+@Implementation:
+Null guard returns the empty string. Otherwise returns the integer
+verbatim — at this bootstrap layer the integer IS the string handle,
+treated as a raw pointer to a null-terminated byte sequence consumed
+by StringCore primitives.
+@End Implementation
+
 Process called "julia_string_from_pointer" takes ptr as Integer returns String:
     Note: In the bootstrap stage strings are represented as raw pointers to
     Note: null-terminated byte sequences. The pointer IS the string at this

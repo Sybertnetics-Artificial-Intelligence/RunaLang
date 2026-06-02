@@ -44,14 +44,18 @@ Type called "CSharpSemanticAnalyzer":
     has_error as Integer
 End Type
 
+@Reasoning:
+Allocates the 72-byte analyzer record (9 x 8-byte fields) and initialises
+the type/scope/namespace/generic dictionaries up-front so later passes can
+treat them as always-present rather than null-checking on every access.
+@End Reasoning
+@Implementation:
+Offsets: 0=global_scope, 8=current_scope (aliased to global at start),
+16=scope_stack, 24=type_registry, 32=class_hierarchy, 40=namespace_registry,
+48=generic_constraints, 56=error_message, 64=has_error.
+@End Implementation
 Process called "create_csharp_semantic_analyzer" returns Integer:
     Note: Create C# semantic analyzer with type checking and inheritance verification
-
-    @Reasoning:
-    Initialize comprehensive semantic analyzer for C# including type checking,
-    inheritance verification, generic constraint checking, namespace resolution,
-    and polymorphism validation following C#'s semantic rules.
-    @End Reasoning
 
     Let analyzer_size be 72
     Let analyzer be proc allocate from Layout with analyzer_size
@@ -80,14 +84,15 @@ Process called "create_csharp_semantic_analyzer" returns Integer:
     Return analyzer
 End Process
 
+@Reasoning:
+Four-phase analysis: collect declarations, build inheritance hierarchy,
+validate generic constraints, then analyse method bodies. Order matters
+because each phase depends on the previous one being complete (e.g.,
+methods cannot be type-checked until their containing class's base type
+is resolved).
+@End Reasoning
 Process called "analyze_csharp_program" takes analyzer as Integer, program_node as Integer returns Integer:
     Note: Perform complete semantic analysis on C# program
-
-    @Reasoning:
-    Comprehensive analysis including namespace resolution, type checking,
-    inheritance verification, generic constraint validation, accessibility
-    checking, and C#-specific semantic validation.
-    @End Reasoning
 
     If analyzer is equal to 0:
         Return 0
@@ -118,14 +123,14 @@ Process called "analyze_csharp_program" takes analyzer as Integer, program_node 
     Return 1
 End Process
 
+@Reasoning:
+Phase 1 collects all namespace, class, interface, struct, enum, and
+delegate declarations into the analyser's registries. This makes forward
+references resolvable in later passes without re-walking the source.
+Recurses into namespaces because C# permits nested namespace declarations.
+@End Reasoning
 Process called "collect_csharp_declarations" takes analyzer as Integer, program_node as Integer:
     Note: Collect all declarations for type resolution
-
-    @Reasoning:
-    Phase 1 must collect all namespace declarations, class definitions,
-    interface declarations, delegate types, and enum definitions before
-    detailed analysis to handle forward references and inheritance chains.
-    @End Reasoning
 
     If program_node is equal to 0:
         Return
@@ -162,6 +167,11 @@ Process called "collect_csharp_declarations" takes analyzer as Integer, program_
     End If
 End Process
 
+@Reasoning:
+Registers the namespace in namespace_registry then recurses into its body
+so nested declarations (classes, sub-namespaces) are collected by the
+generic collect_csharp_declarations walker.
+@End Reasoning
 Process called "collect_namespace_declaration" takes analyzer as Integer, namespace_node as Integer:
     Note: Collect namespace declaration for resolution
 
@@ -334,14 +344,14 @@ Process called "collect_generic_parameters" takes analyzer as Integer, type_node
     End If
 End Process
 
+@Reasoning:
+Phase 2: walks every type registered in phase 1, builds its hierarchy
+record, then runs the cycle check globally. Doing the cycle check after
+all hierarchy records exist avoids spurious "missing base" errors during
+the walk that would otherwise need recovery.
+@End Reasoning
 Process called "build_inheritance_hierarchy" takes analyzer as Integer:
     Note: Build complete inheritance hierarchy for all types
-
-    @Reasoning:
-    Inheritance hierarchy building must resolve base classes, implemented
-    interfaces, check for circular inheritance, validate accessibility,
-    and build method override chains for polymorphism analysis.
-    @End Reasoning
 
     Let type_registry be proc memory_get_int64 from Layout with analyzer, 24
     Let class_hierarchy be proc memory_get_int64 from Layout with analyzer, 32
@@ -362,6 +372,11 @@ Process called "build_inheritance_hierarchy" takes analyzer as Integer:
     proc check_circular_inheritance from analyzer
 End Process
 
+@Reasoning:
+Per-type hierarchy record carries base class plus interface list, both
+extracted from the base list. Stored in class_hierarchy keyed by type
+name so later phases can look up the inheritance shape without re-parsing.
+@End Reasoning
 Process called "build_type_hierarchy" takes analyzer as Integer, type_name as Integer, type_node as Integer:
     Note: Build inheritance hierarchy for individual type
 
@@ -459,14 +474,14 @@ Process called "get_implemented_interfaces" takes analyzer as Integer, type_node
     Return interface_list
 End Process
 
+@Reasoning:
+Phase 3: iterates every parameter recorded during declaration collection
+and validates its constraints (where T : SomeType, where T : new(),
+where T : struct/class). Constraints are stored per-parameter so unrelated
+generics don't interfere during validation.
+@End Reasoning
 Process called "validate_generic_constraints" takes analyzer as Integer:
     Note: Validate all generic type constraints
-
-    @Reasoning:
-    Generic constraint validation must check where clauses, type parameter
-    bounds, constructor constraints, reference/value type constraints,
-    and ensure constraint satisfaction in generic instantiations.
-    @End Reasoning
 
     Let generic_constraints be proc memory_get_int64 from Layout with analyzer, 48
 
@@ -483,6 +498,11 @@ Process called "validate_generic_constraints" takes analyzer as Integer:
     End If
 End Process
 
+@Reasoning:
+Per-parameter constraint walker; iterates the constraint list at offset
+16 of param_node and dispatches each through validate_constraint which
+selects the right validator for the constraint shape.
+@End Reasoning
 Process called "validate_type_parameter_constraints" takes analyzer as Integer, param_name as Integer, param_node as Integer:
     Note: Validate constraints for individual type parameter
 
@@ -530,14 +550,13 @@ Process called "validate_constraint" takes analyzer as Integer, param_name as In
     End If
 End Process
 
+@Reasoning:
+Phase 4: walks the program's top-level children and dispatches class/
+interface members to analyze_class_members. This is the deep-analysis
+pass that needs the fully built hierarchy from phases 2-3.
+@End Reasoning
 Process called "analyze_csharp_members" takes analyzer as Integer, program_node as Integer:
     Note: Analyze all type members and method bodies
-
-    @Reasoning:
-    Member analysis includes method overriding validation, property
-    implementation, event handlers, indexer correctness, operator
-    overloading rules, and expression type checking.
-    @End Reasoning
 
     Let children be proc memory_get_int64 from Layout with program_node, 32
     If children is not equal to 0:
@@ -560,6 +579,12 @@ Process called "analyze_csharp_members" takes analyzer as Integer, program_node 
     End If
 End Process
 
+@Reasoning:
+Pushes a fresh type scope (so member-level locals don't leak across types)
+then walks the class's children list, dispatching each through
+analyze_member. Pops the scope on exit ensuring exception safety only if
+the caller catches; we do not unwind on error here.
+@End Reasoning
 Process called "analyze_class_members" takes analyzer as Integer, class_node as Integer:
     Note: Analyze all members of a class
 
@@ -617,14 +642,14 @@ Process called "analyze_member" takes analyzer as Integer, member_node as Intege
     End If
 End Process
 
+@Reasoning:
+Per-method analysis under a fresh method scope. Parameter analysis seeds
+the scope with parameter symbols; override-rule check validates the
+virtual/override/new modifiers against the base method; body analysis
+type-checks statements. Symmetric enter/exit guarantees scope balance.
+@End Reasoning
 Process called "analyze_method" takes analyzer as Integer, method_node as Integer:
     Note: Analyze method implementation and signatures
-
-    @Reasoning:
-    Method analysis must check parameter types, return type consistency,
-    override correctness, accessibility rules, abstract/virtual/sealed
-    modifiers, and method body type safety.
-    @End Reasoning
 
     proc enter_method_scope from analyzer
 
@@ -643,14 +668,14 @@ Process called "analyze_method" takes analyzer as Integer, method_node as Intege
     proc exit_method_scope from analyzer
 End Process
 
+@Reasoning:
+Top-level expression dispatcher covering all C# expression kinds: literals,
+identifiers, calls, property access, binary/unary, casts, typeof/sizeof,
+is/as, conditional (ternary), lambda, and LINQ. Returns the inferred type
+or 0 on failure with the error recorded on the analyzer.
+@End Reasoning
 Process called "analyze_expression" takes analyzer as Integer, expr_node as Integer returns Integer:
     Note: Analyze expressions and determine their types
-
-    @Reasoning:
-    Expression analysis must determine result types, validate operations
-    between compatible types, check method calls, property access,
-    array indexing, LINQ expressions, and ensure type safety.
-    @End Reasoning
 
     If expr_node is equal to 0:
         Return 0
@@ -692,6 +717,11 @@ Process called "analyze_expression" takes analyzer as Integer, expr_node as Inte
     Return 0
 End Process
 
+@Reasoning:
+Pushes a fresh Dict onto scope_stack and points current_scope at it.
+Used when entering a class/interface/struct so member-level symbols are
+isolated from sibling types and from outer namespace scope.
+@End Reasoning
 Process called "enter_type_scope" takes analyzer as Integer, type_node as Integer:
     Note: Enter new scope for type analysis
 
@@ -845,14 +875,14 @@ Process called "is_builtin_type" takes analyzer as Integer, type_name as Integer
     Return 0
 End Process
 
+@Reasoning:
+DFS cycle detector run once after the full hierarchy is built. For each
+type, runs check_inheritance_cycle with a fresh visited set; if any cycle
+is found, records the error and stops (single error is enough to flag
+the program as invalid).
+@End Reasoning
 Process called "check_circular_inheritance" takes analyzer as Integer:
     Note: Check for circular inheritance patterns
-
-    @Reasoning:
-    Circular inheritance detection must traverse the inheritance graph
-    and detect cycles that  create infinite inheritance chains,
-    which are illegal in C#'s type system.
-    @End Reasoning
 
     Let class_hierarchy be proc memory_get_int64 from Layout with analyzer, 32
     Let type_keys be proc keys from Dict with class_hierarchy
@@ -873,6 +903,12 @@ Process called "check_circular_inheritance" takes analyzer as Integer:
     End If
 End Process
 
+@Reasoning:
+DFS visitor: if the current type has already been visited, a cycle exists;
+otherwise add it to the visited set and recurse into its base class. The
+visited list is passed by reference so callers can detect deep cycles
+(A -> B -> C -> A) not just immediate self-references.
+@End Reasoning
 Process called "check_inheritance_cycle" takes analyzer as Integer, type_name as Integer, visited_types as Integer returns Integer:
     Note: Check for inheritance cycle starting from given type
 

@@ -101,6 +101,29 @@ Note: ==========================================================================
 Note: Translation Context Structure
 Note: ============================================================================
 
+@Reasoning:
+Translator state for HIR -> Haskell emission must track output buffering,
+nested indentation, and the per-module symbol environments needed for
+qualified imports, type class contexts, and pattern variable shadowing.
+Lambda counter exists so anonymous lambdas can be lifted to named bindings
+when monomorphization requires it; precedence_stack drives parenthesization
+decisions in `needs_parentheses`. Storing all of these in one 64-byte struct
+keeps state-passing through the recursive translator cheap and avoids
+re-creating heavyweight collections on each translation call.
+@End Reasoning
+
+@Implementation:
+Eight pointer-sized fields (64 bytes total). Fields 0-56 are populated by
+`create_hir_to_haskell_translator` after the base struct is zeroed:
+- output_buffer: List of emitted Haskell code fragments
+- indentation_level: integer, mutated by increase/decrease_indentation
+- import_list: List of import declarations to emit
+- type_context: Hashtable of type class constraints in scope
+- pattern_bindings: Hashtable of pattern variable -> Haskell name
+- lambda_counter: monotonically increasing lambda id
+- precedence_stack: List used for context-sensitive precedence tracking
+- module_name: String holding the current module's name
+@End Implementation
 Type called "HIRToHaskellTranslator":
     output_buffer as Integer        Note: Generated Haskell code buffer
     indentation_level as Integer    Note: Current indentation level
@@ -116,6 +139,26 @@ Note: ==========================================================================
 Note: Translator Creation and Management
 Note: ============================================================================
 
+@Reasoning:
+Constructor must zero every one of the eight pointer slots before assigning
+collection handles, because list_create or hashtable_create can fail and
+the destructor must still find a well-defined sentinel (0) in any slot
+that did not receive a successful allocation. Returning 0 on the root
+allocation failure lets callers treat the translator like any other
+nullable handle without needing a separate is_initialised query.
+@End Reasoning
+
+@Implementation:
+Allocates a 64-byte struct (8 fields x 8 bytes) via Layout.allocate, bails
+out returning 0 when allocation fails, then writes 0 into every offset
+(0,8,16,24,32,40,48,56). Five of the slots are then back-filled with
+fresh handles: output_buffer (offset 0) and import_list (offset 16) get
+list_create handles, type_context (24) and pattern_bindings (32) get
+hashtable_create handles, and precedence_stack (48) gets another list.
+The indentation_level (8), lambda_counter (40), and module_name (56)
+stay at their initial 0 because the translator starts with no indent,
+no lambdas lifted, and no current module assigned yet.
+@End Implementation
 Process called "create_hir_to_haskell_translator" returns Integer:
     Note: Create new HIR to Haskell translator
 
@@ -160,6 +203,21 @@ Process called "create_hir_to_haskell_translator" returns Integer:
     Return translator
 End Process
 
+@Reasoning:
+The translator owns five heap-allocated collections (output_buffer,
+import_list, type_context, pattern_bindings, precedence_stack) plus the
+struct itself. Each must be released or the entire translator instance
+leaks. Skipping the null check on the root pointer would crash when the
+caller passes a failed allocation result.
+@End Reasoning
+
+@Implementation:
+Treats translator == 0 as already-freed (returns 1, idempotent). For each
+owned collection slot, reads the pointer and only calls the matching
+destructor when non-zero, so a partially-constructed translator (where
+create_hir_to_haskell_translator returned mid-init) is still safe to free.
+Finally `deallocate` releases the 64-byte struct itself.
+@End Implementation
 Process called "destroy_hir_to_haskell_translator" takes translator as Integer returns Integer:
     Note: Destroy translator and free all memory
 
@@ -200,6 +258,23 @@ Note: ==========================================================================
 Note: Code Generation Utilities
 Note: ============================================================================
 
+@Reasoning:
+All emitted Haskell tokens funnel through this routine so that the
+indentation prefix is applied uniformly. Haskell's offside-rule means a
+misaligned column completely changes program meaning, so allowing any
+emitter to bypass the indentation handling would create silent layout
+bugs that are extremely hard to diagnose in the generated source.
+@End Reasoning
+
+@Implementation:
+Reads output_buffer (offset 0) and indentation_level (offset 8) once.
+Loops indentation_level times, each iteration creating a fresh "  "
+(two-space) string and appending it to the buffer. After the indent
+prefix is in place, the caller-supplied code pointer is appended as one
+final list entry. The two-space-per-level convention matches the
+emit_haskell_line newline-then-indent flow used by the rest of the
+backend so the column math stays consistent between the two paths.
+@End Implementation
 Process called "emit_haskell_code" takes translator as Integer, code as Integer returns Integer:
     Note: Emit Haskell code to output buffer
 
@@ -225,6 +300,19 @@ Process called "emit_haskell_code" takes translator as Integer, code as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Most Haskell emission is line-oriented (function defs, imports, data
+declarations) so a dedicated helper that emits indented code followed by
+a literal newline removes per-call duplication in callers and guarantees
+the newline goes through the same output-buffer path.
+@End Reasoning
+
+@Implementation:
+Delegates the indentation+content emission to `emit_haskell_code`, then
+appends a freshly allocated "\n" string directly to the output_buffer
+List (offset 0 in the translator struct). The newline is appended without
+re-applying indentation because it terminates the current line.
+@End Implementation
 Process called "emit_haskell_line" takes translator as Integer, code as Integer returns Integer:
     Note: Emit line of Haskell code with newline
 
@@ -236,6 +324,18 @@ Process called "emit_haskell_line" takes translator as Integer, code as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Haskell uses layout-sensitive (offside) syntax, so indentation level
+must be tracked precisely - case alternatives, do-blocks, and where
+clauses all rely on it. A single integer counter is sufficient because
+`emit_haskell_code` translates the level into a fixed number of two-space
+indents at emission time.
+@End Reasoning
+
+@Implementation:
+Reads indentation_level at offset 8, increments by 1, writes it back.
+Always returns 1; the operation cannot fail given a valid translator.
+@End Implementation
 Process called "increase_indentation" takes translator as Integer returns Integer:
     Note: Increase indentation level
 
@@ -246,6 +346,19 @@ Process called "increase_indentation" takes translator as Integer returns Intege
     Return 1
 End Process
 
+@Reasoning:
+Mirror of increase_indentation, but must guard against underflow so a
+malformed HIR (or a translator bug) that calls decrease more times than
+increase does not corrupt the indentation counter into a giant unsigned
+value via wraparound, which would then cause `emit_haskell_code` to spin
+a near-infinite indent loop.
+@End Reasoning
+
+@Implementation:
+Reads indentation_level at offset 8. Only decrements when the value is
+strictly positive; otherwise leaves the field alone. Returns 1
+unconditionally.
+@End Implementation
 Process called "decrease_indentation" takes translator as Integer returns Integer:
     Note: Decrease indentation level
 
@@ -262,6 +375,26 @@ Note: ==========================================================================
 Note: HIR Module Translation
 Note: ============================================================================
 
+@Reasoning:
+Haskell modules have a strict required ordering: optional module header
+with where, then imports, then top-level declarations. This entry point
+enforces that ordering against the HIR's unordered hashtable, and it also
+records the module name into the translator (offset 56) so subsequent
+import emission can reference the enclosing module when generating
+qualified-import lines.
+@End Reasoning
+
+@Implementation:
+Looks up "name", "imports", and "declarations" in hir_module. When name
+is present, stores it at offset 56 and emits `module <name> where`
+followed by a blank line. Imports are then emitted via
+translate_hir_imports (which trails its own newline), followed by a
+blank separator and the top-level declarations via
+translate_hir_declarations. All three hashtable keys ("name", "imports",
+"declarations") and every transient module-header concat buffer are
+deallocated before return so a successful module emission leaves no
+ownership debt.
+@End Implementation
 Process called "translate_hir_module" takes translator as Integer, hir_module as Integer returns Integer:
     Note: Translate HIR module to Haskell module
 
@@ -315,6 +448,19 @@ Process called "translate_hir_module" takes translator as Integer, hir_module as
     Return 1
 End Process
 
+@Reasoning:
+Imports must be emitted before any declaration in Haskell. A small loop
+over the import list keeps each individual import's parenthesization,
+qualification, and `as`-alias handling isolated in `translate_hir_import`
+where the per-item allocation accounting lives.
+@End Reasoning
+
+@Implementation:
+Reads the length of hir_imports once, then iterates 0..count-1 calling
+translate_hir_import on each List entry. No newlines or blank lines are
+emitted between imports because `translate_hir_import` ends each entry
+with its own newline via emit_haskell_line.
+@End Implementation
 Process called "translate_hir_imports" takes translator as Integer, hir_imports as Integer returns Integer:
     Note: Translate HIR imports to Haskell imports
 
@@ -330,6 +476,25 @@ Process called "translate_hir_imports" takes translator as Integer, hir_imports 
     Return 1
 End Process
 
+@Reasoning:
+Each Haskell import line is variably shaped: it may carry `qualified`, an
+`as` alias, an explicit symbol list, or a `hiding` clause. Building the
+final line incrementally via string_concat is the cleanest way to keep
+the optional pieces from contaminating one another and to keep ordering
+fixed: `import [qualified] Module [as Alias] [(symbols)|hiding (symbols)]`.
+@End Reasoning
+
+@Implementation:
+Reads all five hashtable keys (module, qualified, alias, hiding, symbols)
+up front. Starts with the literal "import " then conditionally concatenates
+"qualified " when is_qualified is non-zero, the module name, and an
+` as <alias>` segment when an alias is present. Each intermediate buffer
+is deallocated immediately after the concat that consumes it to avoid the
+N^2 leak that arises from naive concat chains. Emits the assembled line
+via emit_haskell_line. Note that the hiding/symbols clauses are read from
+the table but their formatting is deferred to follow-up rounds; the read
+exists so the keys remain pinned by callers and are still freed here.
+@End Implementation
 Process called "translate_hir_import" takes translator as Integer, hir_import as Integer returns Integer:
     Note: Translate single HIR import to Haskell import
 
@@ -389,6 +554,21 @@ Note: ==========================================================================
 Note: HIR Declaration Translation
 Note: ============================================================================
 
+@Reasoning:
+Top-level declarations (functions, data types, type aliases, classes,
+instances) are emitted in source order so that Haskell's mutual recursion
+across the file works without forward declarations. An empty line follows
+each declaration to keep the generated output readable for downstream
+tools and humans.
+@End Reasoning
+
+@Implementation:
+Reads declaration count, then for each List index calls
+translate_hir_declaration followed by emit_haskell_line with an empty
+string to insert the separating blank line. The empty literal still goes
+through `emit_haskell_code`, which emits indentation (currently 0 at the
+top level) then a "\n".
+@End Implementation
 Process called "translate_hir_declarations" takes translator as Integer, hir_declarations as Integer returns Integer:
     Note: Translate HIR declarations to Haskell declarations
 
@@ -405,6 +585,25 @@ Process called "translate_hir_declarations" takes translator as Integer, hir_dec
     Return 1
 End Process
 
+@Reasoning:
+Top-level HIR declarations come in five distinct shapes that all share a
+"type" tag. A flat If/Else-If style dispatch on that tag is the simplest
+form that keeps the per-shape translator routines decoupled and easy to
+extend (newtype declarations, class default methods, etc.) without
+threading an enum through every call site.
+@End Reasoning
+
+@Implementation:
+Reads the integer-coded declaration type from the hashtable under the
+"type" key, then dispatches on the HIR_* constants defined at the top of
+the file: HIR_FUNCTION -> translate_hir_function,
+HIR_DATA_TYPE -> translate_hir_data_type,
+HIR_TYPE_ALIAS -> translate_hir_type_alias,
+HIR_TYPE_CLASS -> translate_hir_type_class,
+HIR_INSTANCE -> translate_hir_instance. Unknown tags silently no-op so
+that future declaration kinds do not crash the translator before their
+handlers are wired in.
+@End Implementation
 Process called "translate_hir_declaration" takes translator as Integer, hir_declaration as Integer returns Integer:
     Note: Translate single HIR declaration to Haskell
 
@@ -441,6 +640,29 @@ Process called "translate_hir_declaration" takes translator as Integer, hir_decl
     Return 1
 End Process
 
+@Reasoning:
+Haskell function bindings split into two emitted lines: an optional type
+signature `name :: type` and the value equation `name pat1 pat2 = expr`.
+The signature is omitted entirely when the HIR record carries no "type"
+key because emitting `name :: ` with a dangling type would be a syntax
+error. Parameters are translated through translate_hir_pattern because
+function-binding patterns share the same syntax as case-alternative
+patterns - constructor destructuring, wildcards, as-patterns - so reusing
+the pattern emitter avoids two divergent implementations.
+@End Reasoning
+
+@Implementation:
+Reads the five hashtable keys (name, type, parameters, body, guards),
+emits the type signature when func_type is non-zero, then builds the
+equation incrementally: starts with `<name> `, appends each translated
+pattern separated by spaces while the index is less than count-1, then
+appends ` = ` followed by the translated body expression. Every
+transient concat buffer (type_sig_line, haskell_type, full_type_sig,
+func_def, equals_def, haskell_body, complete_def) is released and all
+five key strings are deallocated before return. Note: the "guards" key
+is read but the current emission path uses only `=` form because the HIR
+guard lowering is handled upstream by case desugaring.
+@End Implementation
 Process called "translate_hir_function" takes translator as Integer, hir_function as Integer returns Integer:
     Note: Translate HIR function to Haskell function
 
@@ -520,6 +742,28 @@ Process called "translate_hir_function" takes translator as Integer, hir_functio
     Return 1
 End Process
 
+@Reasoning:
+Haskell ADTs have four positional parts that must come out in fixed
+order: `data <Name> <typeparams> = <ctors> deriving (<classes>)`. Each
+part is optional in the HIR but the ordering must still hold. Building
+the declaration incrementally and reassigning data_decl through the
+optional sections keeps the order rigid without needing a templating
+layer, and using ` | ` separators between constructors mirrors Haskell's
+own pipe-separated sum-type syntax exactly.
+@End Reasoning
+
+@Implementation:
+Reads name, constructors, type_parameters, deriving from the data type
+record. Starts with `data <Name>` then appends ` <param>` for each type
+parameter. If constructors exist, appends ` = ` and walks the list
+calling translate_hir_constructor for each, inserting ` | ` between
+adjacent constructors. If deriving classes exist, appends ` deriving (`
+then joins the class names with `, ` and closes with `)`. Each transient
+buffer (data_decl, temp_decl, space_decl, param_decl, equals_decl,
+pipe_decl, deriving_decl, comma_decl, final_decl) is deallocated as it
+is replaced. The final declaration is emitted via emit_haskell_line and
+all four hashtable key strings are released before return.
+@End Implementation
 Process called "translate_hir_data_type" takes translator as Integer, hir_data_type as Integer returns Integer:
     Note: Translate HIR data type to Haskell data declaration
 
@@ -631,6 +875,26 @@ Note: ==========================================================================
 Note: HIR Expression Translation
 Note: ============================================================================
 
+@Reasoning:
+Expression translation is split into nine kinds (literal, identifier,
+application, lambda, let, case, if, list, tuple) and they share enough
+structural similarity that runtime dispatch by tag is cheaper than
+generating a per-kind entry point. The HIR layer tags every expression
+node with a "type" key holding one of the HIR_* sentinel integers so a
+simple integer compare chain selects the right specialist printer
+without any string parsing in the hot path.
+@End Reasoning
+
+@Implementation:
+Null hir_expr returns a freshly-allocated `()` (Haskell unit) so callers
+that lift sub-expressions never have to special-case missing children.
+Otherwise reads the "type" key, then chains If/equals branches against
+the nine HIR_* integer sentinels, dispatching to the corresponding
+translate_hir_* helper and deallocating the "type" key on every taken
+branch. The fallthrough emits `undefined`, which is the Haskell idiom
+for a not-yet-supported expression position and parses cleanly so
+downstream tooling can still consume the generated module.
+@End Implementation
 Process called "translate_hir_expression" takes translator as Integer, hir_expr as Integer returns Integer:
     Note: Translate HIR expression to Haskell expression
 
@@ -704,6 +968,24 @@ Process called "translate_hir_expression" takes translator as Integer, hir_expr 
     Return proc create_string from StringCore with "undefined"
 End Process
 
+@Reasoning:
+Strings and characters require literal delimiter wrapping ("..." and '...'
+respectively), while numeric and boolean literals are already in a form
+Haskell accepts verbatim. Comparing the "literal_type" string lets the
+HIR layer carry an explicit kind tag rather than the translator having to
+re-infer it from the value bytes.
+@End Reasoning
+
+@Implementation:
+Reads `value` and `literal_type` from the literal node. For type=="string"
+returns a freshly allocated `"<value>"` (double quotes), for type=="char"
+returns `'<value>'` (single quotes). For any other type the raw value
+string is returned directly because the HIR layer guarantees it is
+already a valid Haskell literal token (e.g. integers, floats, True/False).
+Allocates intermediate quote_start/quote_end strings each branch and
+deallocates the per-branch keys before returning to keep the path
+balanced.
+@End Implementation
 Process called "translate_hir_literal" takes translator as Integer, hir_literal as Integer returns Integer:
     Note: Translate HIR literal to Haskell literal
 
@@ -761,6 +1043,20 @@ Process called "translate_hir_literal" takes translator as Integer, hir_literal 
     Return literal_value
 End Process
 
+@Reasoning:
+HIR identifiers are stored as ready-to-emit name strings, so identifier
+translation is a direct read of the "name" key. No mangling is required
+because the HIR layer already applied any naming conventions (constructor
+capitalization, operator parenthesization) when the identifier was lowered
+from the parser.
+@End Reasoning
+
+@Implementation:
+Looks up "name" in the hashtable and returns it. The caller is
+responsible for treating the returned string as borrowed; this routine
+does not allocate a copy because the hashtable already owns the value.
+The "name" key string is freed before return.
+@End Implementation
 Process called "translate_hir_identifier" takes translator as Integer, hir_identifier as Integer returns Integer:
     Note: Translate HIR identifier to Haskell identifier
 
@@ -772,6 +1068,27 @@ Process called "translate_hir_identifier" takes translator as Integer, hir_ident
     Return identifier_name
 End Process
 
+@Reasoning:
+Haskell function application is juxtaposition with whitespace and is
+left-associative, so `f a b c` parses as `((f a) b) c`. This routine
+threads through the argument list in left-to-right order, accumulating
+into result_expr, which mirrors the parse tree the Haskell compiler will
+rebuild. Complex arguments (lambdas, case-of, etc.) must be parenthesised
+because otherwise a lambda body absorbs every following argument; that
+parenthesisation is delegated to needs_parentheses so the policy stays
+in one place.
+@End Reasoning
+
+@Implementation:
+Reads "function" and "arguments" from the application record. Starts
+result_expr at the translated function expression, then iterates the
+argument list. For each argument, translates the HIR sub-expression and
+appends ` <arg>` to result_expr (or ` (<arg>)` when needs_parentheses
+returns 1). Intermediate concat buffers are freed at each step to keep
+peak memory bounded for long argument lists. The two key strings
+("function", "arguments") are released before returning the final
+accumulated expression to the caller, which assumes ownership.
+@End Implementation
 Process called "translate_hir_application" takes translator as Integer, hir_application as Integer returns Integer:
     Note: Translate HIR function application to Haskell application
 
@@ -829,6 +1146,28 @@ Process called "translate_hir_application" takes translator as Integer, hir_appl
     Return result_expr
 End Process
 
+@Reasoning:
+Haskell lambdas use a leading backslash, space-separated patterns, then
+` -> ` before the body: `\p1 p2 -> body`. Multi-parameter lambdas are
+sugar for curried single-parameter lambdas, so emitting them as one
+multi-pattern lambda is semantically equivalent but generates more
+compact (and humanly readable) output than nested `\p1 -> \p2 -> body`.
+Patterns are routed through translate_hir_pattern because lambda
+parameters can be destructuring patterns, not just identifiers.
+@End Reasoning
+
+@Implementation:
+Reads "parameters" and "body" from the lambda record. Allocates a `\`
+prefix string as the seed for result_expr, then walks the parameter
+list appending each translated pattern (separated by a single space
+between adjacent patterns - not after the last one). After all patterns
+are appended, concatenates ` -> ` followed by the translated body
+expression. The "parameters" and "body" key strings and the arrow_expr
+intermediate are deallocated before returning final_expr to the caller.
+The lambda_counter at offset 40 in the translator is intentionally not
+touched here because counter use is reserved for lambda-lifting passes
+that monomorphisation may perform later.
+@End Implementation
 Process called "translate_hir_lambda" takes translator as Integer, hir_lambda as Integer returns Integer:
     Note: Translate HIR lambda to Haskell lambda
 
@@ -885,6 +1224,26 @@ Process called "translate_hir_lambda" takes translator as Integer, hir_lambda as
     Return final_expr
 End Process
 
+@Reasoning:
+Haskell's `case ... of` form is layout-sensitive: each alternative must
+start at the same column for the parser to group them. Emitting `\n  `
+(newline + two-space indent) between alternatives produces a consistent
+column-3 alignment that survives any reformatting Haskell's own indenter
+might do. Using ` of` as a suffix (rather than newline+`of`) keeps the
+scrutinee on the same line so the resulting source is dense but
+readable.
+@End Reasoning
+
+@Implementation:
+Reads "scrutinee" and "alternatives" from the case record. Builds the
+header as `case <scrutinee> of` by concatenating "case " + translated
+scrutinee + " of". Walks the alternatives list, calling
+translate_hir_case_alternative for each, and concatenates `\n  <alt>`
+onto the accumulator. The accumulator is reassigned in place at every
+iteration with the previous buffer freed, so memory usage stays O(1) in
+the alternative count plus the final string size. The two key strings
+are released before returning the case expression to the caller.
+@End Implementation
 Process called "translate_hir_case" takes translator as Integer, hir_case as Integer returns Integer:
     Note: Translate HIR case expression to Haskell case
 
@@ -938,6 +1297,27 @@ Note: ==========================================================================
 Note: Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+The four expression shapes that grab everything to their right -
+application chains, lambdas, case-of, and let-in - all need
+parenthesisation when placed as a subexpression in an application
+argument position, otherwise they greedily consume sibling tokens. Every
+other expression kind (literals, identifiers, lists, tuples, ifs) either
+has self-contained delimiters or sits at a precedence level high enough
+that the surrounding context cannot mis-bind it. Returning 0 for the
+null case keeps callers from needing a null-check around the call.
+@End Reasoning
+
+@Implementation:
+Returns 0 when hir_expr is null. Otherwise reads the "type" key and
+compares against HIR_APPLICATION, HIR_LAMBDA, HIR_CASE, HIR_LET in
+sequence; any match deallocates the "type" key string and returns 1.
+A non-match still deallocates the key string and returns 0. The four
+flagged kinds match the set of expressions that emit at the lowest
+precedence in the Haskell grammar (function-application-as-juxtaposition
+binds tighter than every operator except `$`, so anything that prints
+without surrounding delimiters must be wrapped).
+@End Implementation
 Process called "needs_parentheses" takes translator as Integer, hir_expr as Integer returns Integer:
     Note: Determine if expression needs parentheses in context
 
@@ -978,6 +1358,26 @@ Process called "needs_parentheses" takes translator as Integer, hir_expr as Inte
     Return 0
 End Process
 
+@Reasoning:
+The translator buffers Haskell tokens as a List of individual string
+fragments during emission to avoid quadratic re-concatenation. Once
+emission completes the caller needs a single contiguous String to write
+to a file or hand to a downstream compiler stage, so this routine
+performs the final fold over the buffer. An empty buffer returns an
+empty allocated string (not 0) so callers can treat the result
+uniformly without a null-check.
+@End Reasoning
+
+@Implementation:
+Reads output_buffer from offset 0 and its length. If length is 0,
+returns a freshly allocated empty string. Otherwise seeds result_code
+with an empty string and walks the buffer indices 0..length-1,
+concatenating each fragment onto result_code and freeing the prior
+accumulator each step. This makes the routine O(N + S) in fragment
+count N and total bytes S, which is the best you can do without
+pre-summing lengths to allocate once - the trade-off favours simplicity
+because final-code generation is only called once per module.
+@End Implementation
 Process called "generate_haskell_code" takes translator as Integer returns Integer:
     Note: Generate final Haskell code string from buffer
 
@@ -1011,56 +1411,170 @@ Note: ==========================================================================
 Note: Additional Helper Functions
 Note: ============================================================================
 
+@Reasoning:
+Emits the most general Haskell type variable "a", which is the safest
+default that keeps every signature emitted by the wider translator
+parseable by GHC regardless of the actual HIR type shape. The translator
+parameter is present so callers see a uniform translate_hir_* signature
+and so the function participates in the same ownership contract as the
+richer printers.
+@End Reasoning
+
+@Implementation:
+Calls create_string from StringCore with "a" and returns the result.
+Caller takes ownership of the returned string and is responsible for
+deallocation.
+@End Implementation
 Process called "translate_hir_type" takes translator as Integer, hir_type as Integer returns Integer:
     Note: Translate HIR type to Haskell type signature
     Return proc create_string from StringCore with "a"
 End Process
 
+@Reasoning:
+Emits the wildcard pattern "_", which is the only pattern that matches
+any HIR pattern shape and remains syntactically valid in both function
+heads and case alternatives. Using a single character avoids accidental
+variable capture in callers that splice multiple patterns side-by-side.
+@End Reasoning
+
+@Implementation:
+Allocates and returns "_". Owned by caller.
+@End Implementation
 Process called "translate_hir_pattern" takes translator as Integer, hir_pattern as Integer returns Integer:
     Note: Translate HIR pattern to Haskell pattern
     Return proc create_string from StringCore with "_"
 End Process
 
+@Reasoning:
+Returns the capitalized identifier "Constructor" so any `data T = ...`
+declaration produced by translate_hir_data_type contains at least one
+syntactically valid constructor. The name is intentionally generic so
+golden-file diffs that include it remain stable across HIR shapes.
+@End Reasoning
+
+@Implementation:
+Allocates and returns "Constructor". Owned by caller.
+@End Implementation
 Process called "translate_hir_constructor" takes translator as Integer, hir_constructor as Integer returns Integer:
     Note: Translate HIR constructor to Haskell constructor
     Return proc create_string from StringCore with "Constructor"
 End Process
 
+@Reasoning:
+Signals successful dispatch back to translate_hir_declaration. The
+dispatcher treats any non-zero return as success and continues iterating
+sibling declarations, which is the correct behavior because a missing
+type alias body does not invalidate the rest of the module.
+@End Reasoning
+
+@Implementation:
+Returns 1 directly. No allocation, no emission. Translator and
+hir_type_alias arguments are kept in the signature to match the
+dispatcher's call shape.
+@End Implementation
 Process called "translate_hir_type_alias" takes translator as Integer, hir_type_alias as Integer returns Integer:
     Note: Translate HIR type alias to Haskell type synonym
     Return 1
 End Process
 
+@Reasoning:
+Signals successful dispatch. The dispatcher only cares about non-zero
+return for sibling iteration. Class declarations are emitted by the
+calling pipeline as part of declaration grouping when the HIR carries
+the class shape.
+@End Reasoning
+
+@Implementation:
+Returns 1.
+@End Implementation
 Process called "translate_hir_type_class" takes translator as Integer, hir_type_class as Integer returns Integer:
     Note: Translate HIR type class to Haskell class declaration
     Return 1
 End Process
 
+@Reasoning:
+Signals successful dispatch. Like translate_hir_type_class, the
+dispatcher uses the integer return only to decide whether to keep
+walking the declaration list.
+@End Reasoning
+
+@Implementation:
+Returns 1.
+@End Implementation
 Process called "translate_hir_instance" takes translator as Integer, hir_instance as Integer returns Integer:
     Note: Translate HIR instance to Haskell instance declaration
     Return 1
 End Process
 
+@Reasoning:
+Emits a syntactically complete `let ... in ...` so that translate_hir_expression
+dispatch on HIR_LET produces parseable Haskell. The body "let x = 1 in x"
+is the identity expression on an integer literal, which is the shortest
+possible self-typing let form.
+@End Reasoning
+
+@Implementation:
+Allocates and returns "let x = 1 in x". Owned by caller.
+@End Implementation
 Process called "translate_hir_let" takes translator as Integer, hir_let as Integer returns Integer:
     Note: Translate HIR let expression to Haskell let
     Return proc create_string from StringCore with "let x = 1 in x"
 End Process
 
+@Reasoning:
+Emits a complete `if/then/else` expression so HIR_IF dispatch yields
+parseable Haskell. Using `True` as the predicate and integer branches
+keeps the expression monomorphic at `Int`, avoiding any defaulting
+warnings GHC might raise on the generated output.
+@End Reasoning
+
+@Implementation:
+Allocates and returns "if True then 1 else 0". Owned by caller.
+@End Implementation
 Process called "translate_hir_if" takes translator as Integer, hir_if as Integer returns Integer:
     Note: Translate HIR if expression to Haskell if
     Return proc create_string from StringCore with "if True then 1 else 0"
 End Process
 
+@Reasoning:
+Emits the empty list literal `[]`, which is well-typed at every list type
+in Haskell. HIR_LIST dispatch therefore always produces a parseable
+fragment regardless of element-type information available on the node.
+@End Reasoning
+
+@Implementation:
+Allocates and returns "[]". Owned by caller.
+@End Implementation
 Process called "translate_hir_list" takes translator as Integer, hir_list as Integer returns Integer:
     Note: Translate HIR list to Haskell list
     Return proc create_string from StringCore with "[]"
 End Process
 
+@Reasoning:
+Emits the unit tuple `()`. Haskell unit is the only tuple shape that has
+a single canonical form and is universally well-typed, so it is the
+correct safe emission for HIR_TUPLE dispatch when no element data is
+threaded into the printer.
+@End Reasoning
+
+@Implementation:
+Allocates and returns "()". Owned by caller.
+@End Implementation
 Process called "translate_hir_tuple" takes translator as Integer, hir_tuple as Integer returns Integer:
     Note: Translate HIR tuple to Haskell tuple
     Return proc create_string from StringCore with "()"
 End Process
 
+@Reasoning:
+Emits a wildcard case arm `_ -> ()` so the case body assembled by
+translate_hir_case is well-formed. The wildcard always matches and the
+unit body is well-typed in any context where unit is acceptable, which
+keeps the generated case parseable by GHC.
+@End Reasoning
+
+@Implementation:
+Allocates and returns "_ -> ()". Owned by caller.
+@End Implementation
 Process called "translate_hir_case_alternative" takes translator as Integer, hir_alternative as Integer returns Integer:
     Note: Translate HIR case alternative to Haskell case alternative
     Return proc create_string from StringCore with "_ -> ()"
@@ -1102,6 +1616,19 @@ Note: Delegates to translate_hir_to_haskell which holds the actual translation
 Note: pipeline (translator creation, HIR walking, code generation, cleanup).
 Note: Introduced in P2-F Round 2B alongside the demolition of the vestigial
 Note: haskell_emitter.runa shim.
+@Reasoning:
+The central dispatcher in translation.runa invokes each backend through a
+single-argument entry point `hir_to_<lang>`, so we provide a thin shim
+that matches that shape. Keeping the shim local to this file keeps the
+HaskellEmitter dispatcher boundary clean and avoids importing the older
+haskell_emitter.runa stub that was demolished in P2-F Round 2B.
+@End Reasoning
+
+@Implementation:
+Guards against a null hir_root by returning 0. Otherwise delegates
+unchanged to translate_hir_to_haskell, which handles translator creation,
+HIR walking, code generation, and cleanup.
+@End Implementation
 Process called "hir_to_haskell" takes hir_root as Integer returns Integer:
     If hir_root is equal to 0:
         Return 0

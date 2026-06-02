@@ -78,6 +78,17 @@ Note: ==========================================================================
 Note: Token Structure
 Note: ============================================================================
 
+@Reasoning:
+LLVM IR token record. Stores lexeme as pointer+length (rather than
+heap-allocated string) so the lexer can carve tokens out of the
+source buffer in-place without per-token allocations - critical for
+LLVM IR files which can be hundreds of thousands of tokens.
+@End Reasoning
+
+@Implementation:
+Five-field record: token_type (TOKEN_* constant), lexeme (pointer
+into the source buffer), lexeme_length (byte count), line, column.
+@End Implementation
 Type called "LLVMIRToken":
     token_type as Integer      Note: Token type constant
     lexeme as Integer          Note: Pointer to lexeme string
@@ -90,6 +101,20 @@ Note: ==========================================================================
 Note: Lexer State
 Note: ============================================================================
 
+@Reasoning:
+Lexer state tracking both the current cursor (position/line/column)
+and the "start" anchor for the in-progress token (start_*). The
+anchor approach lets the lexer mark the beginning of a token before
+walking, then build the token record with the exact starting
+position once the token end is determined.
+@End Reasoning
+
+@Implementation:
+Eight-field record: source (pointer), source_length, position (byte
+offset), line, column (current cursor), start_position, start_line,
+start_column (token-start anchor). The anchor fields are updated by
+the caller via make_token at the start of each token-scan sequence.
+@End Implementation
 Type called "LLVMIRLexer":
     source as Integer          Note: Source code pointer
     source_length as Integer   Note: Source code length
@@ -105,9 +130,19 @@ Note: ==========================================================================
 Note: Lexer Creation
 Note: ============================================================================
 
-Process called "create_llvmir_lexer" takes source as Integer returns Integer:
-    Note: Create LLVM IR lexer
+@Reasoning:
+Allocates and initialises a fresh LLVMIRLexer at the source start.
+Both current cursor and start anchor begin at position 0, line 1,
+column 1 - the typical zero state for a not-yet-started lex.
+@End Reasoning
 
+@Implementation:
+Calls string_length on source. Allocates 64 bytes (8 i64 slots).
+Returns 0 on failure. Writes: source @0, source_length @8,
+position @16 = 0, line @24 = 1, column @32 = 1, start_position @40
+= 0, start_line @48 = 1, start_column @56 = 1.
+@End Implementation
+Process called "create_llvmir_lexer" takes source as Integer returns Integer:
     Let source_length be proc string_length from StringCore with source
 
     Let lexer_size be 64  Note: LLVMIRLexer: 8 fields × 8 bytes
@@ -133,6 +168,21 @@ Note: ==========================================================================
 Note: Character Examination
 Note: ============================================================================
 
+@Reasoning:
+Non-destructive read of the current byte. All scan loops use this
+to decide whether to consume or stop, then call advance_char to
+actually consume. Splitting peek and advance lets the lexer take
+the same byte through multiple classification paths without
+duplicating reads.
+@End Reasoning
+
+@Implementation:
+Reads position @16 and source_length @8. If position >=
+source_length, returns 0 as an EOF sentinel (LLVM IR cannot
+contain a NUL byte outside of string literals, so 0 is safe as a
+sentinel here). Otherwise reads source @0 and returns the byte at
+source[position] via memory_get_byte.
+@End Implementation
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -149,6 +199,19 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+One-byte lookahead. Used by next_token to decide whether '-' starts
+a negative number (followed by a digit) versus a stray dash. Single
+byte of lookahead is sufficient for the LLVM IR grammar handled
+here - no scanner currently needs deeper peeking.
+@End Reasoning
+
+@Implementation:
+Same shape as peek_char but uses position + 1. EOF guard compares
+position + 1 against source_length (so the last byte of the source
+returns 0 from peek_next_char while peek_char still yields the
+real byte). Returns the byte at source[position + 1].
+@End Implementation
 Process called "peek_next_char" takes lexer as Integer returns Integer:
     Note: Peek at next character without advancing
 
@@ -165,6 +228,21 @@ Process called "peek_next_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Single-byte step + position/line/column bookkeeping. Returns the
+byte that was AT the position before stepping (consistent with the
+"read then advance" model used by all scan_* loops). Newlines reset
+column to 1 and bump line - critical for accurate diagnostics later.
+@End Reasoning
+
+@Implementation:
+Calls peek_char to capture the current byte. Increments position
+@16 by 1 and column @32 by 1. If the captured byte is LF (10),
+increments line @24 by 1 and overwrites column back to 1. CR is
+not specifically handled - in CRLF, the LF that follows resets
+column correctly, and in bare-CR sources column tracking is off
+by one which we accept as an extremely rare LLVM IR producer.
+@End Implementation
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance position and return current character
 
@@ -186,6 +264,19 @@ Process called "advance_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+ASCII letter classifier. LLVM IR identifiers are ASCII-only (the
+spec does not allow Unicode in identifier syntax) so we only need
+A-Z and a-z ranges. We deliberately don't use a library function -
+this is called once per byte during lexing and inlining the range
+check keeps the hot path branch-predictable.
+@End Reasoning
+
+@Implementation:
+Two range checks: 65..90 ('A'..'Z') and 97..122 ('a'..'z'). Each
+range is implemented as nested ifs to permit early return on the
+first match. Returns 0 if neither range matches.
+@End Implementation
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -204,6 +295,17 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII decimal-digit classifier. Used in number scanning, integer-
+type detection (i<N>), and the alnum predicate. Pure range check
+on byte values 48..57 - no locale dependency.
+@End Reasoning
+
+@Implementation:
+Two-level if: char >= 48 ('0') AND char <= 57 ('9') -> return 1,
+else return 0. Nested rather than combined to mirror is_alpha's
+structure.
+@End Implementation
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is numeric
 
@@ -216,6 +318,20 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Disjunction of is_alpha and is_digit. Used by identifier-shaped
+scans (after the first character) where LLVM IR allows letters and
+digits intermixed. Implemented as two sequential helper calls
+rather than inlining the range checks to keep the rule centralised.
+@End Reasoning
+
+@Implementation:
+Calls is_alpha, returns 1 if it returns 1. Otherwise calls
+is_digit, returns 1 if it returns 1. Returns 0 if neither matches.
+Underscore (95) and dot (46) are intentionally NOT considered
+alnum here - they are handled by separate branches at each call
+site because their permission varies by token kind.
+@End Implementation
 Process called "is_alnum" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
 
@@ -232,6 +348,20 @@ Process called "is_alnum" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII whitespace classifier. LLVM IR uses the standard four
+whitespace bytes (space, tab, LF, CR). We do NOT treat vertical tab
+or form-feed as whitespace - they would be lexical errors in well-
+formed LLVM IR and treating them as whitespace would silently mask
+malformed inputs.
+@End Reasoning
+
+@Implementation:
+Returns 1 for 32 (space), 9 (TAB), 10 (LF), 13 (CR); 0 otherwise.
+Structured as four sequential ifs rather than a single boolean
+expression to match the rest of the lexer's style and ensure each
+branch is a simple terminal Return.
+@End Implementation
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace
 
@@ -258,6 +388,21 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Materialises an LLVMIRToken from the lexer's current start_*
+anchor and current position. The token's lexeme is a pointer
+SLICE into the source buffer (source + start_position) - the
+caller must keep the source buffer alive for as long as it holds
+tokens, but no per-token byte copy is performed.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes (5 i64 fields). Computes length =
+current_pos - start_pos and lexeme = source + start_pos. Writes
+token_type @0, lexeme @8, length @16, start_line @24, start_column
+@32. Returns the token pointer. If allocation fails returns 0 and
+the caller is responsible for treating that as a fatal lexer error.
+@End Implementation
 Process called "make_token" takes lexer as Integer, token_type as Integer returns Integer:
     Note: Create token from current lexeme
 
@@ -288,6 +433,21 @@ Process called "make_token" takes lexer as Integer, token_type as Integer return
     Return token
 End Process
 
+@Reasoning:
+Builds a TOKEN_ERROR record carrying a static C-string message
+(passed as a pointer constant from the caller). Reuses the same
+40-byte token layout as make_token so consumers can use a single
+free path regardless of token kind.
+@End Reasoning
+
+@Implementation:
+Allocates a token, sets token_type = TOKEN_ERROR, places the
+message pointer in the lexeme slot (consumers treat the lexeme as
+a null-terminated C string in this case), sets lexeme_length = 0
+(the message length is implied by the C string), and copies the
+CURRENT line/column (not start anchor) so the error points to
+where the lexer was when it gave up.
+@End Implementation
 Process called "make_error_token" takes lexer as Integer, message as Integer returns Integer:
     Note: Create error token
 
@@ -314,6 +474,21 @@ Note: ==========================================================================
 Note: Whitespace and Comments
 Note: ============================================================================
 
+@Reasoning:
+Consumes the inter-token noise in LLVM IR: ASCII whitespace and
+semicolon-introduced line comments. Skipping is folded into one
+function so the main scanner does not have to alternate between
+whitespace and comment loops itself.
+@End Reasoning
+
+@Implementation:
+Outer infinite loop. On EOF returns 1. On whitespace, advances and
+continues. On ';' (59), enters an inner loop that advances until
+either newline or EOF and then continues the outer loop (so a
+comment ending in a newline lets the outer loop also strip any
+whitespace that follows). On any other character, returns 1 to
+hand control back to next_token.
+@End Implementation
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace and comments
 
@@ -358,6 +533,19 @@ Note: ==========================================================================
 Note: Keyword and Type Recognition
 Note: ============================================================================
 
+@Reasoning:
+Length-prefixed byte-equality check. Both arguments are pointer +
+length so the comparison is exact and does not depend on null
+termination - important because the lexeme is a slice into the
+source buffer with no terminator after it.
+@End Reasoning
+
+@Implementation:
+Early-out length mismatch first (the cheapest possible reject).
+Then walk index 0..length comparing memory_get_byte on each side,
+returning 0 immediately on the first mismatch. This makes prefix-
+mismatches the fast common case during keyword lookup.
+@End Implementation
 Process called "check_keyword" takes lexeme as Integer, length as Integer, keyword as Integer, keyword_length as Integer returns Integer:
     Note: Check if lexeme matches keyword
 
@@ -381,6 +569,30 @@ Process called "check_keyword" takes lexeme as Integer, length as Integer, keywo
     Return 1
 End Process
 
+@Reasoning:
+Recognises LLVM IR keywords. Organised by lexeme length first to
+prune the search space - for any given identifier we only compare
+against keywords of the same length. This is a hot path during
+lexing (every identifier-shaped token triggers it), so the
+length-bucket structure is a deliberate constant-factor win.
+@End Reasoning
+
+@Implementation:
+Length-2 bucket: "to", "br". Length-3: ret/add/sub/mul/and/xor/shl.
+Length-4: call/load/sdiv/udiv/srem/urem/ashr/lshr/icmp/fcmp/fadd/
+fsub/fmul/fdiv/frem/null/true/type/void. Length-5: store/false/
+align/float. Length-6: alloca/define/switch/double/global.
+Length-7: declare/signext/zeroext/noalias/nonnull. Length-8:
+constant. Length-14: getelementptr. Returns 1 on match, 0 otherwise.
+Each check is a check_keyword call with the length already proven
+equal so the inner loop just compares bytes.
+@End Implementation
+@Performance_Hints:
+This is called for every identifier token. The length-bucketing
+saves dispatching all ~40 string comparisons per identifier - in
+the common case (e.g. a 4-char identifier), only the length-4
+bucket is examined.
+@End Performance_Hints
 Process called "is_llvm_keyword" takes lexeme as Integer, length as Integer returns Integer:
     Note: Check if identifier is LLVM IR keyword
 
@@ -600,6 +812,23 @@ Process called "is_llvm_keyword" takes lexeme as Integer, length as Integer retu
     Return 0
 End Process
 
+@Reasoning:
+Distinguishes LLVM IR type spellings from generic identifiers. The
+hardest case is integer types: LLVM uses 'i<N>' for any bit-width
+(i1, i8, i16, i32, i64, i128, also non-standard widths like i7) so
+a single keyword check cannot work - we must recognise the 'i'
+prefix followed by digits algorithmically.
+@End Reasoning
+
+@Implementation:
+First branch: if lexeme[0] == 'i' (105) and the remaining bytes are
+all digits, classify as integer type. Then exact matches: "ptr",
+"void", "float", "double". Other LLVM type spellings (half, fp128,
+x86_fp80, label, token, metadata, opaque) are not in this short
+list - they fall through to identifier classification and are
+resolved by the parser using context. This keeps the lexer hot path
+small for the four most common scalar types.
+@End Implementation
 Process called "is_llvm_type" takes lexeme as Integer, length as Integer returns Integer:
     Note: Check if identifier is LLVM IR type
 
@@ -665,6 +894,23 @@ Note: ==========================================================================
 Note: Token Scanners
 Note: ============================================================================
 
+@Reasoning:
+Scans an identifier-shaped lexeme then classifies it. LLVM IR
+identifiers permit alphanumerics, underscores, and dots (e.g.
+'br.cond.true'). The result is classified as TOKEN_KEYWORD,
+TOKEN_TYPE, or generic identifier (also reported as TOKEN_KEYWORD
+in this lexer - downstream layers disambiguate by content).
+@End Reasoning
+
+@Implementation:
+Loops accepting [A-Za-z0-9_.]. Then computes the lexeme span
+(source + start_position, current - start) and consults
+is_llvm_keyword and is_llvm_type. is_llvm_keyword takes precedence
+over is_llvm_type because the keyword table is a superset for any
+overlapping spellings. Unclassified identifiers fall through as
+TOKEN_KEYWORD - this is intentional and parser layers decide
+whether each one is a label, attribute name, etc.
+@End Implementation
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Note: Scan identifier or keyword
 
@@ -715,6 +961,21 @@ Process called "scan_identifier" takes lexer as Integer returns Integer:
     Return proc make_token with lexer, TOKEN_KEYWORD  Note: Treat as keyword/identifier
 End Process
 
+@Reasoning:
+Scans an LLVM IR numeric literal. LLVM IR numbers can be integer
+constants (42, -7), floating-point (3.14, 1.0e-5), or hex
+floating-point. The lexer is liberal here - it collects any
+plausible numeric character run and lets the parser validate the
+actual numeric form against the operand's expected type.
+@End Reasoning
+
+@Implementation:
+Loops while peek_char yields a digit, '.', 'e', '-', or '+'. Note
+the dispatcher handles the leading sign separately for negatives;
+the in-loop '-'/'+' acceptance is for exponent signs (e.g. 1.5e-3).
+Returns TOKEN_NUMBER with the lexeme covering the entire numeric
+run. Does not validate well-formedness - that is the parser's job.
+@End Implementation
 Process called "scan_number" takes lexer as Integer returns Integer:
     Note: Scan numeric literal
 
@@ -754,6 +1015,22 @@ Process called "scan_number" takes lexer as Integer returns Integer:
     Return proc make_token with lexer, TOKEN_NUMBER
 End Process
 
+@Reasoning:
+Scans an LLVM IR double-quoted string literal. LLVM IR uses these
+for things like global C-string constants (c"...") and metadata
+strings. Backslash escapes are PASSED THROUGH unchanged - the
+parser/decoder layer handles \xx hex escapes; the lexer only needs
+to skip the escaped byte so it isn't mistaken for a closing quote.
+@End Reasoning
+
+@Implementation:
+Consumes the opening quote then loops byte-by-byte until a closing
+'"' is found. On EOF mid-string, returns error token "Unterminated
+string". On backslash (92), advances past the backslash AND the
+next byte (guarding against EOF on the escape character). The
+final token's lexeme range covers the entire span including both
+quote characters.
+@End Implementation
 Process called "scan_string" takes lexer as Integer returns Integer:
     Note: Scan string literal
 
@@ -791,6 +1068,22 @@ Note: ==========================================================================
 Note: Main Scanner
 Note: ============================================================================
 
+@Reasoning:
+Main token-dispatch entry point. Calls skip_whitespace (which also
+strips ; line comments) and then snapshots position/line/column
+into the start_* anchor fields BEFORE reading the first byte - this
+is what makes make_token report the correct token-start location
+even though the cursor walks forward during scan_identifier/etc.
+@End Reasoning
+
+@Implementation:
+Dispatch order: alpha -> scan_identifier, '@' -> global id,
+'%' -> local id, '!' -> metadata, digit -> scan_number, '-' followed
+by digit -> negative scan_number, '"' -> scan_string, else single-
+char operators. Identifier-class tokens (@, %, !) accept alnum plus
+underscore and dot in subsequent positions (matches LLVM's identifier
+grammar). EOF returns TOKEN_EOF; unknown byte returns error token.
+@End Implementation
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Scan next token from source
 

@@ -10,12 +10,35 @@ Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 
+@Reasoning:
+Verilog code emission state must accumulate text incrementally while honoring
+indentation discipline across nested begin/end blocks. A small struct keeps the
+growing output, current indent level, and an error list together so emission
+helpers can read and update them via raw memory offsets without ferrying three
+parameters through every call.
+@End Reasoning
+@Implementation:
+24-byte layout: offset 0 = output String pointer, offset 8 = indent_level
+Integer, offset 16 = errors list handle. Offsets are hard-coded throughout the
+backend; any reordering must be mirrored in every accessor.
+@End Implementation
 Type called "VerilogBackend":
     output as String
     indent_level as Integer
     errors as Integer
 End Type
 
+@Reasoning:
+Backend state must be heap-resident so the same pointer can be threaded through
+the recursive emission walk without copying. Initializing the output to the
+empty string lets emit() use string_concat unconditionally instead of branching
+on a null first chunk.
+@End Reasoning
+@Implementation:
+Allocates 24 bytes matching the VerilogBackend layout, zeros the indent level,
+and seeds an empty errors list. The list handle is stored at offset 16 to mirror
+the Type declaration order.
+@End Implementation
 Process called "create_backend" that takes nothing returns Integer:
     Let backend_ptr be proc allocate from Memory with 24
     proc write_string from Memory with backend_ptr, 0, ""
@@ -25,6 +48,17 @@ Process called "create_backend" that takes nothing returns Integer:
     Return backend_ptr
 End Process
 
+@Reasoning:
+Top-level dispatch on the HIR node type discriminator localizes the assumption
+that only HIR_VERILOG_MODULE is a valid translation root. Non-module roots are
+returned as whatever has accumulated so far (typically empty) rather than
+silently producing malformed Verilog.
+@End Reasoning
+@Implementation:
+Reads the node tag from offset 0 of hir_module and forwards to
+generate_module on match. The returned String is read fresh from the backend
+to capture whatever generate_module emitted into the buffer.
+@End Implementation
 Process called "translate" that takes backend_ptr as Integer, hir_module as Integer returns String:
     Let node_type be proc read_integer from Memory with hir_module, 0
 
@@ -35,6 +69,18 @@ Process called "translate" that takes backend_ptr as Integer, hir_module as Inte
     Return proc read_string from Memory with backend_ptr, 0
 End Process
 
+@Reasoning:
+A Verilog module is laid out as `module name #(params)(ports); items endmodule`,
+so emission must interleave header text with optional parameter and body
+sections. The `#(...)` block is only valid when parameters exist; emitting an
+empty `#()` would be syntactically legal but pollute generated output.
+@End Reasoning
+@Implementation:
+Reads module fields at fixed offsets (name@8, params@16, ports@24, items@32),
+emits the header in canonical order, then increments indent for the item list
+and decrements after. The trailing `endmodule\n` closes the construct at column
+zero regardless of indent.
+@End Implementation
 Process called "generate_module" that takes backend_ptr as Integer, module_hir as Integer returns Integer:
     Let module_name be proc read_string from Memory with module_hir, 8
 
@@ -60,6 +106,16 @@ Process called "generate_module" that takes backend_ptr as Integer, module_hir a
     Return 1
 End Process
 
+@Reasoning:
+Verilog's `#(parameter X = expr, ...)` block requires comma separation between
+items but no trailing comma. The classic count-minus-1 guard keeps the emitted
+text legal even for single-parameter modules.
+@End Reasoning
+@Implementation:
+Each parameter HIR node carries the name at offset 8 and the value expression
+at offset 16. Walks the list by index and recurses into generate_expression for
+the default value.
+@End Implementation
 Process called "generate_parameters" that takes backend_ptr as Integer, params as Integer returns Integer:
     proc emit with backend_ptr, " #("
     Let count be proc get_list_size from ListCore with params
@@ -81,6 +137,15 @@ Process called "generate_parameters" that takes backend_ptr as Integer, params a
     Return 1
 End Process
 
+@Reasoning:
+The header port list emits only names; direction and width come later in the
+body via port declarations. Keeping these two emissions separate matches the
+ANSI-style/non-ANSI-style choice we leave to upstream HIR construction.
+@End Reasoning
+@Implementation:
+Plain comma-separated walk; entries are bare String identifiers, not nested
+HIR nodes, so no recursion is needed here.
+@End Implementation
 Process called "generate_port_list" that takes backend_ptr as Integer, ports as Integer returns Integer:
     Let count be proc get_list_size from ListCore with ports
     Let index be 0
@@ -95,6 +160,16 @@ Process called "generate_port_list" that takes backend_ptr as Integer, ports as 
     Return 1
 End Process
 
+@Reasoning:
+The module body is a heterogeneous list (ports, nets, regs, always blocks,
+continuous assigns, instances). Iterating once and dispatching per item keeps
+the order chosen by the HIR producer, which matters for tools that key on
+declaration order such as simulators with -hier.
+@End Reasoning
+@Implementation:
+Single linear pass; the per-item dispatch lives in generate_module_item so
+ordering of the dispatch chain can be tuned independently of iteration.
+@End Implementation
 Process called "generate_module_items" that takes backend_ptr as Integer, items as Integer returns Integer:
     Let count be proc get_list_size from ListCore with items
     Let index be 0
@@ -106,6 +181,16 @@ Process called "generate_module_items" that takes backend_ptr as Integer, items 
     Return 1
 End Process
 
+@Reasoning:
+Centralizing the node-tag-to-emitter mapping in one if-chain keeps the Verilog
+construct vocabulary auditable: any new HIR_VERILOG_* tag must add a branch
+here or be silently dropped. Unknown tags fall through and emit nothing, which
+is preferable to fabricating garbage HDL.
+@End Reasoning
+@Implementation:
+Dispatch tags are imported from VerilogHIR; the offsets-of-zero on read_integer
+match the standard "tag at slot 0" HIR header convention.
+@End Implementation
 Process called "generate_module_item" that takes backend_ptr as Integer, item as Integer returns Integer:
     Let node_type be proc read_integer from Memory with item, 0
 
@@ -125,6 +210,17 @@ Process called "generate_module_item" that takes backend_ptr as Integer, item as
     Return 1
 End Process
 
+@Reasoning:
+Non-ANSI-style port declarations need the direction keyword and optional range
+before the bundled name list. The direction codes 102/103 mirror frontend
+token classes and are checked here so the backend stays decoupled from the
+specific upstream enum constants.
+@End Reasoning
+@Implementation:
+Direction default falls to `inout` to ensure something legal is emitted even
+if a producer forgets to set direction. Range is optional (offset 16 zero
+means "no range, single-bit wire").
+@End Implementation
 Process called "generate_port_decl" that takes backend_ptr as Integer, port as Integer returns Integer:
     proc emit_indent from backend_ptr
     Let direction be proc read_integer from Memory with port, 8
@@ -146,6 +242,15 @@ Process called "generate_port_decl" that takes backend_ptr as Integer, port as I
     Return 1
 End Process
 
+@Reasoning:
+Wire declarations look like port declarations minus the direction keyword.
+Sharing the range/name emission shape with generate_port_decl keeps the printer
+consistent and small.
+@End Reasoning
+@Implementation:
+Range at offset 16 and name list at offset 24 match the port layout; only the
+leading keyword changes.
+@End Implementation
 Process called "generate_net_decl" that takes backend_ptr as Integer, net as Integer returns Integer:
     proc emit_indent from backend_ptr
     proc emit with backend_ptr, "wire "
@@ -160,6 +265,16 @@ Process called "generate_net_decl" that takes backend_ptr as Integer, net as Int
     Return 1
 End Process
 
+@Reasoning:
+Reg declarations differ from wires in their structural slot layout: range is
+at offset 8 (not 16) because there is no direction field. Treating that as a
+distinct emitter rather than a parameterized one avoids a confusing dual-mode
+"net_or_reg" routine.
+@End Reasoning
+@Implementation:
+Offsets used: range@8, names@16. Mirrors the upstream HIR_VERILOG_REG layout
+emitted by verilog_to_hir.
+@End Implementation
 Process called "generate_reg_decl" that takes backend_ptr as Integer, reg as Integer returns Integer:
     proc emit_indent from backend_ptr
     proc emit with backend_ptr, "reg "
@@ -174,6 +289,16 @@ Process called "generate_reg_decl" that takes backend_ptr as Integer, reg as Int
     Return 1
 End Process
 
+@Reasoning:
+Verilog packed ranges are always written `[msb:lsb]` regardless of whether the
+MSB or LSB is numerically larger; downstream simulators treat the order as the
+bit indexing direction. Therefore both endpoints are emitted verbatim with no
+normalization.
+@End Reasoning
+@Implementation:
+MSB at offset 0, LSB at offset 8 of the range node. Both can be arbitrary
+expressions (e.g., `WIDTH-1:0`) so generate_expression is recursed for each.
+@End Implementation
 Process called "generate_range" that takes backend_ptr as Integer, range as Integer returns Integer:
     proc emit with backend_ptr, "["
     Let msb be proc read_integer from Memory with range, 0
@@ -185,6 +310,15 @@ Process called "generate_range" that takes backend_ptr as Integer, range as Inte
     Return 1
 End Process
 
+@Reasoning:
+A shared "comma-separated identifiers" emitter is reused by port, wire, and
+reg declarations. Centralizing the trailing-comma guard prevents bugs of the
+"oops, dangling comma in net list" variety from appearing in three places.
+@End Reasoning
+@Implementation:
+Stored names are bare Strings, not HIR nodes, because all three declaration
+types support `decl name1, name2, name3;` syntax with no per-name attributes.
+@End Implementation
 Process called "generate_name_list" that takes backend_ptr as Integer, names as Integer returns Integer:
     Let count be proc get_list_size from ListCore with names
     Let index be 0
@@ -199,6 +333,16 @@ Process called "generate_name_list" that takes backend_ptr as Integer, names as 
     Return 1
 End Process
 
+@Reasoning:
+Sequential logic is expressed as `always @(...) statement`. The sensitivity
+list is optional in source (combinational `always` without `@*` is permitted
+for legacy reasons), so we emit it only when present rather than synthesizing
+`@*`.
+@End Reasoning
+@Implementation:
+Sensitivity at offset 8, body statement at offset 16. The body recurses into
+generate_statement so it can be a single statement or a begin/end block.
+@End Implementation
 Process called "generate_always_block" that takes backend_ptr as Integer, always as Integer returns Integer:
     proc emit_indent from backend_ptr
     proc emit with backend_ptr, "always "
@@ -212,6 +356,17 @@ Process called "generate_always_block" that takes backend_ptr as Integer, always
     Return 1
 End Process
 
+@Reasoning:
+The sensitivity list interleaves three kinds of entries: the wildcard `*`,
+edge-qualified signals (`posedge clk`, `negedge rst_n`), and bare signals.
+Detecting the wildcard up front by string match keeps a special-case branch
+out of the generic edge handler.
+@End Reasoning
+@Implementation:
+For each signal node: offset 0 = name String, offset 8 = posedge flag,
+offset 16 = negedge flag. Signals are joined with the keyword `or` (Verilog's
+sensitivity-list separator, distinct from `,`).
+@End Implementation
 Process called "generate_sensitivity" that takes backend_ptr as Integer, sens as Integer returns Integer:
     proc emit with backend_ptr, "@("
     Let signals be proc read_integer from Memory with sens, 8
@@ -241,6 +396,16 @@ Process called "generate_sensitivity" that takes backend_ptr as Integer, sens as
     Return 1
 End Process
 
+@Reasoning:
+Continuous-assignment `assign lhs = rhs;` is module-scope wiring, distinct
+from procedural assignment inside an always block. Keeping the two emitters
+separate prevents accidental emission of `<=` (non-blocking) at module scope
+which would be a syntax error.
+@End Reasoning
+@Implementation:
+LHS at offset 8, RHS at offset 16. Both can be arbitrary expressions, so
+generate_expression handles concatenations, slices, and so on.
+@End Implementation
 Process called "generate_assign" that takes backend_ptr as Integer, assign as Integer returns Integer:
     proc emit_indent from backend_ptr
     proc emit with backend_ptr, "assign "
@@ -253,6 +418,16 @@ Process called "generate_assign" that takes backend_ptr as Integer, assign as In
     Return 1
 End Process
 
+@Reasoning:
+Module instantiation in Verilog is `ModuleName instance_name (port_connections);`.
+Both names are required identifiers and stored as Strings, not as nested HIR
+nodes, because Verilog disallows expressions in those positions.
+@End Reasoning
+@Implementation:
+Offsets: module_name@8, inst_name@16, ports@32. The gap at offset 24 is
+reserved (likely for parameter overrides which are not yet emitted here); the
+layout matches the upstream instance node shape.
+@End Implementation
 Process called "generate_instance" that takes backend_ptr as Integer, inst as Integer returns Integer:
     proc emit_indent from backend_ptr
     Let module_name be proc read_string from Memory with inst, 8
@@ -267,6 +442,16 @@ Process called "generate_instance" that takes backend_ptr as Integer, inst as In
     Return 1
 End Process
 
+@Reasoning:
+This emits ordered (positional) port connections only. If named connections
+(`.port(expr)`) are needed they must come from a different HIR shape; mixing
+the two in one walk would lose the name/expression pairing.
+@End Reasoning
+@Implementation:
+Each entry is an arbitrary expression HIR node, so recursion into
+generate_expression covers identifiers, literals, slices, and concatenations
+without special handling here.
+@End Implementation
 Process called "generate_port_connections" that takes backend_ptr as Integer, ports as Integer returns Integer:
     Let count be proc get_list_size from ListCore with ports
     Let index be 0
@@ -281,6 +466,17 @@ Process called "generate_port_connections" that takes backend_ptr as Integer, po
     Return 1
 End Process
 
+@Reasoning:
+Null-stmt protection at entry keeps callers from having to guard every body
+slot. Falling through to a Verilog comment for unhandled tags is preferable
+to silently dropping a statement, because the comment will fail a downstream
+synthesis check and surface the gap.
+@End Reasoning
+@Implementation:
+Handles three core statement tags (HIR_BLOCK, HIR_IF, HIR_ASSIGNMENT). The
+unhandled branch emits a `/* unhandled stmt */;` placeholder that is
+syntactically legal but semantically obvious.
+@End Implementation
 Process called "generate_statement" that takes backend_ptr as Integer, stmt as Integer returns Integer:
     If stmt is equal to 0:
         Return 0
@@ -298,6 +494,17 @@ Process called "generate_statement" that takes backend_ptr as Integer, stmt as I
     Return 1
 End Process
 
+@Reasoning:
+A Verilog `begin ... end` block must indent its body one level and emit each
+inner statement on its own indented line. This is the only place indent
+balancing happens for nested control flow, so the indent_inc/indent_dec pair
+must bracket every code path including early returns inside child statements.
+@End Reasoning
+@Implementation:
+Statement list lives at offset 8 of the HIR_BLOCK node. emit_indent precedes
+each child to give consistent column alignment regardless of which kind of
+statement is emitted next.
+@End Implementation
 Process called "generate_begin_end" that takes backend_ptr as Integer, block as Integer returns Integer:
     proc emit with backend_ptr, "begin\n"
     proc indent_inc from backend_ptr
@@ -316,6 +523,16 @@ Process called "generate_begin_end" that takes backend_ptr as Integer, block as 
     Return 1
 End Process
 
+@Reasoning:
+The if/else form uses Verilog's procedural conditional, which requires the
+condition parenthesized and the branch as either a single statement or a
+begin/end block. Leaving each branch as a generate_statement recursion makes
+this work uniformly for both shapes.
+@End Reasoning
+@Implementation:
+Layout: cond@8, then@16, else@24. A zero in the else slot means the conditional
+has no else branch and the `else` keyword must be omitted.
+@End Implementation
 Process called "generate_if" that takes backend_ptr as Integer, if_stmt as Integer returns Integer:
     proc emit with backend_ptr, "if ("
     Let cond be proc read_integer from Memory with if_stmt, 8
@@ -334,6 +551,17 @@ Process called "generate_if" that takes backend_ptr as Integer, if_stmt as Integ
     Return 1
 End Process
 
+@Reasoning:
+Procedural assignment in Verilog has two flavors that look syntactically
+similar but semantically diverge: blocking `=` evaluates and updates
+immediately, while non-blocking `<=` schedules an update at the end of the
+current time step. The flag at offset 24 must be set by the HIR producer
+because guessing wrong silently changes simulation semantics.
+@End Reasoning
+@Implementation:
+LHS@8, RHS@16, is_blocking flag@24 (1 = blocking, anything else = non-blocking).
+A default of non-blocking matches the typical synthesizable sequential pattern.
+@End Implementation
 Process called "generate_assignment" that takes backend_ptr as Integer, assign as Integer returns Integer:
     Let lhs be proc read_integer from Memory with assign, 8
     proc generate_expression with backend_ptr, lhs
@@ -349,6 +577,17 @@ Process called "generate_assignment" that takes backend_ptr as Integer, assign a
     Return 1
 End Process
 
+@Reasoning:
+Expression emission must handle literals, identifiers, bit-selects, and
+binary ops without parenthesizing every subexpression — Verilog parses the
+result and over-parenthesization hurts readability. Precedence-correct output
+relies on the producer choosing an appropriate HIR shape.
+@End Reasoning
+@Implementation:
+Tag dispatch on HIR_LITERAL / HIR_IDENTIFIER / HIR_BINARY_OP / HIR_INDEX.
+Literals are stored as already-formatted Strings (e.g. `8'hFF`), so they are
+emitted verbatim without re-encoding.
+@End Implementation
 Process called "generate_expression" that takes backend_ptr as Integer, expr as Integer returns Integer:
     If expr is equal to 0:
         Return 0
@@ -373,6 +612,15 @@ Process called "generate_expression" that takes backend_ptr as Integer, expr as 
     Return 1
 End Process
 
+@Reasoning:
+The infix layout `left op right` with single-space padding around the operator
+matches widely-used Verilog style guides. Operator emission is delegated to
+emit_operator so the op-code-to-string mapping stays in one place.
+@End Reasoning
+@Implementation:
+Layout: op_type@8, left@16, right@24. Op type is an integer code, not a string,
+so cross-frontend reuse of the same constants is possible.
+@End Implementation
 Process called "generate_binary_op" that takes backend_ptr as Integer, binop as Integer returns Integer:
     Let left be proc read_integer from Memory with binop, 16
     proc generate_expression with backend_ptr, left
@@ -385,6 +633,18 @@ Process called "generate_binary_op" that takes backend_ptr as Integer, binop as 
     Return 1
 End Process
 
+@Reasoning:
+The numeric op codes (230-263) are the Verilog frontend's token classifications
+re-used here as a stable contract; this keeps the backend independent of HIR
+operator enums but couples it to the frontend's numbering. Unknown codes emit
+`?` which is invalid Verilog and will fail synthesis loudly rather than
+silently mis-translate.
+@End Reasoning
+@Implementation:
+Flat if/Otherwise If chain. 230-232 arithmetic, 240-242 bitwise, 250-251
+logical, 260-263 comparison. The default `?` is intentionally invalid so
+downstream tools flag it.
+@End Implementation
 Process called "emit_operator" that takes backend_ptr as Integer, op_type as Integer returns Integer:
     If op_type is equal to 230: proc emit with backend_ptr, "+"
     Otherwise If op_type is equal to 231: proc emit with backend_ptr, "-"
@@ -403,6 +663,21 @@ Process called "emit_operator" that takes backend_ptr as Integer, op_type as Int
     Return 1
 End Process
 
+@Reasoning:
+The output buffer is grown by simple string concatenation rather than a builder
+because the total emitted text per module is modest and a concat-and-store
+keeps the backend state stateless across calls. A rope or builder could be
+introduced later without changing this call site if hot for huge modules.
+@End Reasoning
+@Implementation:
+Reads the current String at offset 0, appends `text`, and writes the result
+back. string_concat returns a freshly allocated String each call.
+@End Implementation
+@Performance_Hints:
+For very large modules (10k+ lines of generated HDL), the repeated concat
+becomes O(n^2) in total characters. If profiled hot, swap for a list-of-chunks
+builder collapsed once at translate() return.
+@End Performance_Hints
 Process called "emit" that takes backend_ptr as Integer, text as String returns Integer:
     Let current be proc read_string from Memory with backend_ptr, 0
     Let new_output be proc string_concat from StringCore with current, text
@@ -410,6 +685,15 @@ Process called "emit" that takes backend_ptr as Integer, text as String returns 
     Return 1
 End Process
 
+@Reasoning:
+Four spaces per indent level matches the conventional Verilog style enforced
+by most linters. Using literal spaces rather than tabs sidesteps tool variance
+in tab-width handling.
+@End Reasoning
+@Implementation:
+Reads indent level from offset 8 and emits that many 4-space chunks. Called
+at the start of each newly indented line.
+@End Implementation
 Process called "emit_indent" that takes backend_ptr as Integer returns Integer:
     Let level be proc read_integer from Memory with backend_ptr, 8
     Let index be 0
@@ -420,12 +704,30 @@ Process called "emit_indent" that takes backend_ptr as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+A separate increment helper instead of inline arithmetic keeps the offset
+constant (8) for indent_level in one place, so a future schema change only
+touches indent_inc / indent_dec / emit_indent.
+@End Reasoning
+@Implementation:
+Read-modify-write of offset 8. No clamping; the caller is expected to balance
+inc/dec pairs.
+@End Implementation
 Process called "indent_inc" that takes backend_ptr as Integer returns Integer:
     Let level be proc read_integer from Memory with backend_ptr, 8
     proc write_integer from Memory with backend_ptr, 8, level plus 1
     Return 1
 End Process
 
+@Reasoning:
+Companion of indent_inc; pairs across nested generate_begin_end calls. Letting
+the level go negative would corrupt indent_emit, but no clamp is added because
+that would mask producer bugs rather than surface them.
+@End Reasoning
+@Implementation:
+Read-modify-write of offset 8. Decreasing past zero is treated as a producer
+contract violation surfaced visually by the eventual malformed output.
+@End Implementation
 Process called "indent_dec" that takes backend_ptr as Integer returns Integer:
     Let level be proc read_integer from Memory with backend_ptr, 8
     proc write_integer from Memory with backend_ptr, 8, level minus 1

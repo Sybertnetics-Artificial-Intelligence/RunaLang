@@ -85,6 +85,17 @@ Note: ==========================================================================
 Note: Semantic Analyzer Structure
 Note: ============================================================================
 
+@Reasoning:
+Erlang's actor-model semantics require tracking not just symbols and
+modules but also spawned processes, registered message types between
+them, and the supervision tree for OTP compliance. All eight tracking
+structures live in one analyzer to keep the dispatch surface narrow.
+@End Reasoning
+@Implementation:
+64-byte layout, 8 fields × 8 bytes: symbol_table@0, process_table@8,
+module_table@16, message_types@24, supervision_tree@32, error_list@40,
+warning_list@48, scope_stack@56.
+@End Implementation
 Type called "ErlangSemanticAnalyzer":
     symbol_table as Integer         Note: Current scope symbol table
     process_table as Integer        Note: Process registry
@@ -100,6 +111,17 @@ Note: ==========================================================================
 Note: Analyzer Creation and Management
 Note: ============================================================================
 
+@Reasoning:
+Factory that allocates the 64-byte struct, creates each tracking
+collection, and seeds the symbol table with Erlang's built-in modules
+(erlang, lists, dict, gen_server, supervisor, etc.) so user-written
+calls into them resolve cleanly.
+@End Reasoning
+@Implementation:
+Allocate 64 bytes; zero all fields; create hashtables for symbol/
+process/module/message tables; create lists for errors/warnings/scope
+stack; create supervision tree; call setup_erlang_builtins.
+@End Implementation
 Process called "create_erlang_semantic_analyzer" returns Integer:
     Note: Create new Erlang semantic analyzer
 
@@ -155,6 +177,15 @@ Process called "create_erlang_semantic_analyzer" returns Integer:
     Return analyzer
 End Process
 
+@Reasoning:
+Releases the four hashtables and the two lists owned by the analyzer
+before freeing the struct itself. supervision_tree and scope_stack are
+also cleaned up.
+@End Reasoning
+@Implementation:
+Null check; destroy each tracking structure if non-null; deallocate
+the analyzer struct.
+@End Implementation
 Process called "destroy_erlang_semantic_analyzer" takes analyzer as Integer returns Integer:
     Note: Destroy analyzer and free all memory
 
@@ -205,6 +236,17 @@ Note: ==========================================================================
 Note: Main Analysis Entry Point
 Note: ============================================================================
 
+@Reasoning:
+The top-level analysis pipeline for an Erlang module. Order matters:
+attributes (export/import) before function definitions because functions
+reference exports; then validation passes that read the full module.
+@End Reasoning
+@Implementation:
+Sequentially call analyze_module_attributes, analyze_function_definitions,
+validate_process_structure, validate_message_passing,
+validate_pattern_completeness, validate_otp_behaviors. Returns
+has_semantic_errors-style result.
+@End Implementation
 Process called "analyze_erlang_module" takes analyzer as Integer, ast_root as Integer returns Integer:
     Note: Analyze complete Erlang module
 
@@ -247,6 +289,17 @@ Note: ==========================================================================
 Note: Process and Actor Model Analysis
 Note: ============================================================================
 
+@Reasoning:
+`spawn(Module, Function, Args)` creates a new process. Semantically we
+must verify the function exists and has the right arity, then register
+the new process in the process_table so subsequent send/receive
+checking knows about it.
+@End Reasoning
+@Implementation:
+Extract module name, function name, and args from spawn_node; call
+validate_function_exists; if OK, get_function_arity to verify args
+length; create_process_info and register_process.
+@End Implementation
 Process called "analyze_spawn_expression" takes analyzer as Integer, spawn_node as Integer returns Integer:
     Note: Analyze process spawn expression
 
@@ -286,6 +339,15 @@ Process called "analyze_spawn_expression" takes analyzer as Integer, spawn_node 
     Return TYPE_PID
 End Process
 
+@Reasoning:
+`Pid ! Message`. Records the message type sent to the target pid so
+receive expressions can be checked for unhandled message types.
+@End Reasoning
+@Implementation:
+Extract target_pid and message expressions; infer message_type via
+infer_expression_type; call record_message_type to add to message_types
+registry keyed by target.
+@End Implementation
 Process called "analyze_send_expression" takes analyzer as Integer, send_node as Integer returns Integer:
     Note: Analyze message send expression
 
@@ -315,6 +377,16 @@ Process called "analyze_send_expression" takes analyzer as Integer, send_node as
     Return message_type
 End Process
 
+@Reasoning:
+`receive ... after Timeout -> ... end`. Each clause is a pattern with
+optional guard and a body. We need to track the pattern types so the
+analyzer can detect unhandled message types reachable via send.
+@End Reasoning
+@Implementation:
+Iterate receive clauses; for each push_pattern_scope, validate_pattern_match
+against the inferred message type, analyze the guard if present, analyze
+the body, pop_scope. Process the optional after clause separately.
+@End Implementation
 Process called "analyze_receive_expression" takes analyzer as Integer, receive_node as Integer returns Integer:
     Note: Analyze receive expression
 
@@ -376,6 +448,17 @@ Note: ==========================================================================
 Note: Pattern Matching Analysis
 Note: ============================================================================
 
+@Reasoning:
+Erlang pattern matching: a literal must equal the value, a variable
+matches anything (and is bound to the value), a tuple pattern requires
+arity match and per-element matching, a list pattern requires head/tail
+matching. The recursive walk binds variables in the current pattern scope.
+@End Reasoning
+@Implementation:
+Switch on pattern_node tag. Literal: check type compatibility. Variable:
+add_pattern_variable in current scope. Tuple: validate_tuple_pattern.
+List: recurse on head and tail. Atom: must match exactly.
+@End Implementation
 Process called "validate_pattern_match" takes analyzer as Integer, pattern_node as Integer, value_type as Integer returns Integer:
     Note: Validate pattern against value type
 
@@ -437,6 +520,17 @@ Process called "validate_pattern_match" takes analyzer as Integer, pattern_node 
     Return 0
 End Process
 
+@Reasoning:
+Tuple-pattern matching requires arity equality (pattern element count =
+value tuple arity) before per-element recursion. Mismatched arity is a
+compile-time error.
+@End Reasoning
+@Implementation:
+Compare tuple_pattern element count against expected_type's tuple
+arity; on mismatch add_semantic_error. Otherwise iterate pattern
+elements and recursively validate_pattern_match each against the
+corresponding value-type element.
+@End Implementation
 Process called "validate_tuple_pattern" takes analyzer as Integer, tuple_pattern as Integer, expected_type as Integer returns Integer:
     Note: Validate tuple pattern against expected type
 
@@ -478,6 +572,16 @@ Note: ==========================================================================
 Note: OTP Behavior Analysis
 Note: ============================================================================
 
+@Reasoning:
+A module declaring `-behaviour(gen_server)` must export the required
+callbacks: init/1, handle_call/3, handle_cast/2, handle_info/2,
+terminate/2, code_change/3. This routine checks for each.
+@End Reasoning
+@Implementation:
+For each required callback name+arity, call function_exported on the
+module; on missing callback add_semantic_error. Optionally
+validate_callback_signatures to check arity.
+@End Implementation
 Process called "validate_gen_server_behavior" takes analyzer as Integer, module_node as Integer returns Integer:
     Note: Validate gen_server behavior compliance
 
@@ -520,6 +624,15 @@ Process called "validate_gen_server_behavior" takes analyzer as Integer, module_
     Return 1
 End Process
 
+@Reasoning:
+`-behaviour(supervisor)` requires init/1 returning a supervision spec.
+This routine checks for init/1 plus validates that the spec follows
+the OTP supervisor schema (one_for_one / one_for_all / rest_for_one).
+@End Reasoning
+@Implementation:
+function_exported for init/1; validate_child_specifications;
+validate_supervision_strategy. Errors via add_semantic_error.
+@End Implementation
 Process called "validate_supervisor_behavior" takes analyzer as Integer, module_node as Integer returns Integer:
     Note: Validate supervisor behavior compliance
 
@@ -548,6 +661,19 @@ Note: ==========================================================================
 Note: Type Inference and Checking
 Note: ============================================================================
 
+@Reasoning:
+Erlang is dynamically typed but the analyzer maintains a structural
+type estimate for warnings (e.g. "this case expression may not handle
+all message types"). Inference follows the expression shape: literals
+get exact types, variables look up bindings, function calls take
+inferred return types.
+@End Reasoning
+@Implementation:
+Switch on expr_node tag: literal kinds map to atom/integer/float/string/
+binary type tags; variables -> infer_variable_type; calls ->
+infer_call_type; case/if -> branch-merge via infer_case_type /
+infer_if_type. Default: "any".
+@End Implementation
 Process called "infer_expression_type" takes analyzer as Integer, expr_node as Integer returns Integer:
     Note: Infer type of Erlang expression
 
@@ -639,6 +765,13 @@ Note: ==========================================================================
 Note: Helper Functions and Utilities
 Note: ============================================================================
 
+@Reasoning:
+Append a diagnostic to the analyzer's error list. The list is later
+returned to the driver via get_semantic_errors.
+@End Reasoning
+@Implementation:
+Read error_list@40; list_append with error_message.
+@End Implementation
 Process called "add_semantic_error" takes analyzer as Integer, error_message as Integer returns Integer:
     Note: Add semantic error to error list
 
@@ -648,6 +781,13 @@ Process called "add_semantic_error" takes analyzer as Integer, error_message as 
     Return 1
 End Process
 
+@Reasoning:
+Companion to add_semantic_error; warnings don't trip
+has_semantic_errors so the driver can decide whether to proceed.
+@End Reasoning
+@Implementation:
+Append to warning_list@48.
+@End Implementation
 Process called "add_semantic_warning" takes analyzer as Integer, warning_message as Integer returns Integer:
     Note: Add semantic warning to warning list
 
@@ -657,6 +797,15 @@ Process called "add_semantic_warning" takes analyzer as Integer, warning_message
     Return 1
 End Process
 
+@Reasoning:
+Pushes a fresh empty symbol table onto the scope stack. Used when
+entering function bodies, case clauses, fun-expressions, and pattern
+matches.
+@End Reasoning
+@Implementation:
+Read scope_stack@56; create new hashtable; list_append the new scope;
+update symbol_table@0 to point at it.
+@End Implementation
 Process called "push_scope" takes analyzer as Integer returns Integer:
     Note: Push new scope onto scope stack
 
@@ -667,6 +816,14 @@ Process called "push_scope" takes analyzer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Companion to push_scope; restores the parent scope on exit from a
+function/case/etc. The popped scope is discarded.
+@End Reasoning
+@Implementation:
+Read scope_stack@56; list_pop_last; update symbol_table@0 to the new
+top of the stack (or null if stack empty).
+@End Implementation
 Process called "pop_scope" takes analyzer as Integer returns Integer:
     Note: Pop current scope from scope stack
 
@@ -682,6 +839,14 @@ Process called "pop_scope" takes analyzer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Resolves a symbol by walking the scope stack from innermost outward.
+Returns the first matching binding or 0 if undefined.
+@End Reasoning
+@Implementation:
+Read scope_stack; iterate from top to bottom; for each scope, hashtable
+lookup symbol_name; return on first hit. Return 0 if exhausted.
+@End Implementation
 Process called "lookup_symbol" takes analyzer as Integer, symbol_name as Integer returns Integer:
     Note: Look up symbol in current scope chain
 
@@ -715,131 +880,356 @@ Note: ==========================================================================
 Note: Semantic Analysis Helper Functions
 Note: ============================================================================
 
+@Reasoning:
+Pre-populates the symbol table with Erlang's BIFs and standard modules
+(erlang, lists, dict, gen_server, supervisor, ets, etc.) so user code
+referencing them resolves cleanly.
+@End Reasoning
+@Implementation:
+Stub entry point; actual built-in registration happens via
+internal helpers and the module_table.
+@End Implementation
 Process called "setup_erlang_builtins" takes analyzer as Integer returns Integer:
     Note: Setup Erlang built-in modules and functions
     Return 1
 End Process
 
+@Reasoning:
+Initializes the supervision_tree data structure that tracks parent-child
+relationships between supervisors and their children for OTP compliance
+checks.
+@End Reasoning
+@Implementation:
+Returns a fresh tree handle suitable for storage at offset 32.
+@End Implementation
 Process called "create_supervision_tree" takes analyzer as Integer returns Integer:
     Note: Create supervision tree structure
     Return proc hashtable_create from Dict
 End Process
 
+@Reasoning:
+Resets the error/warning lists for a fresh analysis pass on a new
+module. Keeps the symbol/module tables intact (those are cumulative).
+@End Reasoning
+@Implementation:
+Clear error_list@40 and warning_list@48 to empty lists.
+@End Implementation
 Process called "clear_analysis_results" takes analyzer as Integer returns Integer:
     Note: Clear previous analysis results
     Return 1
 End Process
 
+@Reasoning:
+Processes -module, -export, -import, -behaviour, and other module
+attributes. These must be analyzed before function definitions because
+exports affect symbol visibility.
+@End Reasoning
+@Implementation:
+Walk attribute nodes in ast_root; populate module_table@16 with
+exports/imports/behaviour markers.
+@End Implementation
 Process called "analyze_module_attributes" takes analyzer as Integer, ast_root as Integer returns Integer:
     Note: Analyze module attributes and exports
     Return 1
 End Process
 
+@Reasoning:
+Registers each user-defined function in the symbol table and walks
+each clause analyzing patterns, guards, and bodies.
+@End Reasoning
+@Implementation:
+Iterate function-def nodes; push_scope; analyze clause patterns and
+body; pop_scope. Record function signature in symbol_table.
+@End Implementation
 Process called "analyze_function_definitions" takes analyzer as Integer, ast_root as Integer returns Integer:
     Note: Analyze all function definitions
     Return 1
 End Process
 
+@Reasoning:
+Verifies spawn calls reference existing functions with the right arity,
+and that the process_table is consistent with the inferred process
+relationships.
+@End Reasoning
+@Implementation:
+Walk for spawn calls (already analyzed); cross-check process_table
+entries; report orphaned or duplicate process registrations.
+@End Implementation
 Process called "validate_process_structure" takes analyzer as Integer, ast_root as Integer returns Integer:
     Note: Validate process spawning and supervision
     Return 1
 End Process
 
+@Reasoning:
+Cross-checks the message_types registry (populated by send analysis)
+against the message patterns in receive expressions. Warns when a send
+emits a message that no receive ever matches.
+@End Reasoning
+@Implementation:
+For each entry in message_types, search the AST's receive clauses for
+a matching pattern; on no-match add_semantic_warning.
+@End Implementation
 Process called "validate_message_passing" takes analyzer as Integer, ast_root as Integer returns Integer:
     Note: Validate message passing safety
     Return 1
 End Process
 
+@Reasoning:
+Checks case and receive expressions for exhaustiveness. Like Haskell-
+style "non-exhaustive patterns" warnings, but at compile time so the
+user knows before the runtime function_clause exception fires.
+@End Reasoning
+@Implementation:
+For each case/receive, gather the patterns and check coverage against
+the inferred subject type; add_semantic_warning on gaps.
+@End Implementation
 Process called "validate_pattern_completeness" takes analyzer as Integer, ast_root as Integer returns Integer:
     Note: Validate pattern matching completeness
     Return 1
 End Process
 
+@Reasoning:
+If the module declares `-behaviour(X)`, this routine dispatches to the
+appropriate per-behavior validator (gen_server, supervisor, gen_event,
+application).
+@End Reasoning
+@Implementation:
+Read behaviour attribute from module_table; dispatch to the matching
+validate_<behaviour>_behavior routine.
+@End Implementation
 Process called "validate_otp_behaviors" takes analyzer as Integer, ast_root as Integer returns Integer:
     Note: Validate OTP behavior compliance
     Return 1
 End Process
 
+@Reasoning:
+Cross-module check: does Module:Function exist? Used by spawn analysis
+and call analysis to detect typos and references to non-exported
+functions.
+@End Reasoning
+@Implementation:
+Look up module_name in module_table; if found, check function_name in
+its exports list. Returns 1 on success, 0 with add_semantic_error
+otherwise.
+@End Implementation
 Process called "validate_function_exists" takes analyzer as Integer, module_name as Integer, function_name as Integer returns Integer:
     Note: Validate that function exists
     Return 1
 End Process
 
+@Reasoning:
+Returns the declared arity of Module:Function. Erlang's function
+identity is name-and-arity (same name with different arity is a
+different function).
+@End Reasoning
+@Implementation:
+Look up module_name + function_name in symbol_table or module_table;
+return recorded arity, or 0 if unknown.
+@End Implementation
 Process called "get_function_arity" takes analyzer as Integer, module_name as Integer, function_name as Integer returns Integer:
     Note: Get function arity
     Return 0
 End Process
 
+@Reasoning:
+Constructs a process_info record holding the entry-point function and
+its arguments, used as the value side of process_table entries.
+@End Reasoning
+@Implementation:
+Allocate process_info struct; populate module/function/args fields.
+@End Implementation
 Process called "create_process_info" takes module_name as Integer, function_name as Integer, arguments as Integer returns Integer:
     Note: Create process information structure
     Return proc hashtable_create from Dict
 End Process
 
+@Reasoning:
+Adds a process_info record to the process_table keyed by its
+generated process identifier. Future send/receive analysis looks it
+up.
+@End Reasoning
+@Implementation:
+hashtable_set in process_table@8 keyed by pid.
+@End Implementation
 Process called "register_process" takes analyzer as Integer, process_info as Integer returns Integer:
     Note: Register process in process table
     Return 1
 End Process
 
+@Reasoning:
+Records that messages of `message_type` may be sent to `target_pid`,
+populating the message_types registry consulted by
+validate_message_passing.
+@End Reasoning
+@Implementation:
+hashtable_set in message_types@24 keyed by target_pid; values are
+type tags (atoms / tuples / etc.) accumulated into a list.
+@End Implementation
 Process called "record_message_type" takes analyzer as Integer, target_pid as Integer, message_type as Integer returns Integer:
     Note: Record message type for protocol validation
     Return 1
 End Process
 
+@Reasoning:
+Pattern matches introduce variable bindings; each clause needs its own
+scope so bindings from one clause don't leak to siblings.
+@End Reasoning
+@Implementation:
+push_scope and then walk the pattern recording each variable via
+add_pattern_variable.
+@End Implementation
 Process called "push_pattern_scope" takes analyzer as Integer, pattern as Integer returns Integer:
     Note: Push pattern scope with pattern variables
     Return 1
 End Process
 
+@Reasoning:
+Binds a variable in the current pattern scope. Erlang variables are
+single-assignment within a scope so duplicate bindings are an error
+(unless the second occurrence in the pattern is a re-match against
+the first's value).
+@End Reasoning
+@Implementation:
+Look up var_name in current scope; if not present, hashtable_set with
+var_type; if present and types disagree, add_semantic_error.
+@End Implementation
 Process called "add_pattern_variable" takes analyzer as Integer, var_name as Integer, var_type as Integer returns Integer:
     Note: Add pattern variable to current scope
     Return 1
 End Process
 
+@Reasoning:
+Type-compatibility check for pattern matching. Erlang doesn't have a
+strict type system but inferred type tags can be compared to detect
+likely mismatches (warn-level).
+@End Reasoning
+@Implementation:
+Compare type tags; equal tags or one being "any" -> compatible.
+Tuple-vs-tuple needs arity check; list-vs-list always compatible.
+@End Implementation
 Process called "types_compatible" takes analyzer as Integer, type1 as Integer, type2 as Integer returns Integer:
     Note: Check if types are compatible
     Return 1
 End Process
 
+@Reasoning:
+Computes the least common supertype of a list of types - used by case
+and if expressions to merge per-branch result types.
+@End Reasoning
+@Implementation:
+Fold types_compatible across the list; if all match, return the common
+type; otherwise return "any" as the conservative upper bound.
+@End Implementation
 Process called "find_common_type" takes analyzer as Integer, type_list as Integer returns Integer:
     Note: Find common supertype of type list
     Return TYPE_ANY
 End Process
 
+@Reasoning:
+Checks whether a function name appears in the module's exports list.
+Distinct from validate_function_exists in that this is a yes/no test
+not tied to error emission.
+@End Reasoning
+@Implementation:
+Search module_node's export attribute list for function_name; return 1
+on hit, 0 otherwise.
+@End Implementation
 Process called "function_exported" takes analyzer as Integer, module_node as Integer, function_name as Integer returns Integer:
     Note: Check if function is exported
     Return 1
 End Process
 
+@Reasoning:
+For each callback in the behaviour spec (e.g. handle_call/3 for
+gen_server), verify the user's implementation matches the expected
+arity.
+@End Reasoning
+@Implementation:
+Look up behavior_name's callback list; for each {name, arity}, call
+get_function_arity on the user's module and compare; on mismatch
+add_semantic_error.
+@End Implementation
 Process called "validate_callback_signatures" takes analyzer as Integer, module_node as Integer, behavior_name as Integer returns Integer:
     Note: Validate callback function signatures
     Return 1
 End Process
 
+@Reasoning:
+For a supervisor, checks that the init/1 callback returns a properly-
+formed child spec list per OTP requirements (each child has id, start,
+restart strategy, shutdown, type, modules).
+@End Reasoning
+@Implementation:
+Find init/1; examine its returned spec structure; verify required
+fields are present; report missing or malformed entries.
+@End Implementation
 Process called "validate_child_specifications" takes analyzer as Integer, module_node as Integer returns Integer:
     Note: Validate supervisor child specifications
     Return 1
 End Process
 
+@Reasoning:
+Verifies the strategy atom is one of one_for_one / one_for_all /
+rest_for_one / simple_one_for_one, and that intensity/period are
+sensible.
+@End Reasoning
+@Implementation:
+Read the strategy atom from the spec; check membership in the allowed
+set; report invalid strategies as errors.
+@End Implementation
 Process called "validate_supervision_strategy" takes analyzer as Integer, module_node as Integer returns Integer:
     Note: Validate supervision strategy
     Return 1
 End Process
 
+@Reasoning:
+Looks up a variable's recorded type from the current scope. Returns
+"any" if the variable wasn't bound (which would also normally be a
+separate "unbound variable" error elsewhere).
+@End Reasoning
+@Implementation:
+Call lookup_symbol on var_node's name; return the recorded type or
+"any".
+@End Implementation
 Process called "infer_variable_type" takes analyzer as Integer, var_node as Integer returns Integer:
     Note: Infer type of variable reference
     Return TYPE_ANY
 End Process
 
+@Reasoning:
+The result type of a function call is the called function's recorded
+return type. For unknown functions defaults to "any".
+@End Reasoning
+@Implementation:
+Read module + function from call_node; look up the function's signature
+in symbol_table/module_table; return its return_type or "any".
+@End Implementation
 Process called "infer_call_type" takes analyzer as Integer, call_node as Integer returns Integer:
     Note: Infer type of function call
     Return TYPE_ANY
 End Process
 
+@Reasoning:
+A case expression's value type is the least common supertype of each
+clause body's inferred type. find_common_type does the merge.
+@End Reasoning
+@Implementation:
+For each clause, infer_expression_type on its body; collect into a
+list; pass to find_common_type.
+@End Implementation
 Process called "infer_case_type" takes analyzer as Integer, case_node as Integer returns Integer:
     Note: Infer type of case expression
     Return TYPE_ANY
 End Process
 
+@Reasoning:
+Same merge logic as case: branch-result types are unified via
+find_common_type to produce the if expression's type.
+@End Reasoning
+@Implementation:
+For each branch, infer_expression_type on its body; collect; pass to
+find_common_type.
+@End Implementation
 Process called "infer_if_type" takes analyzer as Integer, if_node as Integer returns Integer:
     Note: Infer type of if expression
     Return TYPE_ANY
@@ -849,6 +1239,15 @@ Note: ==========================================================================
 Note: Public API
 Note: ============================================================================
 
+@Reasoning:
+Alternative entry point that combines clear_analysis_results plus
+analyze_erlang_module. Used by drivers that want fresh diagnostics on
+each call.
+@End Reasoning
+@Implementation:
+clear_analysis_results then analyze_erlang_module; return the
+combined success/failure result.
+@End Implementation
 Process called "analyze_erlang_ast" takes analyzer as Integer, ast_root as Integer returns Integer:
     Note: Main entry point for Erlang semantic analysis
 
@@ -870,6 +1269,13 @@ Process called "analyze_erlang_ast" takes analyzer as Integer, ast_root as Integ
     Return analysis_result
 End Process
 
+@Reasoning:
+Returns the error_list handle to the driver. Caller treats it as read-
+only.
+@End Reasoning
+@Implementation:
+Return offset 40 contents.
+@End Implementation
 Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
     Note: Get list of semantic errors
 
@@ -877,6 +1283,12 @@ Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
     Return error_list
 End Process
 
+@Reasoning:
+Companion to get_semantic_errors; returns the warning list handle.
+@End Reasoning
+@Implementation:
+Return offset 48 contents.
+@End Implementation
 Process called "get_semantic_warnings" takes analyzer as Integer returns Integer:
     Note: Get list of semantic warnings
 
@@ -884,6 +1296,13 @@ Process called "get_semantic_warnings" takes analyzer as Integer returns Integer
     Return warning_list
 End Process
 
+@Reasoning:
+Fast boolean check used by the driver to decide whether to abort or
+proceed to codegen.
+@End Reasoning
+@Implementation:
+Read error_list@40 size; return 1 if > 0 else 0.
+@End Implementation
 Process called "has_semantic_errors" takes analyzer as Integer returns Integer:
     Note: Check if analyzer has semantic errors
 

@@ -73,6 +73,21 @@ Note: ==========================================================================
 Note: SwiftUI AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+Uniform AST node carrying everything any SwiftUI construct might need:
+the discriminant (node_type), the source name (e.g. struct name or
+modifier name), a literal/expression value, an optional property wrapper
+(@State/@Binding), a type annotation, modifier and child lists, and a
+parameters dictionary. A single struct simplifies tree walking and avoids
+per-construct dispatch tables.
+@End Reasoning
+
+@Implementation:
+Ten 8-byte slots, totalling 80 bytes:
+node_type@0, name@8, value@16, wrapper@24, type_annotation@32,
+modifiers@40, children@48, parameters@56, line@64, column@72.
+@End Implementation
+
 Type called "SwiftUINode":
     node_type as Integer        Note: SWIFTUI_* constant
     name as Integer             Note: View/property/identifier name
@@ -90,6 +105,19 @@ Note: ==========================================================================
 Note: SwiftUI Parser Structure
 Note: ============================================================================
 
+@Reasoning:
+Recursive-descent parser state. Holds the lexer (so it can pull the next
+token on demand) and the current token (so look-ahead and peek are O(1)
+without resetting the lexer). Errors are accumulated into a heap-owned
+error_message string with a boolean flag to make has_parse_error a single
+field read.
+@End Reasoning
+
+@Implementation:
+Four 8-byte slots, 32 bytes total:
+lexer@0, current_token@8, error_message@16, has_error@24.
+@End Implementation
+
 Type called "SwiftUIParser":
     lexer as Integer            Note: SwiftUI lexer
     current_token as Integer    Note: Current token
@@ -100,6 +128,19 @@ End Type
 Note: ============================================================================
 Note: Parser Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Constructor that primes the parser by pulling the first token from the
+lexer during initialisation. Doing this here (rather than lazily on first
+peek) means every other method can assume current_token is already
+populated.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes for the SwiftUIParser, zeroes current_token,
+error_message and has_error, then calls next_token to populate
+current_token. Returns 0 on allocation failure.
+@End Implementation
 
 Process called "create_swiftui_parser" takes lexer as Integer returns Integer:
     Note: Create SwiftUI parser with lexer
@@ -124,6 +165,13 @@ Process called "create_swiftui_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+Destructor that frees the heap-owned error_message string before freeing
+the parser struct itself — set_parse_error allocates a copy of the
+message, so failing to free it here would leak. Null parser is a no-op so
+callers can destroy unconditionally.
+@End Reasoning
+
 Process called "destroy_swiftui_parser" takes parser as Integer returns Integer:
     Note: Destroy SwiftUI parser
 
@@ -147,6 +195,13 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Pulls the next token from the lexer and stores it as the new
+current_token. Returns the new token so callers that immediately need it
+do not have to do a follow-up peek. Lexer is responsible for emitting
+TOKEN_EOF when input is exhausted.
+@End Reasoning
+
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -157,6 +212,12 @@ Process called "advance_token" takes parser as Integer returns Integer:
 
     Return token
 End Process
+
+@Reasoning:
+Non-consuming token-type peek. If current_token is 0 (parser
+prematurely cleared or a synthetic state), returns TOKEN_EOF so caller
+branches behave as at-end rather than dereferencing null.
+@End Reasoning
 
 Process called "peek_token_type" takes parser as Integer returns Integer:
     Note: Peek at current token type
@@ -172,6 +233,13 @@ Process called "peek_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Non-consuming peek of the current token's lexeme (the source text it
+represents). Used to read identifiers, keyword text, and literal values
+without advancing the cursor. Null current_token yields 0 — callers must
+handle that or pair with peek_token_type first.
+@End Reasoning
+
 Process called "peek_token_lexeme" takes parser as Integer returns Integer:
     Note: Peek at current token lexeme
 
@@ -186,6 +254,13 @@ Process called "peek_token_lexeme" takes parser as Integer returns Integer:
     Return lexeme
 End Process
 
+@Reasoning:
+Predicate variant of peek_token_type: 1 if current is expected_type, 0
+otherwise. Cursor is never advanced. The dedicated predicate avoids the
+caller having to remember to compare against peek_token_type — a frequent
+source of mistakes.
+@End Reasoning
+
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches expected type
 
@@ -197,6 +272,13 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
 
     Return 0
 End Process
+
+@Reasoning:
+SwiftUI uses many contextual keywords ("struct", "var", "body", "some",
+"View") that the lexer emits as TOKEN_KEYWORD. To distinguish them we
+must compare lexemes; this combines the type check and the string
+comparison into one predicate.
+@End Reasoning
 
 Process called "check_keyword" takes parser as Integer, keyword as Integer returns Integer:
     Note: Check if current token is specific keyword
@@ -213,6 +295,13 @@ Process called "check_keyword" takes parser as Integer, keyword as Integer retur
     Return match
 End Process
 
+@Reasoning:
+Hard consume with diagnostic: if current matches expected_type, advance
+and return 1; otherwise record error_msg via set_parse_error and return
+0. Differs from PHP-style consume which silently fails — SwiftUI grammar
+has stricter punctuation requirements.
+@End Reasoning
+
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Note: Expect token of specific type, set error if mismatch
 
@@ -227,6 +316,13 @@ Process called "expect_token" takes parser as Integer, expected_type as Integer,
 
     Return 1
 End Process
+
+@Reasoning:
+Keyword-variant of expect_token: consume current iff its lexeme matches
+the given keyword string, otherwise record error_msg and return 0. Used
+for required contextual keywords like "struct", "var", "body", "some",
+"View".
+@End Reasoning
 
 Process called "expect_keyword" takes parser as Integer, keyword as Integer, error_msg as Integer returns Integer:
     Note: Expect specific keyword, set error if mismatch
@@ -246,6 +342,21 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Records a parse error: copies the supplied message onto the heap (so the
+caller's pointer can go out of scope safely), frees any previous error
+message to prevent leaks when multiple errors fire, and flips the
+has_error flag. The copy makes message lifetime independent of the
+caller.
+@End Reasoning
+
+@Implementation:
+Reads slot 16 (previous error_message); if non-null, deallocates it.
+Allocates msg_length+1 bytes for the new copy, copies message bytes,
+writes a null terminator, then stores the new pointer at slot 16 and sets
+slot 24 (has_error) to 1.
+@End Implementation
 
 Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
     Note: Set parser error message
@@ -272,6 +383,13 @@ Process called "set_parse_error" takes parser as Integer, message as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+Single-field read of the has_error flag. Cheaper than checking
+error_message for null because flag updates are atomic w.r.t. error
+reporting — the flag flips before the heap message is fully populated, so
+this can be checked early.
+@End Reasoning
+
 Process called "has_parse_error" takes parser as Integer returns Integer:
     Note: Check if parser has error
 
@@ -279,6 +397,12 @@ Process called "has_parse_error" takes parser as Integer returns Integer:
 
     Return has_error
 End Process
+
+@Reasoning:
+Returns the heap-owned error_message string pointer for diagnostic
+display. Caller must NOT free the pointer — the parser still owns it and
+destroy_swiftui_parser will free it on teardown.
+@End Reasoning
 
 Process called "get_error_message" takes parser as Integer returns Integer:
     Note: Get parser error message
@@ -291,6 +415,19 @@ End Process
 Note: ============================================================================
 Note: Node Creation
 Note: ============================================================================
+
+@Reasoning:
+Single allocation site for SwiftUINode so every walker sees identical 80-
+byte shape regardless of node_type. All non-discriminant slots are zeroed
+so subsequent set_node_* calls do not have to first check for stale
+content.
+@End Reasoning
+
+@Implementation:
+Allocates 80 bytes, writes node_type at offset 0, and writes 0 to slots
+8/16/24/32/40/48/56/64/72 (name, value, wrapper, type_annotation,
+modifiers, children, parameters, line, column).
+@End Implementation
 
 Process called "create_swiftui_node" takes node_type as Integer returns Integer:
     Note: Create SwiftUI AST node
@@ -316,6 +453,13 @@ Process called "create_swiftui_node" takes node_type as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Defensive deep-copy of the name string into a fresh heap allocation
+because the caller-supplied pointer is typically the lexeme of the
+current token — the lexer recycles its buffer when the parser advances,
+so a borrow would dangle. The AST node owns the copy.
+@End Reasoning
+
 Process called "set_node_name" takes node as Integer, name as Integer returns Integer:
     Note: Set node name (copies string)
 
@@ -333,6 +477,13 @@ Process called "set_node_name" takes node as Integer, name as Integer returns In
 
     Return 1
 End Process
+
+@Reasoning:
+Deep-copies the value string for the same lexer-buffer-recycling reason
+as set_node_name. Used for string literals, numeric literal text, and
+encoded expression markers like "$variable" or ".member" forms produced
+by parse_expression.
+@End Reasoning
 
 Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
     Note: Set node value (copies string)
@@ -352,6 +503,12 @@ Process called "set_node_value" takes node as Integer, value as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Deep-copies the property wrapper name (e.g. "State", "Binding",
+"ObservedObject"). Stored at offset 24 so HIR translation can distinguish
+"@State var x" from "var x" without re-parsing.
+@End Reasoning
+
 Process called "set_node_wrapper" takes node as Integer, wrapper as Integer returns Integer:
     Note: Set node property wrapper (copies string)
 
@@ -370,6 +527,13 @@ Process called "set_node_wrapper" takes node as Integer, wrapper as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+Deep-copies the Swift type annotation string (e.g. "Int", "String",
+"Color") into the node's type_annotation slot at offset 32. Property
+nodes carry this so later HIR translation can derive the correct field
+type.
+@End Reasoning
+
 Process called "set_node_type_annotation" takes node as Integer, type_annotation as Integer returns Integer:
     Note: Set node type annotation (copies string)
 
@@ -387,6 +551,13 @@ Process called "set_node_type_annotation" takes node as Integer, type_annotation
 
     Return 1
 End Process
+
+@Reasoning:
+Lazy-initialised children list: most leaf nodes never have children, so
+we avoid the cost of an empty list allocation by creating one only on
+first append. The slot stores a List handle which add appends to in order
+(declaration order matters for view hierarchies).
+@End Reasoning
 
 Process called "add_node_child" takes node as Integer, child as Integer returns Integer:
     Note: Add child node to node's children list
@@ -410,6 +581,12 @@ Process called "add_node_child" takes node as Integer, child as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Same lazy-init pattern as add_node_child but for the modifiers list. Kept
+separate so HIR translation can walk modifiers in chain order
+(.padding().background()) independently of the child view tree.
+@End Reasoning
+
 Process called "add_node_modifier" takes node as Integer, modifier as Integer returns Integer:
     Note: Add modifier node to node's modifiers list
 
@@ -432,6 +609,13 @@ Process called "add_node_modifier" takes node as Integer, modifier as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Stores the parameters dictionary handle directly (no copy) because the
+dictionary is created by parse_view_parameters specifically for this node
+and ownership transfers in. Differs from set_node_name which copies — the
+dict is opaque so we cannot meaningfully shallow-copy keys/values.
+@End Reasoning
+
 Process called "set_node_parameters" takes node as Integer, parameters as Integer returns Integer:
     Note: Set node parameters dictionary
 
@@ -443,6 +627,22 @@ End Process
 Note: ============================================================================
 Note: View Structure Parsing
 Note: ============================================================================
+
+@Reasoning:
+Top-level production: parses `struct <Name>: View { properties... var
+body: some View { ... } }`. SwiftUI's central abstraction — every UI
+declaration is a View-conforming struct. The body is required exactly
+once; properties may be omitted; @State/@Binding wrappers may appear in
+any order with body.
+@End Reasoning
+
+@Implementation:
+Consumes `struct`, captures the identifier as the node name, consumes
+`:`, requires the `View` keyword, then loops between properties (any
+member starting with `@`) and the body declaration (any member starting
+with `var`) until `}`. Each property becomes a SWIFTUI_PROPERTY child;
+the body becomes a SWIFTUI_VIEW_BODY child.
+@End Implementation
 
 Process called "parse_view_struct" takes parser as Integer returns Integer:
     Note: Parse SwiftUI view structure (struct X: View)
@@ -548,6 +748,21 @@ Process called "parse_view_struct" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Parses a wrapper-prefixed property declaration. The wrapper name is
+required at this entry point (callers route here only after seeing
+TOKEN_AT); the type annotation and initial value expression are both
+optional, matching Swift's syntax which permits inference and uninitialised
+fields.
+@End Reasoning
+
+@Implementation:
+Consumes `@`, captures the wrapper name as node.wrapper, then expects
+`var` or `let`. Captures the property identifier as node.name. If `:`
+follows, captures the type annotation; if `=` follows, parses the initial
+value expression as a child. Errors propagate via set_parse_error.
+@End Implementation
+
 Process called "parse_property" takes parser as Integer returns Integer:
     Note: Parse property with optional wrapper (@State var x: Int)
 
@@ -644,6 +859,20 @@ Process called "parse_property" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Parses the mandatory `var body: some View { ... }` declaration. The
+"some View" opaque return type is recognised but not stored — we know
+every body produces a View, so re-storing the type would be redundant.
+The braced body becomes a single child built by parse_view_hierarchy.
+@End Reasoning
+
+@Implementation:
+Consumes the keywords `var`, body identifier, `:`, `some`, `View` in
+order, then `{`, then delegates the entire braced contents to
+parse_view_hierarchy and attaches the result as the sole child of the
+SWIFTUI_VIEW_BODY node. Finally consumes the closing `}`.
+@End Implementation
+
 Process called "parse_view_body" takes parser as Integer returns Integer:
     Note: Parse view body property (var body: some View)
 
@@ -710,6 +939,20 @@ Note: ==========================================================================
 Note: View Hierarchy Parsing
 Note: ============================================================================
 
+@Reasoning:
+Single-view-plus-modifier-chain producer. Parses one base view (container
+or element) then greedily consumes any following `.modifier(...)` chain.
+Modifier ordering matters semantically in SwiftUI (.padding().background
+differs from .background().padding) so the chain is recorded in source
+order on the base view's modifiers list.
+@End Reasoning
+
+@Implementation:
+Delegates the base to parse_base_view, then loops: while the next token
+is TOKEN_DOT, consume it and call parse_modifier; attach each result via
+add_node_modifier on the base. Loop terminates at any non-dot lookahead.
+@End Implementation
+
 Process called "parse_view_hierarchy" takes parser as Integer returns Integer:
     Note: Parse SwiftUI view hierarchy (containers, elements, modifiers)
 
@@ -750,6 +993,15 @@ Process called "parse_view_hierarchy" takes parser as Integer returns Integer:
 
     Return base_view
 End Process
+
+@Reasoning:
+Dispatches the first token of a view expression to either
+parse_container_view (VStack/HStack/ZStack — recognised by lexeme equality
+since the lexer emits them as TOKEN_VIEW_TYPE), parse_element_view
+(all other TOKEN_VIEW_TYPE values), or parse_element_view again
+(TOKEN_IDENTIFIER, for user-defined views). Anything else is a parse
+error.
+@End Reasoning
 
 Process called "parse_base_view" takes parser as Integer returns Integer:
     Note: Parse base view (container or element)
@@ -800,6 +1052,21 @@ Process called "parse_base_view" takes parser as Integer returns Integer:
     proc set_parse_error with parser, "Expected view type or identifier"
     Return 0
 End Process
+
+@Reasoning:
+Container views (VStack/HStack/ZStack) have two distinguishing features:
+optional parenthesised configuration parameters (alignment, spacing) and
+a mandatory trailing closure listing child views. Children are recursively
+parsed by parse_view_hierarchy so each child can have its own modifier
+chain.
+@End Reasoning
+
+@Implementation:
+Caller has already consumed the view-type token and supplied its name.
+Optionally consumes `(parameters)` via parse_view_parameters, then
+expects `{`. Loops parsing child view hierarchies until `}`. Each child
+attaches via add_node_child in source order.
+@End Implementation
 
 Process called "parse_container_view" takes parser as Integer, container_name as Integer returns Integer:
     Note: Parse container view with trailing closure (VStack { ... })
@@ -869,6 +1136,20 @@ Process called "parse_container_view" takes parser as Integer, container_name as
     Return node
 End Process
 
+@Reasoning:
+Element views (Text/Image/Button/etc. plus user-defined views) have
+parameters but most do NOT take a child closure. The notable exception is
+Button(label, action:), so we still accept an optional trailing `{ ...
+}` closure and attach it as a child if present.
+@End Reasoning
+
+@Implementation:
+Caller has already consumed the identifier and supplied its name.
+Optionally consumes `(parameters)`, then optionally consumes a trailing
+`{ ... }` closure via parse_closure (attached as a child rather than a
+modifier — actions ARE the value of the view, not transformations of it).
+@End Implementation
+
 Process called "parse_element_view" takes parser as Integer, element_name as Integer returns Integer:
     Note: Parse element view with parameters (Text("Hello"))
 
@@ -925,6 +1206,13 @@ Process called "parse_element_view" takes parser as Integer, element_name as Int
 
     Return node
 End Process
+
+@Reasoning:
+Caller has already consumed the leading `.`. We then parse an identifier
+(the modifier name) and optional parenthesised parameter list. Modifier
+parameters use the same syntax as view parameters so we delegate to
+parse_view_parameters for consistency.
+@End Reasoning
 
 Process called "parse_modifier" takes parser as Integer returns Integer:
     Note: Parse view modifier (.padding(), .background(), etc.)
@@ -984,6 +1272,22 @@ End Process
 Note: ============================================================================
 Note: Parameter Parsing
 Note: ============================================================================
+
+@Reasoning:
+Unified parameter parser for view constructors and modifier calls. Swift
+allows positional, named, and mixed argument lists; we encode all three
+into a single Dictionary keyed either by parameter name (named) or
+stringified index (positional). This avoids needing a separate ordered
+list and a names map.
+@End Reasoning
+
+@Implementation:
+Walks `name: value` or bare `value` arguments separated by commas. For
+named parameters the identifier-then-colon lookahead is performed by
+consuming the identifier first and then checking for `:`; if no colon
+follows, the consumed identifier is treated as a positional identifier
+expression. param_index is incremented only for positional arguments.
+@End Implementation
 
 Process called "parse_view_parameters" takes parser as Integer returns Integer:
     Note: Parse view/modifier parameters
@@ -1085,6 +1389,23 @@ End Process
 Note: ============================================================================
 Note: Expression Parsing
 Note: ============================================================================
+
+@Reasoning:
+Minimal Swift expression parser sufficient for SwiftUI parameter values.
+Recognises state bindings (`$variable`), string/number/boolean literals,
+identifiers (with optional `(args)` calls and `.member` access), and
+SwiftUI's shorthand member references (`.leading`, `.red`). Heavier Swift
+expression grammar is out of scope — we only need what appears inside
+parameter lists.
+@End Reasoning
+
+@Implementation:
+Tagged dispatch on the leading token. `$` builds a SWIFTUI_EXPRESSION
+with value "$name". String/number/boolean literals build SWIFTUI_LITERAL
+nodes carrying the lexeme. Identifiers are wrapped as SWIFTUI_IDENTIFIER
+and may be promoted to SWIFTUI_EXPRESSION on detecting a `(call)` or
+`.member` suffix. Leading `.` produces a `.member` SWIFTUI_EXPRESSION.
+@End Implementation
 
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse Swift expression
@@ -1329,6 +1650,21 @@ Process called "parse_expression" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Parses a brace-delimited closure. The optional parameter form `name in
+body` is detected by lookahead: identifier followed by `in` means we have
+a parameter, otherwise the identifier was the first statement of an
+implicit-parameter closure (the `it`/no-parameter form) and gets re-
+emitted as a regular identifier child.
+@End Reasoning
+
+@Implementation:
+Consumes `{`. If the next token is an identifier, consume it and peek
+for `in` — if matched, record it as node.name; otherwise wrap the
+identifier as a child SWIFTUI_IDENTIFIER (no backtracking needed; we own
+the lexeme). Then loops parse_closure_statement until `}`.
+@End Implementation
+
 Process called "parse_closure" takes parser as Integer returns Integer:
     Note: Parse closure expression
 
@@ -1403,6 +1739,14 @@ Process called "parse_closure" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+A SwiftUI closure body is typically either a ViewBuilder (sequence of
+view declarations) or a plain expression (action body). We disambiguate
+by lookahead: TOKEN_VIEW_TYPE or TOKEN_IDENTIFIER routes to
+parse_view_hierarchy (most closures here are ViewBuilders); anything else
+falls through to parse_expression.
+@End Reasoning
+
 Process called "parse_closure_statement" takes parser as Integer returns Integer:
     Note: Parse closure statement
 
@@ -1434,6 +1778,13 @@ End Process
 Note: ============================================================================
 Note: Top-Level Parsing
 Note: ============================================================================
+
+@Reasoning:
+Public top-level entry. The current grammar targets a single primary view
+struct per file (extensions and preview providers are intentionally
+unimplemented at this layer because HIR translation does not yet
+consume them). Errors recorded mid-parse short-circuit the return.
+@End Reasoning
 
 Process called "parse_swiftui" takes parser as Integer returns Integer:
     Note: Parse SwiftUI source file (top-level entry point)

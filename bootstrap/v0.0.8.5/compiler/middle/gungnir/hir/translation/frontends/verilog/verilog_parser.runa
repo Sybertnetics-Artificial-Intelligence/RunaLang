@@ -52,6 +52,25 @@ Note: ================================================================
 Note: Parser State
 Note: ================================================================
 
+@Reasoning:
+The Verilog parser maintains a flat three-slot state: the token
+list (produced by the lexer), the current index (advanced
+monotonically through parsing), and an error list for parse
+failures. Verilog's grammar is rich (modules, ports, declarations,
+always-blocks, generate blocks) but the parser stays single-pass;
+no lookahead beyond the immediate token is required because the
+grammar is largely LR(1).
+@End Reasoning
+
+@Implementation:
+Three i64-sized fields, 24 bytes total at offsets 0, 8, 16. The
+tokens field is a pointer to a List of token records (each token
+is itself a record produced by VerilogLexer with type @0, string
+or value @8, line @24, column @32). Current is a plain integer
+index into that list; errors is a List of error records each
+holding message, line, column. No mutable per-token state - all
+parser state is the index.
+@End Implementation
 Type called "VerilogParser":
     tokens as Integer  Note: Pointer to list of tokens
     current as Integer  Note: Current token index
@@ -62,6 +81,17 @@ Note: ================================================================
 Note: Parser Initialization
 Note: ================================================================
 
+@Reasoning:
+Constructs a VerilogParser record from a pre-tokenised token list.
+The current-index starts at 0 and a fresh empty errors_list is
+allocated so the caller does not have to thread error state.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes (three i64 slots). Writes tokens_list @0,
+current_index = 0 @8, and a freshly-allocated empty List @16.
+Returns the parser_ptr.
+@End Implementation
 Process called "create_parser" that takes tokens_list as Integer returns Integer:
     @Reasoning
     Create and initialize a Verilog parser state.
@@ -82,6 +112,18 @@ Note: ================================================================
 Note: Token Navigation
 Note: ================================================================
 
+@Reasoning:
+Returns the full token pointer at the current parser position
+without advancing. Used when a parsing helper needs more than just
+the token type (e.g. to read an identifier's string payload via
+read_string).
+@End Reasoning
+
+@Implementation:
+Reads the tokens_list pointer @0 and current_index @8 from the
+parser state. Calls List.get_from_list to index into the token
+array; returns the token pointer (or 0 if index is past the end).
+@End Implementation
 Process called "peek" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Get current token without advancing.
@@ -93,6 +135,19 @@ Process called "peek" that takes parser_ptr as Integer returns Integer:
     Return proc get_from_list from ListCore with tokens_list, current_index
 End Process
 
+@Reasoning:
+Shortcut to read the token TYPE at the current position. Most
+dispatch decisions in the parser only need the type byte, not the
+full token record - returning the type directly saves the caller a
+read.
+@End Reasoning
+
+@Implementation:
+Reads token_ptr via peek. If 0 (past EOF), returns TOKEN_EOF from
+the lexer module so callers can match against a sentinel without
+special-casing null. Otherwise reads the integer at offset 0 of the
+token record (the token-type field).
+@End Implementation
 Process called "peek_type" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Get current token type without advancing.
@@ -107,6 +162,18 @@ Process called "peek_type" that takes parser_ptr as Integer returns Integer:
     Return proc read_integer from Memory with token_ptr, 0
 End Process
 
+@Reasoning:
+Single-step consume: returns the current token pointer and bumps
+the current index by one. The returned pointer is the token the
+caller wanted to capture before moving past it.
+@End Reasoning
+
+@Implementation:
+Reads token_ptr via peek (current token pointer, may be 0 at EOF).
+Reads current_index @8 and writes back current_index + 1. Returns
+token_ptr. No bounds check here; peek will return 0 past EOF and
+the caller's subsequent peek_type will return TOKEN_EOF.
+@End Implementation
 Process called "advance" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Move to next token and return current token.
@@ -120,6 +187,20 @@ Process called "advance" that takes parser_ptr as Integer returns Integer:
     Return token_ptr
 End Process
 
+@Reasoning:
+Mandatory consume: if the current token type matches the expected
+type, consumes and returns it; otherwise emits an "Unexpected
+token" error and returns 0 without advancing. Unlike match(),
+treats a mismatch as a parse error rather than a normal branch.
+@End Reasoning
+
+@Implementation:
+Reads token_type via peek_type. If equal to expected_type, returns
+proc advance (which also returns the just-consumed token pointer).
+Otherwise calls add_parse_error with message "Unexpected token" and
+returns 0 - the caller may continue parsing under error-recovery
+semantics.
+@End Implementation
 Process called "expect" that takes parser_ptr as Integer, expected_type as Integer returns Integer:
     @Reasoning
     Expect a specific token type and consume it, or report error.
@@ -135,6 +216,18 @@ Process called "expect" that takes parser_ptr as Integer, expected_type as Integ
     End If
 End Process
 
+@Reasoning:
+Conditional consume: peek at the current token type; if it matches
+the expected type, advance and return 1. Otherwise leave the parser
+position unchanged and return 0. Used when the next token is
+optional (lookahead-style decisions).
+@End Reasoning
+
+@Implementation:
+Reads current_type via peek_type. If current_type == token_type,
+calls advance (discarding the returned token) and returns 1.
+Otherwise returns 0 with no side effects on parser state.
+@End Implementation
 Process called "match" that takes parser_ptr as Integer, token_type as Integer returns Integer:
     @Reasoning
     Check if current token matches type and consume if true.
@@ -154,6 +247,25 @@ Note: ================================================================
 Note: Main Parsing Entry Point
 Note: ================================================================
 
+@Reasoning:
+Top-level entry point: parses an entire Verilog source file as a
+list of modules (and any compiler directives). Builds a
+NODE_SOURCE_FILE root node whose children are the modules and
+directives in source order. Unknown top-level tokens generate
+error recovery by skipping one token.
+@End Reasoning
+
+@Implementation:
+Allocates 16 bytes for NODE_SOURCE_FILE. Writes type @0. Creates an
+empty modules_list and writes @8. Loop until EOF:
+  - TOKEN_MODULE -> parse_module, append to modules_list
+  - TOKEN_DIRECTIVE -> parse_directive; if non-null append to
+    modules_list (directives ride in the same list so the
+    preprocessor can find them in source order), then advance
+  - otherwise registers "Expected module or directive" and advances
+    one token for recovery
+Returns the source_file pointer.
+@End Implementation
 Process called "parse" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse Verilog source file (list of modules and compiler directives).
@@ -203,6 +315,24 @@ Note: ================================================================
 Note: Module Parsing
 Note: ================================================================
 
+@Reasoning:
+Parses a full module definition. The grammar is:
+  module Name #(param_port_list)? (port_list)? ; module_items endmodule
+Both parameter port list and signal port list are optional. The
+parser produces a 56-byte NODE_MODULE record carrying the name,
+parameter list, port list, and items list.
+@End Reasoning
+
+@Implementation:
+Allocates 56 bytes for NODE_MODULE. Writes type @0. Expects 'module'
+keyword. Reads name via IDENTIFIER token, writes string @8.
+Parameter list: if '#' follows, expects '(' and parses via
+parse_parameter_port_list, expects ')'. Always writes a list (empty
+if absent) @16. Port list: if '(' follows, parses via
+parse_port_list, expects ')'. Writes ports list @24. Expects ';'.
+Calls parse_module_items, writes items list @32. Expects
+'endmodule'. Returns the module pointer.
+@End Implementation
 Process called "parse_module" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse module definition: module name (ports); ... endmodule
@@ -261,6 +391,19 @@ Process called "parse_module" that takes parser_ptr as Integer returns Integer:
     Return module_ptr
 End Process
 
+@Reasoning:
+Parses the signal port list inside module HeaderName(p1, p2, ...).
+At header level we only capture port NAMES; the directions and
+widths are filled in by separate port declarations inside the
+module body. This matches Verilog-2001 ANSI-style headers as
+well as the older non-ANSI form.
+@End Reasoning
+
+@Implementation:
+Creates an empty list. Loop: expects IDENTIFIER, reads its string
+@8, appends to the list. Then checks for ','; if present advances
+and continues, otherwise stops. Returns the list.
+@End Implementation
 Process called "parse_port_list" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse comma-separated port list.
@@ -288,6 +431,19 @@ Process called "parse_port_list" that takes parser_ptr as Integer returns Intege
     Return ports_list
 End Process
 
+@Reasoning:
+Parses the optional #(...) parameter port list that follows the
+module name in the module header. Each entry is a full parameter
+declaration (with default value). Distinct from parse_port_list
+which handles signal ports.
+@End Reasoning
+
+@Implementation:
+Creates an empty list. Loop: if next token matches PARAMETER,
+calls parse_parameter_declaration and appends the result. Then
+checks for ','; if present advance and continue, otherwise stop.
+Returns the list.
+@End Implementation
 Process called "parse_parameter_port_list" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse parameter port list in module header.
@@ -319,6 +475,32 @@ Note: ================================================================
 Note: Module Item Parsing
 Note: ================================================================
 
+@Reasoning:
+Inside-the-module dispatcher. Verilog has 11 distinct module-level
+items (port/net/reg/integer/parameter declarations, always/initial
+blocks, continuous assigns, function/task declarations, generate
+blocks, and module instantiations). This pass walks token by token
+and dispatches to the right sub-parser until 'endmodule'.
+@End Reasoning
+
+@Implementation:
+Creates an empty items list. Loop while not TOKEN_ENDMODULE:
+  - INPUT/OUTPUT/INOUT -> parse_port_declaration
+  - WIRE/TRI/SUPPLY0/SUPPLY1 -> parse_net_declaration
+  - REG -> parse_reg_declaration
+  - INTEGER -> parse_integer_declaration
+  - PARAMETER/LOCALPARAM -> parse_parameter_declaration
+  - ALWAYS -> parse_always_block
+  - INITIAL -> parse_initial_block
+  - ASSIGN -> parse_assign_statement
+  - FUNCTION -> parse_function_declaration
+  - TASK -> parse_task_declaration
+  - GENERATE -> parse_generate_block
+  - IDENTIFIER -> parse_module_instantiation (an identifier at the
+    item level is a module type name)
+  - anything else -> "Unexpected module item" error and advance
+Each successful parse appends to items_list. Returns items_list.
+@End Implementation
 Process called "parse_module_items" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse module items until endmodule.
@@ -408,6 +590,20 @@ Note: ================================================================
 Note: Declaration Parsing
 Note: ================================================================
 
+@Reasoning:
+Parses a port declaration: input/output/inout direction + optional
+range + name list. Port declarations inside the module body can
+add names not in the original module header port list, so this
+parses each name list independently of the header.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes for NODE_PORT_DECLARATION. Writes type @0.
+Advances past the direction token (TOKEN_INPUT/OUTPUT/INOUT) and
+writes its type code @8. Optionally parses range when next is '['
+and writes range_ptr (or 0) @16. Calls parse_identifier_list,
+writes the names list @24. Expects ';'.
+@End Implementation
 Process called "parse_port_declaration" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse port declaration: input/output/inout [range] name, name, ...;
@@ -442,6 +638,20 @@ Process called "parse_port_declaration" that takes parser_ptr as Integer returns
     Return port_decl_ptr
 End Process
 
+@Reasoning:
+Parses a Verilog net declaration (wire, tri, supply0, supply1).
+Nets are continuously-driven signals - distinct from reg storage.
+The specific net_type byte is preserved so later passes can apply
+the right driver semantics (supply0/supply1 are 0/1 constants
+respectively).
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes for NODE_NET_DECLARATION. Writes type @0.
+Advances past the net-type token and writes net_type @8. Optionally
+parses a range when next is '[', writes range pointer (or 0) @16.
+Calls parse_identifier_list, writes the names list @24. Expects ';'.
+@End Implementation
 Process called "parse_net_declaration" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse net declaration: wire/tri/etc. [range] name, name, ...;
@@ -476,6 +686,20 @@ Process called "parse_net_declaration" that takes parser_ptr as Integer returns 
     Return net_decl_ptr
 End Process
 
+@Reasoning:
+Parses a Verilog 'reg' declaration. reg is the storage-element
+abstraction (driven by procedural assignments inside always /
+initial blocks); semantically distinct from wire (driven by
+continuous assignments) even when synthesised to the same gate
+output.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes for NODE_REG_DECLARATION. Writes type @0.
+Expects TOKEN_REG. Optionally parses a range (when next is '[')
+and writes the range pointer (or 0) @8. Calls parse_identifier_list,
+writes the names list @16. Expects ';'.
+@End Implementation
 Process called "parse_reg_declaration" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse reg declaration: reg [range] name, name, ...;
@@ -508,6 +732,18 @@ Process called "parse_reg_declaration" that takes parser_ptr as Integer returns 
     Return reg_decl_ptr
 End Process
 
+@Reasoning:
+Parses a Verilog 'integer' declaration. Verilog 'integer' is a
+32-bit signed scalar used for loop counters and intermediate
+computations in procedural code. Unlike reg, it has no width
+modifier (always 32 bits).
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes for NODE_INTEGER_DECLARATION. Writes type @0.
+Expects TOKEN_INTEGER. Calls parse_identifier_list to capture the
+comma-separated names, writes the names list @8. Expects ';'.
+@End Implementation
 Process called "parse_integer_declaration" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse integer declaration: integer name, name, ...;
@@ -531,6 +767,21 @@ Process called "parse_integer_declaration" that takes parser_ptr as Integer retu
     Return int_decl_ptr
 End Process
 
+@Reasoning:
+Parses both "parameter" (overridable from outside) and "localparam"
+(internally fixed) declarations. The is_local flag distinguishes
+them in the AST so downstream code can enforce localparam's
+non-overridable semantics.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes for NODE_PARAMETER. Tries match on TOKEN_LOCALPARAM
+- if it consumes, sets is_local = 1; otherwise expects TOKEN_PARAMETER
+and is_local stays 0. Writes is_local @8. Expects an IDENTIFIER for
+the name and writes its string @16. Expects '=' (TOKEN_ASSIGN_OP).
+Parses the RHS via parse_expression and writes @24. Optionally
+consumes a trailing ';' (absent in parameter-port-list form).
+@End Implementation
 Process called "parse_parameter_declaration" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse parameter declaration: parameter name = value;
@@ -569,6 +820,19 @@ Process called "parse_parameter_declaration" that takes parser_ptr as Integer re
     Return param_ptr
 End Process
 
+@Reasoning:
+Parses a Verilog [msb:lsb] range expression. Both bounds are full
+expressions, not literals, because Verilog permits parameterised
+widths like [WIDTH-1:0]. The semantic phase later evaluates these
+expressions to compute the actual bit width.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes for a two-field range record. Expects '[',
+parses msb via parse_expression and writes @0, expects ':', parses
+lsb via parse_expression and writes @8, expects ']'. Returns the
+range pointer.
+@End Implementation
 Process called "parse_range" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse bit range: [msb:lsb]
@@ -591,6 +855,19 @@ Process called "parse_range" that takes parser_ptr as Integer returns Integer:
     Return range_ptr
 End Process
 
+@Reasoning:
+Parses an identifier1, identifier2, ... sequence into a List of
+string pointers. Used by every declaration form (port, net, reg,
+integer) where a single declaration line can introduce multiple
+names of the same type.
+@End Reasoning
+
+@Implementation:
+Creates an empty list. Loop: expect TOKEN_IDENTIFIER, read its
+string @8 from the token, append to the list. If next token is
+TOKEN_COMMA, advance and continue; otherwise stop. Returns the
+list.
+@End Implementation
 Process called "parse_identifier_list" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse comma-separated list of identifiers.
@@ -620,6 +897,19 @@ Note: ================================================================
 Note: Behavioral Block Parsing
 Note: ================================================================
 
+@Reasoning:
+Parses an always block - Verilog's combinational/sequential
+behavioural construct. The sensitivity list (optional in pre-2001
+syntax, mandatory for synthesisable code) determines whether this
+synthesises to combinational logic, latches, or flip-flops.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes for NODE_ALWAYS_BLOCK. Writes type @0. Expects
+'always'. If next is '@', parses the sensitivity list via
+parse_sensitivity_list; otherwise leaves sensitivity pointer as 0.
+Writes @8. Parses the body via parse_statement and writes @16.
+@End Implementation
 Process called "parse_always_block" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse always block: always @(sensitivity_list) statement
@@ -648,6 +938,17 @@ Process called "parse_always_block" that takes parser_ptr as Integer returns Int
     Return always_ptr
 End Process
 
+@Reasoning:
+Parses an initial block. Initial blocks run exactly once at time 0
+in simulation; they are typically used for testbench setup and are
+NOT synthesisable. The AST node carries a single statement (which
+may itself be a begin/end block holding many statements).
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes for NODE_INITIAL_BLOCK. Writes type @0. Expects
+'initial'. Parses the body via parse_statement and writes @8.
+@End Implementation
 Process called "parse_initial_block" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse initial block: initial statement
@@ -667,6 +968,23 @@ Process called "parse_initial_block" that takes parser_ptr as Integer returns In
     Return initial_ptr
 End Process
 
+@Reasoning:
+Parses a Verilog sensitivity list following always @ - the set of
+signals whose changes re-trigger the block. Supports the three
+common forms: @(posedge X), @(*) (implicit, all read signals), and
+@(a or b or c). Each signal entry preserves the optional posedge/
+negedge edge specifier so synthesis can build the right flip-flop.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes for NODE_SENSITIVITY_LIST. Writes type @0.
+Expects '@' '('. If next is '*', advances and inserts "*" as a
+sentinel into signals_list. Otherwise loops: optionally consumes
+posedge/negedge, expects IDENTIFIER, allocates a 24-byte signal_info
+record with name @0, is_posedge @8, is_negedge @16, and appends it
+to signals_list. Between entries accepts either 'or' keyword or
+comma. Writes signals_list @8. Expects ')'.
+@End Implementation
 Process called "parse_sensitivity_list" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse sensitivity list: @(posedge clk) or @(*) or @(a or b or c)
@@ -737,6 +1055,26 @@ Note: ================================================================
 Note: Statement Parsing
 Note: ================================================================
 
+@Reasoning:
+Procedural-statement dispatcher. Routes based on the leading token
+to the correct statement-specific sub-parser. Used inside always /
+initial blocks and inside nested statement contexts (then/else
+branches, loop bodies, case items).
+@End Reasoning
+
+@Implementation:
+Reads peek_type. Dispatches:
+  - BEGIN -> parse_begin_end_block
+  - IF -> parse_if_statement
+  - CASE / CASEX / CASEZ -> parse_case_statement
+  - FOR -> parse_for_loop
+  - WHILE -> parse_while_loop
+  - SYSTEM_TASK -> parse_system_task_call
+  - IDENTIFIER -> parse_assignment_or_call (ambiguous lookahead
+    handled inside that helper)
+  - anything else -> registers "Expected statement" error and
+    returns 0
+@End Implementation
 Process called "parse_statement" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse any statement (assignment, if, case, loop, block, etc.).
@@ -778,6 +1116,18 @@ Process called "parse_statement" that takes parser_ptr as Integer returns Intege
     Return 0
 End Process
 
+@Reasoning:
+Parses a begin/end statement-group block. begin..end is Verilog's
+braced statement container, used to group multiple statements where
+the grammar expects a single statement (e.g. then-branch of an if).
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes for NODE_BEGIN_END_BLOCK. Writes type @0. Expects
+'begin'. Loops parsing statements until it sees TOKEN_END;
+appending each via parse_statement to statements_list. Writes the
+list @8. Expects 'end'.
+@End Implementation
 Process called "parse_begin_end_block" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse begin...end block: begin statements... end
@@ -809,6 +1159,21 @@ Process called "parse_begin_end_block" that takes parser_ptr as Integer returns 
     Return block_ptr
 End Process
 
+@Reasoning:
+Parses procedural if/else. Verilog's if-without-else has the classic
+dangling-else ambiguity; the grammar (and this parser) resolve it
+greedy-left: each 'else' binds to the nearest preceding 'if'. This
+is implicit in the recursive descent because parse_statement on the
+then-branch eagerly consumes any nested 'else'.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes for NODE_IF_STATEMENT. Writes type @0. Expects
+'if' '('. Parses condition via parse_expression, writes @8.
+Expects ')'. Parses then via parse_statement, writes @16. Optional
+'else' (via match): if present, parses else-statement via
+parse_statement and writes @24; otherwise leaves @24 as 0.
+@End Implementation
 Process called "parse_if_statement" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse if statement: if (condition) statement else statement
@@ -842,6 +1207,23 @@ Process called "parse_if_statement" that takes parser_ptr as Integer returns Int
     Return if_ptr
 End Process
 
+@Reasoning:
+Parses Verilog case / casex / casez statements. The variants differ
+in how unknown bits in the case items are treated: casex treats x/z
+as don't-cares; casez treats z as don't-care; case requires exact
+match. The case_type byte preserved on the AST lets the synthesis
+backend emit the correct comparison.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes for NODE_CASE_STATEMENT. Writes type @0. Captures
+the case-variant token type into @8. Expects '(' selector ')'.
+Parses the selector expression and writes @16. Then loops parsing
+case items: each is either an expression list followed by ':' and a
+statement, OR "default :" + statement. Items are accumulated in a
+list. Expects 'endcase'. Writes the items list into the case
+record.
+@End Implementation
 Process called "parse_case_statement" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse case statement: case (expr) item: stmt ... endcase
@@ -900,6 +1282,21 @@ Process called "parse_case_statement" that takes parser_ptr as Integer returns I
     Return case_ptr
 End Process
 
+@Reasoning:
+Parses a C-style for loop with init, condition, and update slots.
+init and update are assignment statements; condition is an
+expression. Used for both bounded iteration in testbenches and for
+generate-loop indices in synthesis.
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes for NODE_FOR_LOOP. Writes type @0. Expects 'for'
+'('. Parses init via parse_assignment_or_call (which expects its
+own ';'), writes @8. Expects another ';'. Parses condition via
+parse_expression, writes @16. Expects ';'. Parses update via
+parse_assignment_or_call, writes @24. Expects ')'. Parses body via
+parse_statement, writes @32.
+@End Implementation
 Process called "parse_for_loop" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse for loop: for (init; condition; update) statement
@@ -938,6 +1335,18 @@ Process called "parse_for_loop" that takes parser_ptr as Integer returns Integer
     Return for_ptr
 End Process
 
+@Reasoning:
+Parses a procedural while-loop. Used inside always / initial blocks
+to model iterative behaviour. The condition is a full expression
+(typically a bit check or counter compare); the body is a single
+statement (may be a begin/end block).
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes for NODE_WHILE_LOOP. Writes type @0. Expects
+'while' '('. Parses condition via parse_expression, writes @8.
+Expects ')'. Parses body via parse_statement, writes @16.
+@End Implementation
 Process called "parse_while_loop" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse while loop: while (condition) statement
@@ -962,6 +1371,26 @@ Process called "parse_while_loop" that takes parser_ptr as Integer returns Integ
     Return while_ptr
 End Process
 
+@Reasoning:
+Disambiguator: when a statement begins with an identifier, it could
+be a blocking assignment (lhs = rhs;), a non-blocking assignment
+(lhs <= rhs;), or a bare expression statement (task call /
+function call). The LHS is parsed first as a primary expression and
+then we look at what follows.
+@End Reasoning
+
+@Implementation:
+Parses LHS via parse_primary_expression. Peeks the next token type:
+  - TOKEN_ASSIGN_OP -> advance, allocate NODE_BLOCKING_ASSIGNMENT
+    (32 bytes), write type @0, lhs @8, rhs (via parse_expression)
+    @16. Expects ';'.
+  - TOKEN_NONBLOCKING_ASSIGN -> advance, allocate
+    NODE_NONBLOCKING_ASSIGNMENT (32 bytes), same field layout but
+    different node type tag.
+  - else -> expects ';' and returns the lhs_expr unchanged
+    (treating it as a standalone expression statement, used for
+    task/function calls that don't return values).
+@End Implementation
 Process called "parse_assignment_or_call" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse assignment (blocking or non-blocking) or task call.
@@ -1010,6 +1439,21 @@ Process called "parse_assignment_or_call" that takes parser_ptr as Integer retur
     Return lhs_expr
 End Process
 
+@Reasoning:
+Parses a $-prefixed system task call ($display, $monitor, $finish,
+etc.). The lexer emits TOKEN_SYSTEM_TASK for any $name; this parser
+captures the name and optional argument list. Arguments are full
+expressions because system tasks accept format strings followed by
+any number of value expressions.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes for NODE_SYSTEM_TASK_CALL. Writes type @0.
+Expects TOKEN_SYSTEM_TASK; reads its name string @8 from the token
+and writes onto the node @8. Argument list is OPTIONAL - if next
+token is '(', parses comma-separated expressions into args_list
+until ')'. Writes args_list @16. Expects ';'.
+@End Implementation
 Process called "parse_system_task_call" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse system task call: $display(...); $monitor(...);
@@ -1058,6 +1502,20 @@ Note: ================================================================
 Note: Other Declaration Parsing
 Note: ================================================================
 
+@Reasoning:
+Parses a continuous-assignment 'assign' module item. Continuous
+assignments drive nets (typically wires) and are evaluated whenever
+their RHS changes - distinct from procedural blocking/non-blocking
+assignments which run inside always/initial blocks.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes for NODE_ASSIGN. Writes type @0. Expects 'assign'.
+Parses LHS via parse_primary_expression (continuous assigns can only
+target identifier-shaped lvalues with optional bit/part select).
+Expects '=' (TOKEN_ASSIGN_OP). Parses RHS via parse_expression.
+Writes lhs @8 and rhs @16. Expects ';'.
+@End Implementation
 Process called "parse_assign_statement" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse continuous assignment: assign lhs = rhs;
@@ -1083,6 +1541,24 @@ Process called "parse_assign_statement" that takes parser_ptr as Integer returns
     Return assign_ptr
 End Process
 
+@Reasoning:
+Parses a child-module instantiation inside a module body. Verilog
+distinguishes module declaration (with 'module' keyword) from
+instantiation (just the module type name followed by an instance
+name). Optional parameter overrides via #(...) and the port
+connection list complete the construct.
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes for NODE_MODULE_INSTANTIATION. Writes type @0.
+Reads module_name via IDENTIFIER token, writes string @8.
+If '#' (TOKEN_HASH) follows, expects '(' and parses
+comma-separated parameter expressions into params_list, then ')'.
+Always writes params_list @16. Reads instance name via IDENTIFIER,
+writes string @24. Expects '('; parses comma-separated port
+connection expressions into ports_list. Expects ')'. Writes
+ports_list @32. Expects ';'.
+@End Implementation
 Process called "parse_module_instantiation" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse module instantiation: module_name #(params) instance_name (ports);
@@ -1155,6 +1631,24 @@ Process called "parse_module_instantiation" that takes parser_ptr as Integer ret
     Return inst_ptr
 End Process
 
+@Reasoning:
+Parses a Verilog function declaration. Functions differ from tasks
+in that they: must return a single value (specified by an optional
+return-type range), cannot have inout/output ports (only input),
+and complete in zero simulation time (no #/wait delays in body).
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes for NODE_FUNCTION_DECLARATION. Writes type @0.
+Expects 'function'. Optional range after function keyword becomes
+return_type @8. Expects IDENTIFIER for function name; reads its
+string @8 from the token and writes onto the node @16. Expects ';'.
+Loops parsing input declarations and reg/integer locals into
+'declarations' list; loop exits when next token isn't a declaration
+keyword. Writes declarations @24. Parses body (begin/end or single
+statement) and writes @32. Expects 'endfunction'. Reserved slot
+@40 = 0.
+@End Implementation
 Process called "parse_function_declaration" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse Verilog function declaration with return type, name, input/output ports, and body.
@@ -1230,6 +1724,23 @@ Process called "parse_function_declaration" that takes parser_ptr as Integer ret
     Return func_ptr
 End Process
 
+@Reasoning:
+Parses a Verilog task declaration. Tasks are subroutines that may
+have input/output/inout ports, may contain timing controls (#/wait),
+and do not return a value. The body parser collects all statements
+until 'endtask' rather than expecting a single statement.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes for NODE_TASK_DECLARATION. Writes type @0.
+Expects 'task'. Reads task_name from IDENTIFIER token and writes @8.
+Expects ';'. Loops parsing input/output/inout declarations and
+reg/integer locals into 'declarations' list; loop exits when the
+next token is not a declaration keyword. Writes declarations @16.
+Parses body: if next is 'begin' delegates to parse_begin_end_block;
+otherwise accumulates statements until 'endtask'. Writes body @24.
+Expects 'endtask'. Reserved slot @32 = 0.
+@End Implementation
 Process called "parse_task_declaration" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse Verilog task declaration with name, input/output/inout ports, and body.
@@ -1313,6 +1824,30 @@ Process called "parse_task_declaration" that takes parser_ptr as Integer returns
     Return task_ptr
 End Process
 
+@Reasoning:
+Parses a Verilog generate block. Generate blocks are evaluated at
+elaboration time to conditionally instantiate hardware - allowing
+parameterised module structures (e.g. N copies of a sub-module
+selected by a genvar loop). Permitted items: genvar declarations,
+for/if/case constructs, module instantiations, and net/parameter
+declarations.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes for NODE_GENERATE_BLOCK. Writes type @0. Expects
+'generate'. Loops until TOKEN_ENDGENERATE, dispatching:
+  - GENVAR -> parse_genvar_declaration
+  - FOR -> parse_for_loop (generate-for has the same syntax as the
+    procedural for loop)
+  - IF -> parse_if_statement (generate-if uses statement syntax)
+  - CASE -> parse_case_statement
+  - IDENTIFIER -> parse_module_instantiation
+  - PARAMETER -> parse_parameter_declaration
+  - WIRE / REG -> parse_net_declaration
+  - anything else -> advance one token (defensive infinite-loop
+    guard)
+Writes items list @8. Expects 'endgenerate'. Reserved @16 = 0.
+@End Implementation
 Process called "parse_generate_block" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse Verilog generate block with conditional instantiation, loops, and case statements.
@@ -1403,6 +1938,19 @@ Note: ================================================================
 Note: Expression Parsing (with precedence)
 Note: ================================================================
 
+@Reasoning:
+Public entry point for any expression parse. Doesn't itself
+implement any operator handling - just delegates to the top of the
+precedence cascade (the ternary level). Centralising this delegation
+in a named function lets callers say parse_expression() without
+having to know the precedence root.
+@End Reasoning
+
+@Implementation:
+Direct tail-call to parse_conditional_expression. The conditional
+is the lowest-precedence binary form in Verilog so it sits at the
+top of the cascade.
+@End Implementation
 Process called "parse_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse expression with operator precedence (start with conditional/ternary).
@@ -1411,6 +1959,21 @@ Process called "parse_expression" that takes parser_ptr as Integer returns Integ
     Return proc parse_conditional_expression from parser_ptr
 End Process
 
+@Reasoning:
+Top of the precedence cascade. Verilog's ternary "cond ? then :
+else" sits above logical-OR. The branches are parsed via the full
+parse_expression so they can themselves be ternaries (right-
+associative chaining produces a ? b : (c ? d : e)).
+@End Reasoning
+
+@Implementation:
+Parses the condition via parse_logical_or_expression. If next token
+is TOKEN_QUESTION, allocates a 40-byte NODE_CONDITIONAL_EXPR:
+type @0, cond @8, then @16, else @24. Parses then-expr via
+parse_expression, expects ':' via expect, parses else-expr via
+parse_expression. Returns the conditional node. If no '?' at the
+front, returns the unguarded left expression.
+@End Implementation
 Process called "parse_conditional_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse ternary conditional: expr ? expr : expr
@@ -1437,6 +2000,16 @@ Process called "parse_conditional_expression" that takes parser_ptr as Integer r
     Return expr
 End Process
 
+@Reasoning:
+Left-associative logical-OR parser ('||'). Below the conditional/
+ternary level and above logical-AND in precedence.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_logical_and_expression. Loop while peek_type
+== TOKEN_LOGICAL_OR: advance, parse right via
+parse_logical_and_expression, build binop, reassign left.
+@End Implementation
 Process called "parse_logical_or_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse logical OR: expr || expr
@@ -1457,6 +2030,18 @@ Process called "parse_logical_or_expression" that takes parser_ptr as Integer re
     Return left
 End Process
 
+@Reasoning:
+Left-associative logical-AND parser ('&&'). Sits between
+logical-OR (above) and bitwise-OR (below). Logical AND evaluates
+operand truthiness rather than bit-by-bit AND - that distinction is
+in semantic analysis, not in this parser.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_bitwise_or_expression. Loop while peek_type
+== TOKEN_LOGICAL_AND: advance, parse right via
+parse_bitwise_or_expression, build binop, reassign left.
+@End Implementation
 Process called "parse_logical_and_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse logical AND: expr && expr
@@ -1477,6 +2062,16 @@ Process called "parse_logical_and_expression" that takes parser_ptr as Integer r
     Return left
 End Process
 
+@Reasoning:
+Left-associative bitwise-OR parser ('|'). Sits between logical-AND
+(above) and bitwise-XOR (below).
+@End Reasoning
+
+@Implementation:
+Parses left via parse_bitwise_xor_expression. Loop while peek_type
+== TOKEN_PIPE: advance, parse right via parse_bitwise_xor_expression,
+build binop, reassign left.
+@End Implementation
 Process called "parse_bitwise_or_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse bitwise OR: expr | expr
@@ -1497,6 +2092,19 @@ Process called "parse_bitwise_or_expression" that takes parser_ptr as Integer re
     Return left
 End Process
 
+@Reasoning:
+Left-associative bitwise-XOR parser ('^'). Sits between bitwise-OR
+(above) and bitwise-AND (below). Same operator token is also used
+for the binary XNOR (^~ / ~^), but those forms are lexed as
+distinct tokens at parse_unary_expression's level for unary
+reduction.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_bitwise_and_expression. Loop while peek_type
+== TOKEN_CARET: advance, parse right via parse_bitwise_and_expression,
+build binop, reassign left.
+@End Implementation
 Process called "parse_bitwise_xor_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse bitwise XOR: expr bitwise xor expr
@@ -1517,6 +2125,19 @@ Process called "parse_bitwise_xor_expression" that takes parser_ptr as Integer r
     Return left
 End Process
 
+@Reasoning:
+Left-associative single-token operator parser for bitwise AND ('&').
+Sits between bitwise-XOR (above in precedence) and equality (below).
+@End Reasoning
+
+@Implementation:
+Parses left via parse_equality_expression. Loop while peek_type ==
+TOKEN_AMPERSAND: advance, parse right via parse_equality_expression,
+build binop, reassign left. Note: token name AMPERSAND is reused for
+the unary reduction-and operator at parse_unary_expression's level;
+no conflict because precedence-driven recursion has already
+consumed reduction-ands before reaching here.
+@End Implementation
 Process called "parse_bitwise_and_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse bitwise AND: expr bitwise and expr
@@ -1537,6 +2158,21 @@ Process called "parse_bitwise_and_expression" that takes parser_ptr as Integer r
     Return left
 End Process
 
+@Reasoning:
+Left-associative equality-operator parser. Verilog has FOUR forms:
+== / != (logical equality, with x/z values yielding x), and the
+"case equality" === / !== which treat x and z as ordinary bit
+values for exact-match comparison. The lexer distinguishes them; we
+treat all four at the same precedence here.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_relational_expression. Caches EQ, NE,
+CASE_EQ, CASE_NE token constants. Standard loop with _is_eq_op flag
+recomputed each iteration against the four constants. On match:
+capture op_type, advance, parse right via
+parse_relational_expression, build binop, reassign to left.
+@End Implementation
 Process called "parse_equality_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse equality: expr == expr, expr != expr, expr === expr, expr !== expr
@@ -1591,6 +2227,20 @@ Process called "parse_equality_expression" that takes parser_ptr as Integer retu
     Return left
 End Process
 
+@Reasoning:
+Left-associative comparison-operator parser at the relational level
+(<, >, <=, >=). Sits between shift and equality in the precedence
+cascade.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_shift_expression. Caches LT, GT, LE, GE
+token constants. Tests _is_rel_op flag. Standard loop: capture
+op_type on match, advance, parse right via parse_shift_expression,
+build binop, reassign to left. Recomputes _is_rel_op against the
+four constants each iteration so the loop exits on the first
+non-relational token.
+@End Implementation
 Process called "parse_relational_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse relational: expr < expr, expr > expr, expr < or equal to expr, expr > or equal to expr
@@ -1629,6 +2279,21 @@ Process called "parse_relational_expression" that takes parser_ptr as Integer re
     Return left
 End Process
 
+@Reasoning:
+Left-associative shift-operator parser. Verilog has FOUR shift
+operators distinguishing logical vs arithmetic on the right:
+<<, >>, <<<, >>>. The latter two preserve the sign bit on right
+shift / fill with the sign on left shift for signed operands.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_additive_expression. Caches LSHIFT, RSHIFT,
+ARITH_LSHIFT, ARITH_RSHIFT token constants and an _is_shift flag.
+Standard left-associative loop: rebuild _is_shift each iteration
+from peek vs the four constants. On match: capture op_type,
+advance, parse right via parse_additive_expression, build binop,
+reassign to left. Returns left at exit.
+@End Implementation
 Process called "parse_shift_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse shift: expr shifted left by expr, expr shifted right by expr, expr <<< expr, expr >>> expr
@@ -1667,6 +2332,19 @@ Process called "parse_shift_expression" that takes parser_ptr as Integer returns
     Return left
 End Process
 
+@Reasoning:
+Left-associative + / - parser. Sits between shift and multiplicative
+in the precedence cascade. The tokens TOKEN_PLUS / TOKEN_MINUS at
+this layer are binary additive ops; the same token bytes used as
+unary signs are consumed earlier in parse_unary_expression.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_multiplicative_expression. Caches plus/minus
+token constants. Loop while peek is one of them: capture op_type,
+advance, parse right via parse_multiplicative_expression, build a
+binop, reassign to left. Returns left at exit.
+@End Implementation
 Process called "parse_additive_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse addition/subtraction: expr + expr, expr - expr
@@ -1699,6 +2377,20 @@ Process called "parse_additive_expression" that takes parser_ptr as Integer retu
     Return left
 End Process
 
+@Reasoning:
+Left-associative binary parser at the multiplicative precedence
+level. Standard while-loop pattern that handles *, /, % in
+sequence at the same precedence.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_power_expression. Caches the three operator
+tokens. Loop: while the current token is one of TOKEN_STAR /
+TOKEN_SLASH / TOKEN_PERCENT, capture op_type, advance, parse the
+right operand via parse_power_expression, build a binop via
+create_binary_op, and assign back to left for the left-associative
+chaining. Returns left when no more multiplicative operators.
+@End Implementation
 Process called "parse_multiplicative_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse multiplication/division/modulo: expr * expr, expr / expr, expr % expr
@@ -1734,6 +2426,20 @@ Process called "parse_multiplicative_expression" that takes parser_ptr as Intege
     Return left
 End Process
 
+@Reasoning:
+Verilog's '**' exponentiation operator is RIGHT-associative (unlike
+most binary operators) so this parser recurses on the right operand
+rather than looping. Slots between unary and multiplicative in the
+precedence cascade.
+@End Reasoning
+
+@Implementation:
+Parses left via parse_unary_expression. If next token is
+TOKEN_POWER, advances and recursively calls parse_power_expression
+for the right operand (giving right-associative chains like
+a**b**c parsing as a**(b**c)). Builds the binop and returns. If
+not '**' returns left as-is.
+@End Implementation
 Process called "parse_power_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse power: expr ** expr
@@ -1754,6 +2460,22 @@ Process called "parse_power_expression" that takes parser_ptr as Integer returns
     Return left
 End Process
 
+@Reasoning:
+Handles prefix unary operators plus Verilog's reduction operators
+(unary &, |, ^, ~&, ~|, ~^, ^~ - these collapse a vector into a
+single bit). Unary is right-associative: -!~x means -(!(~x)), which
+falls out naturally from the recursive call to parse_unary_expression
+on the operand.
+@End Reasoning
+
+@Implementation:
+Peeks the token type. If it matches one of the 11 unary operators
+(+, -, !, ~, &, |, ^, ~&, ~|, ~^, ^~), advances past it,
+recursively parses the operand via parse_unary_expression, then
+allocates a 24-byte NODE_UNARY_OP record: type @0, op_type @8,
+operand @16. If no unary operator at the front, delegates to
+parse_primary_expression.
+@End Implementation
 Process called "parse_unary_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse unary operators: +, -, !, ~, &, |, ^, ~&, ~|, ~^, ^~
@@ -1779,6 +2501,27 @@ Process called "parse_unary_expression" that takes parser_ptr as Integer returns
     Return proc parse_primary_expression from parser_ptr
 End Process
 
+@Reasoning:
+Atom-level parser for the expression grammar. Handles all leaf forms
+(numbers, strings, identifiers with optional bit/part select),
+grouped expressions (parens), and brace-delimited concatenations.
+This is the recursive base case for the precedence cascade and the
+exit point where the parser converts a token into an AST node.
+@End Reasoning
+
+@Implementation:
+Reads peek_type and dispatches:
+  - TOKEN_NUMBER -> builds NODE_NUMBER from the token value
+  - TOKEN_STRING -> builds NODE_STRING_LITERAL
+  - TOKEN_IDENTIFIER -> builds NODE_IDENTIFIER, then if followed by
+    '[' allocates a NODE_BIT_SELECT or NODE_PART_SELECT depending on
+    whether a ':' appears between the bracket expressions
+  - TOKEN_LPAREN -> recurses into parse_expression and expects ')'
+  - TOKEN_LBRACE -> parses a comma-separated list into a
+    NODE_CONCATENATION
+  - anything else -> registers "Expected primary expression" via
+    add_parse_error and returns 0
+@End Implementation
 Process called "parse_primary_expression" that takes parser_ptr as Integer returns Integer:
     @Reasoning
     Parse primary expressions: identifiers, numbers, strings, parenthesized expressions, concatenations.
@@ -1906,11 +2649,20 @@ Note: ================================================================
 Note: Helper Functions
 Note: ================================================================
 
-Process called "create_binary_op" that takes op_type as Integer, left as Integer, right as Integer returns Integer:
-    @Reasoning
-    Create a binary operation node.
-    @End Reasoning
+@Reasoning:
+Shared helper to build a NODE_BINARY_OP AST node. Used by every
+infix-operator parser (or/and/xor/eq/rel/shift/add/mul/power) so
+the AST shape stays uniform - having a single allocator means
+later semantic passes need only one schema.
+@End Reasoning
 
+@Implementation:
+Allocates 32 bytes for a four-field record. Writes node_type =
+NODE_BINARY_OP @0, op_type @8, left @16, right @24. Returns the
+node pointer. Does NOT touch the parser state - the caller is
+responsible for having advanced past the operator token already.
+@End Implementation
+Process called "create_binary_op" that takes op_type as Integer, left as Integer, right as Integer returns Integer:
     Let bin_op_ptr be proc allocate from Memory with 32
 
     proc write_integer from Memory with bin_op_ptr, 0, NODE_BINARY_OP
@@ -1925,11 +2677,21 @@ Note: ================================================================
 Note: Error Handling
 Note: ================================================================
 
-Process called "add_parse_error" that takes parser_ptr as Integer, message as String returns Integer:
-    @Reasoning
-    Add a parse error to the error list.
-    @End Reasoning
+@Reasoning:
+Records a parse error at the lexical location of the CURRENT token.
+The token's line and column come from the lexer's per-token
+metadata so error reports point at the offending byte even after
+the parser has skipped ahead in recovery.
+@End Reasoning
 
+@Implementation:
+Peeks the current token (may be 0 at EOF). Reads line @24 and
+column @32 from the token record, defaulting to 0/0 if the token
+pointer is null. Allocates a 24-byte error node: message string
+@0, line @8, column @16. Reads the parser's errors_list pointer
+from @16 and appends the new error node.
+@End Implementation
+Process called "add_parse_error" that takes parser_ptr as Integer, message as String returns Integer:
     Let token_ptr be proc peek from parser_ptr
     Let line be 0
     Let column be 0
@@ -1950,10 +2712,17 @@ Process called "add_parse_error" that takes parser_ptr as Integer, message as St
     Return 1
 End Process
 
-Process called "get_errors" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Get the list of parse errors.
-    @End Reasoning
+@Reasoning:
+Public accessor for the parser's accumulated error list. Drivers
+call this after parse() returns so they can decide whether to
+proceed with semantic analysis or report errors and bail.
+@End Reasoning
 
+@Implementation:
+Reads the errors_list pointer stored at offset 16 of the
+VerilogParser record (the third slot). Returns it directly without
+copying.
+@End Implementation
+Process called "get_errors" that takes parser_ptr as Integer returns Integer:
     Return proc read_integer from Memory with parser_ptr, 16
 End Process

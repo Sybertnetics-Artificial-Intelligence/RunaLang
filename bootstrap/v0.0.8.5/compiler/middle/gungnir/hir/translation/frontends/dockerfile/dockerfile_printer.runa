@@ -18,6 +18,15 @@ Note: indent_level is currently unused by the Dockerfile emitter but kept in
 Note: the public type for source compatibility.
 Note: ============================================================================
 
+@Reasoning:
+Minimal three-field emitter state delegated to the shared EmitterCommon
+byte-buffer infrastructure. indent_level is intentionally absent because
+Dockerfile syntax is flat - all instructions live at column 0.
+@End Reasoning
+@Implementation:
+buffer is a heap-allocated byte buffer with `capacity` slots, `length`
+filled. EmitterCommon manages growth via doubling.
+@End Implementation
 Type called "DockerfileEmitter":
     buffer as Integer
     capacity as Integer
@@ -28,26 +37,62 @@ Note: ==========================================================================
 Note: Emitter Creation
 Note: ============================================================================
 
+@Reasoning:
+Thin wrapper over EmitterCommon's raw byte-buffer factory; keeps the
+Dockerfile-printer API surface narrow.
+@End Reasoning
+@Implementation:
+Forwards to emitter_raw_create.
+@End Implementation
 Process called "create_emitter" returns Integer:
     Note: Allocate a raw byte-buffer-backed emitter via emitter_common.
     Return proc emitter_raw_create from EmitterCommon
 End Process
 
+@Reasoning:
+Pairs with create_emitter; releases the buffer AND the struct.
+@End Reasoning
+@Implementation:
+Forwards to emitter_raw_destroy.
+@End Implementation
 Process called "free_emitter" that takes emitter_ptr as Integer returns Integer:
     Note: Release the emitter's buffer and the emitter struct itself.
     Return proc emitter_raw_destroy from EmitterCommon with emitter_ptr
 End Process
 
+@Reasoning:
+Materializes the byte buffer as a freshly-allocated null-terminated String.
+The buffer remains owned by the emitter; the returned String is
+caller-owned.
+@End Reasoning
+@Implementation:
+Forwards to emitter_raw_get_output.
+@End Implementation
 Process called "get_output" that takes emitter_ptr as Integer returns String:
     Note: Return a freshly-allocated null-terminated copy of the emitted bytes.
     Return proc emitter_raw_get_output from EmitterCommon with emitter_ptr
 End Process
 
+@Reasoning:
+Byte-level append rather than character-level so Unicode passes through
+unchanged. Used by every instruction emitter.
+@End Reasoning
+@Implementation:
+Forwards to emitter_raw_emit_string which copies the bytes of `text` to
+the buffer, growing if necessary.
+@End Implementation
 Process called "emit_string" that takes emitter_ptr as Integer, text as String returns Integer:
     Note: Append text bytes to the byte buffer (amortized O(1)).
     Return proc emitter_raw_emit_string from EmitterCommon with emitter_ptr, text
 End Process
 
+@Reasoning:
+Dockerfile uses Unix LF line endings universally (Docker engine accepts
+CRLF on Windows but normalizes); emit a single LF byte.
+@End Reasoning
+@Implementation:
+Emits byte 10 (LF) via emitter_raw_emit_byte.
+@End Implementation
 Process called "emit_newline" that takes emitter_ptr as Integer returns Integer:
     Note: Append a single LF byte to the buffer.
     Return proc emitter_raw_emit_byte from EmitterCommon with emitter_ptr, 10
@@ -57,6 +102,17 @@ Note: ==========================================================================
 Note: Instruction Emission Functions
 Note: ============================================================================
 
+@Reasoning:
+FROM is the only required Dockerfile instruction and the most complex
+header: optional `--platform=`, mandatory image, optional `:tag` or
+`@digest`, optional `AS stage-name`. All optional pieces are checked
+individually.
+@End Reasoning
+@Implementation:
+Read platform@40, image@8, tag@16, digest@24, alias@32. Emit "FROM ",
+optional "--platform=X ", image, optional ":tag" or "@digest", optional
+" AS alias", newline.
+@End Implementation
 Process called "emit_from_instruction" that takes emitter_ptr as Integer, from_ptr as Integer returns Integer:
     @Reasoning
     Emit FROM instruction: FROM [--platform=<platform>] <image>[:<tag>|@<digest>] [AS <name>].
@@ -113,6 +169,20 @@ Process called "emit_from_instruction" that takes emitter_ptr as Integer, from_p
     Return 1
 End Process
 
+@Reasoning:
+Dockerfile RUN/CMD/ENTRYPOINT support two forms: shell (`RUN cmd args`)
+and exec (`RUN ["cmd", "arg"]`). The exec form is a JSON array - this
+helper renders that array with proper quoting and escaping.
+@End Reasoning
+@Implementation:
+Emit "["; for each arg in args list, emit quoted "arg" with embedded
+backslash and quote escaping, with ", " between elements; emit "]".
+@End Implementation
+@Security_Scope:
+JSON-quote escaping must handle embedded `"` and `\\` correctly to keep
+Docker engine parsing safe; relies on the upstream emitter to render
+those bytes consistently.
+@End Security_Scope
 Process called "emit_json_array" that takes emitter_ptr as Integer, args_ptr as Integer returns Integer:
     @Reasoning
     Emit a JSON array: ["element1", "element2", "element3"].
@@ -147,6 +217,16 @@ Process called "emit_json_array" that takes emitter_ptr as Integer, args_ptr as 
     Return 1
 End Process
 
+@Reasoning:
+RUN supports both shell form (`RUN cmd`) and exec form (`RUN ["cmd"]`).
+The HIR node carries an is_exec flag that selects between the two
+emissions.
+@End Reasoning
+@Implementation:
+Read is_exec flag and command/args. Emit "RUN ". If exec form, call
+emit_json_array. Otherwise emit the raw shell command string. Emit
+newline.
+@End Implementation
 Process called "emit_run_instruction" that takes emitter_ptr as Integer, run_ptr as Integer returns Integer:
     @Reasoning
     Emit RUN instruction: RUN <command> or RUN ["executable", "param1"].
@@ -175,6 +255,14 @@ Process called "emit_run_instruction" that takes emitter_ptr as Integer, run_ptr
     Return 1
 End Process
 
+@Reasoning:
+CMD has the same dual shell/exec form as RUN, but with different
+semantics: it provides the default arguments to ENTRYPOINT and may be
+overridden at container run time.
+@End Reasoning
+@Implementation:
+Same pattern as emit_run_instruction with "CMD " prefix.
+@End Implementation
 Process called "emit_cmd_instruction" that takes emitter_ptr as Integer, cmd_ptr as Integer returns Integer:
     @Reasoning
     Emit CMD instruction: CMD <command> or CMD ["executable", "param1"].
@@ -201,6 +289,15 @@ Process called "emit_cmd_instruction" that takes emitter_ptr as Integer, cmd_ptr
     Return 1
 End Process
 
+@Reasoning:
+`LABEL key=value key=value` accepts multiple key=value pairs on one
+LABEL line per Docker recommended practice (one layer per LABEL).
+Values containing whitespace must be quoted.
+@End Reasoning
+@Implementation:
+Emit "LABEL "; iterate the labels dictionary emitting `key="value"` with
+proper quoting, space-separated. Emit newline.
+@End Implementation
 Process called "emit_label_instruction" that takes emitter_ptr as Integer, label_ptr as Integer returns Integer:
     @Reasoning
     Emit LABEL instruction: LABEL <key>=<value> [<key>=<value> ...].
@@ -246,6 +343,15 @@ Process called "emit_label_instruction" that takes emitter_ptr as Integer, label
     Return 1
 End Process
 
+@Reasoning:
+`EXPOSE port[/protocol]` declares network ports the container listens on.
+Multiple ports can be on one EXPOSE line (space-separated). Protocol is
+`tcp` (default) or `udp`.
+@End Reasoning
+@Implementation:
+Emit "EXPOSE "; iterate ports list, emitting port number followed by
+optional "/protocol" if set; space-separated. Emit newline.
+@End Implementation
 Process called "emit_expose_instruction" that takes emitter_ptr as Integer, expose_ptr as Integer returns Integer:
     @Reasoning
     Emit EXPOSE instruction: EXPOSE <port>[/<protocol>] [<port>[/<protocol>] ...].
@@ -289,6 +395,14 @@ Process called "emit_expose_instruction" that takes emitter_ptr as Integer, expo
     Return 1
 End Process
 
+@Reasoning:
+`ENV key=value` for environment variables. Like LABEL, multiple
+key=value pairs per ENV are recommended for layer efficiency.
+@End Reasoning
+@Implementation:
+Emit "ENV "; iterate the env dictionary as `key=value` (quoted if value
+contains whitespace) space-separated. Emit newline.
+@End Implementation
 Process called "emit_env_instruction" that takes emitter_ptr as Integer, env_ptr as Integer returns Integer:
     @Reasoning
     Emit ENV instruction: ENV <key>=<value> [<key>=<value> ...].
@@ -334,6 +448,16 @@ Process called "emit_env_instruction" that takes emitter_ptr as Integer, env_ptr
     Return 1
 End Process
 
+@Reasoning:
+COPY supports several optional flags: --from=stage for multi-stage builds,
+--chown=user:group, --chmod=mode, --link for layer optimization. Multiple
+sources are space-separated before the destination.
+@End Reasoning
+@Implementation:
+Emit "COPY "; emit any --from/--chown/--chmod/--link flags that are
+non-empty; iterate sources list emitting each space-separated; emit
+destination; newline.
+@End Implementation
 Process called "emit_copy_instruction" that takes emitter_ptr as Integer, copy_ptr as Integer returns Integer:
     @Reasoning
     Emit COPY instruction: COPY [flags] <src>... <dest>.
@@ -400,6 +524,15 @@ Process called "emit_copy_instruction" that takes emitter_ptr as Integer, copy_p
     Return 1
 End Process
 
+@Reasoning:
+ADD is like COPY but with extra capabilities: tar auto-extraction for
+local archive sources, and URL fetch for remote sources. Same flag set
+as COPY plus a --checksum flag for URL fetches.
+@End Reasoning
+@Implementation:
+Emit "ADD "; emit --from/--chown/--chmod/--link/--checksum flags;
+iterate sources; emit destination; newline.
+@End Implementation
 Process called "emit_add_instruction" that takes emitter_ptr as Integer, add_ptr as Integer returns Integer:
     @Reasoning
     Emit ADD instruction: ADD [flags] <src>... <dest>.
@@ -472,6 +605,14 @@ Process called "emit_add_instruction" that takes emitter_ptr as Integer, add_ptr
     Return 1
 End Process
 
+@Reasoning:
+ENTRYPOINT mirrors RUN/CMD in supporting both shell and exec forms.
+Exec form is strongly preferred (it gives proper signal handling).
+@End Reasoning
+@Implementation:
+Emit "ENTRYPOINT "; dispatch on is_exec to emit_json_array or raw shell
+string; emit newline.
+@End Implementation
 Process called "emit_entrypoint_instruction" that takes emitter_ptr as Integer, entrypoint_ptr as Integer returns Integer:
     @Reasoning
     Emit ENTRYPOINT instruction: ENTRYPOINT <command> or ENTRYPOINT ["executable", "param1"].
@@ -498,6 +639,15 @@ Process called "emit_entrypoint_instruction" that takes emitter_ptr as Integer, 
     Return 1
 End Process
 
+@Reasoning:
+VOLUME declares one or more mount points that should be volumes (i.e.,
+external storage). Accepts either JSON array form (preferred for paths
+with spaces) or space-separated shell form.
+@End Reasoning
+@Implementation:
+Emit "VOLUME "; emit either the JSON array or the space-separated path
+list. Newline.
+@End Implementation
 Process called "emit_volume_instruction" that takes emitter_ptr as Integer, volume_ptr as Integer returns Integer:
     @Reasoning
     Emit VOLUME instruction: VOLUME ["/data"] or VOLUME /data.
@@ -528,6 +678,13 @@ Process called "emit_volume_instruction" that takes emitter_ptr as Integer, volu
     Return 1
 End Process
 
+@Reasoning:
+USER sets the UID/GID for subsequent RUN/CMD/ENTRYPOINT. Group is
+optional (default: primary group of user).
+@End Reasoning
+@Implementation:
+Emit "USER " + user; if group is non-empty emit ":" + group; newline.
+@End Implementation
 Process called "emit_user_instruction" that takes emitter_ptr as Integer, user_ptr as Integer returns Integer:
     @Reasoning
     Emit USER instruction: USER <user>[:<group>].
@@ -555,6 +712,13 @@ Process called "emit_user_instruction" that takes emitter_ptr as Integer, user_p
     Return 1
 End Process
 
+@Reasoning:
+`WORKDIR /path` sets the cwd for subsequent instructions. Best practice is
+to use absolute paths; this emitter doesn't validate that.
+@End Reasoning
+@Implementation:
+Emit "WORKDIR " + path + newline.
+@End Implementation
 Process called "emit_workdir_instruction" that takes emitter_ptr as Integer, workdir_ptr as Integer returns Integer:
     @Reasoning
     Emit WORKDIR instruction: WORKDIR /path/to/workdir.
@@ -574,6 +738,13 @@ Process called "emit_workdir_instruction" that takes emitter_ptr as Integer, wor
     Return 1
 End Process
 
+@Reasoning:
+ARG declares a build-time variable: `ARG name[=default_value]`. Default
+value is optional.
+@End Reasoning
+@Implementation:
+Emit "ARG " + name; if default is non-empty emit "=" + default; newline.
+@End Implementation
 Process called "emit_arg_instruction" that takes emitter_ptr as Integer, arg_ptr as Integer returns Integer:
     @Reasoning
     Emit ARG instruction: ARG <name>[=<default>].
@@ -601,6 +772,15 @@ Process called "emit_arg_instruction" that takes emitter_ptr as Integer, arg_ptr
     Return 1
 End Process
 
+@Reasoning:
+ONBUILD wraps another Dockerfile instruction to be deferred until a
+downstream image USES this one as a base. The inner instruction is
+emitted as-is following the "ONBUILD " prefix.
+@End Reasoning
+@Implementation:
+Emit "ONBUILD "; recurse emit_instruction on the wrapped instruction.
+The wrapped emitter handles its own trailing newline.
+@End Implementation
 Process called "emit_onbuild_instruction" that takes emitter_ptr as Integer, onbuild_ptr as Integer returns Integer:
     @Reasoning
     Emit ONBUILD instruction: ONBUILD <INSTRUCTION>.
@@ -627,6 +807,13 @@ Process called "emit_onbuild_instruction" that takes emitter_ptr as Integer, onb
     Return 1
 End Process
 
+@Reasoning:
+STOPSIGNAL sets the signal sent to the main process for container stop.
+Accepts a signal number (e.g. `9`) or name (e.g. `SIGKILL`).
+@End Reasoning
+@Implementation:
+Emit "STOPSIGNAL " + signal + newline.
+@End Implementation
 Process called "emit_stopsignal_instruction" that takes emitter_ptr as Integer, stopsignal_ptr as Integer returns Integer:
     @Reasoning
     Emit STOPSIGNAL instruction: STOPSIGNAL signal.
@@ -646,6 +833,16 @@ Process called "emit_stopsignal_instruction" that takes emitter_ptr as Integer, 
     Return 1
 End Process
 
+@Reasoning:
+HEALTHCHECK has two shapes: NONE (`HEALTHCHECK NONE`) to disable
+inherited healthcheck, or `CMD ...` form with optional --interval,
+--timeout, --start-period, --start-interval, --retries flags.
+@End Reasoning
+@Implementation:
+If is_none flag set, emit "HEALTHCHECK NONE" + newline and return.
+Otherwise emit "HEALTHCHECK "; emit each optional flag that is set;
+emit "CMD " + the wrapped command/array; emit newline.
+@End Implementation
 Process called "emit_healthcheck_instruction" that takes emitter_ptr as Integer, healthcheck_ptr as Integer returns Integer:
     @Reasoning
     Emit HEALTHCHECK instruction: HEALTHCHECK [options] CMD command or HEALTHCHECK NONE.
@@ -718,6 +915,13 @@ Process called "emit_healthcheck_instruction" that takes emitter_ptr as Integer,
     Return 1
 End Process
 
+@Reasoning:
+SHELL overrides the default shell used for the RUN/CMD/ENTRYPOINT shell
+form. Must be a JSON array per Docker spec.
+@End Reasoning
+@Implementation:
+Emit "SHELL "; emit JSON array of the shell command arguments; newline.
+@End Implementation
 Process called "emit_shell_instruction" that takes emitter_ptr as Integer, shell_ptr as Integer returns Integer:
     @Reasoning
     Emit SHELL instruction: SHELL ["executable", "parameters"].
@@ -737,6 +941,14 @@ Process called "emit_shell_instruction" that takes emitter_ptr as Integer, shell
     Return 1
 End Process
 
+@Reasoning:
+MAINTAINER is deprecated in favor of `LABEL maintainer=` but still
+recognized. Emitting it here lets the printer reproduce legacy Dockerfiles
+faithfully.
+@End Reasoning
+@Implementation:
+Emit "MAINTAINER " + name + newline.
+@End Implementation
 Process called "emit_maintainer_instruction" that takes emitter_ptr as Integer, maintainer_ptr as Integer returns Integer:
     @Reasoning
     Emit MAINTAINER instruction: MAINTAINER <name>.
@@ -760,6 +972,17 @@ Note: ==========================================================================
 Note: Main Emission Functions
 Note: ============================================================================
 
+@Reasoning:
+The central instruction dispatcher. Reads the instruction-kind tag and
+routes to the corresponding emit_<kind>_instruction. Centralizes the
+mapping so any new instruction kind requires one new branch here plus
+its dedicated emitter.
+@End Reasoning
+@Implementation:
+Read kind tag from instruction_ptr offset 0. If/Otherwise If chain on
+each Dockerfile instruction tag, calling the appropriate emit_*_instruction.
+Unknown tags fall through with no output.
+@End Implementation
 Process called "emit_instruction" that takes emitter_ptr as Integer, instruction_ptr as Integer returns Integer:
     @Reasoning
     Emit a single Dockerfile instruction AST node.
@@ -864,6 +1087,17 @@ Process called "emit_instruction" that takes emitter_ptr as Integer, instruction
     Return 0
 End Process
 
+@Reasoning:
+Top-level entry point: walks the dockerfile_ast's instruction list and
+dispatches each instruction. Preserves original order which matters
+because Dockerfile semantics depend on instruction order (image layers
+are built sequentially).
+@End Reasoning
+@Implementation:
+Iterate instructions list of dockerfile_ast; call emit_instruction for
+each. No trailing scaffolding because each instruction emits its own
+terminating newline.
+@End Implementation
 Process called "emit_dockerfile" that takes emitter_ptr as Integer, dockerfile_ast_ptr as Integer returns Integer:
     @Reasoning
     Emit a complete Dockerfile AST to source code.

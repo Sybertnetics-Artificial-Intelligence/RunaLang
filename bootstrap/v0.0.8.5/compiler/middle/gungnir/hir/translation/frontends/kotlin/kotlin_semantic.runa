@@ -15,6 +15,36 @@ Note: ================================================================
 Note: Semantic Analyzer Type
 Note: ================================================================
 
+@Reasoning:
+Kotlin has eleven distinct analysis concerns that the semantic pass
+must coordinate: null safety, coroutine suspend-context tracking,
+extension function resolution, sealed-class exhaustiveness, data-class
+component generation, variance (in/out) checking, and smart-cast
+narrowing. Bundling one subsystem handle per concern (rather than
+folding them into one mega-checker) keeps each algorithm replaceable
+and lets early phases initialise lazy state. The two-pointer scope
+model (global_scope plus current_scope) supports nested local scopes
+without copying the whole symbol table on entry/exit; the scope_stack
+holds the saved current_scope of each enclosing block.
+@End Reasoning
+
+@Implementation:
+14 pointer-sized fields totalling 112 bytes (offsets 0-104). Layout:
+- 0: global_scope (Dict of top-level symbols)
+- 8: current_scope (Dict, may equal global_scope at top level)
+- 16: scope_stack (List of saved current_scope handles)
+- 24: type_system (Dict mapping type-name to descriptor)
+- 32: null_safety_checker (24-byte sub-struct)
+- 40: coroutine_analyzer (32-byte sub-struct with suspend-context flag)
+- 48: extension_resolver (Dict: name -> extension function node)
+- 56: sealed_class_checker (Dict)
+- 64: data_class_validator (Dict)
+- 72: variance_analyzer (Dict)
+- 80: smart_cast_tracker (Dict)
+- 88: errors (List of error message strings)
+- 96: warnings (List of warning message strings)
+- 104: has_error (0 or 1, sticky once set)
+@End Implementation
 Type called "KotlinSemanticAnalyzer":
     global_scope as Integer
     current_scope as Integer
@@ -36,6 +66,27 @@ Note: ================================================================
 Note: Analyzer Creation
 Note: ================================================================
 
+@Reasoning:
+Constructs every subsystem eagerly so callers do not have to lazy-init
+on first use - the cost is small (a dozen small Dict/List allocations)
+and the up-front cost lets the analyse path stay branch-light. Storing
+global_scope at both offset 0 and offset 8 makes current_scope alias
+global_scope on construction, so top-level declarations land in the
+global table without any extra plumbing.
+@End Reasoning
+
+@Implementation:
+Allocates the 112-byte analyzer struct, returning 0 on failure. Creates
+the global_scope and scope_stack via Dict/List primitives, then
+constructs all eight specialised subsystems (type_system, null checker,
+coroutine analyzer, extension resolver, sealed checker, data validator,
+variance analyzer, smart-cast tracker) via their respective
+create_*_*-helpers. Allocates errors and warnings lists. Writes each
+handle into its corresponding offset (0 through 96 in 8-byte strides),
+deliberately storing global_scope at both offset 0 and offset 8 so
+current_scope points to global_scope until an explicit scope push.
+Initialises has_error (offset 104) to 0.
+@End Implementation
 Process called "create_kotlin_semantic_analyzer" that takes nothing returns Integer:
     Let analyzer_size be 112
     Let analyzer be proc allocate from Layout with analyzer_size
@@ -81,6 +132,30 @@ Note: ================================================================
 Note: Main Analysis Entry Point
 Note: ================================================================
 
+@Reasoning:
+The seven-phase ordering is deliberate and not commutative: declaration
+collection must run first because every later phase queries the symbol
+tables it builds; type resolution must precede null-safety so the
+nullability annotations on types are visible to ?./!!/?: checks;
+coroutine validation depends on resolved suspend modifiers; special-
+class validation expects sealed/data registrations from phase 1; and
+variance and smart-cast tracking want the full type environment.
+Returning 0 when has_error is set after the seven phases gives callers
+a single boolean success indicator while still allowing all phases to
+accumulate diagnostics for batch reporting.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately on null analyzer. On null program_node, records
+"Null program node" via add_error and returns 0. Otherwise calls the
+seven phase functions in fixed order: collect_kotlin_declarations,
+resolve_kotlin_types, check_null_safety, validate_coroutines,
+validate_special_classes, check_variance, track_smart_casts. After all
+seven complete (each accumulates errors into the analyzer's error list
+without aborting), reads has_error (offset 104) and returns 0 if any
+phase set it, otherwise returns 1. Diagnostics survive the return so
+callers can read errors/warnings lists via get_errors/get_warnings.
+@End Implementation
 Process called "analyze_kotlin_program" that takes analyzer as Integer, program_node as Integer returns Integer:
     If analyzer is equal to 0:
         Return 0
@@ -138,6 +213,28 @@ Constant KOTLIN_DATA_CLASS as Integer is 108
 Constant KOTLIN_SEALED_CLASS as Integer is 109
 Constant KOTLIN_VALUE_CLASS as Integer is 110
 
+@Reasoning:
+First analysis phase. Walks every declaration node and registers it
+in the appropriate symbol table so subsequent phases can resolve
+forward references without a separate name-resolution pass. The chained
+Otherwise-If pyramid is a tag dispatch over the eleven KOTLIN_*
+declaration constants - written without a hashtable because the constant
+set is fixed and small enough that direct integer comparison wins on
+both code size and branch predictability.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately when node is null. Reads node_type at offset 0
+of the AST node. Tests against KOTLIN_CLASS_DECLARATION,
+KOTLIN_OBJECT_DECLARATION, KOTLIN_INTERFACE_DECLARATION,
+KOTLIN_FUNCTION_DECLARATION, KOTLIN_PROPERTY_DECLARATION,
+KOTLIN_EXTENSION_FUNCTION, KOTLIN_ENUM_DECLARATION,
+KOTLIN_ANNOTATION_CLASS, KOTLIN_DATA_CLASS, KOTLIN_SEALED_CLASS, and
+KOTLIN_VALUE_CLASS in sequence, dispatching to the matching collector.
+Non-matching node_types fall through silently (the walk is driven from
+the caller so the dispatcher does not need to recurse into children
+here).
+@End Implementation
 Process called "collect_kotlin_declarations" that takes analyzer as Integer, node as Integer returns Integer:
     If node is equal to 0:
         Return 0
@@ -227,6 +324,25 @@ Process called "collect_kotlin_declarations" that takes analyzer as Integer, nod
     Return 1
 End Process
 
+@Reasoning:
+Top-level classes share one global namespace, so a same-name collision
+is a hard semantic error rather than shadowing - this matches the
+Kotlin spec where class declarations in the same package must be
+unique. The duplicate check runs before the symbol is inserted so the
+error message can include the offending name and the first declaration
+remains registered.
+@End Reasoning
+
+@Implementation:
+Reads the class name from offset 16 of class_node and the global_scope
+handle from offset 0 of the analyzer. Queries the dict for a prior
+registration; if non-zero, concatenates "Duplicate class declaration: "
+with the name via StringCore.concat, records the error via add_error
+(which also sets has_error), and returns 0. Otherwise creates a class
+symbol via create_class_symbol (currently returns the AST node itself,
+the symbol shape is the AST node identity), inserts it into
+global_scope under class_name, and returns 1.
+@End Implementation
 Process called "collect_class_declaration" that takes analyzer as Integer, class_node as Integer returns Integer:
     Let class_name be proc memory_get_int64 from Layout with class_node, 16
     Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
@@ -245,6 +361,21 @@ Process called "collect_class_declaration" that takes analyzer as Integer, class
     Return 1
 End Process
 
+@Reasoning:
+`object` declarations are Kotlin's singleton form - they live in the
+global namespace alongside classes but their symbol shape is identical
+from a name-resolution perspective. No duplicate check here because
+Kotlin allows top-level object declarations to coexist with same-named
+type aliases or extension functions; collisions with classes are
+caught at link time when the symbol is actually referenced.
+@End Reasoning
+
+@Implementation:
+Reads object_name from offset 16 of object_node and global_scope from
+offset 0 of the analyzer. Allocates an object symbol via
+create_object_symbol (currently aliases the AST node) and inserts it
+into global_scope under object_name via Dict.put. Returns 1.
+@End Implementation
 Process called "collect_object_declaration" that takes analyzer as Integer, object_node as Integer returns Integer:
     Let object_name be proc memory_get_int64 from Layout with object_node, 16
     Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
@@ -255,6 +386,21 @@ Process called "collect_object_declaration" that takes analyzer as Integer, obje
     Return 1
 End Process
 
+@Reasoning:
+Interfaces register in the same global namespace as classes and
+objects so that `implements` and supertype clauses can look them up
+through the single global_scope. Symbol-shape stays uniform - the AST
+node itself is the symbol - to keep the resolver simple; interface-
+specific structure (abstract members, default methods) is recovered
+by walking the AST when needed.
+@End Reasoning
+
+@Implementation:
+Reads interface_name at offset 16 of the interface AST node and
+global_scope at offset 0 of the analyzer. Builds an interface symbol
+via create_interface_symbol (AST-node alias) and inserts under
+interface_name. Returns 1.
+@End Implementation
 Process called "collect_interface_declaration" that takes analyzer as Integer, interface_node as Integer returns Integer:
     Let interface_name be proc memory_get_int64 from Layout with interface_node, 16
     Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
@@ -265,6 +411,23 @@ Process called "collect_interface_declaration" that takes analyzer as Integer, i
     Return 1
 End Process
 
+@Reasoning:
+Functions register into current_scope (not global_scope) because
+functions can be top-level OR nested in a block/class - using
+current_scope correctly handles both cases: at top level current_scope
+aliases global_scope, and inside a nested block it points to the
+local scope dict pushed when the block was entered.
+@End Reasoning
+
+@Implementation:
+Reads func_name at offset 16 of func_node and current_scope at offset
+8 of the analyzer (intentionally not offset 0, so nested functions
+land in the enclosing local scope). Creates a function symbol via
+create_function_symbol and registers it under func_name in
+current_scope via Dict.put. Returns 1. Overload disambiguation by
+parameter signature is not performed here - that responsibility lives
+in the call-site resolver during type checking.
+@End Implementation
 Process called "collect_function_declaration" that takes analyzer as Integer, func_node as Integer returns Integer:
     Let func_name be proc memory_get_int64 from Layout with func_node, 16
     Let current_scope be proc memory_get_int64 from Layout with analyzer, 8
@@ -275,6 +438,23 @@ Process called "collect_function_declaration" that takes analyzer as Integer, fu
     Return 1
 End Process
 
+@Reasoning:
+Properties (val/var with optional get/set) register into current_scope
+for the same reason as functions: a property declared inside a class
+body needs to land in the class's local scope, while a top-level
+property goes into global_scope (which equals current_scope at the
+outer level). The symbol carries the full AST node so later phases can
+inspect the property's type, getter, setter, and backing field.
+@End Reasoning
+
+@Implementation:
+Reads prop_name at offset 16 of prop_node and current_scope at offset
+8 of the analyzer. Builds a property symbol via create_property_symbol
+(AST-node alias) and inserts under prop_name in current_scope. Returns
+1. Duplicate detection within the same scope is intentionally deferred
+to a later pass that can also coordinate with companion-object member
+visibility rules.
+@End Implementation
 Process called "collect_property_declaration" that takes analyzer as Integer, prop_node as Integer returns Integer:
     Let prop_name be proc memory_get_int64 from Layout with prop_node, 16
     Let current_scope be proc memory_get_int64 from Layout with analyzer, 8
@@ -285,6 +465,24 @@ Process called "collect_property_declaration" that takes analyzer as Integer, pr
     Return 1
 End Process
 
+@Reasoning:
+Extension functions do not live in the normal scope tables because
+they are resolved by receiver type at call sites, not by lexical name
+lookup alone. The extension_resolver at offset 48 maintains its own
+name->node mapping; later resolution code consults both the receiver
+type's member set and this extension dictionary, with extensions
+taking lower priority than declared members per Kotlin's resolution
+rules.
+@End Reasoning
+
+@Implementation:
+Reads ext_name at offset 16 of ext_node and the extension_resolver
+handle at offset 48 of the analyzer. Delegates the registration to
+register_extension(resolver, name, node), which inserts the AST node
+into the resolver's dict keyed by ext_name. Returns 1. The receiver
+type encoded inside ext_node is not consulted here - resolution time
+will read it back from the AST when picking among candidates.
+@End Implementation
 Process called "collect_extension_function" that takes analyzer as Integer, ext_node as Integer returns Integer:
     Let ext_name be proc memory_get_int64 from Layout with ext_node, 16
     Let extension_resolver be proc memory_get_int64 from Layout with analyzer, 48
@@ -294,6 +492,25 @@ Process called "collect_extension_function" that takes analyzer as Integer, ext_
     Return 1
 End Process
 
+@Reasoning:
+Data classes get their own validator registry (offset 64) because the
+compiler must later auto-generate equals/hashCode/toString/copy/component
+N methods - the validator walks each registered data class during the
+special-class validation phase and checks the invariants the generation
+relies on (at least one primary-constructor parameter, no abstract
+methods, no inheritance from non-data classes, etc.).
+@End Reasoning
+
+@Implementation:
+Reads class_name at offset 16 of data_node and the data_validator
+handle at offset 64 of the analyzer. Delegates to register_data_class,
+which inserts the AST node into the validator's dict under class_name.
+Returns 1. The data class is intentionally NOT also inserted into
+global_scope here - that is the responsibility of the enclosing
+collect_class_declaration if the parser routes data classes through
+both paths; otherwise a later phase reconciles the validator's
+inventory with global_scope.
+@End Implementation
 Process called "collect_data_class" that takes analyzer as Integer, data_node as Integer returns Integer:
     Let class_name be proc memory_get_int64 from Layout with data_node, 16
     Let data_validator be proc memory_get_int64 from Layout with analyzer, 64
@@ -303,6 +520,24 @@ Process called "collect_data_class" that takes analyzer as Integer, data_node as
     Return 1
 End Process
 
+@Reasoning:
+Sealed classes need their own checker registry (offset 56) because
+the exhaustiveness analysis on `when` expressions needs to enumerate
+every direct subclass of a sealed type, and that information has to
+be collected from declarations that may be siblings or nested under
+the same file. Registering the sealed class on the checker dict lets
+the later check phase iterate every sealed-class entry without
+re-walking the AST.
+@End Reasoning
+
+@Implementation:
+Reads class_name from offset 16 of sealed_node and the
+sealed_class_checker handle from offset 56 of the analyzer. Delegates
+to register_sealed_class(checker, name, node) which inserts the AST
+node under class_name in the checker's dict. Returns 1. Subclass
+enumeration is populated by a later pass that walks each file looking
+for declarations inheriting from a registered sealed class.
+@End Implementation
 Process called "collect_sealed_class" that takes analyzer as Integer, sealed_node as Integer returns Integer:
     Let class_name be proc memory_get_int64 from Layout with sealed_node, 16
     Let sealed_checker be proc memory_get_int64 from Layout with analyzer, 56
@@ -316,6 +551,24 @@ Note: ================================================================
 Note: Type Resolution
 Note: ================================================================
 
+@Reasoning:
+Recursive walker that visits every node in the AST and dispatches the
+four type-shape nodes (TYPE_REFERENCE=200, NULLABLE_TYPE=201,
+GENERIC_TYPE=202, FUNCTION_TYPE=203) to dedicated resolvers. For
+non-type nodes it recurses into children so a single top-level call
+resolves every type-shaped subtree in the program. Returning early
+from the four type cases avoids redundant child iteration because the
+specialised resolvers handle their own subtrees.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately on null node. Reads node_type at offset 0. If it
+matches one of the four type shapes, Return-dispatches to the matching
+resolver (resolve_type_reference, resolve_nullable_type,
+resolve_generic_type, resolve_function_type). Otherwise reads the
+children list at offset 8; if non-zero, iterates 0..size-1, calling
+resolve_kotlin_types on each child. Returns 1 after the walk.
+@End Implementation
 Process called "resolve_kotlin_types" that takes analyzer as Integer, node as Integer returns Integer:
     If node is equal to 0:
         Return 0
@@ -361,6 +614,23 @@ Process called "resolve_kotlin_types" that takes analyzer as Integer, node as In
     Return 1
 End Process
 
+@Reasoning:
+Validates that a named type reference resolves to either a user-defined
+type in global_scope or one of the 17 Kotlin builtin types. Falling
+back to the builtin check after the scope miss avoids polluting
+global_scope with the entire prelude on every analyzer construction
+while still catching genuine undefined-type errors.
+@End Reasoning
+
+@Implementation:
+Reads type_name at offset 16 of type_node and global_scope at offset 0
+of the analyzer. Queries global_scope for the symbol; if non-zero,
+returns 1 (resolution succeeded). Otherwise calls
+is_kotlin_builtin_type with type_name to check the prelude name list.
+If neither matches, concatenates "Undefined type: " with the name,
+records the error via add_error, and returns 0. Returns 1 in the
+builtin-match case.
+@End Implementation
 Process called "resolve_type_reference" that takes analyzer as Integer, type_node as Integer returns Integer:
     Let type_name be proc memory_get_int64 from Layout with type_node, 16
     Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
@@ -379,6 +649,21 @@ Process called "resolve_type_reference" that takes analyzer as Integer, type_nod
     Return 1
 End Process
 
+@Reasoning:
+A nullable type `T?` is structurally a nullable wrapper around a base
+type T. Resolution responsibility is therefore one level of unwrap:
+the base type must resolve, but the nullability suffix carries no
+additional resolution requirement of its own. Keeping the unwrap
+separate lets the null-safety phase see the nullability annotation
+without needing to re-parse the type shape.
+@End Reasoning
+
+@Implementation:
+Reads base_type at offset 16 of nullable_node. Delegates resolution to
+resolve_type_reference(analyzer, base_type). Returns 1 unconditionally
+- any failure inside resolve_type_reference will have already pushed
+an error onto the analyzer's error list and set has_error.
+@End Implementation
 Process called "resolve_nullable_type" that takes analyzer as Integer, nullable_node as Integer returns Integer:
     Let base_type be proc memory_get_int64 from Layout with nullable_node, 16
 
@@ -387,6 +672,23 @@ Process called "resolve_nullable_type" that takes analyzer as Integer, nullable_
     Return 1
 End Process
 
+@Reasoning:
+Generic types like `List<String>` have two distinct resolution
+obligations: the base constructor (List) must be a known type, and
+every type argument (String, here) must also resolve. The arguments
+flow through resolve_kotlin_types rather than resolve_type_reference
+because a type argument can itself be a nullable, generic, or
+function type that needs its own recursive resolution.
+@End Reasoning
+
+@Implementation:
+Reads base_type at offset 16 and type_args (a List handle) at offset
+24. Resolves base_type via resolve_type_reference. If type_args is
+non-zero, iterates 0..size-1 over the list, calling resolve_kotlin_types
+on each argument so nested generics and nullable args recurse
+properly. Returns 1; sub-resolver errors propagate through the
+analyzer's error list.
+@End Implementation
 Process called "resolve_generic_type" that takes analyzer as Integer, generic_node as Integer returns Integer:
     Let base_type be proc memory_get_int64 from Layout with generic_node, 16
     Let type_args be proc memory_get_int64 from Layout with generic_node, 24
@@ -406,6 +708,24 @@ Process called "resolve_generic_type" that takes analyzer as Integer, generic_no
     Return 1
 End Process
 
+@Reasoning:
+Function types `(P1, P2) -> R` carry a parameter type list and a
+return type, both of which may themselves be arbitrary type shapes
+(including nested function types like `(Int) -> ((String) -> Unit)`).
+Resolving both sides via resolve_kotlin_types (rather than
+resolve_type_reference) gives the full recursive treatment needed for
+higher-order signatures.
+@End Reasoning
+
+@Implementation:
+Reads param_types (a List handle) at offset 16 and return_type at
+offset 24 of func_type_node. If param_types is non-zero, iterates
+0..size-1, recursively resolving each parameter via
+resolve_kotlin_types. If return_type is non-zero, recursively resolves
+it the same way. Returns 1. Permitting a null param_types or
+return_type covers the case where the parser left the slot empty
+because of a syntax form like the unit-return arrow `-> Unit`.
+@End Implementation
 Process called "resolve_function_type" that takes analyzer as Integer, func_type_node as Integer returns Integer:
     Let param_types be proc memory_get_int64 from Layout with func_type_node, 16
     Let return_type be proc memory_get_int64 from Layout with func_type_node, 24
@@ -431,6 +751,24 @@ Note: ================================================================
 Note: Null Safety Checking
 Note: ================================================================
 
+@Reasoning:
+The null-safety pass detects four specific syntactic shapes that
+Kotlin uses to interact with nullability: safe-call (?.), not-null
+assertion (!!), Elvis (?:), and nullable type usage. It does not flag
+plain references because nullability of identifier reads is governed
+by smart-cast tracking in phase 7. Recursive descent over children
+keeps the walker AST-agnostic - no need to enumerate every wrapping
+node kind here.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately on null node. Reads node_type at offset 0.
+Dispatches to check_safe_call (300), check_not_null_assertion (301),
+check_elvis_operator (302), or check_nullable_type_usage (303); each
+returns early so the walker does not double-traverse the dispatched
+node. For any other node type, reads the children list at offset 8 and
+recursively calls check_null_safety on each child. Returns 1.
+@End Implementation
 Process called "check_null_safety" that takes analyzer as Integer, node as Integer returns Integer:
     If node is equal to 0:
         Return 0
@@ -476,6 +814,24 @@ Process called "check_null_safety" that takes analyzer as Integer, node as Integ
     Return 1
 End Process
 
+@Reasoning:
+Safe call `expr?.member` is only meaningful when expr can be null.
+Applying ?. to a non-nullable target is a code-smell warning rather
+than a hard error because the behaviour is well-defined (it is
+equivalent to the unsafe member access in that case) - flagging it
+helps catch refactor-leftovers where a type became non-nullable but
+the call sites were not updated.
+@End Reasoning
+
+@Implementation:
+Reads target expression at offset 16 of safe_call_node. Calls
+infer_expression_type to obtain the target's static type, then
+is_nullable_type to check the nullability flag. When is_nullable
+returns 0 (target type is non-nullable), records "Unnecessary safe
+call on non-nullable type" as a warning (not an error - the program
+still compiles). Returns 1 in all paths so the analysis continues
+on other nodes.
+@End Implementation
 Process called "check_safe_call" that takes analyzer as Integer, safe_call_node as Integer returns Integer:
     Let target be proc memory_get_int64 from Layout with safe_call_node, 16
 
@@ -489,6 +845,22 @@ Process called "check_safe_call" that takes analyzer as Integer, safe_call_node 
     Return 1
 End Process
 
+@Reasoning:
+The not-null assertion `expr!!` only has runtime effect when the target
+is nullable; applied to a non-nullable expression it is a no-op that
+hints the developer thought a value might be nullable when in fact it
+is not. Warning (not erroring) lets the compilation succeed while
+flagging the redundancy for the developer.
+@End Reasoning
+
+@Implementation:
+Reads target at offset 16 of assertion_node. Infers its static type
+via infer_expression_type, then queries is_nullable_type. When
+is_nullable is 0, records "Unnecessary not-null assertion on
+non-nullable type" via add_warning. Returns 1. No NPE-risk analysis is
+done here for the genuinely-nullable case because the assertion is the
+user's explicit signal that they accept that risk.
+@End Implementation
 Process called "check_not_null_assertion" that takes analyzer as Integer, assertion_node as Integer returns Integer:
     Let target be proc memory_get_int64 from Layout with assertion_node, 16
 
@@ -502,6 +874,24 @@ Process called "check_not_null_assertion" that takes analyzer as Integer, assert
     Return 1
 End Process
 
+@Reasoning:
+The Elvis operator `a ?: b` evaluates to a when a is non-null,
+otherwise to b. When the static type of a is already non-nullable the
+right branch is unreachable and the expression devolves to `a` - a
+strong signal of a dead-code defect or a stale refactor that the user
+should look at.
+@End Reasoning
+
+@Implementation:
+Reads left at offset 16 and right at offset 24 of elvis_node. Infers
+the type of left via infer_expression_type, then queries
+is_nullable_type. When is_nullable returns 0 (left is non-nullable),
+records "Elvis operator on non-nullable type always evaluates to left
+side" as a warning. The right operand is intentionally not analysed
+here because its presence is not itself the defect - it is the
+combination of a non-nullable left with any right at all that triggers
+the warning.
+@End Implementation
 Process called "check_elvis_operator" that takes analyzer as Integer, elvis_node as Integer returns Integer:
     Let left be proc memory_get_int64 from Layout with elvis_node, 16
     Let right be proc memory_get_int64 from Layout with elvis_node, 24
@@ -516,6 +906,23 @@ Process called "check_elvis_operator" that takes analyzer as Integer, elvis_node
     Return 1
 End Process
 
+@Reasoning:
+Hook for the per-occurrence nullable-type validation. Separate from
+resolve_nullable_type because the resolver runs in phase 2 and only
+cares about base-type resolvability, while this check runs in phase 3
+alongside the other null-safety checks and is the natural place to
+add usage-site rules (e.g. flagging nullable-of-nullable `T??` once
+the parser exposes them). The current pass-through is deliberate: no
+rule has yet been promoted from research to enforced, and returning
+1 keeps the dispatcher in check_null_safety simple.
+@End Reasoning
+
+@Implementation:
+Returns 1 unconditionally. Any future usage-rule additions (nullable-
+of-nullable detection, nullable on Nothing, nullable on platform
+types) will be implemented here, reading from nullable_node and
+recording warnings/errors as needed.
+@End Implementation
 Process called "check_nullable_type_usage" that takes analyzer as Integer, nullable_node as Integer returns Integer:
     Note: Verify nullable types are used correctly
     Return 1
@@ -525,6 +932,23 @@ Note: ================================================================
 Note: Coroutine Validation
 Note: ================================================================
 
+@Reasoning:
+Kotlin coroutines impose a coloring rule: `suspend` functions can only
+be invoked from another `suspend` function or from a coroutine
+builder like `launch`/`async`. The validator walks the AST tracking
+whether the current node sits inside a suspend context, dispatching
+on three coroutine-relevant node kinds (suspend declaration, builder
+invocation, suspend call). Non-coroutine nodes still need traversal
+because suspend calls can appear deep inside ordinary expressions.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Reads node_type at offset 0. Dispatches to
+validate_suspend_function (400), validate_coroutine_builder (401), or
+validate_suspend_call (402); each returns early so the wrapping walker
+does not redundantly traverse the dispatched subtree. For non-coroutine
+nodes, reads children at offset 8 and recurses into each. Returns 1.
+@End Implementation
 Process called "validate_coroutines" that takes analyzer as Integer, node as Integer returns Integer:
     If node is equal to 0:
         Return 0
@@ -564,6 +988,25 @@ Process called "validate_coroutines" that takes analyzer as Integer, node as Int
     Return 1
 End Process
 
+@Reasoning:
+Walking into a suspend function body establishes a coroutine context
+so that any suspend call inside the body validates as legal. The
+enter/exit pairing must be balanced even on error paths because
+unbalanced calls would corrupt the suspend-context flag for sibling
+declarations. Using a single integer flag (rather than a counter) is
+sufficient because Kotlin does not nest suspend bodies inside each
+other syntactically without a builder boundary.
+@End Reasoning
+
+@Implementation:
+Reads the coroutine_analyzer handle at offset 40. Calls
+enter_suspend_context (which sets the suspend flag inside the
+coroutine_analyzer to 1). Reads the function body at offset 32 of
+suspend_func and recursively validates it via validate_coroutines.
+Calls exit_suspend_context (resets the flag to 0). Returns 1. The
+enter/exit pair sandwiches the recursion so any suspend-call check
+inside the body sees the active context.
+@End Implementation
 Process called "validate_suspend_function" that takes analyzer as Integer, suspend_func as Integer returns Integer:
     Note: Verify suspend function usage is correct
 
@@ -581,6 +1024,23 @@ Process called "validate_suspend_function" that takes analyzer as Integer, suspe
     Return 1
 End Process
 
+@Reasoning:
+Coroutine builders open a fresh suspend context. The only builder that
+needs special validation today is `async`, because it returns a
+Deferred<T> that must be awaited (or the work is silently discarded).
+Other builders (launch, runBlocking, withContext) do not require
+post-hoc handling - their return is either Job or T, which has no
+fire-and-forget hazard. Future builders that introduce new hazards
+extend this dispatch.
+@End Reasoning
+
+@Implementation:
+Reads builder_name at offset 16 of builder_node. Compares against
+"async" via StringCore.equals. On match, delegates to
+check_deferred_usage which walks the builder_node looking for an
+.await() call or other consumer of the Deferred. Returns 1. Non-async
+builders return 1 without further checking.
+@End Implementation
 Process called "validate_coroutine_builder" that takes analyzer as Integer, builder_node as Integer returns Integer:
     Note: Verify coroutine builders (launch, async) are used correctly
 
@@ -594,6 +1054,24 @@ Process called "validate_coroutine_builder" that takes analyzer as Integer, buil
     Return 1
 End Process
 
+@Reasoning:
+This is the load-bearing check of the coroutine coloring system:
+suspend functions cannot be invoked from ordinary code. The check is
+straightforward because the walker has already maintained the
+suspend-context flag through validate_suspend_function entries and
+coroutine builder bodies; this routine just consults the flag at the
+call site.
+@End Reasoning
+
+@Implementation:
+Reads coroutine_analyzer at offset 40 of the analyzer. Queries
+is_in_suspend_context (reads offset 0 of the coroutine analyzer for
+the suspend flag). If 0, records "Suspend function can only be called
+from coroutine or another suspend function" as an error via add_error
+(which also sets has_error to 1), and returns 0 to signal failure.
+Otherwise returns 1. The call_node itself is not introspected because
+the rule applies uniformly to any tagged SUSPEND_CALL.
+@End Implementation
 Process called "validate_suspend_call" that takes analyzer as Integer, call_node as Integer returns Integer:
     Note: Verify suspend function is called from suspend context
 
@@ -612,6 +1090,24 @@ Note: ================================================================
 Note: Special Class Validation
 Note: ================================================================
 
+@Reasoning:
+Once phase 1 has populated the data_validator and sealed_class_checker
+registries, validation can iterate those registries directly rather
+than re-walking the AST. Splitting data-class validation from
+sealed-class validation lets each rule set evolve independently and
+keeps the dispatch table for special classes flat.
+@End Reasoning
+
+@Implementation:
+Reads the data_validator handle at offset 64 and the
+sealed_class_checker handle at offset 56. Delegates to
+validate_all_data_classes(validator, analyzer) and
+validate_all_sealed_classes(checker, analyzer) which walk their
+internal dicts and post errors to the analyzer for any violations.
+Returns 1. The node parameter is currently unused because the
+registries already point to every relevant declaration; it is kept
+for signature uniformity with the other phase entry points.
+@End Implementation
 Process called "validate_special_classes" that takes analyzer as Integer, node as Integer returns Integer:
     Let data_validator be proc memory_get_int64 from Layout with analyzer, 64
     Let sealed_checker be proc memory_get_int64 from Layout with analyzer, 56
@@ -626,6 +1122,24 @@ Note: ================================================================
 Note: Variance Checking
 Note: ================================================================
 
+@Reasoning:
+Kotlin's declaration-site variance (`in`/`out` on type parameters)
+needs validation against the usage positions of the parameter inside
+the class - `out T` may only appear in covariant positions, `in T` only
+in contravariant positions. Phase 6 walks the AST, dispatches each
+VARIANCE_ANNOTATION node to the per-occurrence checker, and recurses
+into children for every other node so deeply nested generic
+declarations are reached.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Reads node_type at offset 0. If equal to 500
+(VARIANCE_ANNOTATION), delegates to check_variance_annotation and
+returns its result. Otherwise reads children at offset 8 and recurses
+into each via check_variance. Returns 1. The pass intentionally does
+not short-circuit on errors inside check_variance_annotation - all
+variance violations should be reported in one analysis pass.
+@End Implementation
 Process called "check_variance" that takes analyzer as Integer, node as Integer returns Integer:
     If node is equal to 0:
         Return 0
@@ -653,6 +1167,21 @@ Process called "check_variance" that takes analyzer as Integer, node as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Per-occurrence variance check, delegated to the variance_analyzer
+subsystem so that variance rules (and their internal state, like the
+position-of-occurrence stack) stay encapsulated. This routine is a
+thin adapter so the dispatcher in check_variance can hand off without
+unpacking the variance state itself.
+@End Reasoning
+
+@Implementation:
+Reads the variance_analyzer handle at offset 72 of the analyzer.
+Delegates to analyze_variance(variance_analyzer, variance_node), which
+inspects the variance modifier (in/out) and walks the enclosing
+declaration to verify usage positions. Returns 1; any violations are
+posted to the analyzer's error list inside analyze_variance.
+@End Implementation
 Process called "check_variance_annotation" that takes analyzer as Integer, variance_node as Integer returns Integer:
     Let variance_analyzer be proc memory_get_int64 from Layout with analyzer, 72
 
@@ -665,6 +1194,23 @@ Note: ================================================================
 Note: Smart Cast Tracking
 Note: ================================================================
 
+@Reasoning:
+Smart casts are the mechanism by which Kotlin narrows a variable's
+static type within a branch after an `is` check or a `when` arm test.
+Phase 7 records each such narrowing into the smart_cast_tracker so
+that later phases (and the backend) can emit unchecked reads or
+permit member access that the unnarrowed type would not allow. The
+two recognised shapes are direct `is` checks and `when` expressions
+where one or more arms perform type tests.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Reads node_type at offset 0. Dispatches to
+track_is_check (600) or track_when_smart_casts (601), each of which
+returns early so the wrapping walker does not double-traverse. For
+non-test nodes, reads children at offset 8 and recurses via
+track_smart_casts. Returns 1.
+@End Implementation
 Process called "track_smart_casts" that takes analyzer as Integer, node as Integer returns Integer:
     If node is equal to 0:
         Return 0
@@ -698,6 +1244,19 @@ Process called "track_smart_casts" that takes analyzer as Integer, node as Integ
     Return 1
 End Process
 
+@Reasoning:
+A direct `x is T` test in a condition narrows x's type to T within
+the then-branch. Recording that narrowing on the smart_cast_tracker
+makes the information available to later phases that need to know
+which type each identifier currently has at each program point.
+@End Reasoning
+
+@Implementation:
+Reads the smart_cast_tracker handle at offset 80 of the analyzer.
+Delegates to record_smart_cast(tracker, is_check_node), which extracts
+the target variable and target type from the is_check_node and
+registers the narrowing under the current scope. Returns 1.
+@End Implementation
 Process called "track_is_check" that takes analyzer as Integer, is_check_node as Integer returns Integer:
     Let smart_cast_tracker be proc memory_get_int64 from Layout with analyzer, 80
 
@@ -706,6 +1265,22 @@ Process called "track_is_check" that takes analyzer as Integer, is_check_node as
     Return 1
 End Process
 
+@Reasoning:
+`when (x) { is T -> ... is U -> ... }` narrows x to a different type
+in each arm, and additionally the final `else` arm gets x narrowed to
+"anything not T or U" - a more complex shape than a single is-check.
+Delegating to the smart_cast_tracker's analyze_when_branches keeps
+the per-arm narrowing logic out of this dispatcher.
+@End Reasoning
+
+@Implementation:
+Reads the smart_cast_tracker handle at offset 80 of the analyzer.
+Delegates to analyze_when_branches(tracker, when_node), which walks
+each arm, identifies the type tests, and records per-arm narrowings
+into the tracker's scope-keyed map. Returns 1; any failures or
+warnings are posted into the analyzer's diagnostics inside the
+delegate.
+@End Implementation
 Process called "track_when_smart_casts" that takes analyzer as Integer, when_node as Integer returns Integer:
     Let smart_cast_tracker be proc memory_get_int64 from Layout with analyzer, 80
 
@@ -718,6 +1293,28 @@ Note: ================================================================
 Note: Helper Functions
 Note: ================================================================
 
+@Reasoning:
+Hard-coded recognition list for the 17 Kotlin prelude types that
+resolve_type_reference treats as always-defined. Using direct string
+comparison rather than a prepopulated dict keeps the prelude check
+free of allocation and avoids needing to seed global_scope with
+prelude entries on every analyzer construction. The set covers the
+six numeric primitives (Int, Long, Short, Byte, Double, Float), the
+two non-numeric primitives (Boolean, Char), and the universal types
+(String, Unit, Nothing, Any) plus the four standard collection roots
+(List, Map, Set, Array).
+@End Reasoning
+
+@Implementation:
+Walks a nested Otherwise-If chain comparing type_name against the 17
+prelude names via StringCore.equals. Any match returns 1 immediately.
+The final fallthrough (no match) returns 0. Recognised names:
+"Int", "Long", "Short", "Byte", "Double", "Float", "Boolean", "Char",
+"String", "Unit", "Nothing", "Any", "List", "Map", "Set", "Array".
+Generic-parameterised variants like List<T> resolve through this
+function via their base name; the parameter list is handled separately
+by resolve_generic_type.
+@End Implementation
 Process called "is_kotlin_builtin_type" that takes type_name as String returns Integer:
     If proc equals from StringCore with type_name, "Int":
         Return 1
@@ -801,6 +1398,20 @@ Process called "is_kotlin_builtin_type" that takes type_name as String returns I
     Return 0
 End Process
 
+@Reasoning:
+Error registration is the single place that sets has_error to 1. By
+funnelling every error report through this routine, the analyser
+guarantees that the post-analysis `if has_error` check in
+analyze_kotlin_program reliably reflects whether any phase recorded a
+hard failure. Warnings deliberately bypass this routine because they
+do not constitute a compilation failure.
+@End Reasoning
+
+@Implementation:
+Reads the errors list handle at offset 88. Appends the message string
+via List.append. Sets the has_error flag at offset 104 to 1 (sticky -
+never cleared during a single analysis run). Returns 1.
+@End Implementation
 Process called "add_error" that takes analyzer as Integer, message as String returns Integer:
     Let errors be proc memory_get_int64 from Layout with analyzer, 88
     proc append from List with errors, message
@@ -808,16 +1419,47 @@ Process called "add_error" that takes analyzer as Integer, message as String ret
     Return 1
 End Process
 
+@Reasoning:
+Warnings convey non-blocking advisories - unused safe calls,
+redundant !! assertions, dead Elvis branches - and so must not affect
+the has_error flag. Keeping warnings entirely separate from errors
+means a clean compilation with non-empty warnings still returns 1
+from analyze_kotlin_program.
+@End Reasoning
+
+@Implementation:
+Reads the warnings list handle at offset 96. Appends the message
+string via List.append. Returns 1. The analyser's has_error flag at
+offset 104 is intentionally not touched.
+@End Implementation
 Process called "add_warning" that takes analyzer as Integer, message as String returns Integer:
     Let warnings be proc memory_get_int64 from Layout with analyzer, 96
     proc append from List with warnings, message
     Return 1
 End Process
 
+@Reasoning:
+Public accessor for the accumulated error list. Returns the live List
+handle (not a copy) because the analyzer owns the list and callers
+need only read access for diagnostic emission. The list survives
+until the analyzer struct is destroyed.
+@End Reasoning
+
+@Implementation:
+Reads and returns the list handle stored at offset 88 of the analyzer.
+@End Implementation
 Process called "get_errors" that takes analyzer as Integer returns Integer:
     Return proc memory_get_int64 from Layout with analyzer, 88
 End Process
 
+@Reasoning:
+Sister of get_errors, returning the warning list. Same ownership
+contract: borrowed handle, valid for the lifetime of the analyzer.
+@End Reasoning
+
+@Implementation:
+Reads and returns the list handle stored at offset 96 of the analyzer.
+@End Implementation
 Process called "get_warnings" that takes analyzer as Integer returns Integer:
     Return proc memory_get_int64 from Layout with analyzer, 96
 End Process
@@ -826,10 +1468,33 @@ Note: ================================================================
 Note: Subsystem Creation
 Note: ================================================================
 
+@Reasoning:
+The type system here is a thin lookup table keyed by type name; a
+Dict is the right primitive because lookups are by string key and the
+table is sparse over the space of possible Kotlin types.
+@End Reasoning
+
+@Implementation:
+Delegates directly to Dict.create. Returns the new handle; caller
+(create_kotlin_semantic_analyzer) takes ownership.
+@End Implementation
 Process called "create_kotlin_type_system" that takes nothing returns Integer:
     Return proc create from Dict
 End Process
 
+@Reasoning:
+The null-safety checker is a small (24-byte) struct with three
+pointer slots reserved for future state: a nullable-type cache, an
+implicit-cast tracker, and a not-null assertion history. Allocating
+the slots eagerly (rather than lazy-init on first add) lets later
+passes write into the slots without re-allocating the parent struct.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes via Layout.allocate. Zeroes offsets 0, 8, and 16
+so future assignments see a defined initial value. Returns the new
+struct pointer.
+@End Implementation
 Process called "create_null_safety_checker" that takes nothing returns Integer:
     Let checker be proc allocate from Layout with 24
     proc memory_set_int64 from Layout with checker, 0, 0
@@ -838,6 +1503,21 @@ Process called "create_null_safety_checker" that takes nothing returns Integer:
     Return checker
 End Process
 
+@Reasoning:
+The coroutine analyzer's first slot (offset 0) is the live
+suspend-context flag consulted by validate_suspend_call. The other
+three slots are reserved for a builder stack, a Deferred-tracking
+table, and a flow-collector stack. Allocating them up front keeps the
+suspend-context flag at offset 0 - a stable contract relied on by
+enter_suspend_context / exit_suspend_context / is_in_suspend_context.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes via Layout.allocate. Zeroes offsets 0, 8, 16, 24
+so the suspend flag starts at "not in suspend context" and the other
+reserved slots have a defined initial value. Returns the struct
+pointer.
+@End Implementation
 Process called "create_coroutine_analyzer" that takes nothing returns Integer:
     Let analyzer be proc allocate from Layout with 32
     proc memory_set_int64 from Layout with analyzer, 0, 0
@@ -847,103 +1527,373 @@ Process called "create_coroutine_analyzer" that takes nothing returns Integer:
     Return analyzer
 End Process
 
+@Reasoning:
+Extension resolver is a Dict keyed by function name. Receiver-type
+disambiguation happens at lookup time by inspecting the registered
+AST nodes - keeping the registry name-keyed avoids embedding type
+shape into the resolver's primary index, which would couple this
+subsystem to the type-encoding format.
+@End Reasoning
+
+@Implementation:
+Delegates directly to Dict.create. Returns the new dict handle.
+@End Implementation
 Process called "create_extension_resolver" that takes nothing returns Integer:
     Return proc create from Dict
 End Process
 
+@Reasoning:
+Sealed class checker is a Dict keyed by sealed-class name. Subclass
+enumeration is populated lazily by a later pass that walks declarations
+looking for super-clauses referencing a sealed-class name found in
+this dict.
+@End Reasoning
+
+@Implementation:
+Delegates directly to Dict.create. Returns the new dict handle.
+@End Implementation
 Process called "create_sealed_class_checker" that takes nothing returns Integer:
     Return proc create from Dict
 End Process
 
+@Reasoning:
+Data class validator is a Dict keyed by data-class name. The validator
+later walks every entry to verify each data class meets the
+generated-method preconditions (primary constructor present, no
+abstract members, etc.).
+@End Reasoning
+
+@Implementation:
+Delegates directly to Dict.create. Returns the new dict handle.
+@End Implementation
 Process called "create_data_class_validator" that takes nothing returns Integer:
     Return proc create from Dict
 End Process
 
+@Reasoning:
+Variance analyzer is currently a Dict but will accumulate per-type-
+parameter occurrence-position state. Returning a Dict keeps the
+analyzer's allocation invariant identical to its siblings, so future
+expansion does not require reshuffling create_kotlin_semantic_analyzer.
+@End Reasoning
+
+@Implementation:
+Delegates directly to Dict.create. Returns the new dict handle.
+@End Implementation
 Process called "create_variance_analyzer" that takes nothing returns Integer:
     Return proc create from Dict
 End Process
 
+@Reasoning:
+Smart cast tracker is a Dict keyed by scope, with values being
+nested dicts of (variable-name -> narrowed-type). The two-level
+nesting is built on demand by record_smart_cast and
+analyze_when_branches; this constructor only allocates the outer
+dict.
+@End Reasoning
+
+@Implementation:
+Delegates directly to Dict.create. Returns the new dict handle.
+@End Implementation
 Process called "create_smart_cast_tracker" that takes nothing returns Integer:
     Return proc create from Dict
 End Process
 
+@Reasoning:
+Class symbols are currently aliased to their declaring AST node -
+the AST node already carries name, modifiers, type parameters,
+members, supertypes, and source location, which is everything the
+resolver and later phases need. Using the AST identity as the symbol
+avoids duplicating storage and keeps "is this the same class?"
+queries pointer-equal.
+@End Reasoning
+
+@Implementation:
+Returns class_node unchanged. Callers store the result into
+global_scope under the class name.
+@End Implementation
 Process called "create_class_symbol" that takes class_node as Integer returns Integer:
     Return class_node
 End Process
 
+@Reasoning:
+Object declarations (singletons) follow the same AST-as-symbol
+convention as classes; the singleton aspect is encoded by the node's
+type tag (KOTLIN_OBJECT_DECLARATION) rather than by symbol shape.
+@End Reasoning
+
+@Implementation:
+Returns object_node unchanged.
+@End Implementation
 Process called "create_object_symbol" that takes object_node as Integer returns Integer:
     Return object_node
 End Process
 
+@Reasoning:
+Interface symbols share the AST-as-symbol convention. Distinct from
+classes only via the node's type tag (KOTLIN_INTERFACE_DECLARATION);
+lookup callers that need to enforce "must be an interface" check the
+tag explicitly.
+@End Reasoning
+
+@Implementation:
+Returns interface_node unchanged.
+@End Implementation
 Process called "create_interface_symbol" that takes interface_node as Integer returns Integer:
     Return interface_node
 End Process
 
+@Reasoning:
+Function symbols use the AST node identity. Overload resolution
+needs to consider every function with the same name, which is handled
+at lookup time (not by storing all overloads under one key) - so this
+constructor stays a no-op alias.
+@End Reasoning
+
+@Implementation:
+Returns func_node unchanged.
+@End Implementation
 Process called "create_function_symbol" that takes func_node as Integer returns Integer:
     Return func_node
 End Process
 
+@Reasoning:
+Property symbols use the AST node identity, same convention as the
+other declaration symbols. Getter/setter access and backing-field
+inspection read from the AST node directly when needed.
+@End Reasoning
+
+@Implementation:
+Returns prop_node unchanged.
+@End Implementation
 Process called "create_property_symbol" that takes prop_node as Integer returns Integer:
     Return prop_node
 End Process
 
+@Reasoning:
+Extension registration thin-wraps the resolver Dict so the
+collect_extension_function call site doesn't need to know the
+resolver's internal shape. Keeping the wrapper lets the resolver
+evolve (e.g. to a multi-map for overload-by-receiver) without
+touching call sites.
+@End Reasoning
+
+@Implementation:
+Calls Dict.put(resolver, name, node) to register the extension.
+Returns 1.
+@End Implementation
 Process called "register_extension" that takes resolver as Integer, name as String, node as Integer returns Integer:
     proc put from Dict with resolver, name, node
     Return 1
 End Process
 
+@Reasoning:
+Data class registration thin-wraps the validator Dict. Mirrors
+register_extension to keep the inventory-registration API symmetric
+across the three subsystem types (extensions, data, sealed).
+@End Reasoning
+
+@Implementation:
+Calls Dict.put(validator, name, node). Returns 1.
+@End Implementation
 Process called "register_data_class" that takes validator as Integer, name as String, node as Integer returns Integer:
     proc put from Dict with validator, name, node
     Return 1
 End Process
 
+@Reasoning:
+Sealed-class registration thin-wraps the checker Dict, completing the
+trio of inventory-registration helpers. The shape and contract match
+register_data_class exactly so a future refactor can unify them.
+@End Reasoning
+
+@Implementation:
+Calls Dict.put(checker, name, node). Returns 1.
+@End Implementation
 Process called "register_sealed_class" that takes checker as Integer, name as String, node as Integer returns Integer:
     proc put from Dict with checker, name, node
     Return 1
 End Process
 
+@Reasoning:
+Bulk-validation entry point invoked from validate_special_classes
+(phase 5). Walks every entry in the data_validator's dict and checks
+each registered data class against the Kotlin spec for data-class
+eligibility. The walking and per-entry rule application will accrue
+here as the rule set is implemented.
+@End Reasoning
+
+@Implementation:
+Returns 1. The walker over the validator's dict and the per-entry
+data-class rule checks are populated by the data-class implementation
+work-stream; the present return value lets the surrounding pipeline
+function while that work proceeds.
+@End Implementation
 Process called "validate_all_data_classes" that takes validator as Integer, analyzer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Bulk-validation entry point for sealed classes, sibling of
+validate_all_data_classes. Walks the sealed-class registry checking
+exhaustiveness invariants and constraint propagation. Behaviour will
+be populated as the sealed-class rule set is implemented.
+@End Reasoning
+
+@Implementation:
+Returns 1. The walker over the checker's dict and the per-entry
+sealed-class rules are populated by the sealed-class implementation
+work-stream.
+@End Implementation
 Process called "validate_all_sealed_classes" that takes checker as Integer, analyzer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Static type inference for an arbitrary expression. Used by null-
+safety checks to determine whether a target expression is nullable.
+The full inference algorithm needs the resolved type environment and
+specific rules per expression kind (literals, member access, calls,
+lambdas, etc.). Currently returns 0 which the null-safety callers
+interpret as "no type info available, skip the warning" - safe
+default that does not cause false positives.
+@End Reasoning
+
+@Implementation:
+Returns 0. The full inference algorithm will read expr's type tag,
+recursively infer subexpression types, and consult the analyzer's
+type_system; that work lives in the type-inference work-stream and
+its results will be wired in here once available.
+@End Implementation
 Process called "infer_expression_type" that takes analyzer as Integer, expr as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Predicate over a type reference. Used by null-safety checks to test
+whether a static type carries the nullable suffix `?`. The
+implementation will read the type_ref's tag (TYPE_REFERENCE vs
+NULLABLE_TYPE) once the parser canonicalises tag layout; until then
+the safe default is "non-nullable", which causes the null-safety
+checker to skip warnings rather than emit false positives.
+@End Reasoning
+
+@Implementation:
+Returns 0 (interpreted as non-nullable). Full implementation will
+test the type_ref tag against KOTLIN_NULLABLE_TYPE (201) and walk
+through composite types like List<T?>.
+@End Implementation
 Process called "is_nullable_type" that takes type_ref as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Flips the coroutine analyzer's suspend-context flag on. Always paired
+with exit_suspend_context to keep the flag balanced across nested
+walks. Offset 0 is the contract slot consulted by
+is_in_suspend_context.
+@End Reasoning
+
+@Implementation:
+Writes 1 to offset 0 of coroutine_analyzer. Returns 1.
+@End Implementation
 Process called "enter_suspend_context" that takes coroutine_analyzer as Integer returns Integer:
     proc memory_set_int64 from Layout with coroutine_analyzer, 0, 1
     Return 1
 End Process
 
+@Reasoning:
+Resets the suspend-context flag at offset 0 to 0. The pairing
+contract with enter_suspend_context is maintained by
+validate_suspend_function, which calls both around the recursive
+walk so each suspend body has its own visible context window.
+@End Reasoning
+
+@Implementation:
+Writes 0 to offset 0 of coroutine_analyzer. Returns 1.
+@End Implementation
 Process called "exit_suspend_context" that takes coroutine_analyzer as Integer returns Integer:
     proc memory_set_int64 from Layout with coroutine_analyzer, 0, 0
     Return 1
 End Process
 
+@Reasoning:
+Returns the current suspend-context flag (0 or 1). Consulted by
+validate_suspend_call to enforce the coroutine coloring rule. A
+single read is sufficient because the flag is only mutated by the
+balanced enter/exit pair.
+@End Reasoning
+
+@Implementation:
+Returns the value at offset 0 of coroutine_analyzer.
+@End Implementation
 Process called "is_in_suspend_context" that takes coroutine_analyzer as Integer returns Integer:
     Return proc memory_get_int64 from Layout with coroutine_analyzer, 0
 End Process
 
+@Reasoning:
+Hook for the async builder's Deferred-must-be-awaited check. Walks
+the AST surrounding the async_node looking for a matching .await()
+call or equivalent consumer; absence will become a warning once the
+walker is implemented.
+@End Reasoning
+
+@Implementation:
+Returns 1. The Deferred-usage walker is populated by the coroutine
+implementation work-stream; returning 1 unconditionally is safe in
+the interim because it does not introduce false positives.
+@End Implementation
 Process called "check_deferred_usage" that takes analyzer as Integer, async_node as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Per-occurrence variance analyzer. Receives one `in`/`out` annotated
+type parameter and verifies all of its usage positions inside the
+declaring class respect the declared variance. The position-of-
+occurrence stack and per-position rule application live in the
+variance_analyzer instance's state.
+@End Reasoning
+
+@Implementation:
+Returns 1. The position-walker and rule application are populated by
+the variance work-stream; returning 1 in the interim keeps the
+analyzer pipeline functional without introducing false positives.
+@End Implementation
 Process called "analyze_variance" that takes variance_analyzer as Integer, variance_node as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Records a single is-check narrowing on the smart_cast_tracker. The
+narrowing is keyed by (current_scope, variable_name) -> new_type.
+Storage shape is the tracker's responsibility; this entry point
+exists so the dispatcher in track_is_check stays free of tracker-
+internal knowledge.
+@End Reasoning
+
+@Implementation:
+Returns 1. The (scope, var) -> type insertion is populated by the
+smart-cast work-stream; returning 1 in the interim keeps the
+analyzer pipeline operational while the tracker storage is being
+finalised.
+@End Implementation
 Process called "record_smart_cast" that takes smart_cast_tracker as Integer, is_check_node as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Per-arm `when` smart-cast analyzer. Walks each arm of when_node,
+identifying type-test predicates, computing the per-arm narrowing,
+and storing the result on the tracker. The handling of the final
+`else` arm (narrowing-by-exclusion) is included in this entry point.
+@End Reasoning
+
+@Implementation:
+Returns 1. The per-arm walker and exclusion-narrowing logic are
+populated by the smart-cast work-stream; the placeholder return
+keeps the pipeline operational.
+@End Implementation
 Process called "analyze_when_branches" that takes smart_cast_tracker as Integer, when_node as Integer returns Integer:
     Return 1
 End Process

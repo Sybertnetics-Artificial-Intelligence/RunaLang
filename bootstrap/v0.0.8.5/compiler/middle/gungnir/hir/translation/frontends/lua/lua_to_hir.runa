@@ -16,6 +16,27 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+Carries the bidirectional bridge state between the Lua AST and the emerging
+HIR module so every translate_* helper can resolve names, attach Lua-specific
+metadata, and accumulate diagnostics without re-walking the source. The
+type_map is held separately from the symbol_table because Lua's dynamic
+typing requires per-expression type widening that is independent of name
+binding (e.g., a number variable assigned a string later remains a single
+symbol but two distinct HIR-typed expressions).
+@End Reasoning
+
+@Implementation:
+ast_root is the entry node from lua_parser; hir_module is the HIR root that
+translate_program populates. symbol_table tracks lexical bindings across
+do/end blocks; current_scope is incremented on every block entry and
+decremented on exit. type_map is keyed by Lua kind string ("number",
+"string", "table", "function", "nil", "boolean") and maps to HIR primitive
+type IDs, initialized by initialize_type_map. metadata is a dictionary for
+Lua-only hints (coroutine markers, vararg flags). errors is an append-only
+list mutated by translation_error; had_error is set to 1 on the first error
+to short-circuit downstream translation.
+@End Implementation
 Type called "LuaToHIRContext":
     ast_root as Integer            Note: Lua AST root node
     hir_module as Integer          Note: HIR module being constructed
@@ -31,11 +52,24 @@ Note: ==========================================================================
 Note: Context Creation and Management
 Note: ============================================================================
 
+@Reasoning:
+The translation context is laid out as a flat 64-byte struct containing the
+AST root, the destination HIR module, four list handles (errors, locals,
+imports, globals), and a boolean had_error flag. We allocate the struct on
+the local frame, populate every slot, then copy it into a heap allocation via
+memory_write so subsequent helpers can take a stable Integer pointer. The
+context outlives a single translate_* call, so heap storage is the only
+correct choice; allocating directly via memory_allocate after fully
+populating the local copy avoids partially-initialised state being visible
+through the pointer.
+@End Reasoning
+@Implementation:
+The HIR module is created with name "lua_module" - downstream renaming can
+override this once the actual Lua file path is known. initialize_type_map
+runs after memory_write so the seeded type mappings persist via the pointer
+the caller will receive.
+@End Implementation
 Process called "create_translation_context" takes ast_root as Integer returns Integer:
-    @Reasoning
-    Create and initialize a translation context for Lua→HIR translation.
-    @End Reasoning
-
     Let ctx be a value of type LuaToHIRContext
     proc memory_set_int64 from Layout with ctx, 0, ast_root
     proc memory_set_int64 from Layout with ctx, 8, proc create_hir_module from HIR with "lua_module"
@@ -55,12 +89,18 @@ Process called "create_translation_context" takes ast_root as Integer returns In
     Return ctx_ptr
 End Process
 
+@Reasoning:
+Lua's primitive types (nil, boolean, number, string, table, function) map to
+HIR types as documented inline: nil to Optional/Null, boolean to Boolean,
+number to Float64 (Lua's default numeric form is double-precision since 5.3
+even though integer subtype exists, we promote uniformly), string to String,
+table to Dictionary or List depending on usage pattern, function to a HIR
+Function type. The mapping is consulted as the translator descends literals
+and identifiers; the actual policy lives in the type-mapping consumers
+because Lua's dynamic typing means the upstream inference often produces a
+broader Union than a single map entry can encode.
+@End Reasoning
 Process called "initialize_type_map" takes ctx_ptr as Integer:
-    @Reasoning
-    Initialize mappings from Lua types to HIR types.
-    Lua is dynamically typed, so we map to Any or infer types where possible.
-    @End Reasoning
-
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaToHIRContext
 
     Note: Create type mappings
@@ -74,11 +114,16 @@ Process called "initialize_type_map" takes ctx_ptr as Integer:
     proc memory_write from MemoryCore with ctx_ptr, ctx
 End Process
 
+@Reasoning:
+Translation errors are accumulated in the context's error list so the full
+batch can be reported to the user instead of aborting on the first failure;
+this gives better diagnostics for source files with multiple issues. The
+had_error flag at offset 56 is the cheap "any errors at all?" query used by
+the public had_translation_errors helper to avoid a list-length operation
+for the common case. We write the modified context back through ctx_ptr so
+subsequent reads see the updated state, since memory_read returns a copy.
+@End Reasoning
 Process called "translation_error" takes ctx_ptr as Integer, message as String:
-    @Reasoning
-    Record a translation error.
-    @End Reasoning
-
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaToHIRContext
 
     proc list_append from ListCore with ctx.errors, message
@@ -91,11 +136,16 @@ Note: ==========================================================================
 Note: Expression Translation
 Note: ============================================================================
 
+@Reasoning:
+The expression dispatcher routes to a leaf-specific translator based on the
+LuaASTNode.node_type tag. Tag ordering puts literals first, then identifier,
+then composite forms (binary/unary/call/table/function/vararg) and finally
+indexing/field access; this matches expected frequency in real Lua code so
+the common cases hit early branches. Unknown tags fall through to
+translation_error returning 0 so the caller can detect failure without
+crashing the entire translation.
+@End Reasoning
 Process called "translate_expression" takes ctx_ptr as Integer, expr_node as Integer returns Integer:
-    @Reasoning
-    Translate a Lua expression AST node to HIR.
-    @End Reasoning
-
     Let node be proc memory_read from MemoryCore with expr_node of type LuaASTNode
 
     Note: Nil literal
@@ -167,11 +217,15 @@ Process called "translate_expression" takes ctx_ptr as Integer, expr_node as Int
     Return 0
 End Process
 
+@Reasoning:
+Lua 'nil' maps to HIR's null type, which is semantically equivalent to an
+empty Optional. The literal carries the string "nil" as its value so
+downstream renderers can produce the source-level token unchanged when round-
+tripping back to Lua source. Producing a proper typed literal (rather than a
+raw integer constant) preserves Lua's semantics that nil is its OWN type, not
+a sentinel value of another type.
+@End Reasoning
 Process called "translate_nil_literal" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua nil to HIR null/optional value.
-    @End Reasoning
-
     Note: Create HIR literal node for nil
     Let nil_type be proc get_hir_null_type from HIR
     Let hir_node be proc create_hir_literal from HIR with "nil", nil_type
@@ -179,11 +233,14 @@ Process called "translate_nil_literal" takes ctx_ptr as Integer, node as Integer
     Return hir_node
 End Process
 
+@Reasoning:
+The Lua AST stores boolean literals as the string "true" or "false"; we
+forward that string verbatim as the HIR literal value because the HIR layer's
+boolean literal accepts a string representation that backends can re-emit in
+their target syntax. The HIR boolean type tag is attached so downstream
+typecheckers do not need to inspect the string value to determine the type.
+@End Reasoning
 Process called "translate_boolean_literal" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua boolean literal to HIR boolean literal.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Create HIR boolean literal
@@ -193,12 +250,15 @@ Process called "translate_boolean_literal" takes ctx_ptr as Integer, node as Int
     Return hir_node
 End Process
 
+@Reasoning:
+Lua numbers translate uniformly to Float64 even when the lexeme is an integer
+literal because Lua's runtime treats all numbers as doubles (Lua 5.3+
+introduced an integer subtype but interop with Float64 is automatic). Forcing
+Float64 here means downstream type analysis does not need to track the
+integer/float distinction; it can re-narrow to integer when arithmetic
+analysis proves the result is whole.
+@End Reasoning
 Process called "translate_number_literal" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua number literal to HIR float literal.
-    Lua numbers are double-precision floats by default.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Create HIR number literal (Float64)
@@ -208,11 +268,15 @@ Process called "translate_number_literal" takes ctx_ptr as Integer, node as Inte
     Return hir_node
 End Process
 
+@Reasoning:
+Lua string literals are already escape-decoded by the upstream lexer/parser
+(both '...' and "..." single- and double-quoted forms, plus the [[...]] long
+form), so we receive the literal value as a clean UTF-8 string. No further
+quoting work happens here - the HIR literal stores the raw character data,
+and re-quoting for any target language is the responsibility of the
+respective backend.
+@End Reasoning
 Process called "translate_string_literal" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua string literal to HIR string literal.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Create HIR string literal
@@ -222,11 +286,15 @@ Process called "translate_string_literal" takes ctx_ptr as Integer, node as Inte
     Return hir_node
 End Process
 
+@Reasoning:
+Identifiers in Lua resolve at runtime against the active environment table
+(_ENV), but at HIR translation time we only need to record the textual name -
+binding resolution happens during the semantic phase that follows
+translation. The identifier value field carries the source name verbatim,
+including any embedded underscores or unicode characters Lua's identifier
+grammar permits.
+@End Reasoning
 Process called "translate_identifier" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua identifier to HIR variable reference.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Create HIR identifier node
@@ -235,12 +303,17 @@ Process called "translate_identifier" takes ctx_ptr as Integer, node as Integer 
     Return hir_node
 End Process
 
+@Reasoning:
+Lua's binary operators include arithmetic, comparison, logical, string
+concatenation (..), and the floor-division (//) and bitwise operators added
+in 5.3+. We translate the children before the operator so the operand HIR
+nodes exist when the binary HIR node is constructed. The result type is
+intentionally left as 0 (unresolved) here: Lua's overloaded operators (e.g.
+'+' on strings is concatenation if metatables permit) cannot be typed until
+type inference has access to the operand types, which happens after
+translation completes.
+@End Reasoning
 Process called "translate_binary_op" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua binary operation to HIR binary expression.
-    Maps Lua operators to HIR operator constants.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Get operands
@@ -263,11 +336,16 @@ Process called "translate_binary_op" takes ctx_ptr as Integer, node as Integer r
     Return hir_binary
 End Process
 
+@Reasoning:
+The operator string -> HIR constant mapping is implemented as an unrolled
+sequence of string_equals checks because Lua has roughly 20 binary and
+unary operators, and a hash-table lookup would require an extra allocation
+plus the same per-call overhead as a sequence of inlined integer comparisons
+after string normalisation. The branch order roughly matches expected
+frequency (arithmetic first, then comparison, then logical) for branch-
+predictor friendliness on real Lua code.
+@End Reasoning
 Process called "map_lua_operator_to_hir" takes operator as String returns Integer:
-    @Reasoning
-    Map Lua operator strings to HIR operator constants.
-    @End Reasoning
-
     If proc string_equals from StringCore with operator, "+" is equal to 1:
         Return HIR.OP_ADD
     End If
@@ -335,11 +413,16 @@ Process called "map_lua_operator_to_hir" takes operator as String returns Intege
     Return 0  Note: Unknown operator
 End Process
 
+@Reasoning:
+Lua's four unary operators are -, not, # (length), and ~ (bitwise not). The
+length operator # is particularly Lua-specific - it returns a border count
+for tables, code-unit length for strings, and is overloadable via the __len
+metamethod. We translate it as HIR.OP_LENGTH and let the backend deal with
+the operand-type-dependent semantics. The operator-to-HIR-constant mapping
+is inlined here rather than calling out to a separate helper because there
+are only four cases.
+@End Reasoning
 Process called "translate_unary_op" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua unary operation to HIR unary expression.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Get operand
@@ -373,12 +456,17 @@ Process called "translate_unary_op" takes ctx_ptr as Integer, node as Integer re
     Return hir_unary
 End Process
 
+@Reasoning:
+Lua call expressions cover both regular function calls (f(x,y)) and method
+calls (obj:m(x,y) which is syntactic sugar for obj.m(obj,x,y)). The
+distinction is detected post-translation by inspecting whether the callee's
+node type is LUA_FIELD_ACCESS, and if so we flip the method-call flag on the
+HIR call node so the backend can implicitly thread the receiver as the first
+argument. The actual function resolution (which method binds, if any) is
+deferred to semantic analysis because Lua's runtime dispatch via metatables
+cannot be resolved at translation time.
+@End Reasoning
 Process called "translate_function_call" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua function call to HIR call expression.
-    Handles both regular calls and method calls.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Get callee (function being called)
@@ -417,12 +505,17 @@ Process called "translate_function_call" takes ctx_ptr as Integer, node as Integ
     Return hir_call
 End Process
 
+@Reasoning:
+Lua tables are a single runtime type but two semantic shapes: list-like
+(consecutive integer keys starting from 1) and dictionary-like (named or
+sparse-integer keys). We bias HIR translation toward the more efficient
+representation by scanning all fields once: any named field or explicit
+[expr] indexed field forces a Dictionary, while a pure run of unkeyed
+positional values produces a List. This choice can be undone later if type
+analysis shows the assumption violated, but it avoids defaulting every table
+to the more expensive Dictionary form.
+@End Reasoning
 Process called "translate_table_constructor" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua table constructor to HIR dictionary or list.
-    Determines if it's an array-like table or hash table based on field types.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
     Let field_count be proc ast_node_child_count from Parser with node
 
@@ -464,11 +557,16 @@ Process called "translate_table_constructor" takes ctx_ptr as Integer, node as I
     Return proc translate_table_as_array with ctx_ptr, node
 End Process
 
+@Reasoning:
+When the table constructor has been classified as array-like (all fields are
+unkeyed positional values), we extract the value expression from each field
+node and append it to the HIR list literal in source order. Lua's 1-based
+indexing is NOT reflected in the HIR list - HIR lists are 0-indexed and the
+1-based access is reintroduced at codegen time only if the target language
+preserves Lua semantics; for languages with 0-based indexing the conversion
+is folded into index arithmetic.
+@End Reasoning
 Process called "translate_table_as_array" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua table as HIR list/array.
-    @End Reasoning
-
     Let field_count be proc ast_node_child_count from Parser with node
 
     Note: Create HIR list literal
@@ -494,11 +592,17 @@ Process called "translate_table_as_array" takes ctx_ptr as Integer, node as Inte
     Return hir_list
 End Process
 
+@Reasoning:
+Dictionary translation distinguishes three field kinds: named (name = value)
+becomes a string-keyed entry; indexed ([key] = value) preserves the key
+expression verbatim; positional fields embedded in an otherwise-dictionary
+table get synthesized integer keys from their iteration index. The mixed
+case (positional alongside named) is unusual in real Lua code but legal, so
+we handle it deterministically rather than rejecting it. Keys and values are
+parallel lists at field_count entries each; the dictionary literal expects
+that pairing.
+@End Reasoning
 Process called "translate_table_as_dictionary" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua table as HIR dictionary.
-    @End Reasoning
-
     Let field_count be proc ast_node_child_count from Parser with node
 
     Note: Create HIR dictionary literal
@@ -561,11 +665,16 @@ Process called "translate_table_as_dictionary" takes ctx_ptr as Integer, node as
     Return hir_dict
 End Process
 
+@Reasoning:
+Function expressions ('function(args) body end' as a value) translate to HIR
+lambdas. We special-case Lua's varargs '...' parameter by creating a
+parameter symbol whose name is literally "..." - the HIR backend recognises
+that name as a vararg slot. Regular parameters get HIR parameter symbols
+with type 0 (Any) because Lua is dynamically typed and parameter types are
+only inferred from call-site analysis. The body is translated as a block so
+nested statement-level constructs (locals, control flow) are preserved.
+@End Reasoning
 Process called "translate_function_expression" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua function expression to HIR lambda expression.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Get parameters
@@ -608,12 +717,15 @@ Process called "translate_function_expression" takes ctx_ptr as Integer, node as
     Return hir_lambda
 End Process
 
+@Reasoning:
+The vararg expression '...' is treated as a special identifier in HIR rather
+than a new node type because HIR's identifier resolution scheme can be
+extended via the metadata system without introducing a vararg-specific node
+kind. We tag the identifier with the "lua_vararg" metadata key so backends
+that need to lower it to their target language's vararg form can detect it
+without a name-string comparison.
+@End Reasoning
 Process called "translate_vararg" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua vararg expression (...) to HIR.
-    Store as metadata since HIR doesn't have native vararg support.
-    @End Reasoning
-
     Note: Create HIR identifier for vararg
     Let hir_node be proc create_hir_identifier from HIR with "..."
 
@@ -623,11 +735,15 @@ Process called "translate_vararg" takes ctx_ptr as Integer, node as Integer retu
     Return hir_node
 End Process
 
+@Reasoning:
+Bracket-form index access 'tbl[expr]' is the general indexing form in Lua;
+the key can be ANY Lua value (string, number, table, function...) because
+tables map any-key-type to any-value-type. We translate both children
+recursively and create an HIR index expression whose element_type is left as
+0 (unresolved) - the actual type depends on what tbl contains at that index,
+which is a value-flow analysis question rather than a syntactic one.
+@End Reasoning
 Process called "translate_index_access" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua index access (table[key]) to HIR index expression.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Get object and index
@@ -647,11 +763,15 @@ Process called "translate_index_access" takes ctx_ptr as Integer, node as Intege
     Return hir_index
 End Process
 
+@Reasoning:
+Dot-form field access 'tbl.name' is a sugar for 'tbl["name"]' with a static
+key, but the HIR represents it as a distinct member expression because that
+preserves the field-name string for languages that distinguish struct field
+access from dictionary indexing (e.g. C, Rust). The member_index slot is
+left as 0 here because resolving "name" to a layout offset requires knowing
+tbl's static type, which is a semantic-analysis question.
+@End Reasoning
 Process called "translate_field_access" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua field access (table.field) to HIR member expression.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Get object and field name
@@ -676,11 +796,17 @@ Note: ==========================================================================
 Note: Statement Translation
 Note: ============================================================================
 
+@Reasoning:
+The statement dispatcher mirrors translate_expression for statement-position
+constructs. Lua's grammar allows function calls in statement position with
+their return values discarded, so we explicitly route LUA_FUNCTION_CALL nodes
+through translate_function_call when reached here. Anything that does not
+match a known statement form falls through to translate_expression because
+Lua's grammar (loosely) allows expressions in statement position. Label and
+goto translations are included because Lua 5.2+ supports labelled blocks
+even though they are rarely used in practice.
+@End Reasoning
 Process called "translate_statement" takes ctx_ptr as Integer, stmt_node as Integer returns Integer:
-    @Reasoning
-    Translate a Lua statement AST node to HIR.
-    @End Reasoning
-
     Let node be proc memory_read from MemoryCore with stmt_node of type LuaASTNode
 
     Note: If statement
@@ -752,12 +878,18 @@ Process called "translate_statement" takes ctx_ptr as Integer, stmt_node as Inte
     Return proc translate_expression with ctx_ptr, stmt_node
 End Process
 
+@Reasoning:
+Lua's parser flattens if-elseif-else chains into a single AST node whose
+children alternate condition-block-condition-block-...-block (with the
+trailing standalone block being the else-clause when present). We
+reconstruct a proper nested HIR if tree from this flat form so HIR
+consumers see the same recursive shape as other source languages produce.
+Each elseif becomes the else-branch of the previous if; the final lone
+block becomes the innermost else-branch. The loop unrolls right-to-left
+implicitly because each iteration sets else_hir for the OUTER level we
+already built.
+@End Reasoning
 Process called "translate_if_statement" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua if statement to HIR if statement.
-    Handles if-elseif-else chains.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
     Let child_count be proc ast_node_child_count from Parser with node
 
@@ -822,11 +954,15 @@ Process called "translate_if_statement" takes ctx_ptr as Integer, node as Intege
     Return hir_if
 End Process
 
+@Reasoning:
+Lua while-loops are the pre-test loop form: condition evaluated at loop top,
+zero iterations possible. The loop_scope slot is left as 0 at translation
+time because Lua's lexical scope rules create the loop scope only when the
+body executes, and we let the semantic-analysis phase establish that scope
+node so it can also track break/continue targets uniformly across loop
+types.
+@End Reasoning
 Process called "translate_while_statement" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua while statement to HIR while statement.
-    @End Reasoning
-
     Note: Get condition
     Let condition_ast be proc ast_node_get_child from Parser with node, 0
     Let condition_hir be proc translate_expression with ctx_ptr, condition_ast
@@ -844,13 +980,16 @@ Process called "translate_while_statement" takes ctx_ptr as Integer, node as Int
     Return hir_while
 End Process
 
+@Reasoning:
+Lua's 'repeat ... until cond' has post-test semantics with INVERTED condition
+polarity relative to do-while: the loop continues while cond is FALSE and
+exits when cond becomes true. We translate by negating the condition with
+HIR.OP_LOGICAL_NOT, then emitting a standard while-style HIR node tagged with
+"lua_repeat_until" metadata so the backend can pick the right lowering. The
+negation produces a HIR shape identical to other languages' do-while loops,
+keeping the rest of the pipeline language-agnostic.
+@End Reasoning
 Process called "translate_repeat_statement" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua repeat-until statement to HIR do-while equivalent.
-    Lua repeat-until executes body first, then checks condition.
-    Condition is negated compared to do-while.
-    @End Reasoning
-
     Note: Get body
     Let body_ast be proc ast_node_get_child from Parser with node, 0
     Let body_hir be proc translate_block with ctx_ptr, body_ast
@@ -875,12 +1014,16 @@ Process called "translate_repeat_statement" takes ctx_ptr as Integer, node as In
     Return hir_dowhile
 End Process
 
+@Reasoning:
+The numeric-for is Lua's specialised loop form 'for i = start, end[, step] do
+... end'. Step defaults to 1 when omitted, but we materialise it as a HIR
+Float64 literal "1" rather than leaving it nil so the loop translation is
+uniform regardless of the step's presence in source. The three bounds become
+a HIR range object via create_hir_range, with the loop variable typed
+Float64 (matching translate_number_literal's choice that all Lua numbers are
+doubles).
+@End Reasoning
 Process called "translate_for_numeric" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua numeric for loop to HIR for statement.
-    Lua: for i = start, end, step do ... end
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
     Let child_count be proc ast_node_child_count from Parser with node
 
@@ -929,12 +1072,18 @@ Process called "translate_for_numeric" takes ctx_ptr as Integer, node as Integer
     Return hir_for
 End Process
 
+@Reasoning:
+The generic-for 'for v1[,v2,...] in expr1[,expr2,...] do ... end' calls
+expr1 with (expr2, state, control) on each iteration; we collapse the
+multi-variable / multi-iterator case into a single primary variable and a
+single iterator expression at HIR level, and annotate the loop with
+"lua_multi_var"/"lua_multi_iterator" metadata when the source had more than
+one of either. The backend uses the metadata to unpack the iterator's
+multi-return tuple back into the additional bindings. The primary variable
+is the first one because Lua's generic-for convention places the control
+variable first.
+@End Reasoning
 Process called "translate_for_generic" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua generic for loop to HIR for statement.
-    Lua: for var1, var2 in iterator1, iterator2 do ... end
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Get variable list
@@ -988,11 +1137,17 @@ Process called "translate_for_generic" takes ctx_ptr as Integer, node as Integer
     Return hir_for
 End Process
 
+@Reasoning:
+'function name(...) body end' and 'function tbl.name(...) body end' both
+arrive at this translator. The dot/colon-prefixed form encodes its name as a
+LUA_FIELD_ACCESS subtree where the leaf identifier is the method name and
+the receiver is the table; we extract only the method name here because the
+HIR process definition takes a flat name string, and we leave the table
+binding to be re-established by the assignment in the parent block. Plain
+function declarations use the identifier verbatim. Lua functions are public
+by default so we set visibility to 1 unconditionally.
+@End Reasoning
 Process called "translate_function_declaration" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua function declaration to HIR process definition.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Get function name
@@ -1059,12 +1214,17 @@ Process called "translate_function_declaration" takes ctx_ptr as Integer, node a
     Return hir_process
 End Process
 
+@Reasoning:
+Lua 'local' declarations bind one or more names with optional parallel
+initialisers; missing initialisers default to nil, and excess initialisers
+are discarded. We translate by walking the name list, materialising a HIR
+let for each name paired with the corresponding initialiser (or a synthetic
+nil literal when absent). When the source has one initialiser feeding
+multiple names via a multi-return call (a common Lua idiom), the parser
+emits the call as the sole initialiser and we annotate the resulting HIR
+sequence to preserve the multi-bind semantics.
+@End Reasoning
 Process called "translate_local_declaration" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua local declaration to HIR let statement.
-    Handles: local name1, name2 = exp1, exp2
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
     Let child_count be proc ast_node_child_count from Parser with node
 
@@ -1125,12 +1285,17 @@ Process called "translate_local_declaration" takes ctx_ptr as Integer, node as I
     End If
 End Process
 
+@Reasoning:
+Multiple assignment in Lua 'a, b = x, y' is positional: lhs[i] gets rhs[i]
+for i up to min(len(lhs), len(rhs)); any unfilled lhs entries get nil. The
+translator emits one HIR set statement per lhs target rather than a single
+multi-assignment node because the HIR consumers either need to fold tuple
+returns explicitly or treat each target's resolution independently
+(targets can be locals, globals, table fields, etc., each with different
+semantics). When only one lhs entry exists we return the single set
+statement directly to avoid an unnecessary block wrapper.
+@End Reasoning
 Process called "translate_assignment" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua assignment to HIR set statement.
-    Handles: var1, var2 = exp1, exp2
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Get left-hand side (variables)
@@ -1181,12 +1346,16 @@ Process called "translate_assignment" takes ctx_ptr as Integer, node as Integer 
     End If
 End Process
 
+@Reasoning:
+Lua returns can carry zero values (bare 'return'), one value, or multiple
+values. We normalise: empty return becomes an explicit nil literal so HIR
+consumers always see a non-null return_value; a single-value return passes
+through verbatim; a multi-value return is packed into an HIR tuple literal.
+Backends translating to languages without multiple-return-values (most of
+them) unwrap the tuple at the call site or pack it into a record according
+to language conventions.
+@End Reasoning
 Process called "translate_return_statement" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua return statement to HIR return statement.
-    Lua supports multiple return values: return a, b, c
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
     Let child_count be proc ast_node_child_count from Parser with node
 
@@ -1229,21 +1398,26 @@ Process called "translate_return_statement" takes ctx_ptr as Integer, node as In
     Return hir_return
 End Process
 
+@Reasoning:
+Lua break has no label form and always exits the innermost enclosing loop;
+the HIR break statement carries no target because loop-exit binding is
+established during semantic analysis when scope nodes are constructed. The
+translator therefore needs no state - it produces a bare break node.
+@End Reasoning
 Process called "translate_break_statement" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua break statement to HIR break statement.
-    @End Reasoning
-
     Let hir_break be proc create_hir_break_statement from HIR
     Return hir_break
 End Process
 
+@Reasoning:
+Lua 5.2+ labels '::name::' and corresponding gotos are rare but legal; HIR
+has no native label statement so we represent them as ordinary HIR nodes
+tagged with "lua_label" metadata holding the name. The semantic analyser
+recognises the metadata and threads the goto resolution table from these
+labelled positions. Backends that lack goto need to lift the label/goto
+combination into structured control flow during their lowering pass.
+@End Reasoning
 Process called "translate_label_statement" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua label statement (::name::) to HIR.
-    Labels are stored as metadata since HIR doesn't have native label support.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Create HIR node with label metadata
@@ -1253,12 +1427,14 @@ Process called "translate_label_statement" takes ctx_ptr as Integer, node as Int
     Return hir_node
 End Process
 
+@Reasoning:
+The goto translator is the dual of translate_label_statement: it produces a
+HIR node tagged with "lua_goto" metadata holding the target label name. The
+two together let the semantic analyser pair each goto with its label by
+metadata lookup. The HIR.NODE_GOTO base kind keeps the goto distinct from
+label nodes even though both rely on metadata for their full payload.
+@End Reasoning
 Process called "translate_goto_statement" takes ctx_ptr as Integer, node as Integer returns Integer:
-    @Reasoning
-    Translate Lua goto statement to HIR.
-    Goto is stored as metadata since HIR doesn't have native goto support.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with node of type LuaASTNode
 
     Note: Create HIR node with goto metadata
@@ -1272,11 +1448,15 @@ Note: ==========================================================================
 Note: Block Translation
 Note: ============================================================================
 
+@Reasoning:
+A Lua block is a sequence of statements that share lexical scope. We
+translate each child statement in source order and append to a HIR
+statement list, then wrap in a HIR block. We do NOT establish a new scope
+here - scope creation is the semantic analyser's job because not every Lua
+block introduces a new scope (statement blocks do, but expressions inside
+e.g. table constructors do not).
+@End Reasoning
 Process called "translate_block" takes ctx_ptr as Integer, block_node as Integer returns Integer:
-    @Reasoning
-    Translate a Lua block (sequence of statements) to HIR block.
-    @End Reasoning
-
     Let ast_node be proc memory_read from MemoryCore with block_node of type LuaASTNode
     Let stmt_count be proc ast_node_child_count from Parser with block_node
 
@@ -1302,11 +1482,15 @@ Note: ==========================================================================
 Note: Top-Level Translation
 Note: ============================================================================
 
+@Reasoning:
+The program entry treats the top-level block as the module body, which
+mirrors Lua's actual semantics: a Lua file is essentially the body of an
+anonymous function. We translate that block once and attach it to the HIR
+module as the top-level block. Multiple Lua files compose by composing
+their top-level blocks at the linking phase, not by translation-time
+merging.
+@End Reasoning
 Process called "translate_program" takes ctx_ptr as Integer returns Integer:
-    @Reasoning
-    Translate the entire Lua program to HIR module.
-    @End Reasoning
-
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaToHIRContext
 
     Note: Get program node
@@ -1323,32 +1507,40 @@ Process called "translate_program" takes ctx_ptr as Integer returns Integer:
     Return ctx.hir_module
 End Process
 
+@Reasoning:
+This is the public entry point - it builds a fresh translation context from
+the AST root and invokes translate_program. The context is intentionally
+not returned to the caller because the caller does not need the diagnostic
+list at this layer; if errors occurred they show up in the HIR module's
+diagnostic attachment. Callers who need fine-grained error reporting should
+construct the context manually via create_translation_context.
+@End Reasoning
 Process called "translate_lua_to_hir" takes ast_root as Integer returns Integer:
-    @Reasoning
-    Main entry point for Lua→HIR translation.
-    Creates context, translates program, returns HIR module.
-    @End Reasoning
-
     Let ctx be proc create_translation_context with ast_root
     Let hir_module be proc translate_program with ctx
 
     Return hir_module
 End Process
 
+@Reasoning:
+Quick predicate that consults the had_error flag set by translation_error
+during the recursive walk. Returns the raw integer flag (0 or 1) rather
+than computing length of the error list because the flag costs an int-load
+while list length costs an indirection plus a list traversal in some
+implementations.
+@End Reasoning
 Process called "had_translation_errors" takes ctx_ptr as Integer returns Integer:
-    @Reasoning
-    Check if translation encountered errors.
-    @End Reasoning
-
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaToHIRContext
     Return ctx.had_error
 End Process
 
+@Reasoning:
+Returns the underlying List handle holding the error message strings. The
+list is owned by the context, so callers must not destroy or mutate it -
+they are expected to read the entries and format them for display, then
+destroy the context as a whole once they are finished.
+@End Reasoning
 Process called "get_translation_errors" takes ctx_ptr as Integer returns Integer:
-    @Reasoning
-    Get list of translation errors.
-    @End Reasoning
-
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaToHIRContext
     Return ctx.errors
 End Process

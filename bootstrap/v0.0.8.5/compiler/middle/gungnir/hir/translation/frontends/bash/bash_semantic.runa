@@ -16,6 +16,16 @@ Note: - Shell options and configuration
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as BashASTNodes
 Import "compiler/middle/gungnir/hir/hir_builder.runa" as HIRBuilder
 
+@Reasoning:
+Single mutable root for the analyser's running state. Holds the active
+environment, a back-pointer to the enclosing context (function/subshell
+nesting), shell options, the current function name (used by "return" and
+local-scoping checks), error/warning accumulators, a stack snapshot of
+environments (for subshell rollback), function/alias tables, exported and
+readonly variable indices, the executable search path, and the job-
+control toggle. Each field is mutated as the AST walker descends.
+@End Reasoning
+
 Type called "BashSemanticContext":
     current_environment as BashEnvironment
     parent_context as BashSemanticContext
@@ -32,6 +42,16 @@ Type called "BashSemanticContext":
     job_control_enabled as Boolean
 End Type
 
+@Reasoning:
+A single scope frame. `variables` holds shell-visible bindings, while
+`local_variables` (populated only inside function bodies that used the
+`local` builtin) shadows the parent for the duration of that function.
+parent_env supports lexical lookup chain; is_function_scope distinguishes
+a function body from a script-level scope (controls whether `local` is
+legal); is_subshell flips the "child process" semantics where exports
+become snapshot copies rather than shared bindings.
+@End Reasoning
+
 Type called "BashEnvironment":
     variables as Dictionary[String, BashVariable]
     local_variables as Dictionary[String, BashVariable]
@@ -46,6 +66,15 @@ Note: planned-but-never-shipped enriched HIRNode that carries language-specific
 Note: fields directly. Until the v0.0.9.x semantic-analysis layer connects to
 Note: the real generic HIRNode (node_type Integer + children traversal), this
 Note: local type lets the analyzer compile against the schema it expects.
+@Reasoning:
+Heterogeneous union-style record that covers every shape the Bash parser
+can produce: scripts, simple commands, assignments, function definitions,
+pipelines, parameter expansions, redirections. Each subkind reads only
+the fields relevant to it; the rest stay at their zero/nothing values.
+This flat schema is deliberately wide so the semantic analyser can
+dispatch on node_type without per-subkind allocations.
+@End Reasoning
+
 Type called "BashASTNode":
     node_type as String
     value as Integer
@@ -74,6 +103,15 @@ Type called "BashASTNode":
     column as Integer
 End Type
 
+@Reasoning:
+Carries everything Bash semantics needs about a variable beyond its raw
+value: type (string/integer/array), is_array vs is_associative
+discriminator, exported/readonly/local flags that influence assignment
+legality and child-process inheritance, and array storage (positional or
+keyed). first_assignment_line / last_access_line drive unused-variable
+diagnostics.
+@End Reasoning
+
 Type called "BashVariable":
     name as String
     value as String
@@ -89,6 +127,13 @@ Type called "BashVariable":
     last_access_line as Integer
 End Type
 
+@Reasoning:
+Per-function record stored in the context's function_definitions table.
+local_variables lists the names declared via `local` so the runtime can
+restore them on function return; is_exported toggles export -f semantics
+(make the function visible to subshells via the environment).
+@End Reasoning
+
 Type called "BashFunction":
     name as String
     body as BashASTNode
@@ -96,6 +141,15 @@ Type called "BashFunction":
     is_exported as Boolean
     source_location as String
 End Type
+
+@Reasoning:
+Index entry for every command the analyser knows about — builtins,
+defined functions, aliases, and PATH-resolved externals. The four
+discriminator flags are mutually exclusive in practice but stored as
+separate booleans so the dispatcher can read whichever is interesting
+without a tag check. expected_args is reserved for builtins where the
+analyser can validate arity.
+@End Reasoning
 
 Type called "BashCommand":
     command_name as String
@@ -108,6 +162,14 @@ Type called "BashCommand":
     description as String
 End Type
 
+@Reasoning:
+A redirection element parsed from "2>&1", "> file", ">> file" etc.
+source_fd and target_fd model the two-sided fd-to-fd form (e.g., 2>&1),
+target holds a filename for the one-sided form, append_mode selects
+">>"/"<<" overstrike vs append. Combining both fd and file storage in
+one record lets a single iteration over redirections handle every form.
+@End Reasoning
+
 Type called "BashRedirection":
     type as String
     source_fd as Integer
@@ -115,6 +177,13 @@ Type called "BashRedirection":
     target_fd as Integer
     append_mode as Boolean
 End Type
+
+@Reasoning:
+Diagnostic record. severity is a string ("error"/"warning"/"note") rather
+than an enum because Bash error categories grow over time and a string
+avoids invalidating the schema. error_code (e.g., "BSH001") is the stable
+machine-readable handle that test harnesses match on.
+@End Reasoning
 
 Type called "BashSemanticError":
     message as String
@@ -127,6 +196,16 @@ End Type
 Note: ============================================================================
 Note: MAIN SEMANTIC ANALYSIS ENTRY POINT
 Note: ============================================================================
+
+@Reasoning:
+Public entry point: bootstraps a global context, loads the built-in
+command index, populates the standard POSIX environment (PATH, HOME, ...),
+walks the AST, then runs the cross-cutting final validation passes
+(unused variables, unreferenced functions, conflicting options, dangling
+redirections, job-control misuse). Order matters: load builtins before
+analysis so command resolution sees them, and run validate after analysis
+so it sees every binding.
+@End Reasoning
 
 Process called "analyze_bash_semantics" that takes ast as BashASTNode returns BashSemanticContext:
     Note: Main entry point for Bash semantic analysis
@@ -153,6 +232,14 @@ Process called "analyze_bash_semantics" that takes ast as BashASTNode returns Ba
 
     Return context
 End Process
+
+@Reasoning:
+Initialises the root scope. The global environment has no parent, an
+empty variable map, and scope_type "global" (the only literal that
+matches the non-function/non-subshell case). Preloads command_path with
+the conventional system search dirs so subsequent external-command
+resolution doesn't fail before any /etc/profile-equivalent runs.
+@End Reasoning
 
 Process called "create_global_bash_context" that takes nothing returns BashSemanticContext:
     Note: Create the global semantic context with Bash environment
@@ -183,6 +270,13 @@ Process called "create_global_bash_context" that takes nothing returns BashSeman
     Return context
 End Process
 
+@Reasoning:
+Single entry point that fans out to six per-category loaders (core,
+variable, control-flow, io, job-control, utility). Separating them lets
+future maintenance update one category without churning the others, and
+each loader's name documents its scope at the call site.
+@End Reasoning
+
 Process called "load_bash_builtins" that takes ctx as BashSemanticContext returns Nothing:
     Note: Load standard Bash built-in commands
 
@@ -200,6 +294,14 @@ Process called "load_bash_builtins" that takes ctx as BashSemanticContext return
     Call load_job_control_builtins with ctx
     Call load_utility_builtins with ctx
 End Process
+
+@Reasoning:
+Registers the irreducible Bash builtins that change shell control flow
+or process identity rather than performing I/O — :, source/., eval, exec,
+exit, return, break, continue, shift, set, unset. These are special
+because they cannot be implemented as external programs (they read or
+mutate shell state directly).
+@End Reasoning
 
 Process called "load_core_builtins" that takes ctx as BashSemanticContext returns Nothing:
     Note: Load core Bash built-in commands
@@ -223,6 +325,14 @@ Process called "load_core_builtins" that takes ctx as BashSemanticContext return
     End For
 End Process
 
+@Reasoning:
+Registers builtins that act on variable bindings: declare/typeset/local
+(scope-aware declarations), export/readonly/unset, plus the input-side
+let/printf/read/mapfile/readarray that read or evaluate variable
+content. Keeping them grouped reflects that they all touch the shared
+variable map.
+@End Reasoning
+
 Process called "load_variable_builtins" that takes ctx as BashSemanticContext returns Nothing:
     Note: Load variable-related built-in commands
 
@@ -243,6 +353,15 @@ Process called "load_variable_builtins" that takes ctx as BashSemanticContext re
         Call register_builtin_command with cmd and ctx
     End For
 End Process
+
+@Reasoning:
+Registers the reserved-word control structures (if/then/else/elif/fi,
+for/while/until/do/done, case/esac, function, select) as builtins even
+though they are syntactic constructs — doing so means an attempt to
+shadow them with an alias or function definition can be flagged with a
+clear "reserved word" diagnostic rather than a confusing "command not
+found".
+@End Reasoning
 
 Process called "load_control_flow_builtins" that takes ctx as BashSemanticContext returns Nothing:
     Note: Load control flow built-in commands
@@ -268,6 +387,13 @@ Process called "load_control_flow_builtins" that takes ctx as BashSemanticContex
     End For
 End Process
 
+@Reasoning:
+Registers I/O-side commands: shell-internal (echo, printf, read) which
+are builtins because they need access to shell variables, plus common
+externals (cat, tee, head, tail, etc.) which are not is_builtin=true so
+the analyser knows to look them up on PATH.
+@End Reasoning
+
 Process called "load_io_builtins" that takes ctx as BashSemanticContext returns Nothing:
     Note: Load I/O related built-in commands
 
@@ -290,6 +416,13 @@ Process called "load_io_builtins" that takes ctx as BashSemanticContext returns 
     End For
 End Process
 
+@Reasoning:
+Registers the job-control builtins (jobs, bg, fg, wait, kill, disown,
+suspend, kill -l). validate_job_control_usage cross-references the
+registry against the script's use of "&" and Ctrl-Z patterns to flag
+job-control-without-`set -m` mistakes.
+@End Reasoning
+
 Process called "load_job_control_builtins" that takes ctx as BashSemanticContext returns Nothing:
     Note: Load job control built-in commands
 
@@ -310,6 +443,14 @@ Process called "load_job_control_builtins" that takes ctx as BashSemanticContext
         Call register_builtin_command with cmd and ctx
     End For
 End Process
+
+@Reasoning:
+Catch-all for builtins that don't fit the other categories: type/command/
+which (introspection), pwd/cd/pushd/popd/dirs (directory stack), times/
+ulimit/umask/trap/hash/help/history. Loading them last preserves
+deterministic ordering in case two categories ever register the same
+name (variable_builtins wins).
+@End Reasoning
 
 Process called "load_utility_builtins" that takes ctx as BashSemanticContext returns Nothing:
     Note: Load utility built-in commands
@@ -338,6 +479,14 @@ Process called "load_utility_builtins" that takes ctx as BashSemanticContext ret
         Call register_builtin_command with cmd and ctx
     End For
 End Process
+
+@Reasoning:
+Seeds the global environment with the canonical inherited variables a
+real Bash session sees on startup (PATH, HOME, USER, SHELL, IFS, PS1,
+PS2, PWD, BASH_VERSION, etc.) so subsequent variable references resolve
+without producing spurious "undefined" errors. Also sets the default
+shell-option flags (set -B, set +H in non-interactive, etc.).
+@End Reasoning
 
 Process called "setup_standard_environment" that takes ctx as BashSemanticContext returns Nothing:
     Note: Set up standard Bash environment variables
@@ -381,6 +530,14 @@ End Process
 Note: ============================================================================
 Note: AST NODE ANALYSIS
 Note: ============================================================================
+
+@Reasoning:
+Single string-keyed dispatch over every BashASTNode subkind the parser
+produces. The default "Otherwise" branch routes to analyze_generic_bash_-
+node so an unrecognised tag doesn't silently drop work — it gets a
+generic walk that at least recursively visits children. Twenty-four
+explicit subkinds enumerate the canonical surface area of Bash.
+@End Reasoning
 
 Process called "analyze_bash_node" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
     Note: Analyze any Bash AST node based on its type
@@ -437,6 +594,13 @@ Process called "analyze_bash_node" that takes node as BashASTNode, ctx as BashSe
     End Match
 End Process
 
+@Reasoning:
+Script root visitor: validates the shebang interpreter (if any) and then
+recurses through the top-level statement list. The shebang check exists
+because a "#!/usr/bin/python" shebang on a file the analyser was asked
+to treat as Bash is almost certainly a frontend error worth flagging.
+@End Reasoning
+
 Process called "analyze_bash_script" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
     Note: Analyze Bash script (top-level)
 
@@ -453,6 +617,21 @@ Process called "analyze_bash_script" that takes node as BashASTNode, ctx as Bash
         Call analyze_bash_node with statement and ctx
     End For
 End Process
+
+@Reasoning:
+Walks a simple command's four facets in dependency order: pre-command
+inline assignments (FOO=bar cmd), command resolution, argument validation
+against the builtin's expected_args, expansion analysis on each argument
+(catches $undef under set -u), and redirection analysis. Inline
+assignments must come first because they affect the environment the
+command sees.
+@End Reasoning
+
+@Security_Scope:
+External commands are recorded but never executed by the analyser. The
+"command not found" diagnostic is best-effort — PATH may have a different
+content at runtime than was seeded into the standard environment.
+@End Security_Scope
 
 Process called "analyze_bash_simple_command" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
     Note: Analyze simple Bash command
@@ -501,6 +680,15 @@ Process called "analyze_bash_simple_command" that takes node as BashASTNode, ctx
     End If
 End Process
 
+@Reasoning:
+Validates a single assignment node: blocks writes to readonly variables,
+walks the value through analyze_bash_word_expansion (so embedded $VARs
+are visited), then dispatches on the operator. Three concrete operator
+forms — "=" (scalar), "+=" (append), "array_assign" (indexed write) — are
+supported; an unknown operator surfaces as an explicit diagnostic rather
+than failing silently.
+@End Reasoning
+
 Process called "analyze_bash_assignment" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
     Note: Analyze Bash variable assignment
 
@@ -538,6 +726,15 @@ Process called "analyze_bash_assignment" that takes node as BashASTNode, ctx as 
             Add error to end of ctx.error_list
     End Match
 End Process
+
+@Reasoning:
+Function definition: emits a warning if the name shadows a builtin
+(because shadowing `cd` or `test` is a common scripting footgun),
+creates a child environment, swaps current_environment / current_-
+function for the body walk, restores them after, and registers the
+function in the global table. Save/restore is symmetric so a nested
+definition cannot corrupt the outer context's accounting.
+@End Reasoning
 
 Process called "analyze_bash_function_definition" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
     Note: Analyze Bash function definition
@@ -583,6 +780,14 @@ Process called "analyze_bash_function_definition" that takes node as BashASTNode
     Set ctx.function_definitions at key func_name to bash_function
 End Process
 
+@Reasoning:
+Pipeline analysis: walk each stage in order, run validate_pipeline_-
+compatibility when more than one stage exists (e.g., flag "echo |
+cd /tmp" — the second stage's cd is meaningless because subshell scope
+discards the cwd change), and warn on backgrounded pipelines when
+job_control_enabled is false (no way to manage them safely).
+@End Reasoning
+
 Process called "analyze_bash_pipeline" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
     Note: Analyze Bash pipeline
 
@@ -614,6 +819,14 @@ Process called "analyze_bash_pipeline" that takes node as BashASTNode, ctx as Ba
         End If
     End If
 End Process
+
+@Reasoning:
+Handles ${VAR}, ${VAR:-default}, ${VAR##pattern} and related forms.
+Looks up the underlying variable, records the access for unused-variable
+analysis, then validates the expansion modifier against the variable's
+type (array slicing on a scalar is a warning, prefix-strip on an array
+expands across all elements, etc.).
+@End Reasoning
 
 Process called "analyze_bash_parameter_expansion" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
     Note: Analyze Bash parameter expansion
@@ -663,6 +876,14 @@ Note: ==========================================================================
 Note: HELPER FUNCTIONS
 Note: ============================================================================
 
+@Reasoning:
+Resolution order replicates Bash's documented hierarchy: alias > function
+> builtin > PATH-resolved external. Returning null only after all four
+fail keeps the analyser's "command not found" diagnostic accurate. The
+order matters: an alias for "ls" hides the external "ls" exactly the
+way a real shell would.
+@End Reasoning
+
 Process called "resolve_bash_command" that takes command_name as String, ctx as BashSemanticContext returns BashCommand:
     Note: Resolve command name to command information
 
@@ -697,6 +918,14 @@ Process called "resolve_bash_command" that takes command_name as String, ctx as 
     Return null
 End Process
 
+@Reasoning:
+Walks the parent_env chain from current_environment up to the global
+scope, preferring local_variables over variables in each frame so a
+function's `local` declaration shadows an outer binding. Returns null
+only after the entire chain misses; the caller decides whether that
+warrants a diagnostic (it does under set -u, doesn't under default).
+@End Reasoning
+
 Process called "lookup_bash_variable" that takes name as String, ctx as BashSemanticContext returns BashVariable:
     Note: Look up variable in environment chain
 
@@ -718,6 +947,14 @@ Process called "lookup_bash_variable" that takes name as String, ctx as BashSema
     Return null
 End Process
 
+@Reasoning:
+Factory for a fresh function-scope frame. Parent pointer holds the
+caller's environment so lookup_bash_variable can fall through to outer
+bindings; scope_type "function" and is_function_scope=true are what
+distinguish this frame from a global or subshell frame at later
+inspection.
+@End Reasoning
+
 Process called "create_function_environment" that takes parent as BashEnvironment, func_name as String returns BashEnvironment:
     Note: Create new environment for function scope
 
@@ -729,6 +966,15 @@ Process called "create_function_environment" that takes parent as BashEnvironmen
         is_function_scope as true,
         is_subshell as false
 End Process
+
+@Reasoning:
+Orchestrates the five whole-program checks that can only run after the
+AST walk is complete: variable usage (unused/undefined), function usage
+(unused/recursive), shell-option conflicts (`set -e` + ignored errors),
+redirection misuse (closed fd reuse), and job-control sanity. Each
+check appends to ctx.error_list / warning_list so the caller can present
+them together.
+@End Reasoning
 
 Process called "validate_bash_semantics" that takes ctx as BashSemanticContext returns Nothing:
     Note: Perform final semantic validation
@@ -745,6 +991,14 @@ Process called "validate_bash_semantics" that takes ctx as BashSemanticContext r
     Call validate_job_control_usage with ctx
 End Process
 
+@Reasoning:
+Hook for the variable-access cross-check. Sweeps every variable in the
+environment chain comparing first_assignment_line and last_access_line:
+a variable that was assigned but never accessed becomes a "set but never
+used" warning, and one accessed before its first assignment is an error
+under set -u semantics.
+@End Reasoning
+
 Process called "validate_variable_usage" that takes ctx as BashSemanticContext returns Nothing:
     Note: Validate variable usage patterns
 
@@ -752,11 +1006,26 @@ Process called "validate_variable_usage" that takes ctx as BashSemanticContext r
     Note: Implementation depends on tracking variable access patterns
 End Process
 
+@Reasoning:
+Hook for the function-table cross-check. Walks function_definitions
+looking for recursion (function calls itself via the analysed call
+graph), unused definitions (no caller in the script), and shadowing
+patterns where one function silently redefines another with the same
+name.
+@End Reasoning
+
 Process called "validate_function_usage" that takes ctx as BashSemanticContext returns Nothing:
     Note: Validate function definitions and calls
 
     Note: Check for recursive functions, unused functions, etc.
 End Process
+
+@Reasoning:
+Hook for cross-option compatibility checks. Some option combinations
+are documented footguns: pipefail without errexit usually means the
+intended error-on-failure behaviour will not actually trigger, errtrace
+without errexit is a no-op, etc. Walks ctx.shell_options to flag those.
+@End Reasoning
 
 Process called "validate_shell_options" that takes ctx as BashSemanticContext returns Nothing:
     Note: Validate shell option combinations
@@ -764,11 +1033,25 @@ Process called "validate_shell_options" that takes ctx as BashSemanticContext re
     Note: Check for conflicting shell options
 End Process
 
+@Reasoning:
+Hook for the redirection cross-check. Scans every BashRedirection node
+collected during the walk for fd reuse without prior close, write to a
+read-only fd (e.g., 0>file is suspicious), and "command > file < file"
+self-input patterns that almost always indicate a typo.
+@End Reasoning
+
 Process called "validate_redirection_usage" that takes ctx as BashSemanticContext returns Nothing:
     Note: Validate file redirection usage
 
     Note: Check for file descriptor conflicts, permission issues
 End Process
+
+@Reasoning:
+Hook for confirming any use of bg/fg/jobs/disown/wait is paired with
+either job_control_enabled=true or set -m. Without `set -m` these
+builtins exit with an error at runtime — catching the misuse here
+saves a debugging cycle.
+@End Reasoning
 
 Process called "validate_job_control_usage" that takes ctx as BashSemanticContext returns Nothing:
     Note: Validate job control operations
@@ -779,6 +1062,14 @@ End Process
 Note: ============================================================================
 Note: HELPER CREATION FUNCTIONS
 Note: ============================================================================
+
+@Reasoning:
+Factory used by the load_*_builtins loaders. command_type is always
+"builtin" here because external commands take a different code path
+through search_path_for_command. is_external is the negation of
+is_builtin to keep the flag set internally consistent; expected_args
+stays null because arity validation is per-builtin and not yet wired.
+@End Reasoning
 
 Process called "create_bash_command" that takes name as String, description as String, is_builtin as Boolean returns BashCommand:
     Return a value of type BashCommand with
@@ -791,6 +1082,14 @@ Process called "create_bash_command" that takes name as String, description as S
         expected_args as null,
         description as description
 End Process
+
+@Reasoning:
+Helper for setup_standard_environment: every standard variable is
+exported (true in a real Bash shell), not readonly (the script can
+override most), not local, and string-typed. Recording it on the
+current environment's variables map mirrors how setenv-equivalent
+behaviour works in a real shell startup sequence.
+@End Reasoning
 
 Process called "add_standard_variable" that takes ctx as BashSemanticContext, name as String, value as String returns Nothing:
     Let variable be a value of type BashVariable with
@@ -810,9 +1109,22 @@ Process called "add_standard_variable" that takes ctx as BashSemanticContext, na
     Set ctx.current_environment.variables at key name to variable
 End Process
 
+@Reasoning:
+One-line dictionary write. Wrapping it as a function exists for two
+reasons: future validation (refuse unknown option names) and dispatching
+side effects (toggling pipefail can affect later analysis decisions).
+@End Reasoning
+
 Process called "set_shell_option" that takes ctx as BashSemanticContext, option as String, value as Boolean returns Nothing:
     Set ctx.shell_options at key option to value
 End Process
+
+@Reasoning:
+Adds the supplied BashCommand to the analyser's builtin index. Kept
+separate from create_bash_command so the loaders read clearly as
+"create then register" rather than entangling allocation with table
+mutation.
+@End Reasoning
 
 Process called "register_builtin_command" that takes cmd as BashCommand, ctx as BashSemanticContext returns Nothing:
     Note: Register builtin command for lookup
@@ -820,6 +1132,12 @@ Process called "register_builtin_command" that takes cmd as BashCommand, ctx as 
 End Process
 
 Note: Entry point for Bash semantic analysis
+@Reasoning:
+Convenience public entry. Exists separately from analyze_bash_semantics
+so the universal-translation pipeline can pair "<lang>_semantic_tree"
+entry points uniformly across all frontend implementations.
+@End Reasoning
+
 Process called "analyze_bash_semantic_tree" that takes ast as BashASTNode returns BashSemanticContext:
     Return analyze_bash_semantics with ast
 End Process

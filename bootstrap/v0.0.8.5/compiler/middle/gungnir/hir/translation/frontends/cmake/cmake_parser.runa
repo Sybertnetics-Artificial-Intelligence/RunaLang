@@ -65,6 +65,17 @@ Note: ==========================================================================
 Note: Parser State
 Note: ============================================================================
 
+@Reasoning:
+Minimal parser state: a borrowed lexer plus the cached current_token
+and a sticky had_error flag. CMake's grammar is shallow (no nested
+expression precedence) so the parser needs no expression stack.
+@End Reasoning
+
+@Implementation:
+3 x i64 record (24 bytes). offsets: 0 = lexer (borrowed), 8 =
+current_token (borrowed from lexer's stream), 16 = had_error bool.
+@End Implementation
+
 Type called "CMakeParser":
     lexer as Integer
     current_token as Integer
@@ -75,11 +86,35 @@ Note: ==========================================================================
 Note: AST Node Structures
 Note: ============================================================================
 
+@Reasoning:
+The program (root) node is a flat sequence of top-level statements.
+CMake has no module/namespace concept, so the root just holds a List
+of children.
+@End Reasoning
+
+@Implementation:
+3 x i64 record (24 bytes). offsets: 0 = NODE_PROGRAM discriminator,
+8 = statements List handle (lazily created on first add), 16 =
+statement_count maintained alongside the list for O(1) size queries.
+@End Implementation
+
 Type called "CMakeProgram":
     node_type as Integer     Note: NODE_PROGRAM
     statements as Integer    Note: List of statement nodes
     statement_count as Integer
 End Type
+
+@Reasoning:
+Most CMake statements are commands of the form `name(arg1 arg2 ...)`.
+The command record carries the name string plus the argument list,
+together with source position for diagnostics.
+@End Reasoning
+
+@Implementation:
+5 x i64 record (40 bytes). offsets: 0 = NODE_COMMAND, 8 = command_name
+string handle, 16 = arguments List (lazy), 24 = argument_count,
+32 = line. Column is implicitly the byte offset of the command start.
+@End Implementation
 
 Type called "CMakeCommand":
     node_type as Integer     Note: NODE_COMMAND
@@ -90,6 +125,21 @@ Type called "CMakeCommand":
     column as Integer
 End Type
 
+@Reasoning:
+CMake if/elseif/else uses parenthesised condition lists rather than
+boolean expressions. elseif chains are modelled as nested CMakeIf
+nodes in the else slot so traversal code only needs to know two
+branches per if-node.
+@End Reasoning
+
+@Implementation:
+5 x i64 record (40 bytes). offsets: 0 = NODE_IF, 8 = condition List,
+16 = then_block CMakeBlock handle, 24 = elseif_clauses (unused after
+the elseif-as-nested-if refactor), 32 = else_block handle (0 if no
+else). parse_if walks the elseif chain by attaching nested CMakeIf
+records via set_if_else.
+@End Implementation
+
 Type called "CMakeIf":
     node_type as Integer     Note: NODE_IF
     condition as Integer     Note: List of condition arguments
@@ -98,6 +148,18 @@ Type called "CMakeIf":
     else_block as Integer    Note: Block node (0 if no else)
 End Type
 
+@Reasoning:
+foreach(var item1 item2 ...) ... endforeach(): iterator_var holds the
+loop variable name, iterable is the list of items, body is the loop
+body block.
+@End Reasoning
+
+@Implementation:
+4 x i64 record (32 bytes). offsets: 0 = NODE_FOREACH,
+8 = iterator_var name string, 16 = iterable List of CMakeArguments,
+24 = body CMakeBlock.
+@End Implementation
+
 Type called "CMakeForeach":
     node_type as Integer     Note: NODE_FOREACH
     iterator_var as Integer  Note: String pointer
@@ -105,11 +167,33 @@ Type called "CMakeForeach":
     body as Integer          Note: Block node
 End Type
 
+@Reasoning:
+while(condition) ... endwhile() shape, mirroring CMakeIf's condition
+representation as an argument list rather than a typed boolean.
+@End Reasoning
+
+@Implementation:
+3 x i64 record (24 bytes). offsets: 0 = NODE_WHILE,
+8 = condition List, 16 = body CMakeBlock.
+@End Implementation
+
 Type called "CMakeWhile":
     node_type as Integer     Note: NODE_WHILE
     condition as Integer     Note: List of condition arguments
     body as Integer          Note: Block node
 End Type
+
+@Reasoning:
+function(name args...) ... endfunction(). CMake functions have their
+own scope and explicit-argument access — distinguished from macros
+(CMakeMacro) which are scoped textually.
+@End Reasoning
+
+@Implementation:
+4 x i64 record (32 bytes). offsets: 0 = NODE_FUNCTION,
+8 = function_name string, 16 = parameters List of CMakeArguments,
+24 = body CMakeBlock.
+@End Implementation
 
 Type called "CMakeFunction":
     node_type as Integer     Note: NODE_FUNCTION
@@ -118,12 +202,38 @@ Type called "CMakeFunction":
     body as Integer          Note: Block node
 End Type
 
+@Reasoning:
+macro(name args...) ... endmacro(). Identical structure to CMakeFunction
+but with different semantics — macros are unscoped and inherit caller
+variables directly. Kept as a separate type so callers can switch on
+the structural difference.
+@End Reasoning
+
+@Implementation:
+4 x i64 record (32 bytes). offsets: 0 = NODE_MACRO,
+8 = macro_name string, 16 = parameters List, 24 = body CMakeBlock.
+@End Implementation
+
 Type called "CMakeMacro":
     node_type as Integer     Note: NODE_MACRO
     macro_name as Integer    Note: String pointer
     parameters as Integer    Note: List of parameter names
     body as Integer          Note: Block node
 End Type
+
+@Reasoning:
+Every command/control-flow argument carries a kind tag distinguishing
+strings, ${VAR} variable references, $<...> generator expressions, and
+bare identifiers. The kind drives how downstream code resolves the
+argument at evaluation time.
+@End Reasoning
+
+@Implementation:
+5 x i64 record (40 bytes). offsets: 0 = NODE_ARGUMENT,
+8 = arg_type discriminator (ARG_STRING / ARG_VARIABLE /
+ARG_GENERATOR_EXPR / ARG_IDENTIFIER), 16 = value string handle,
+24 = line, 32 = column.
+@End Implementation
 
 Type called "CMakeArgument":
     node_type as Integer     Note: NODE_ARGUMENT
@@ -132,6 +242,18 @@ Type called "CMakeArgument":
     line as Integer
     column as Integer
 End Type
+
+@Reasoning:
+A block is a sequence of statements used as the body of if/foreach/
+while/function/macro nodes. Structurally identical to CMakeProgram
+but kept as a distinct type so traversal code can distinguish the
+root from nested bodies.
+@End Reasoning
+
+@Implementation:
+3 x i64 record (24 bytes). offsets: 0 = NODE_BLOCK,
+8 = statements List (lazy), 16 = statement_count.
+@End Implementation
 
 Type called "CMakeBlock":
     node_type as Integer     Note: NODE_BLOCK
@@ -142,6 +264,18 @@ End Type
 Note: ============================================================================
 Note: Parser Creation and Token Management
 Note: ============================================================================
+
+@Reasoning:
+Constructs the parser record and primes it by consuming the first
+token, so parse_statement can dispatch on current_token without a
+special-case initial advance.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes via Layout. Sets lexer at offset 0, zero-initialises
+current_token and had_error, then calls advance to pull the first
+token into the parser. Returns 0 on allocation failure.
+@End Implementation
 
 Process called "create_parser" takes lexer as Integer returns Integer:
     Note: Create CMake parser
@@ -163,6 +297,16 @@ Process called "create_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+Single consumption point used by every parser helper: reads the next
+token from the lexer and caches it in the parser's current_token slot.
+@End Reasoning
+
+@Implementation:
+Loads lexer from offset 0, calls Lexer.next_token, writes the result
+to offset 8, returns it so the caller can capture without re-reading.
+@End Implementation
+
 Process called "advance" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -174,12 +318,34 @@ Process called "advance" takes parser as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+Read accessor for the cached current token, used pervasively by parse
+helpers when they need the raw token (for value/line/column) rather
+than just the type.
+@End Reasoning
+
+@Implementation:
+Returns the i64 at offset 8 of the parser record without modifying
+any state.
+@End Implementation
+
 Process called "current_token" takes parser as Integer returns Integer:
     Note: Get current token
 
     Let token be proc memory_get_int64 from Layout with parser, 8
     Return token
 End Process
+
+@Reasoning:
+Hides the offset-0 layout of the lexer's token records from parser
+code. Null token is mapped to TOKEN_EOF so callers reach EOF safely
+even if the lexer hands back nothing.
+@End Reasoning
+
+@Implementation:
+Null guard returns Lexer.TOKEN_EOF; on a live token reads i64 at
+offset 0.
+@End Implementation
 
 Process called "token_type" takes token as Integer returns Integer:
     Note: Get token type from token
@@ -192,6 +358,16 @@ Process called "token_type" takes token as Integer returns Integer:
     Return type
 End Process
 
+@Reasoning:
+Accessor for the lexeme string handle on a token. Null-safe so the
+parser can chain it on optional/fallback tokens.
+@End Reasoning
+
+@Implementation:
+Null guard returns 0 (null string); on a live token reads i64 at
+offset 8 (lexeme handle slot).
+@End Implementation
+
 Process called "token_value" takes token as Integer returns Integer:
     Note: Get token value (string) from token
 
@@ -202,6 +378,18 @@ Process called "token_value" takes token as Integer returns Integer:
     Let value be proc memory_get_int64 from Layout with token, 8
     Return value
 End Process
+
+@Reasoning:
+Mandatory-token gate: when the grammar requires a specific token,
+this helper sets had_error on mismatch (so the caller can choose to
+bail) and consumes on match.
+@End Reasoning
+
+@Implementation:
+Compares token_type(current_token) with expected_type. On mismatch
+writes 1 to had_error (offset 16) and returns 0. On match calls
+advance (consuming the token) and returns 1.
+@End Implementation
 
 Process called "expect" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Verify current token type and advance
@@ -217,6 +405,17 @@ Process called "expect" takes parser as Integer, expected_type as Integer return
     proc advance from parser
     Return 1
 End Process
+
+@Reasoning:
+Predicate for "is the current token X" used to gate optional grammar
+rules. Unlike expect, never raises an error and never consumes the
+token — purely a lookup.
+@End Reasoning
+
+@Implementation:
+Reads current_token, calls token_type, returns 1 if equal to
+expected_type, 0 otherwise.
+@End Implementation
 
 Process called "match" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches type without advancing
@@ -235,6 +434,18 @@ Note: ==========================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Empty program-root constructor used at the start of parse. Statements
+list is left at 0 and created lazily on the first append to keep
+single-line CMake files from allocating an empty list.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes. Writes NODE_PROGRAM at offset 0, leaves
+statements (8) and statement_count (16) at 0. Returns 0 on
+allocation failure.
+@End Implementation
+
 Process called "create_program" returns Integer:
     Note: Create program (root) node
 
@@ -251,6 +462,19 @@ Process called "create_program" returns Integer:
 
     Return program
 End Process
+
+@Reasoning:
+Lazy List creation on first add; subsequent adds append directly.
+Keeps the statement_count in sync with the list so traversal code can
+get the count without walking.
+@End Reasoning
+
+@Implementation:
+Null guards on program and statement. Reads statements list at
+offset 8; if 0, calls List.create and writes it back. Appends the
+statement via List.append, then bumps statement_count at offset 16
+by 1.
+@End Implementation
 
 Process called "add_statement_to_program" takes program as Integer, statement as Integer returns Integer:
     Note: Add statement to program
@@ -279,6 +503,18 @@ Process called "add_statement_to_program" takes program as Integer, statement as
     Return 1
 End Process
 
+@Reasoning:
+Allocates a CMakeCommand record with the supplied name and source
+position; arguments list is left at 0 for lazy creation.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes; returns 0 on failure. Writes NODE_COMMAND (0),
+name string handle (8), arguments=0 (16), argument_count=0 (24),
+line (32). column is intentionally not stored in this record (kept
+on a per-token basis).
+@End Implementation
+
 Process called "create_command" takes name as Integer, line as Integer, column as Integer returns Integer:
     Note: Create command node
 
@@ -297,6 +533,18 @@ Process called "create_command" takes name as Integer, line as Integer, column a
 
     Return cmd
 End Process
+
+@Reasoning:
+Lazy-allocate the arguments list, append the argument, and keep
+argument_count in sync so the codegen pass can size buffers without
+walking.
+@End Reasoning
+
+@Implementation:
+Null guards. Reads arguments at offset 16; if 0, creates a new List
+and writes it back. Appends via List.append, increments
+argument_count at offset 24 by 1.
+@End Implementation
 
 Process called "add_argument_to_command" takes command as Integer, argument as Integer returns Integer:
     Note: Add argument to command
@@ -325,6 +573,17 @@ Process called "add_argument_to_command" takes command as Integer, argument as I
     Return 1
 End Process
 
+@Reasoning:
+Builds a CMakeArgument record carrying the discriminator (ARG_STRING /
+ARG_VARIABLE / etc), value string, and source position for
+diagnostics.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes; returns 0 on failure. Writes NODE_ARGUMENT (0),
+arg_type (8), value handle (16), line (24), column (32).
+@End Implementation
+
 Process called "create_argument" takes arg_type as Integer, value as Integer, line as Integer, column as Integer returns Integer:
     Note: Create argument node
 
@@ -344,6 +603,17 @@ Process called "create_argument" takes arg_type as Integer, value as Integer, li
     Return arg
 End Process
 
+@Reasoning:
+Empty-block constructor used as the body of if/foreach/while/
+function/macro. Same lazy-list strategy as create_program — keeps
+empty bodies allocation-light.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes. Writes NODE_BLOCK (0), statements=0 (8),
+statement_count=0 (16). Returns 0 on allocation failure.
+@End Implementation
+
 Process called "create_block" returns Integer:
     Note: Create block node
 
@@ -360,6 +630,17 @@ Process called "create_block" returns Integer:
 
     Return block
 End Process
+
+@Reasoning:
+Mirror of add_statement_to_program for the body block case; kept
+separate so block layout can diverge from program layout if needed.
+@End Reasoning
+
+@Implementation:
+Null guards on block and statement. Reads statements list at offset
+8; if 0, allocates and stores it. Appends and bumps statement_count
+at offset 16.
+@End Implementation
 
 Process called "add_statement_to_block" takes block as Integer, statement as Integer returns Integer:
     Note: Add statement to block
@@ -388,6 +669,19 @@ Process called "add_statement_to_block" takes block as Integer, statement as Int
     Return 1
 End Process
 
+@Reasoning:
+Builds a CMakeIf record with condition and then-block; the optional
+else_block is attached later via set_if_else as the parser walks
+elseif/else chains.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes; returns 0 on failure. Writes NODE_IF (0),
+condition (8), then_block (16), elseif_clauses=0 (24), else_block=0
+(32). elseif_clauses remains 0 because the elseif chain is encoded
+as nested CMakeIf nodes in else_block.
+@End Implementation
+
 Process called "create_if" takes condition as Integer, then_block as Integer returns Integer:
     Note: Create if node
 
@@ -407,6 +701,17 @@ Process called "create_if" takes condition as Integer, then_block as Integer ret
     Return if_node
 End Process
 
+@Reasoning:
+Mutator used by parse_if to attach the else branch (or, for elseif
+chains, the nested CMakeIf that represents the next condition) after
+the head if-node has been constructed.
+@End Reasoning
+
+@Implementation:
+Null guard returns 0. Writes else_block at offset 32 of if_node and
+returns 1.
+@End Implementation
+
 Process called "set_if_else" takes if_node as Integer, else_block as Integer returns Integer:
     Note: Set else block for if node
 
@@ -417,6 +722,16 @@ Process called "set_if_else" takes if_node as Integer, else_block as Integer ret
     proc memory_set_int64 from Layout with if_node, 32, else_block
     Return 1
 End Process
+
+@Reasoning:
+Constructs a CMakeForeach with the loop variable name, the iterable
+arguments list, and the body block.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes. Writes NODE_FOREACH (0), iterator_var (8),
+iterable (16), body (24). Returns 0 on allocation failure.
+@End Implementation
 
 Process called "create_foreach" takes iterator_var as Integer, iterable as Integer, body as Integer returns Integer:
     Note: Create foreach node
@@ -436,6 +751,15 @@ Process called "create_foreach" takes iterator_var as Integer, iterable as Integ
     Return foreach_node
 End Process
 
+@Reasoning:
+Constructs a CMakeWhile with the condition list and body block.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes. Writes NODE_WHILE (0), condition (8), body (16).
+Returns 0 on allocation failure.
+@End Implementation
+
 Process called "create_while" takes condition as Integer, body as Integer returns Integer:
     Note: Create while node
 
@@ -452,6 +776,17 @@ Process called "create_while" takes condition as Integer, body as Integer return
 
     Return while_node
 End Process
+
+@Reasoning:
+Constructs a CMakeFunction with name, parameters list, and body
+block. Distinct from create_macro to preserve the function-vs-macro
+scoping difference downstream.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes. Writes NODE_FUNCTION (0), function_name (8),
+parameters (16), body (24).
+@End Implementation
 
 Process called "create_function" takes function_name as Integer, parameters as Integer, body as Integer returns Integer:
     Note: Create function node
@@ -470,6 +805,16 @@ Process called "create_function" takes function_name as Integer, parameters as I
 
     Return func_node
 End Process
+
+@Reasoning:
+Same shape as create_function but tagged NODE_MACRO so the codegen
+treats it as a textual macro (unscoped, inherits caller variables).
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes. Writes NODE_MACRO (0), macro_name (8),
+parameters (16), body (24).
+@End Implementation
 
 Process called "create_macro" takes macro_name as Integer, parameters as Integer, body as Integer returns Integer:
     Note: Create macro node
@@ -492,6 +837,22 @@ End Process
 Note: ============================================================================
 Note: Parsing Functions
 Note: ============================================================================
+
+@Reasoning:
+Top-level parse driver: walks tokens until EOF, invoking parse_statement
+for each statement and tolerating unrecognised tokens by skipping
+them (unless they trigger had_error, in which case the whole parse
+aborts).
+@End Reasoning
+
+@Implementation:
+Creates a CMakeProgram root via create_program; returns 0 on
+allocation failure. Loops while current token is not TOKEN_EOF: calls
+parse_statement; on 0-result checks had_error and bails on hard
+error, otherwise advances past the unrecognised token. On non-zero
+result adds the statement to the program. Returns the populated
+program record.
+@End Implementation
 
 Process called "parse" takes parser as Integer returns Integer:
     Note: Parse entire CMake file into AST
@@ -521,6 +882,22 @@ Process called "parse" takes parser as Integer returns Integer:
 
     Return program
 End Process
+
+@Reasoning:
+Dispatches between control-flow constructs (if/foreach/while/function/
+macro) and regular commands. The token-type ranges allow built-in
+CMake command keywords (SET..TARGET_COMPILE_OPTIONS) to dispatch to
+parse_command without needing a separate kind tag.
+@End Reasoning
+
+@Implementation:
+Reads current_token's type. Sequential If checks for TOKEN_IF,
+TOKEN_FOREACH, TOKEN_WHILE, TOKEN_FUNCTION, TOKEN_MACRO each routing
+to the matching parse_* helper. Otherwise routes any TOKEN_IDENTIFIER
+or any token in the TOKEN_SET..TOKEN_TARGET_COMPILE_OPTIONS range to
+parse_command. Returns 0 for unrecognised tokens — the caller in
+parse() handles the skip.
+@End Implementation
 
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse single statement (command or control flow)
@@ -564,6 +941,22 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Skip unrecognized tokens
     Return 0
 End Process
+
+@Reasoning:
+Parses a CMake command of the form `name(arg arg ...)`. Tolerant of
+unrecognised tokens inside the argument list — it skips them rather
+than aborting, to maximise the amount of structure recovered from a
+malformed file.
+@End Reasoning
+
+@Implementation:
+Captures the command name lexeme and position from the current token,
+advances past it, calls expect for left-paren (returns 0 on failure).
+Builds a CMakeCommand. Loop until right-paren: parse_argument; if 0,
+checks for TOKEN_EOF (bails) and otherwise skips a token. Non-zero
+arguments are attached. Advances past the closing right-paren and
+returns the command node.
+@End Implementation
 
 Process called "parse_command" takes parser as Integer returns Integer:
     Note: Parse command: name(arg1 arg2 ...)
@@ -614,6 +1007,24 @@ Process called "parse_command" takes parser as Integer returns Integer:
     Return command
 End Process
 
+@Reasoning:
+Each CMake command argument is one of: quoted string, ${VAR} variable
+reference, $<...> generator expression, bare identifier, control-flow
+keyword (e.g. NOT, AND, EQUAL as argument), or numeric literal. The
+parser tags the produced CMakeArgument with the right ARG_* kind so
+downstream evaluation can dispatch.
+@End Reasoning
+
+@Implementation:
+Reads token type/value/line/column. Sequential dispatch by token type
+mapping to ARG_STRING (TOKEN_STRING/TOKEN_NUMBER), ARG_VARIABLE
+(TOKEN_VARIABLE), ARG_GENERATOR_EXPR (TOKEN_GENERATOR_EXPR), or
+ARG_IDENTIFIER (TOKEN_IDENTIFIER and keyword tokens in
+TOKEN_IF..TOKEN_EXISTS). Each branch advances and constructs a
+CMakeArgument. Returns 0 if the token doesn't match any argument
+kind.
+@End Implementation
+
 Process called "parse_argument" takes parser as Integer returns Integer:
     Note: Parse command argument
 
@@ -663,6 +1074,24 @@ Process called "parse_argument" takes parser as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Handles if(cond) ... [elseif(cond) ...]* [else() ...] endif() by
+constructing nested CMakeIf nodes for each elseif. This keeps each
+if-node binary (then + else) while still representing arbitrary-
+length chains correctly.
+@End Reasoning
+
+@Implementation:
+Consumes the leading `if` keyword. Parses the condition as an argument
+list via parse_condition_list, then the then-block via
+parse_block_until_keyword. Builds a CMakeIf. Walks the elseif chain:
+for each TOKEN_ELSEIF, parses its condition and body, builds a nested
+CMakeIf, attaches it as the else-block of the current-tail and
+rebinds the tail. On TOKEN_ELSE, optionally consumes `()` and parses
+the else block, attaches it to the tail. Finally consumes endif (and
+its optional `()`). Returns the head if-node.
+@End Implementation
 
 Process called "parse_if" takes parser as Integer returns Integer:
     Note: Parse if statement: if(condition) ... endif()
@@ -753,6 +1182,21 @@ Process called "parse_if" takes parser as Integer returns Integer:
     Return if_node
 End Process
 
+@Reasoning:
+Parses foreach(var item ...) ... endforeach(). The first argument
+inside the parens is the loop variable; subsequent arguments form the
+iterable list.
+@End Reasoning
+
+@Implementation:
+Consumes `foreach`, expects/consumes `(`. Captures the loop variable
+name if the first argument is an identifier. Loops collecting remaining
+arguments via parse_argument into a List (iterable), skipping
+unrecognised tokens. Consumes the closing `)`. Parses the body block
+via parse_block_until_keyword. Consumes the `endforeach` keyword and
+its optional `()`. Builds and returns a CMakeForeach.
+@End Implementation
+
 Process called "parse_foreach" takes parser as Integer returns Integer:
     Note: Parse foreach statement: foreach(var items...) ... endforeach()
 
@@ -809,6 +1253,17 @@ Process called "parse_foreach" takes parser as Integer returns Integer:
     Return proc create_foreach with iterator_var, iterable, body
 End Process
 
+@Reasoning:
+Parses while(condition) ... endwhile() following the same shape as
+parse_if but without elseif/else branches.
+@End Reasoning
+
+@Implementation:
+Consumes `while`, parses the condition as an argument list, parses
+the body via parse_block_until_keyword. Consumes `endwhile` and its
+optional `()`. Builds and returns a CMakeWhile.
+@End Implementation
+
 Process called "parse_while" takes parser as Integer returns Integer:
     Note: Parse while statement: while(condition) ... endwhile()
 
@@ -842,6 +1297,20 @@ Process called "parse_while" takes parser as Integer returns Integer:
 
     Return proc create_while with condition, body
 End Process
+
+@Reasoning:
+Parses function definitions, mirroring parse_foreach's argument-
+collection pattern: first identifier is the name, rest are parameters,
+then a body block followed by `endfunction`.
+@End Reasoning
+
+@Implementation:
+Consumes `function`, expects `(`. Captures the function name token,
+collects parameter arguments via parse_argument into a List until the
+matching `)`. Parses the body via parse_block_until_keyword. Consumes
+`endfunction` and its optional `()`. Builds and returns a
+CMakeFunction.
+@End Implementation
 
 Process called "parse_function" takes parser as Integer returns Integer:
     Note: Parse function definition: function(name args...) ... endfunction()
@@ -899,6 +1368,19 @@ Process called "parse_function" takes parser as Integer returns Integer:
     Return proc create_function with function_name, parameters, body
 End Process
 
+@Reasoning:
+Parses macro definitions, identical in shape to parse_function but
+emitting a CMakeMacro and matching against `endmacro` instead of
+`endfunction`.
+@End Reasoning
+
+@Implementation:
+Consumes `macro`, expects `(`. Captures the macro name. Collects
+parameter arguments until `)`. Parses body via
+parse_block_until_keyword. Consumes `endmacro` and optional `()`.
+Builds and returns a CMakeMacro.
+@End Implementation
+
 Process called "parse_macro" takes parser as Integer returns Integer:
     Note: Parse macro definition: macro(name args...) ... endmacro()
 
@@ -955,6 +1437,20 @@ Process called "parse_macro" takes parser as Integer returns Integer:
     Return proc create_macro with macro_name, parameters, body
 End Process
 
+@Reasoning:
+CMake conditions are syntactically just argument lists: `if(A AND B)`
+is a head `if` with an argument list [A, AND, B]. This helper reuses
+parse_argument for each item.
+@End Reasoning
+
+@Implementation:
+Expects `(`. Creates an empty List, loops while current token is not
+`)`: parse_argument returns either an argument (appended) or 0 (in
+which case the helper checks for EOF and bails, otherwise advances
+past the offending token). Consumes the closing `)` and returns the
+list.
+@End Implementation
+
 Process called "parse_condition_list" takes parser as Integer returns Integer:
     Note: Parse condition as list of arguments (for if/while)
 
@@ -988,6 +1484,23 @@ Process called "parse_condition_list" takes parser as Integer returns Integer:
     Return condition
 End Process
 
+@Reasoning:
+The body of every control-flow construct ends at a known terminating
+keyword (endif/else/elseif/endforeach/endwhile/endfunction/endmacro).
+This helper greedily parses statements until one of those is hit,
+shared across parse_if / parse_foreach / parse_while / parse_function
+/ parse_macro.
+@End Reasoning
+
+@Implementation:
+Creates a CMakeBlock. Loops while is_block_end_keyword returns 0:
+checks for TOKEN_EOF (returns the partial block), calls
+parse_statement; non-zero results are appended, 0 results trigger an
+advance to skip the token. Does NOT consume the terminating keyword
+— the calling parse_* helper does so based on which keyword it
+expects.
+@End Implementation
+
 Process called "parse_block_until_keyword" takes parser as Integer returns Integer:
     Note: Parse block of statements until control flow end keyword
 
@@ -1017,6 +1530,20 @@ Process called "parse_block_until_keyword" takes parser as Integer returns Integ
 
     Return block
 End Process
+
+@Reasoning:
+Tells parse_block_until_keyword when to stop. The set is the union
+of every "end" keyword (endif, endforeach, endwhile, endfunction,
+endmacro) plus the if-chain branch keywords (else, elseif) since
+those also delimit a then-block.
+@End Reasoning
+
+@Implementation:
+Reads current_token's type via current_token + token_type. Returns
+1 if the type matches any of TOKEN_ENDIF, TOKEN_ELSEIF, TOKEN_ELSE,
+TOKEN_ENDFOREACH, TOKEN_ENDWHILE, TOKEN_ENDFUNCTION, TOKEN_ENDMACRO.
+Returns 0 otherwise.
+@End Implementation
 
 Process called "is_block_end_keyword" takes parser as Integer returns Integer:
     Note: Check if current token is a block-ending keyword

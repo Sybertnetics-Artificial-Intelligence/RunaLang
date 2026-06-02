@@ -13,6 +13,24 @@ Note: ==========================================================================
 Note: TRANSLATION CONTEXT
 Note: ============================================================================
 
+@Reasoning:
+Translation context bundles every piece of mutable state the Erlang
+translator needs: the current module name, its exported function set,
+record/type indexes for resolution, a local-variable type environment,
+an accumulating error list, and a counter for synthetic temp names.
+Bundling avoids threading many parameters through every translate_*
+call.
+@End Reasoning
+
+@Implementation:
+Field-based struct. current_module is the module being translated.
+exported_functions is a list of {name, arity} pairs read from the
+`-export(...)` attribute. records/types/local_vars are dictionaries
+populated as declarations are encountered. errors collects diagnostic
+strings without aborting translation. next_temp_id is a monotonic
+counter used by generate_temp_var.
+@End Implementation
+
 Type called "ErlangTranslationContext":
     current_module as String
     exported_functions as List[Dictionary[String, Integer]]  Note: {name, arity}
@@ -22,6 +40,18 @@ Type called "ErlangTranslationContext":
     errors as List[String]
     next_temp_id as Integer
 End Type
+
+@Reasoning:
+Constructs an empty context bound to the supplied module name. All
+collections start empty; populating them is the responsibility of
+translate_erlang_module_to_hir as it walks the AST.
+@End Reasoning
+
+@Implementation:
+Builds the ErlangTranslationContext struct; sets current_module from
+the parameter; initialises exported_functions/errors as empty lists,
+records/types/local_vars as empty dictionaries, and next_temp_id to 0.
+@End Implementation
 
 Process called "create_translation_context" that takes module_name as String returns ErlangTranslationContext:
     Let ctx be a value of type ErlangTranslationContext
@@ -35,6 +65,19 @@ Process called "create_translation_context" that takes module_name as String ret
     Return ctx
 End Process
 
+@Reasoning:
+Generates fresh synthetic variable names for cases where the
+translator needs to bind a value (e.g. for desugaring pattern matches
+into explicit dispatch). Names use a `$erlang_temp_` prefix so they
+cannot collide with Erlang identifiers (which don't allow `$`).
+@End Reasoning
+
+@Implementation:
+Concatenates "$erlang_temp_" with the string form of next_temp_id,
+then increments next_temp_id so the next call produces a fresh name.
+Returns the new name.
+@End Implementation
+
 Process called "generate_temp_var" that takes ctx as ErlangTranslationContext returns String:
     Let temp_name be "$erlang_temp_" joined with string representation of ctx.next_temp_id
     Set ctx.next_temp_id to ctx.next_temp_id plus 1
@@ -45,6 +88,16 @@ Note: ==========================================================================
 Note: MODULE TRANSLATION
 Note: ============================================================================
 
+@Reasoning:
+Module translation walks attributes first to extract the exported-functions
+list (the only attribute with HIR-level effect; others are pre-processor or
+documentation), then indexes records and types into name-keyed maps so later
+expression translation can resolve record/type references in constant time.
+Function translation is the final pass because functions may refer to
+records and types declared anywhere in the module, even after the function
+itself - Erlang's parser collects declarations across the whole module
+before semantic processing.
+@End Reasoning
 Process called "translate_erlang_module_to_hir" that takes erl_module as ErlangModule returns HIRModule:
     Let ctx be create_translation_context with erl_module.module_name
 
@@ -89,6 +142,16 @@ Note: ==========================================================================
 Note: FUNCTION TRANSLATION
 Note: ============================================================================
 
+@Reasoning:
+Erlang functions are syntactically a sequence of clauses sharing a name+arity,
+each with its own pattern list and optional guard sequence. HIR has no native
+multi-clause construct, so we collapse to a single function whose body is a
+pattern-matching dispatch. We special-case the common single-clause-no-guards
+shape with a direct body translation to avoid wrapping trivial functions in
+an unconditional if-statement that the optimiser would have to undo. The
+exported flag is set by walking ctx.exported_functions and matching on
+name+arity, the same identity Erlang uses for export resolution.
+@End Reasoning
 Process called "translate_function" that takes erl_func as ErlangFunction, ctx as ErlangTranslationContext returns HIRFunction:
     Note: Erlang functions can have multiple clauses with different patterns
     Note: Translate to single HIR function with pattern matching dispatch
@@ -159,6 +222,14 @@ Process called "translate_function" that takes erl_func as ErlangFunction, ctx a
     Return hir_func
 End Process
 
+@Reasoning:
+Identifies patterns that bind a name (or the wildcard) without performing any
+structural destructuring. The result drives translate_function's fast path:
+single-clause functions whose patterns are ALL simple variables can skip the
+match-dispatch machinery entirely. Underscore is treated as simple even
+though it is technically an atom because it never fails to match and
+contributes no bindings.
+@End Reasoning
 Process called "is_simple_variable_pattern" that takes pattern as ErlangExpression returns Boolean:
     Note: Check if pattern is just a simple variable (no destructuring)
     If pattern.expr_type is equal to "var":
@@ -172,6 +243,15 @@ Process called "is_simple_variable_pattern" that takes pattern as ErlangExpressi
     Return false
 End Process
 
+@Reasoning:
+Multi-clause functions become an if-chain where each clause becomes one
+if-statement. We walk clauses in source order because Erlang's first-match
+semantics requires the first matching clause to win - converting to nested
+else-if would also work but the flat sequence is easier for downstream
+optimisers to flatten or convert into a switch. Every dispatch chain
+terminates with an erlang:error(function_clause) call so the runtime
+behaviour mirrors what the Erlang VM produces when no clause matches.
+@End Reasoning
 Process called "translate_clauses_with_dispatch" that takes clauses as List[ErlangFunctionClause], parameters as List[String], ctx as ErlangTranslationContext returns List[HIRStatement]:
     Note: Build pattern matching dispatch for multiple clauses
     Let body be a list containing nothing
@@ -216,6 +296,16 @@ Process called "translate_clauses_with_dispatch" that takes clauses as List[Erla
     Return body
 End Process
 
+@Reasoning:
+A clause matches when ALL its patterns match the corresponding parameters AND
+all its guards succeed. We linearise that into a list of boolean expressions
+(one per pattern check, one per guard expression) and AND them all together.
+The AND chain is left-associative because Erlang guards short-circuit
+left-to-right and our build_pattern_match emits checks that can fail safely
+in any order. When no conditions exist (degenerate empty pattern list), we
+return literal true so the if-statement degenerates to an unconditional
+branch.
+@End Reasoning
 Process called "build_clause_condition" that takes clause as ErlangFunctionClause, parameters as List[String], ctx as ErlangTranslationContext returns HIRExpression:
     Note: Build condition expression that checks if parameters match patterns and guards
 
@@ -259,6 +349,17 @@ Process called "build_clause_condition" that takes clause as ErlangFunctionClaus
     Return result
 End Process
 
+@Reasoning:
+Translates an Erlang pattern into a boolean expression that tests whether a
+target variable matches. Returns null (which the caller interprets as
+"trivially true") for variable patterns and the wildcard, because those
+patterns always succeed - but variable patterns also have a SIDE EFFECT of
+recording the binding in ctx.local_vars so subsequent body translations can
+resolve the variable. Literal patterns become equality comparisons; list and
+tuple patterns recursively check structure (is_list / is_tuple + size match)
+before recursing into elements. Element access uses erlang:nth (lists) or
+erlang:element (1-indexed tuples) to mirror the canonical Erlang accessors.
+@End Reasoning
 Process called "build_pattern_match" that takes pattern as ErlangExpression, target_var as String, ctx as ErlangTranslationContext returns HIRExpression:
     Note: Build condition expression that checks if target_var matches pattern
 
@@ -395,6 +496,14 @@ Note: ==========================================================================
 Note: EXPRESSION TRANSLATION
 Note: ============================================================================
 
+@Reasoning:
+Translates a sequence of expressions (e.g. the body of a function clause or
+case arm) into a list of HIR statements. The last expression in the list
+typically becomes the implicit return value; we do NOT wrap it in an
+explicit return here because the surrounding HIR function form treats the
+final statement's value as the return automatically. Sequence semantics are
+left-to-right with no early termination.
+@End Reasoning
 Process called "translate_expressions" that takes exprs as List[ErlangExpression], ctx as ErlangTranslationContext returns List[HIRStatement]:
     Let statements be a list containing nothing
 
@@ -416,6 +525,16 @@ Process called "translate_expressions" that takes exprs as List[ErlangExpression
     Return statements
 End Process
 
+@Reasoning:
+The central expression dispatcher routes on expr.expr_type string. Leaf
+literals (atom, var, integer, float, string, char) are handled inline
+because each maps to a single HIR helper; composite forms delegate to
+specialised translators (translate_list, translate_tuple, translate_binary,
+etc.). The fallthrough at the end records an error in ctx.errors and emits
+a sentinel HIR error node so the rest of the module can still translate even
+when one expression is unrecognised - this is essential for the
+research/debugging workflow where partial Erlang support is acceptable.
+@End Reasoning
 Process called "translate_expression" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Note: Translate Erlang expression to HIR expression
 
@@ -546,6 +665,14 @@ Process called "translate_expression" that takes expr as ErlangExpression, ctx a
     Return create_hir_error with "unsupported_expression"
 End Process
 
+@Reasoning:
+Erlang lists come in two shapes: proper lists [e1, e2, e3] and improper lists
+[H | T] where T is itself a list (or anything; Erlang permits improper
+lists). Proper lists become a single HIR list literal. Improper lists are
+built right-to-left as a chain of erlang:cons calls so the tail expression
+appears at the rightmost position and each head prepends one element at a
+time. This matches how Erlang's VM constructs lists internally.
+@End Reasoning
 Process called "translate_list" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let elements be expr.expr_data at key "elements"
     Let tail be expr.expr_data at key "tail"
@@ -577,6 +704,13 @@ Process called "translate_list" that takes expr as ErlangExpression, ctx as Erla
     Return result
 End Process
 
+@Reasoning:
+Tuples are fixed-arity heterogeneous containers and translate directly to
+an HIR tuple value. Element order matters and is preserved verbatim. Tuple
+literals are first-class HIR primitives because too many downstream targets
+have native tuple types for it to be worth lowering to a list-based form
+here.
+@End Reasoning
 Process called "translate_tuple" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let elements be expr.expr_data at key "elements"
 
@@ -590,6 +724,15 @@ Process called "translate_tuple" that takes expr as ErlangExpression, ctx as Erl
     Return create_hir_tuple with hir_elements
 End Process
 
+@Reasoning:
+Erlang binary syntax '<<S1, S2, ...>>' constructs a binary from a sequence
+of segments, each carrying a value expression, an optional size, and a list
+of type specifiers (integer/float/binary/utf8/etc., big/little endian,
+signed/unsigned). We translate each segment into a dictionary preserving all
+three components so backends can reproduce the bit-level layout exactly.
+Specifiers are forwarded verbatim because Erlang's binary spec semantics are
+intricate and the backend is in the best position to lower them.
+@End Reasoning
 Process called "translate_binary" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let segments be expr.expr_data at key "segments"
 
@@ -618,6 +761,17 @@ Process called "translate_binary" that takes expr as ErlangExpression, ctx as Er
     Return create_hir_binary with hir_segments
 End Process
 
+@Reasoning:
+Most Erlang binary operators map directly to HIR operator strings. Exceptions
+require special HIR forms: '!' is the message-send operator (create_hir_send),
+'=' is pattern match (create_hir_match), '++' and '--' are list operations
+implemented as erlang:append / erlang:subtract calls because HIR has no
+dedicated nodes for them. Other special spellings (=:=, =/=, andalso, orelse,
+div, rem, b* bitwise) are rewritten to HIR's operator spelling without
+semantic change. The default branch sets hir_op = operator so unrecognised
+operators pass through (useful when Erlang adds new operator spellings the
+translator hasn't been updated for).
+@End Reasoning
 Process called "translate_binary_op" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let operator be expr.expr_data at key "operator"
     Let left be translate_expression with expr.expr_data at key "left" and ctx
@@ -680,6 +834,13 @@ Process called "translate_binary_op" that takes expr as ErlangExpression, ctx as
     Return create_hir_binary_op with hir_op, left, right
 End Process
 
+@Reasoning:
+Erlang's three unary operators are +, -, not, and bnot. '+' and '-' pass
+through unchanged. 'not' becomes '!' to match HIR's boolean negation
+spelling, and 'bnot' becomes '~' for bitwise negation. The operator string
+substitution is the entirety of the transformation; HIR's unary node form is
+otherwise identical.
+@End Reasoning
 Process called "translate_unary_op" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let operator be expr.expr_data at key "operator"
     Let operand be translate_expression with expr.expr_data at key "operand" and ctx
@@ -697,6 +858,16 @@ Process called "translate_unary_op" that takes expr as ErlangExpression, ctx as 
     Return create_hir_unary_op with hir_op and operand
 End Process
 
+@Reasoning:
+Erlang calls come in three flavours: local 'foo(args)', remote
+'mod:foo(args)' (an explicit ':' operator at the AST level), and higher-order
+'F(args)' where F is a function-valued expression. We disambiguate by the
+shape of the function position: a ':' op means remote, an atom literal means
+local, anything else means higher-order. Local calls are always qualified
+with ctx.current_module so HIR consumers see fully-qualified names
+everywhere - this matches Erlang's actual runtime behaviour where the VM
+resolves bare function names against the calling module.
+@End Reasoning
 Process called "translate_call" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let function be expr.expr_data at key "function"
     Let arguments be expr.expr_data at key "arguments"
@@ -744,6 +915,15 @@ Process called "translate_call" that takes expr as ErlangExpression, ctx as Erla
     Return create_hir_call_indirect with func_expr and hir_args
 End Process
 
+@Reasoning:
+'fun' expressions have three syntactic forms: a remote reference
+'fun M:F/N' becomes a HIR function reference with qualified name and arity;
+a local reference 'fun F/N' is qualified with current_module before becoming
+a function reference; an anonymous 'fun(args)->body end' (possibly with
+multiple clauses) becomes a lambda. The anonymous case re-uses
+translate_clauses_with_dispatch for the body so the clause-dispatch logic is
+shared between named functions and anonymous lambdas.
+@End Reasoning
 Process called "translate_fun" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let fun_type be expr.expr_data at key "type"
 
@@ -801,6 +981,16 @@ Process called "translate_fun" that takes expr as ErlangExpression, ctx as Erlan
     Return create_hir_error with "unsupported_fun_type"
 End Process
 
+@Reasoning:
+'case Expr of Patterns... end' tests Expr against each clause's pattern,
+running the body of the first matching clause. We translate to a HIR match
+expression with a list of (pattern, guard, body) branches. Each branch
+preserves the pattern as a translated HIR pattern (so the match expression
+can perform real structural matching, not just equality testing), the guard
+sequence (combined into a single boolean via AND), and the translated body
+statements. The branches list keeps source order so the first-match
+semantics persist into HIR consumers.
+@End Reasoning
 Process called "translate_case" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let scrutinee be translate_expression with expr.expr_data at key "scrutinee" and ctx
     Let clauses be expr.expr_data at key "clauses"
@@ -841,6 +1031,14 @@ Process called "translate_case" that takes expr as ErlangExpression, ctx as Erla
     Return create_hir_match_expr with scrutinee and branches
 End Process
 
+@Reasoning:
+Erlang's 'if' is not a binary if/else - it is a sequence of guard-protected
+clauses where the first clause whose guards all succeed wins. We translate
+to nested HIR if expressions: each clause's guards combine via AND to form a
+condition, and the bodies become the then-branches. If no clause matches the
+runtime raises if_clause; we do not emit that fallthrough error here because
+the if-chain naturally terminates at the last clause's else (or null).
+@End Reasoning
 Process called "translate_if" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let clauses be expr.expr_data at key "clauses"
 
@@ -891,6 +1089,16 @@ Process called "translate_if" that takes expr as ErlangExpression, ctx as Erlang
     Return if_expr
 End Process
 
+@Reasoning:
+'receive ... after T -> ... end' is Erlang's mailbox primitive: the calling
+process blocks reading from its mailbox until a message matches one of the
+clauses or the timeout T fires. We translate clauses identically to
+case-clauses (each becomes a {pattern, guards, body} dictionary), plus an
+optional timeout expression and after-body. The HIR receive node is a
+first-class construct because no other target language has identical
+semantics; backends lower it differently depending on whether they target
+actor-model runtimes, channel-based concurrency, or pure thread+queue.
+@End Reasoning
 Process called "translate_receive" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let clauses be expr.expr_data at key "clauses"
     Let after_timeout be expr.expr_data at key "after_timeout"
@@ -939,6 +1147,16 @@ Process called "translate_receive" that takes expr as ErlangExpression, ctx as E
     Return create_hir_receive with receive_clauses, hir_timeout, hir_after_body
 End Process
 
+@Reasoning:
+'try Body of Patterns... catch Clauses... after AfterBody end' is Erlang's
+unified exception construct. We preserve all four sections: the try body,
+the optional 'of' clauses that pattern-match the try body's value (when
+present, the try succeeds only when an of clause matches), the catch
+clauses keyed by exception class (error/exit/throw), and the after body
+that always runs for cleanup. Catch clauses carry both a class and a
+pattern, which the backend uses to filter exceptions by kind and then
+match the exception term itself.
+@End Reasoning
 Process called "translate_try" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let try_body be expr.expr_data at key "try_body"
     Let of_clauses be expr.expr_data at key "of_clauses"
@@ -1018,6 +1236,15 @@ Process called "translate_try" that takes expr as ErlangExpression, ctx as Erlan
     Return create_hir_try with hir_try_body, hir_of_clauses, hir_catch_clauses, hir_after_body
 End Process
 
+@Reasoning:
+'begin ... end' is Erlang's block expression that groups a sequence of
+expressions into one expression whose value is the last sub-expression. We
+translate the body via translate_expressions (which handles the
+last-expression-is-return convention) and wrap in a HIR block. No special
+scope semantics apply because Erlang's begin-end does not introduce a new
+binding scope - bindings inside the block escape into the surrounding
+scope.
+@End Reasoning
 Process called "translate_begin" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let body be expr.expr_data at key "body"
     Let hir_body be translate_expressions with body and ctx
@@ -1026,6 +1253,16 @@ Process called "translate_begin" that takes expr as ErlangExpression, ctx as Erl
     Return create_hir_block with hir_body
 End Process
 
+@Reasoning:
+List comprehensions '[Template || Q1, Q2, ...]' carry one template expression
+and a list of qualifiers, each either a generator (Pat <- List) or a filter
+(BoolExpr). We translate the template once and each qualifier into a typed
+dictionary preserving its kind. Multiple qualifiers are handled either by
+the dedicated build_nested_comprehension_loops helper (when there are
+several, allowing proper nesting) or inline (single qualifier). The HIR
+comprehension node keeps the generator/filter distinction so backends can
+either lower to nested loops or use a target language's own comprehension.
+@End Reasoning
 Process called "translate_list_comprehension" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let template be expr.expr_data at key "template"
     Let qualifiers be expr.expr_data at key "qualifiers"
@@ -1079,6 +1316,15 @@ Process called "translate_list_comprehension" that takes expr as ErlangExpressio
     Return create_hir_list_comprehension with hir_template and hir_qualifiers
 End Process
 
+@Reasoning:
+Binary comprehensions '<< Template || Q1, Q2, ... >>' are the binary-data
+counterpart to list comprehensions, producing a binary instead of a list.
+The template is a binary segment dictionary rather than an arbitrary
+expression. Qualifiers can be ordinary list generators ('Pat <- List') OR
+binary generators ('Pat <= Binary'); we distinguish via qual_type and route
+the source through either "list" or "binary" key so the backend knows which
+collection kind to iterate.
+@End Reasoning
 Process called "translate_binary_comprehension" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let template be expr.expr_data at key "template"
     Let qualifiers be expr.expr_data at key "qualifiers"
@@ -1126,6 +1372,15 @@ Process called "translate_binary_comprehension" that takes expr as ErlangExpress
     Return create_hir_binary_comprehension with hir_template and hir_qualifiers
 End Process
 
+@Reasoning:
+Erlang records are tuples with named field access; we translate them to HIR
+record constructions that preserve the record name (for type resolution),
+the field/value map, and an optional base record (Erlang's '#Record{X=Y}'
+update form). The field map omits fields not explicitly given - they will
+take default values from the record definition at the time the HIR is
+lowered. The record_def lookup in ctx.records is currently used only for
+later type checking; field validation happens during semantic analysis.
+@End Reasoning
 Process called "translate_record_create" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let record_name be expr.expr_data at key "name"
     Let fields be expr.expr_data at key "fields"
@@ -1154,6 +1409,13 @@ Process called "translate_record_create" that takes expr as ErlangExpression, ct
     Return create_hir_record with record_name, hir_fields, hir_base
 End Process
 
+@Reasoning:
+'Record#name.field' is Erlang's record field access syntax. We translate the
+record expression and pair it with the field name (kept as a string because
+record field-to-tuple-index resolution happens during semantic analysis when
+the record definition is available). HIR consumers handling record_access
+nodes are expected to consult the record definition catalogue separately.
+@End Reasoning
 Process called "translate_record_access" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Let record be expr.expr_data at key "record"
     Let field be expr.expr_data at key "field"
@@ -1163,6 +1425,18 @@ Process called "translate_record_access" that takes expr as ErlangExpression, ct
     Return create_hir_record_access with hir_record and field
 End Process
 
+@Reasoning:
+This is the pattern-to-HIR-pattern translator, used by case/receive/try
+clauses where the HIR consumer can match patterns structurally rather than
+emitting equality tests. It mirrors build_pattern_match (which emits boolean
+conditions) but produces actual HIR pattern objects: variables become
+var_patterns, literals become literal_patterns, lists become list_patterns
+with an optional tail pattern, tuples become tuple_patterns, and the special
+"_" wildcard becomes a wildcard_pattern. Unrecognised pattern shapes return
+a wildcard so HIR consumers default to "match anything", which keeps
+translation partial-safe at the cost of potentially admitting matches the
+original Erlang would have rejected.
+@End Reasoning
 Process called "translate_pattern" that takes pattern as ErlangExpression and ctx as ErlangTranslationContext returns ErlangPatternIR:
     Note: Translate Erlang pattern to HIR pattern
 
@@ -1219,72 +1493,141 @@ Note: ==========================================================================
 Note: HIR CREATION HELPERS
 Note: ============================================================================
 
+@Reasoning:
+Constructor for HIRType records used wherever the translator needs to embed
+a concrete type reference (parameter types, return types, generic
+instantiations). The two-field structure (name + type-argument list) is the
+minimal representation that supports both monomorphic types like "integer"
+and parametric forms like Dict[String, Atom].
+@End Reasoning
 Process called "create_hir_type" that takes type_name as String, type_args as List[Any] returns HIRType:
     Return a value of type HIRType with
         name as type_name,
         args as type_args
 End Process
 
+@Reasoning:
+Wraps an atom literal as an HIRExpression. Atoms are distinguished from
+other string-valued literals by their kind tag so downstream consumers
+(particularly target-language renderers) emit the correct syntactic form -
+e.g. ':symbol' in Ruby, ":atom" in Elixir, "Symbol(:foo)" in Racket.
+@End Reasoning
 Process called "create_hir_atom" that takes value as String returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "atom",
         data as value
 End Process
 
+@Reasoning:
+Variable reference constructor. The data field carries the source identifier
+verbatim; binding resolution is the responsibility of the consumer once the
+HIR is paired with a scope analysis pass.
+@End Reasoning
 Process called "create_hir_var" that takes name as String returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "var",
         data as name
 End Process
 
+@Reasoning:
+Integer literal constructor. The Integer type is used directly because
+Erlang integers are arbitrary-precision in semantics but typically fit into
+machine-word sizes for the translator's purposes; downstream type analysis
+may widen the representation later when overflow is provable.
+@End Reasoning
 Process called "create_hir_int" that takes value as Integer returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "int",
         data as value
 End Process
 
+@Reasoning:
+Float literal constructor. Erlang floats are 64-bit IEEE doubles; we accept
+a Float here and emit a HIR float node with the value preserved bit-exactly.
+@End Reasoning
 Process called "create_hir_float" that takes value as Float returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "float",
         data as value
 End Process
 
+@Reasoning:
+String literal constructor. Note that Erlang "strings" are actually lists of
+integers (Unicode code points) at the language level, but we expose them as
+HIR string nodes so the backend can emit native string types where the
+target language has them; targets that need to preserve Erlang's
+list-of-integers semantics can re-lower at code emission.
+@End Reasoning
 Process called "create_hir_string" that takes value as String returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "string",
         data as value
 End Process
 
+@Reasoning:
+Character literal constructor. Erlang's '$X' notation yields the integer
+code point of X; we keep the original character form here as a String for
+display fidelity, with backends free to lower to integer if their target
+language treats characters as integers.
+@End Reasoning
 Process called "create_hir_char" that takes value as String returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "char",
         data as value
 End Process
 
+@Reasoning:
+Boolean literal constructor. Erlang booleans are the atoms 'true' and
+'false' at the runtime level; we expose them as a distinct HIR kind so
+backends with native booleans can emit those directly rather than going
+through the atom path.
+@End Reasoning
 Process called "create_hir_bool" that takes value as Boolean returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "bool",
         data as value
 End Process
 
+@Reasoning:
+Proper-list constructor (no tail). For improper lists 'translate_list'
+synthesises a chain of erlang:cons calls via create_hir_call rather than
+calling this constructor, so a 'list' HIR node always represents a fully-
+materialised proper list.
+@End Reasoning
 Process called "create_hir_list" that takes elements as List[HIRExpression] returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "list",
         data as elements
 End Process
 
+@Reasoning:
+Tuple constructor for fixed-arity heterogeneous tuples. Distinct from list
+so backends can map to native tuple/record types where available; in
+languages without tuples the backend lowers to a struct or array.
+@End Reasoning
 Process called "create_hir_tuple" that takes elements as List[HIRExpression] returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "tuple",
         data as elements
 End Process
 
+@Reasoning:
+Binary literal constructor for Erlang's '<<...>>' bit-syntax. The segments
+list preserves each segment's value/size/specifiers as a dictionary so the
+backend can reproduce the precise bit-level layout.
+@End Reasoning
 Process called "create_hir_binary" that takes segments as List[Any] returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "binary",
         data as segments
 End Process
 
+@Reasoning:
+Binary-operator constructor. The op field carries the post-translation
+operator string (after translate_binary_op has normalised Erlang-specific
+spellings to HIR spellings), and left/right are the operand HIR
+expressions.
+@End Reasoning
 Process called "create_hir_binary_op" that takes operator as String, left as HIRExpression, right as HIRExpression returns HIRExpression:
     Let op_data be a dictionary containing:
         "op" as operator,
@@ -1297,6 +1640,11 @@ Process called "create_hir_binary_op" that takes operator as String, left as HIR
         data as op_data
 End Process
 
+@Reasoning:
+Unary-operator constructor mirroring create_hir_binary_op but with a single
+operand. The op spelling is the post-normalisation HIR form ('!', '~', '-',
+'+'), set by translate_unary_op before this constructor is invoked.
+@End Reasoning
 Process called "create_hir_unary_op" that takes operator as String, operand as HIRExpression returns HIRExpression:
     Let op_data be a dictionary containing:
         "op" as operator,
@@ -1308,6 +1656,12 @@ Process called "create_hir_unary_op" that takes operator as String, operand as H
         data as op_data
 End Process
 
+@Reasoning:
+Static call constructor for calls whose target is a fully-qualified
+'Module:function' or 'self_module:function' string. The function_name is
+pre-qualified by translate_call so consumers do not need to re-resolve
+module context.
+@End Reasoning
 Process called "create_hir_call" that takes function_name as String, arguments as List[HIRExpression] returns HIRExpression:
     Let call_data be a dictionary containing:
         "function" as function_name,
@@ -1319,6 +1673,12 @@ Process called "create_hir_call" that takes function_name as String, arguments a
         data as call_data
 End Process
 
+@Reasoning:
+Indirect call constructor for higher-order calls where the callee is itself
+an expression (a function variable, a lambda, the result of another call).
+Distinguished from create_hir_call by the kind tag so backends can choose
+between direct dispatch and value-level call mechanism.
+@End Reasoning
 Process called "create_hir_call_indirect" that takes function as HIRExpression, arguments as List[HIRExpression] returns HIRExpression:
     Let call_data be a dictionary containing:
         "function" as function,
@@ -1330,6 +1690,12 @@ Process called "create_hir_call_indirect" that takes function as HIRExpression, 
         data as call_data
 End Process
 
+@Reasoning:
+Anonymous-function (lambda) constructor. Preserves parameter names, their
+types, the return type, and the body statement list. Used both for explicit
+'fun(args) -> body end' source and for synthetic lambdas produced when
+translating multi-clause anonymous functions.
+@End Reasoning
 Process called "create_hir_lambda" that takes parameters as List[String], param_types as List[HIRType], return_type as HIRType, body as List[HIRStatement] returns HIRExpression:
     Let lambda_data be a dictionary containing:
         "parameters" as parameters,
@@ -1343,6 +1709,12 @@ Process called "create_hir_lambda" that takes parameters as List[String], param_
         data as lambda_data
 End Process
 
+@Reasoning:
+Function reference constructor for the 'fun M:F/N' and 'fun F/N' Erlang
+forms. Carries name and arity rather than a callable value so the backend
+can decide whether to emit a closure object, a function pointer, or a
+delegate depending on its target language idiom.
+@End Reasoning
 Process called "create_hir_function_ref" that takes function_name as String, arity as Integer returns HIRExpression:
     Let ref_data be a dictionary containing:
         "function" as function_name,
@@ -1354,6 +1726,12 @@ Process called "create_hir_function_ref" that takes function_name as String, ari
         data as ref_data
 End Process
 
+@Reasoning:
+Message-send constructor for the Erlang '!' operator. Distinct from a
+regular call because the runtime semantics involve enqueueing into a
+process mailbox rather than synchronous invocation; backends targeting
+actor frameworks lower this to their framework's send primitive.
+@End Reasoning
 Process called "create_hir_send" that takes destination as HIRExpression, message as HIRExpression returns HIRExpression:
     Let send_data be a dictionary containing:
         "destination" as destination,
@@ -1365,6 +1743,13 @@ Process called "create_hir_send" that takes destination as HIRExpression, messag
         data as send_data
 End Process
 
+@Reasoning:
+Erlang's '=' match operator constructor. Distinct from assignment because
+the LHS is a pattern (which may destructure) and the operator can fail at
+runtime if the pattern does not match the value. Backends translating to
+languages without pattern-match-as-expression lower to a conditional and
+an exception throw on mismatch.
+@End Reasoning
 Process called "create_hir_match" that takes pattern as HIRExpression, value as HIRExpression returns HIRExpression:
     Let match_data be a dictionary containing:
         "pattern" as pattern,
@@ -1376,6 +1761,12 @@ Process called "create_hir_match" that takes pattern as HIRExpression, value as 
         data as match_data
 End Process
 
+@Reasoning:
+Case-expression constructor: holds the scrutinee and a list of
+{pattern, guards, body} branches. The branches list is in source order to
+preserve first-match semantics. Used by translate_case for Erlang's 'case
+... of ... end' construct.
+@End Reasoning
 Process called "create_hir_match_expr" that takes scrutinee as HIRExpression, branches as List[Any] returns HIRExpression:
     Let match_data be a dictionary containing:
         "scrutinee" as scrutinee,
@@ -1387,6 +1778,12 @@ Process called "create_hir_match_expr" that takes scrutinee as HIRExpression, br
         data as match_data
 End Process
 
+@Reasoning:
+If-expression constructor with explicit then/else statement lists. Used by
+translate_if to build the nested chain for Erlang's 'if ... end'. The else
+list is empty when the source had no terminating else clause, in which case
+the runtime would raise if_clause if no preceding clause matched.
+@End Reasoning
 Process called "create_hir_if_expr" that takes condition as HIRExpression, then_body as List[HIRStatement], else_body as List[HIRStatement] returns HIRExpression:
     Let if_data be a dictionary containing:
         "condition" as condition,
@@ -1399,6 +1796,13 @@ Process called "create_hir_if_expr" that takes condition as HIRExpression, then_
         data as if_data
 End Process
 
+@Reasoning:
+Receive-expression constructor for Erlang's mailbox primitive. Holds the
+list of receive clauses (each with pattern+guards+body), an optional
+timeout expression, and the after-body statements that run if the timeout
+fires. Both timeout and after_body may be null when no 'after' clause was
+present.
+@End Reasoning
 Process called "create_hir_receive" that takes clauses as List[Any], timeout as HIRExpression, after_body as List[HIRStatement] returns HIRExpression:
     Let receive_data be a dictionary containing:
         "clauses" as clauses,
@@ -1411,6 +1815,13 @@ Process called "create_hir_receive" that takes clauses as List[Any], timeout as 
         data as receive_data
 End Process
 
+@Reasoning:
+Try-expression constructor preserving all four sections of Erlang's
+try/of/catch/after: the protected body, the 'of' value-match clauses (empty
+when absent), the catch clauses keyed by exception class, and the always-
+runs after-body. Backends with simpler exception models flatten the of and
+catch sections during lowering.
+@End Reasoning
 Process called "create_hir_try" that takes try_body as List[HIRStatement], of_clauses as List[Any], catch_clauses as List[Any], after_body as List[HIRStatement] returns HIRExpression:
     Let try_data be a dictionary containing:
         "try" as try_body,
@@ -1424,12 +1835,23 @@ Process called "create_hir_try" that takes try_body as List[HIRStatement], of_cl
         data as try_data
 End Process
 
+@Reasoning:
+Block expression constructor wrapping a statement list. Used for 'begin
+... end' and for synthetic blocks produced when an expression context needs
+multiple statements. The block value is the value of its last sub-statement.
+@End Reasoning
 Process called "create_hir_block" that takes body as List[HIRStatement] returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "block",
         data as body
 End Process
 
+@Reasoning:
+List comprehension constructor preserving template and qualifier list.
+Distinct from the binary comprehension constructor only by its kind tag and
+the type of the template (full expression here vs. binary-segment dict for
+binary comprehensions).
+@End Reasoning
 Process called "create_hir_list_comprehension" that takes template as HIRExpression, qualifiers as List[Any] returns HIRExpression:
     Let comp_data be a dictionary containing:
         "template" as template,
@@ -1441,6 +1863,12 @@ Process called "create_hir_list_comprehension" that takes template as HIRExpress
         data as comp_data
 End Process
 
+@Reasoning:
+Binary comprehension constructor; the template is typed Any because it is
+a segment dictionary rather than an HIRExpression. Backends recognise the
+kind tag and treat the template as bit-syntax rather than ordinary
+expression syntax.
+@End Reasoning
 Process called "create_hir_binary_comprehension" that takes template as Any, qualifiers as List[Any] returns HIRExpression:
     Let comp_data be a dictionary containing:
         "template" as template,
@@ -1452,6 +1880,12 @@ Process called "create_hir_binary_comprehension" that takes template as Any, qua
         data as comp_data
 End Process
 
+@Reasoning:
+Record-creation constructor for '#name{field=value, ...}' and the update
+form '#name{Base|...}'. Base is null for fresh-record creation and non-null
+for update; the field map carries only EXPLICITLY-SET fields (omitted
+fields default at lower-level lowering).
+@End Reasoning
 Process called "create_hir_record" that takes name as String, fields as Dictionary[String, HIRExpression], base as HIRExpression returns HIRExpression:
     Let record_data be a dictionary containing:
         "name" as name,
@@ -1464,6 +1898,11 @@ Process called "create_hir_record" that takes name as String, fields as Dictiona
         data as record_data
 End Process
 
+@Reasoning:
+Record-access constructor for 'Record#name.field'. The field is held as a
+string because resolving it to a tuple slot index requires the record
+definition, which is consulted during semantic analysis.
+@End Reasoning
 Process called "create_hir_record_access" that takes record as HIRExpression, field as String returns HIRExpression:
     Let access_data be a dictionary containing:
         "record" as record,
@@ -1475,30 +1914,58 @@ Process called "create_hir_record_access" that takes record as HIRExpression, fi
         data as access_data
 End Process
 
+@Reasoning:
+Macro reference constructor for '?MACRO_NAME'. The translator does not
+expand the macro - it preserves the reference so a separate pre-processing
+or expansion pass can substitute the macro body when the macro definitions
+table is available.
+@End Reasoning
 Process called "create_hir_macro" that takes name as String returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "macro",
         data as name
 End Process
 
+@Reasoning:
+Error sentinel expression used when the translator encounters an unsupported
+construct. The kind tag "error" lets HIR consumers either propagate the
+error to the user or substitute a runtime exception throw, depending on
+their error-handling policy.
+@End Reasoning
 Process called "create_hir_error" that takes message as String returns HIRExpression:
     Return a value of type HIRExpression with
         kind as "error",
         data as message
 End Process
 
+@Reasoning:
+Return-statement constructor. Used in translate_expressions to mark the
+last expression in a sequence as the value to return from the enclosing
+function/clause.
+@End Reasoning
 Process called "create_hir_return" that takes value as HIRExpression returns HIRStatement:
     Return a value of type HIRStatement with
         stmt_type as "return",
         data as value
 End Process
 
+@Reasoning:
+Expression-statement constructor. Wraps an expression as a statement so it
+appears in a statement-list context where its value is discarded. Required
+because HIR statement lists do not accept bare expression values.
+@End Reasoning
 Process called "create_hir_expr_statement" that takes expr as HIRExpression returns HIRStatement:
     Return a value of type HIRStatement with
         stmt_type as "expr",
         data as expr
 End Process
 
+@Reasoning:
+Statement-position if constructor (companion to create_hir_if_expr which
+produces an if EXPRESSION). Used for clause dispatch in
+translate_clauses_with_dispatch where the if must be a top-level statement
+rather than a sub-expression.
+@End Reasoning
 Process called "create_hir_if" that takes condition as HIRExpression, then_body as List[HIRStatement], else_body as List[HIRStatement] returns HIRStatement:
     Let if_data be a dictionary containing:
         "condition" as condition,
@@ -1512,18 +1979,32 @@ Process called "create_hir_if" that takes condition as HIRExpression, then_body 
 End Process
 
 Note: Pattern creation helpers
+
+@Reasoning:
+Variable-binding pattern constructor. Used by translate_pattern when an
+Erlang variable appears in pattern position; the binding semantics (capture
+the matched value into the named slot) is the HIR consumer's job.
+@End Reasoning
 Process called "create_hir_var_pattern" that takes name as String returns ErlangPatternIR:
     Return a value of type ErlangPatternIR with
         pattern_type as "var",
         data as name
 End Process
 
+@Reasoning:
+Literal pattern constructor for atoms, integers, floats, strings, and
+chars in pattern position. Match semantics are exact-equality.
+@End Reasoning
 Process called "create_hir_literal_pattern" that takes value as Any returns ErlangPatternIR:
     Return a value of type ErlangPatternIR with
         pattern_type as "literal",
         data as value
 End Process
 
+@Reasoning:
+List-shape pattern constructor with optional cons-tail. The tail captures
+the '[H|T]' / '[A,B|T]' forms; for proper-list patterns tail is null.
+@End Reasoning
 Process called "create_hir_list_pattern" that takes elements as List[ErlangPatternIR], tail as ErlangPatternIR returns ErlangPatternIR:
     Let list_data be a dictionary containing:
         "elements" as elements,
@@ -1535,12 +2016,22 @@ Process called "create_hir_list_pattern" that takes elements as List[ErlangPatte
         data as list_data
 End Process
 
+@Reasoning:
+Tuple-shape pattern constructor for '{A,B,C}' patterns. Arity matching is
+implied by element list length and is the HIR consumer's responsibility to
+verify against the scrutinee.
+@End Reasoning
 Process called "create_hir_tuple_pattern" that takes elements as List[ErlangPatternIR] returns ErlangPatternIR:
     Return a value of type ErlangPatternIR with
         pattern_type as "tuple",
         data as elements
 End Process
 
+@Reasoning:
+Wildcard pattern constructor. Always matches and binds nothing. Carries
+the string "_" as data for source-reconstruction fidelity even though the
+match semantics depend only on the pattern_type tag.
+@End Reasoning
 Process called "create_hir_wildcard_pattern" returns ErlangPatternIR:
     Return a value of type ErlangPatternIR with
         pattern_type as "wildcard",
@@ -1551,6 +2042,12 @@ Note: ==========================================================================
 Note: TRANSLATION ENTRY POINT
 Note: ============================================================================
 
+@Reasoning:
+Public entry point with the canonical translator name. Delegates to the
+fully-named translate_erlang_module_to_hir which does the actual work; this
+indirection exists so external callers see a name that matches the module
+file convention without losing the more-descriptive internal function name.
+@End Reasoning
 Process called "translate_erlang_to_hir" that takes erl_module as ErlangModule returns HIRModule:
     Return translate_erlang_module_to_hir with erl_module
 End Process

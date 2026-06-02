@@ -56,6 +56,26 @@ Note: ===================================================================
 Note: ANALYZER CREATION
 Note: ===================================================================
 
+@Reasoning:
+Constructor eagerly allocates every registry so the analysis passes
+do not have to lazy-init them on first use. The 18-slot struct holds
+three Dict-typed registries (targets, variables, dependencies) for
+O(1) name lookup during cycle detection, ten List-typed registries
+that are iterated linearly during validation, plus three scalar
+slots (default_target, error_message, has_error). One eager allocation
+batch is cheaper than per-phase init because the analyse pass runs
+exactly once per Makefile.
+@End Reasoning
+
+@Implementation:
+Allocates 144 bytes (18 fields x 8 bytes) via Layout.allocate. Returns
+0 on allocation failure. Creates three Dicts (targets, variables,
+dependencies) and twelve Lists for the iterable registries plus the
+two diagnostics lists. Writes each into its offset (0..120 in 8-byte
+strides) per the field layout in the Type declaration above. Offsets
+48, 128, and 136 (default_target, error_message, has_error) are
+zeroed because they are scalar slots that start empty.
+@End Implementation
 Process called "create_makefile_semantic_analyzer" returns Integer:
     Note: Create Makefile semantic analyzer for build system validation
 
@@ -120,6 +140,30 @@ Note: ===================================================================
 Note: MAIN ANALYSIS ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+The six analysis phases run in fixed order because each later phase
+consumes registries that earlier phases populate. Declarations come
+first because every subsequent phase queries the targets/variables
+dicts. Dependency resolution must precede target validation because
+the validator checks that prerequisites are themselves declared.
+Variable analysis follows because dependency expansion in recipes
+references variables. Pattern validation runs late because it relies
+on the fully populated rule registries. Circular dependency detection
+runs last so it sees the complete dependency graph including
+implicit and pattern-rule edges.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately on null analyzer. On null makefile_ast, records
+"Null Makefile AST" via set_makefile_semantic_error and returns 0.
+Otherwise calls the six phase functions in order:
+collect_makefile_declarations, resolve_makefile_dependencies,
+validate_makefile_targets, analyze_makefile_variables,
+validate_makefile_patterns, detect_makefile_circular_dependencies.
+Reads has_error at offset 136 after all phases run; returns 0 if any
+phase set it, otherwise 1. Diagnostics persist on the analyzer's
+validation_errors / validation_warnings lists for caller retrieval.
+@End Implementation
 Process called "analyze_makefile" takes analyzer as Integer, makefile_ast as Integer returns Integer:
     Note: Perform complete semantic analysis on Makefile
 
@@ -174,6 +218,26 @@ Note: ===================================================================
 Note: DECLARATION COLLECTION
 Note: ===================================================================
 
+@Reasoning:
+GNU Make designates the first explicit target as the "default goal"
+that runs when `make` is invoked without arguments. The first_target_set
+flag threads through the iteration so collect_makefile_target can
+distinguish the first encountered target rule from subsequent ones
+and assign it to the default_target slot. Five statement kinds are
+recognised here (target_rule, variable_assignment, include_directive,
+conditional_block, pattern_rule); other statement types fall through
+to later phases where their specialised handling lives.
+@End Reasoning
+
+@Implementation:
+Reads the AST's flat statement list via get_makefile_statements.
+Initialises first_target_set to 0 and iterates. For each statement,
+reads stmt_type and Match-dispatches to the appropriate collector.
+For target_rule, sets first_target_set to 1 after the first call so
+subsequent targets do not overwrite default_target. The Otherwise arm
+silently skips statement kinds that other phases handle (e.g.
+function calls, which are gathered during dependency resolution).
+@End Implementation
 Process called "collect_makefile_declarations" takes analyzer as Integer, makefile_ast as Integer:
     Note: Collect all Makefile declarations for reference resolution
 
@@ -214,6 +278,29 @@ Process called "collect_makefile_declarations" takes analyzer as Integer, makefi
     End While
 End Process
 
+@Reasoning:
+A single target_rule can declare multiple targets (e.g. `a b c: deps`)
+so the registration loop iterates the target_names list. The first
+target seen in the whole Makefile (first_target_set == 0 AND first
+name in this rule) becomes the default goal - tracked at offset 48.
+Duplicate target detection is a warning rather than an error because
+GNU Make legitimately supports overriding rules via `::` and explicit
+re-declarations; the warning surfaces accidental shadowing.
+@End Reasoning
+
+@Implementation:
+Reads target_names via get_makefile_target_names. Reads the targets
+registry (offset 0) and dependencies registry (offset 16). Loops
+i = 0..target_count - 1:
+- If first_target_set is 0 AND i is 0, writes target_name to offset 48
+  (default_target).
+- Calls Dict.contains on targets_registry; if 1, concatenates
+  "Duplicate target definition: " with target_name and records via
+  add_makefile_validation_warning.
+- Inserts target_name -> target_rule into targets_registry.
+- Calls get_makefile_target_prerequisites to register dependency edges
+  into dependencies_registry (continues outside the shown excerpt).
+@End Implementation
 Process called "collect_makefile_target" takes analyzer as Integer, target_rule as Integer, first_target_set as Integer:
     Note: Collect target rule for registry
 
@@ -257,6 +344,25 @@ Process called "collect_makefile_target" takes analyzer as Integer, target_rule 
     proc check_special_targets with analyzer, target_names
 End Process
 
+@Reasoning:
+GNU Make has four assignment flavours: recursive (=), simple (:=),
+conditional (?=), append (+=). The flavour matters at expansion time
+because recursive variables re-expand their values on each reference
+while simple variables snapshot the value at assignment time. Storing
+the value and assignment_type together in a variable_info record lets
+the later variable-resolution pass apply the correct expansion
+strategy without re-querying the AST node.
+@End Reasoning
+
+@Implementation:
+Reads variable_name, variable_value, and assignment_type from the
+variable_assignment AST node via the corresponding getters. Reads the
+variables registry at offset 8. Constructs a variable_info via
+create_variable_info, then inserts variable_name -> var_info into the
+variables registry via Dict.set. The variables registry overwrites
+on duplicate keys, matching GNU Make's late-binding semantics where
+a later assignment supersedes earlier ones.
+@End Implementation
 Process called "collect_makefile_variable" takes analyzer as Integer, variable_assignment as Integer:
     Note: Collect variable assignment for registry
 
@@ -276,6 +382,23 @@ Process called "collect_makefile_variable" takes analyzer as Integer, variable_a
     proc set from Dict with variables_registry, variable_name, var_info
 End Process
 
+@Reasoning:
+`include` directives may name multiple files in a single statement
+(e.g. `include $(wildcard *.d)`), so each one is registered
+individually onto the include_files list at offset 56. Per-file
+existence validation runs at collection time rather than during the
+later validation phase so a missing include can fail fast with a
+precise pointer to the offending file path.
+@End Reasoning
+
+@Implementation:
+Reads include_files registry handle from offset 56 and the list of
+filenames from the include_directive via get_makefile_include_files.
+Iterates i = 0..file_count - 1: reads include_file, appends to the
+analyzer's include_files list, then calls validate_include_file_existence
+which performs access(F_OK)/access(R_OK) syscalls to verify presence
+and readability and records errors/warnings as appropriate.
+@End Implementation
 Process called "collect_makefile_include" takes analyzer as Integer, include_directive as Integer:
     Note: Collect include directive for dependency tracking
 
@@ -345,6 +468,24 @@ Process called "validate_include_file_existence" takes analyzer as Integer, incl
     Return 1
 End Process
 
+@Reasoning:
+Conditional blocks (`ifdef`, `ifndef`, `ifeq`, `ifneq`, `else`,
+`endif`) parameterise which targets and rules become visible during a
+particular Make invocation, but for static analysis we record every
+conditional block so the variable-usage analysis can warn about
+variables that appear only inside conditional bodies. Analyzing the
+condition expression eagerly catches references to undefined variables
+in the condition itself.
+@End Reasoning
+
+@Implementation:
+Reads the conditional_blocks registry handle from offset 64 and
+appends conditional_block via List.add. Reads the condition expression
+via get_makefile_condition_expression and passes it to
+analyze_condition_variables, which records every variable name
+referenced in the condition into the analyzer's variable_references
+list for cross-check during analyze_makefile_variables.
+@End Implementation
 Process called "collect_makefile_conditional" takes analyzer as Integer, conditional_block as Integer:
     Note: Collect conditional block for analysis
 
@@ -362,6 +503,23 @@ Process called "collect_makefile_conditional" takes analyzer as Integer, conditi
     proc analyze_condition_variables with analyzer, condition_expr
 End Process
 
+@Reasoning:
+Pattern rules like `%.o: %.c` define how to build any target matching
+the `%.o` pattern from a prerequisite matching the corresponding `%.c`
+pattern. Registering them on the pattern_rules list at offset 24 lets
+the validate_makefile_patterns phase later iterate every pattern rule
+to verify the stem placeholder appears in both target and prerequisite
+sides and that the recipe is non-empty.
+@End Reasoning
+
+@Implementation:
+Reads the pattern_rules registry handle from offset 24 and appends
+the pattern_rule via List.add. Calls validate_pattern_rule_syntax to
+perform the immediate syntactic checks (single %, balanced stem
+usage, recipe present); deeper semantic checks (no overlap with more
+specific rules, no impossible patterns) happen in
+validate_makefile_patterns once all rules are collected.
+@End Implementation
 Process called "collect_makefile_pattern_rule" takes analyzer as Integer, pattern_rule as Integer:
     Note: Collect pattern rule for validation
 
@@ -378,6 +536,24 @@ Process called "collect_makefile_pattern_rule" takes analyzer as Integer, patter
     proc validate_pattern_rule_syntax with analyzer, pattern_rule
 End Process
 
+@Reasoning:
+GNU Make's special targets begin with a dot (.PHONY, .DEFAULT,
+.SUFFIXES, .PRECIOUS, .INTERMEDIATE, etc.) and instruct Make to treat
+their prerequisites specially. The most consequential for static
+analysis is .PHONY because phony targets are exempt from "this
+target's name exists as a file" checks - missing the .PHONY
+registration would produce false positives during validation.
+@End Reasoning
+
+@Implementation:
+Reads the phony_targets list handle from offset 40. Iterates the
+target_names list. For each target_name, compares against ".PHONY"
+via StringCore.string_equals; if matched, calls
+mark_phony_prerequisites which walks the prerequisites of the .PHONY
+rule and adds each one to phony_targets. The other special targets
+(.DEFAULT, etc.) are recognised by their own branches inside this
+function (continued outside the shown excerpt).
+@End Implementation
 Process called "check_special_targets" takes analyzer as Integer, target_names as Integer:
     Note: Check for special Make targets
 
@@ -418,6 +594,25 @@ Note: ===================================================================
 Note: DEPENDENCY RESOLUTION
 Note: ===================================================================
 
+@Reasoning:
+Phase 2 entry point. The four sub-steps (target dependency resolution,
+variable reference resolution, function-call resolution, dependency
+graph construction) are sequenced so each can rely on its predecessors:
+target dependencies must be resolved before variable references can be
+checked in prerequisite lists, function calls are resolved after
+because they can appear in any string position, and the final graph
+build assembles the edges all three prior steps discovered.
+@End Reasoning
+
+@Implementation:
+Calls four phase-internal functions in fixed order:
+resolve_target_dependencies, resolve_variable_references,
+resolve_function_calls, build_dependency_graph. Each operates on
+registries the analyzer's collection phase populated and writes its
+own outputs into the analyzer (variable_references, function_calls,
+dependencies graph). No explicit error propagation here - each
+sub-step records errors directly into the analyzer's diagnostic lists.
+@End Implementation
 Process called "resolve_makefile_dependencies" takes analyzer as Integer:
     Note: Resolve all target dependencies and references
 
@@ -433,6 +628,27 @@ Process called "resolve_makefile_dependencies" takes analyzer as Integer:
     proc build_dependency_graph from analyzer
 End Process
 
+@Reasoning:
+For each registered target, every prerequisite must resolve to one of
+three things: another declared target, a pattern rule match, or an
+on-disk file. Items that match none of these are added to
+undefined_targets - this is not an error in Make (the build may still
+succeed if the prereq is generated at runtime) but the analyzer
+records it for the user's review. Pattern-rule fallback is checked
+before declaring something undefined to avoid false positives on
+common patterns like %.o being implied by a %.o:%.c rule.
+@End Reasoning
+
+@Implementation:
+Reads the dependencies registry (offset 16), targets registry
+(offset 0), and undefined_targets list (offset 96). Iterates every
+key in dependencies_registry, reading the prerequisite list for each.
+For each prerequisite: queries targets_registry; if absent, calls
+check_pattern_rule_match against the registered pattern_rules. If
+neither matches, appends the prereq_name to undefined_targets. Both
+loops are O(N) over their respective lists; total work is O(T * P)
+for T targets and P average prerequisites per target.
+@End Implementation
 Process called "resolve_target_dependencies" takes analyzer as Integer:
     Note: Resolve target dependency references
 
@@ -482,6 +698,25 @@ Process called "resolve_target_dependencies" takes analyzer as Integer:
     End While
 End Process
 
+@Reasoning:
+Variable references can appear in three positions: target names
+(`$(SUFFIX): ...`), prerequisite lists (`obj: $(DEPS)`), and recipe
+command lines (`@echo $(MSG)`). Each must be scanned so the
+analyzer's variable_references list accumulates every name used,
+making it possible for analyze_makefile_variables to cross-check
+against the variables registry and report undefined-variable usage.
+@End Reasoning
+
+@Implementation:
+Reads targets_registry (offset 0), variables_registry (offset 8),
+and variable_references list (offset 80). Reads every target_rule
+from targets_registry via Dict.values. For each rule, calls
+check_variable_references_in_list three times with the target names,
+prerequisites, and recipe lines respectively, accumulating into
+variable_references. The same list is reused for all three positions
+because downstream analysis works off the full reference set rather
+than separating by position.
+@End Implementation
 Process called "resolve_variable_references" takes analyzer as Integer:
     Note: Resolve all variable references in targets and recipes
 
@@ -542,14 +777,24 @@ Process called "check_variable_references_in_list" takes analyzer as Integer, st
     End While
 End Process
 
+@Reasoning:
+Parses a free-form Make text fragment (recipe line or variable value)
+and appends every embedded variable reference to the caller's
+references list. Make recognizes three reference forms: $(VAR),
+${VAR}, and bare $VAR for single-character names. The single ASCII
+char-code 36 ('$') is the only sentinel we scan for; the actual
+bracket parsing happens in parse_variable_reference.
+@End Reasoning
+@Implementation:
+Linear pass over the text by character index. On encountering '$' we
+delegate to parse_variable_reference to extract the variable name and,
+on success, append it and advance past `name + 2` (the 2 accounts for
+the `$` and the opening bracket; for bare `$X` references parse_*
+returns the single-char form and the +2 is still safe because the
+loop will skip the trailing non-`$` characters).
+@End Implementation
 Process called "extract_variable_references" takes analyzer as Integer, text as Integer, references as Integer:
     Note: Extract variable references from text string
-
-    @Reasoning:
-    Parse text for Make variable references in forms $(VAR), ${VAR}, and
-    $VAR to build complete list of referenced variables for validation
-    against defined variables registry.
-    @End Reasoning
 
     Let length be proc string_length from StringCore with text
     Let i be 0
@@ -576,6 +821,26 @@ Note: ===================================================================
 Note: TARGET VALIDATION
 Note: ===================================================================
 
+@Reasoning:
+Phase 3 wraps four orthogonal validation tasks: syntactic checks on
+target names and prerequisite lists, recipe-command syntax checks,
+.PHONY-specific validation (phony targets must have no on-disk file
+of the same name to avoid Make's "up-to-date" optimisation), and a
+missing-recipe sweep that catches non-phony targets without any
+commands. Splitting them into four sub-functions keeps the
+responsibilities cleanly partitioned and lets each evolve
+independently.
+@End Reasoning
+
+@Implementation:
+Calls four phase-internal functions in fixed order:
+validate_target_syntax, validate_recipe_commands,
+validate_phony_targets, check_missing_recipes. Each operates on the
+targets registry and writes errors/warnings into the analyzer's
+validation_errors / validation_warnings lists. No explicit return
+value; the per-error has_error flag flip in add_makefile_error makes
+the eventual `has_error` check in analyze_makefile authoritative.
+@End Implementation
 Process called "validate_makefile_targets" takes analyzer as Integer:
     Note: Validate target rules and recipes
 
@@ -621,14 +886,24 @@ Process called "validate_target_syntax" takes analyzer as Integer:
     End While
 End Process
 
+@Reasoning:
+Dispatcher over the targets registry that delegates per-command
+validation to validate_recipe_command. Each Makefile target carries a
+recipe (a list of shell commands); flattening the iteration here
+avoids duplicating the registry walk in every per-command check and
+keeps line_number computation linear with the command index.
+@End Reasoning
+@Implementation:
+Outer loop over target_rules from the targets registry (offset 0).
+For each rule, get_makefile_target_recipe yields its command list,
+which inner loop walks. line_number passed to validate_recipe_command
+is the command's index within its recipe, not the absolute file line;
+the per-target relative index is sufficient for diagnostic anchoring
+because the recipe is already namespaced by target name in the error
+message.
+@End Implementation
 Process called "validate_recipe_commands" takes analyzer as Integer:
     Note: Validate recipe command syntax
-
-    @Reasoning:
-    Validate recipe commands for proper shell syntax, command prefixes
-    (@, -, +), and common command patterns. Check for potential issues
-    like missing error handling and unsafe command usage.
-    @End Reasoning
 
     Let targets_registry be proc memory_get_int64 from Layout with analyzer, 0
     Let target_rules be proc values from Dict with targets_registry
@@ -654,6 +929,32 @@ Process called "validate_recipe_commands" takes analyzer as Integer:
     End While
 End Process
 
+@Reasoning:
+A Make recipe command may carry up to three prefix modifiers that
+must be skipped before the actual shell command is parsed: `@`
+suppresses echo, `-` ignores errors, `+` forces execution even under
+`make -n`. The validator must understand the prefix layer to avoid
+flagging a leading prefix as a syntax error and to expose the bare
+command for further inspection.
+@End Reasoning
+
+@Implementation:
+Reads the command's length; returns immediately on empty command.
+Reads the first character; if 64 ('@'), advances command_start to 1
+to skip the silent prefix. If 45 ('-'), advances similarly for the
+ignore-errors prefix. If 43 ('+'), advances for the force-execute
+prefix (continued outside the shown excerpt). The actual command
+syntax check then runs against command_start..length-1. line_number
+is threaded through so any error message can pinpoint the offending
+line within the recipe.
+@End Implementation
+
+@Security_Scope:
+Recipe commands are shell scripts under user control. This routine
+only inspects the first character for known Make prefixes; it does
+not interpret the command body. Downstream callers that emit the
+command into a shell remain responsible for quoting and escaping.
+@End Security_Scope
 Process called "validate_recipe_command" takes analyzer as Integer, command as Integer, line_number as Integer:
     Note: Validate individual recipe command
 
@@ -689,6 +990,26 @@ Process called "validate_recipe_command" takes analyzer as Integer, command as I
     proc check_recipe_best_practices with analyzer, actual_command, line_number
 End Process
 
+@Reasoning:
+A name declared phony via `.PHONY: name` is expected to also have a
+corresponding rule definition - otherwise the phony declaration has no
+effect. Walking phony_targets and cross-checking against the targets
+registry surfaces accidental .PHONY entries for typo'd target names.
+Phony targets that DO have prerequisites need extra scrutiny because
+declaring a file-backed prerequisite of a phony target makes the file
+always re-build.
+@End Reasoning
+
+@Implementation:
+Reads phony_targets list (offset 40), targets registry (offset 0),
+and dependencies registry (offset 16). Iterates phony_targets. For
+each phony_target name: queries targets_registry; if absent, records
+"Phony target not defined: <name>" via add_makefile_validation_warning.
+Reads the prerequisite list for the phony target from
+dependencies_registry; if non-empty, delegates to
+validate_phony_dependencies which checks each prereq for file-vs-
+phony conflicts.
+@End Implementation
 Process called "validate_phony_targets" takes analyzer as Integer:
     Note: Validate phony target declarations
 
@@ -729,6 +1050,22 @@ Note: ===================================================================
 Note: VARIABLE ANALYSIS
 Note: ===================================================================
 
+@Reasoning:
+Phase 4 entry point. Four orthogonal variable-analysis tasks:
+naming-convention and assignment-type analysis (analyze_variable_-
+definitions), undefined-variable detection via cross-reference
+against the registry (check_undefined_variable_usage), scope
+analysis for target-local variables (analyze_variable_scope), and
+unused-variable detection (check_unused_variables).
+@End Reasoning
+
+@Implementation:
+Calls four phase-internal functions in fixed order:
+analyze_variable_definitions, check_undefined_variable_usage,
+analyze_variable_scope, check_unused_variables. Each operates on the
+variables registry (offset 8) and variable_references list (offset
+80) and records its findings into the analyzer's diagnostic lists.
+@End Implementation
 Process called "analyze_makefile_variables" takes analyzer as Integer:
     Note: Analyze variable usage and definitions
 
@@ -744,6 +1081,25 @@ Process called "analyze_makefile_variables" takes analyzer as Integer:
     proc check_unused_variables from analyzer
 End Process
 
+@Reasoning:
+Each variable's definition needs two checks: that its name follows
+Make conventions (uppercase by convention for user variables, no
+spaces, no embedded $ signs) and that its assignment type is used
+consistently (e.g. mixing := and += against the same variable in
+ways that surprise the user). Walking the keys of variables_registry
+is the natural iteration because each entry corresponds to exactly
+one final definition.
+@End Reasoning
+
+@Implementation:
+Reads the variables registry handle from offset 8. Reads the key
+list via Dict.keys. Iterates: for each variable_name, reads the
+var_info record, calls check_variable_naming (which inspects the
+name string for convention violations) and
+check_variable_assignment_consistency (which inspects var_info's
+assignment_type against historical uses tracked elsewhere). Both
+delegates record their findings into the analyzer's diagnostics.
+@End Implementation
 Process called "analyze_variable_definitions" takes analyzer as Integer:
     Note: Analyze variable definition patterns
 
@@ -772,6 +1128,25 @@ Process called "analyze_variable_definitions" takes analyzer as Integer:
     End While
 End Process
 
+@Reasoning:
+GNU Make tolerates undefined variable references at runtime
+(expanding them to empty strings), so undefined-variable usage is a
+warning rather than an error - it is almost always a defect but may
+be intentional in some setups. The check must consult the builtin
+list because variables like `$(CC)`, `$(CFLAGS)`, `$(MAKE)` are
+defined by Make itself and never appear in the user's variable
+declarations.
+@End Reasoning
+
+@Implementation:
+Reads the variable_references list (offset 80) and variables registry
+(offset 8). Iterates the references list. For each var_ref: queries
+Dict.contains on variables_registry; if 0, calls
+is_builtin_make_variable to fall back to the prelude list. If neither
+matches, builds "Undefined variable used: <name>" via string_concat
+and records via add_makefile_validation_warning. References that are
+declared or builtin pass through silently.
+@End Implementation
 Process called "check_undefined_variable_usage" takes analyzer as Integer:
     Note: Check for usage of undefined variables
 
@@ -811,6 +1186,22 @@ Note: ===================================================================
 Note: PATTERN RULE VALIDATION
 Note: ===================================================================
 
+@Reasoning:
+Phase 5 entry point. Pattern-rule validation needs three sub-steps:
+syntactic validation of every registered pattern rule
+(validate_pattern_rule_syntax_all), conflict detection between rules
+that could match the same target (check_pattern_conflicts), and
+suffix-rule legacy checks (validate_suffix_rules - old-style .c.o
+rules need different handling than %.o:%.c pattern rules).
+@End Reasoning
+
+@Implementation:
+Calls three phase-internal functions in fixed order:
+validate_pattern_rule_syntax_all, check_pattern_conflicts,
+validate_suffix_rules. Each iterates the pattern_rules list at
+offset 24 and writes errors/warnings into the analyzer's diagnostic
+lists. No explicit return value.
+@End Implementation
 Process called "validate_makefile_patterns" takes analyzer as Integer:
     Note: Validate pattern rules and implicit rules
 
@@ -844,14 +1235,26 @@ Process called "validate_pattern_rule_syntax_all" takes analyzer as Integer:
     End While
 End Process
 
+@Reasoning:
+A Make pattern rule encodes a build template using a single `%` stem
+in the target; the same `%` is implicit-bound in prerequisites and
+expands to whatever portion of a concrete target name matched the
+literal flanks of the pattern. Three invariants must therefore hold:
+(1) the target carries exactly one `%`, (2) prerequisites carry
+patterns whose stem alignment is consistent with the target, and (3)
+the recipe references automatic variables (`$<`, `$@`, etc.) rather
+than a hardcoded filename, since the rule applies to many targets.
+@End Reasoning
+@Implementation:
+Counts `%` in target_pattern (char 37) via count_character_occurrences
+and emits an error on any count other than exactly one. Delegates
+prerequisite alignment to validate_pattern_prerequisites and recipe
+automatic-variable checks to check_automatic_variable_usage. Both
+delegations skip on null inputs because absent prerequisites and an
+empty recipe are both legal for a forward declaration.
+@End Implementation
 Process called "validate_individual_pattern_rule" takes analyzer as Integer, pattern_rule as Integer:
     Note: Validate individual pattern rule
-
-    @Reasoning:
-    Validate pattern rule target contains exactly one % character,
-    prerequisites use matching patterns, and recipe commands properly
-    reference automatic variables like $< and $@ for pattern rules.
-    @End Reasoning
 
     Let target_pattern be proc get_pattern_rule_target from pattern_rule
     Let prerequisites be proc get_pattern_rule_prerequisites from pattern_rule
@@ -879,6 +1282,31 @@ Note: ===================================================================
 Note: CIRCULAR DEPENDENCY DETECTION
 Note: ===================================================================
 
+@Reasoning:
+Phase 6 entry point. Cycle detection on the dependency graph uses
+the classic three-color DFS - 'visiting' marks nodes on the current
+recursion stack, 'visited' marks completely processed subtrees. The
+outer loop iterates every target so unreachable cycles (cycles not
+reachable from the default target) are still found.
+@End Reasoning
+
+@Implementation:
+Reads the dependencies registry (offset 16) and circular_dependencies
+list (offset 88). Allocates two scratch Dicts (visited and visiting)
+that live only for the duration of this phase. Iterates every key in
+dependencies_registry: if not yet visited, calls
+detect_cycle_from_target which performs the recursive DFS marking
+visiting on entry and moving the node to visited on exit. Cycles
+are recorded into circular_dependencies and as errors on the
+analyzer's diagnostic list.
+@End Implementation
+
+@Performance_Hints:
+O(V + E) total over the dependency graph: each target is processed
+exactly once thanks to the visited check; each dependency edge is
+walked once during its target's DFS. Memory is O(V) for the visited
+and visiting scratch dicts plus O(D) for recursion depth.
+@End Performance_Hints
 Process called "detect_makefile_circular_dependencies" takes analyzer as Integer:
     Note: Detect circular dependencies in target graph
 
@@ -967,6 +1395,27 @@ Note: ===================================================================
 Note: UTILITY FUNCTIONS
 Note: ===================================================================
 
+@Reasoning:
+The undefined-variable check would generate noise on every Make-
+provided builtin if it did not have an authoritative recognition
+function. The set is two-tiered: a fixed name list for the named
+builtins (CC, CFLAGS, etc.) and a single-character check for the
+automatic variables ($@, $<, $^, $?) which use punctuation as the
+variable name. Splitting the two recognition styles keeps the lookup
+simple while covering both surfaces.
+@End Reasoning
+
+@Implementation:
+Builds an 11-entry list of named builtins (CC, CXX, CFLAGS, CXXFLAGS,
+LDFLAGS, MAKE, MAKEFILE_LIST, SHELL, PWD, USER, HOME). Iterates the
+list comparing against variable_name via StringCore.string_equals;
+any match returns 1. If no named match, reads the first character of
+variable_name and returns 1 for '@' (64), '<' (60), '^' (94), or '?'
+(63). All other names return 0. Building the list each call is a
+deliberate trade against keeping a module-level static dict because
+this function is on the cold path and the list construction is
+cheaper than the alternative module-init bookkeeping.
+@End Implementation
 Process called "is_builtin_make_variable" takes variable_name as Integer returns Integer:
     Note: Check if variable is a built-in Make variable
 
@@ -1020,6 +1469,27 @@ Process called "is_builtin_make_variable" takes variable_name as Integer returns
     Return 0
 End Process
 
+@Reasoning:
+Make accepts three variable-reference syntaxes: `$(VAR)`, `${VAR}`,
+and the single-character form `$X` where X is any character. The
+parser must pick the right closing delimiter for the bracketed forms
+and the right one-character extract for the bare form. Returning 0
+for malformed references (unclosed bracket, end-of-text right after
+the $) lets the caller skip past the offending character without
+hard-erroring.
+@End Reasoning
+
+@Implementation:
+Reads the text length. Returns 0 if there is no character after the
+dollar (start_pos + 1 >= length). Reads the character at start_pos+1:
+- 40 ('('): finds the matching ')' via string_find_from starting at
+  start_pos+2; if found, returns the substring between the brackets.
+- 123 ('{'): same logic with '}' as the closer.
+- otherwise: treats it as a single-character variable reference and
+  returns that character as a 1-byte string via char_to_string.
+Returns 0 if a bracketed form has no closing bracket within the
+remaining text.
+@End Implementation
 Process called "parse_variable_reference" takes text as Integer, start_pos as Integer returns Integer:
     Note: Parse variable reference from text starting at position
 

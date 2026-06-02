@@ -61,6 +61,20 @@ Note: ================================================================
 Note: Translator State
 Note: ================================================================
 
+@Reasoning:
+Translator state for the LaTeX-to-HIR frontend. Holds the HIR module
+being constructed, separate diagnostic lists (errors and warnings),
+a scope stack for nested environment tracking, and tables of label
+and citation references for cross-reference validation in a final
+pass.
+@End Reasoning
+
+@Implementation:
+48-byte record (6 x i64). Offsets: 0 hir_module, 8 errors list, 16
+warnings list, 24 current_scope stack, 32 label_table, 40
+citation_table. All lists are ListCore handles. Created by
+create_translator.
+@End Implementation
 Type called "LaTeXTranslator":
     hir_module as Integer
     errors as Integer
@@ -74,6 +88,20 @@ Note: ================================================================
 Note: Translator Creation and Initialization
 Note: ================================================================
 
+@Reasoning:
+Creates and primes a LaTeXTranslator. Initialises the HIR module
+root as a HIR_LATEX_DOCUMENT and the five auxiliary lists so the
+first call to translate has all needed slots populated.
+@End Reasoning
+
+@Implementation:
+Memory.allocate(48). Creates a 32-byte HIR module with type
+HIR_LATEX_DOCUMENT, name "latex_document", and an empty items list
+at offset 16. Stores the module pointer at translator offset 0.
+Allocates ListCore lists for errors (8), warnings (16), scope_stack
+(24), label_table (32), citation_table (40). Returns the translator
+handle.
+@End Implementation
 Process called "create_translator" that takes nothing returns Integer:
     Let translator_ptr be proc allocate from Memory with 48
 
@@ -112,6 +140,20 @@ Note: ================================================================
 Note: Main Translation Entry Point
 Note: ================================================================
 
+@Reasoning:
+Top-level entry. Validates the AST root is a NODE_DOCUMENT then
+dispatches to the preamble and body translators. The returned value
+is the populated HIR module handle.
+@End Reasoning
+
+@Implementation:
+Null AST guard: emits "Null AST" error and returns 0. Reads root
+type at offset 0; if not LaTeXParser.NODE_DOCUMENT emits "Expected
+DOCUMENT" error. Reads preamble (offset 8); if non-null calls
+translate_preamble. Reads body (offset 16); if non-null calls
+translate_content_list. Returns the HIR module from offset 0 of
+translator.
+@End Implementation
 Process called "translate" that takes translator_ptr as Integer, latex_ast as Integer returns Integer:
     If latex_ast is equal to 0:
         proc add_error with translator_ptr, "Null AST provided to translator"
@@ -145,6 +187,17 @@ Note: ================================================================
 Note: Preamble Translation
 Note: ================================================================
 
+@Reasoning:
+Iterates the preamble items (\documentclass, \usepackage, custom
+preamble commands) and emits HIR for each. The preamble ends at
+\begin{document}; the parser separates it from the body so this
+translator never accidentally consumes body nodes.
+@End Reasoning
+
+@Implementation:
+Type-checks the preamble node. Reads the items list from offset 8;
+loops 0..size calling translate_preamble_item for each. Returns 1.
+@End Implementation
 Process called "translate_preamble" that takes translator_ptr as Integer, preamble_ptr as Integer returns Integer:
     Let node_type be proc read_integer from Memory with preamble_ptr, 0
 
@@ -166,6 +219,18 @@ Process called "translate_preamble" that takes translator_ptr as Integer, preamb
     Return 1
 End Process
 
+@Reasoning:
+Dispatches a single preamble item by its parser-assigned kind:
+\documentclass, \usepackage, or a generic preamble command. Unknown
+preamble kinds return 0 silently so HIR construction is robust to
+parser-extension nodes.
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0. Cascade: NODE_DOCUMENT_CLASS ->
+translate_documentclass; NODE_USEPACKAGE -> translate_usepackage;
+NODE_COMMAND -> translate_preamble_command. Falls through to 0.
+@End Implementation
 Process called "translate_preamble_item" that takes translator_ptr as Integer, item_ptr as Integer returns Integer:
     Let node_type be proc read_integer from Memory with item_ptr, 0
 
@@ -186,6 +251,19 @@ Process called "translate_preamble_item" that takes translator_ptr as Integer, i
     Return 0
 End Process
 
+@Reasoning:
+Emits HIR for '\documentclass[options]{class}'. The class name comes
+from the required argument and options from the optional bracket
+argument; both are captured as strings on the resulting
+HIR_LATEX_DOCUMENTCLASS node.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte node with type HIR_LATEX_DOCUMENTCLASS. Reads
+the required arg (offset 8) and extracts its text into the name slot.
+Reads the optional arg (offset 16); if non-null extracts text into
+the options slot, otherwise stores empty string. Adds to module.
+@End Implementation
 Process called "translate_documentclass" that takes translator_ptr as Integer, docclass_ptr as Integer returns Integer:
     Note: Create HIR node for document class
     Let hir_node be proc allocate from Memory with 32
@@ -209,6 +287,25 @@ Process called "translate_documentclass" that takes translator_ptr as Integer, d
 
     Return 1
 End Process
+
+@Reasoning:
+LaTeX `\usepackage[opts]{name}` declarations are the document's analogue
+of imports - they pull in macro definitions and styling from external
+packages. We capture both the package name (offset 8 of the parser node)
+and the optional [options] argument (offset 16) so downstream HIR
+consumers can decide which packages map to which target-format
+equivalents (e.g., `graphicx` -> include-image support, `hyperref` ->
+link generation).
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node. Writes HIR_LATEX_USEPACKAGE at offset 0.
+Reads package_arg from parser offset 8, extracts the text via
+extract_text_from_argument, writes it at HIR offset 8. Reads options_arg
+from parser offset 16; if non-zero extracts its text into options_str,
+otherwise leaves "". Writes options_str at HIR offset 16. Calls
+add_to_module to enroll the node. Returns 1 (success).
+@End Implementation
 
 Process called "translate_usepackage" that takes translator_ptr as Integer, package_ptr as Integer returns Integer:
     Note: Create HIR node for package import
@@ -234,6 +331,22 @@ Process called "translate_usepackage" that takes translator_ptr as Integer, pack
     Return 1
 End Process
 
+@Reasoning:
+Preamble commands like `\title`, `\author`, `\date` set document
+metadata that doesn't render at the call site but flows into
+`\maketitle`. We tag them HIR_METADATA (rather than HIR_CALL) so
+downstream passes know to route them to the document-info table
+instead of inline output.
+@End Reasoning
+
+@Implementation:
+Reads command_name from parser offset 8. Allocates a 40-byte HIR node
+tagged HIR.HIR_METADATA. Writes command_name at HIR offset 8. Reads
+args_list from parser offset 16 and translates it via
+translate_argument_list, writing the resulting HIR list at offset 16.
+Calls add_to_module. Returns 1.
+@End Implementation
+
 Process called "translate_preamble_command" that takes translator_ptr as Integer, command_ptr as Integer returns Integer:
     Note: Handle preamble commands like \title, \author, \date
     Let command_name be proc read_string from Memory with command_ptr, 8
@@ -257,6 +370,21 @@ Note: ================================================================
 Note: Content Translation
 Note: ================================================================
 
+@Reasoning:
+Iterates a parser List of content nodes (section bodies, environment
+bodies, top-level document content) and dispatches each through
+translate_node. Side-effects-only: each translation enrolls its HIR
+node into the module via add_to_module, so this helper itself doesn't
+need to return individual results.
+@End Reasoning
+
+@Implementation:
+Reads count via ListCore.get_list_size(content_list). Initialises
+index = 0. Loops while index < count: reads node_ptr at index via
+ListCore.get_from_list, calls translate_node(translator_ptr, node_ptr),
+bumps index. Returns 1.
+@End Implementation
+
 Process called "translate_content_list" that takes translator_ptr as Integer, content_list as Integer returns Integer:
     Let count be proc get_list_size from ListCore with content_list
     Let index be 0
@@ -269,6 +397,29 @@ Process called "translate_content_list" that takes translator_ptr as Integer, co
 
     Return 1
 End Process
+
+@Reasoning:
+LaTeX-AST dispatcher that routes each parser node to its specialised
+HIR translator based on the node_type tag stored at offset 0. The
+node_type set covers LaTeX's syntactic categories: sectioning commands
+(SECTION/SUBSECTION/etc), ENVIRONMENT, COMMAND, TEXT_BLOCK, MATH_INLINE
+and MATH_DISPLAY, CITATION, REFERENCE, LABEL, LIST_ITEM. Unrecognised
+types fall through to Return 0 (the translation simply produces no HIR
+for unknown constructs - this is safer than aborting because LaTeX
+documents commonly have package-specific macros we can't handle).
+@End Reasoning
+
+@Implementation:
+Null-guards node_ptr (returns 0). Reads node_type at offset 0. A long
+cascading-If chain compares node_type against LaTeXParser node-type
+constants and tail-calls the matching translator: NODE_SECTION /
+SUBSECTION / SUBSUBSECTION / PARAGRAPH / SUBPARAGRAPH -> translate_section
+with the corresponding HIR_LATEX_* type tag; NODE_ENVIRONMENT ->
+translate_environment; NODE_COMMAND -> translate_command; NODE_TEXT_BLOCK
+-> translate_text_block; NODE_MATH_INLINE/DISPLAY -> translate_math_*;
+NODE_CITATION -> translate_citation; NODE_REFERENCE -> translate_reference;
+NODE_LABEL -> translate_label; NODE_LIST_ITEM -> translate_list_item.
+@End Implementation
 
 Process called "translate_node" that takes translator_ptr as Integer, node_ptr as Integer returns Integer:
     If node_ptr is equal to 0:
@@ -357,6 +508,30 @@ Note: ================================================================
 Note: Section Translation
 Note: ================================================================
 
+@Reasoning:
+Shared translator for all five LaTeX sectioning levels (section,
+subsection, subsubsection, paragraph, subparagraph) - they share
+identical structure but produce different HIR types. Three fields:
+title (required, the visible heading text), short_title (optional,
+used in TOC entries), and content (the body of the section, a list of
+child nodes). Children are recursively translated through translate_node
+so nested constructs (e.g., subsection inside section) get their own
+HIR nodes appended to the content list.
+@End Reasoning
+
+@Implementation:
+Allocates a 40-byte HIR node, tags it with the passed hir_type
+parameter. Extracts title_arg from parser offset 8, runs
+extract_text_from_argument, writes title_text at HIR offset 8. Extracts
+optional short_title_arg from parser offset 16; if non-zero extracts
+its text into short_title (otherwise ""), writes at HIR offset 16.
+Reads content_list at parser offset 24, creates a fresh ListCore list
+hir_content. If content_list is non-zero, loops content_list translating
+each child via translate_node and appending non-zero results to
+hir_content. Writes hir_content at HIR offset 24. Calls add_to_module.
+Returns hir_node.
+@End Implementation
+
 Process called "translate_section" that takes translator_ptr as Integer, section_ptr as Integer, hir_type as Integer returns Integer:
     Note: Create HIR section node
     Let hir_node be proc allocate from Memory with 40
@@ -405,6 +580,29 @@ Note: ================================================================
 Note: Environment Translation
 Note: ================================================================
 
+@Reasoning:
+LaTeX environments (`\begin{name}...\end{name}`) cover everything from
+itemize/enumerate lists to figures/tables to equations to bare custom
+environments. We dispatch to get_environment_hir_type to map well-
+known names to specialised HIR_LATEX_* tags (ITEMIZE, ENUMERATE,
+FIGURE, TABLE, EQUATION) so downstream backends emit format-native
+output, with HIR_LATEX_ENVIRONMENT as the generic fallback. The
+environment's parameters (e.g. `\begin{figure}[h!]`) are preserved
+as a free-form string for the backend to interpret.
+@End Reasoning
+
+@Implementation:
+Reads name_arg from parser offset 8, extracts env_name. Calls
+get_environment_hir_type(env_name) to choose a specialised HIR tag.
+Allocates a 48-byte HIR node tagged with the chosen type, writes
+env_name at offset 8. Reads params_arg at parser offset 16; if non-zero
+extracts text into params_str (else ""), writes at HIR offset 16.
+Reads content_list at parser offset 24, builds hir_content by looping
+each child through translate_node and appending non-zero results.
+Writes hir_content at HIR offset 24. Calls add_to_module. Returns
+hir_node.
+@End Implementation
+
 Process called "translate_environment" that takes translator_ptr as Integer, env_ptr as Integer returns Integer:
     Note: Extract environment name
     Let name_arg be proc read_integer from Memory with env_ptr, 8
@@ -451,6 +649,25 @@ Process called "translate_environment" that takes translator_ptr as Integer, env
 
     Return hir_node
 End Process
+
+@Reasoning:
+String-keyed lookup that maps well-known LaTeX environment names to
+their specialised HIR type constants. We use direct string_equals
+chains rather than a hash table because the set is small (7 names) and
+the chain ends in a generic-fallback Return that costs nothing extra.
+The three math environments (equation, align, gather) collapse to a
+single HIR_LATEX_EQUATION because all three are visually equivalent at
+the HIR level - the alignment-specific layout is handled by math-
+backend rendering, not by separate HIR types.
+@End Reasoning
+
+@Implementation:
+Cascade of string_equals tests via StringCore: "itemize" ->
+HIR_LATEX_ITEMIZE, "enumerate" -> HIR_LATEX_ENUMERATE, "description"
+-> HIR_LATEX_DESCRIPTION, "figure" -> HIR_LATEX_FIGURE, "table" ->
+HIR_LATEX_TABLE, "equation"/"align"/"gather" all -> HIR_LATEX_EQUATION.
+Falls through to Return HIR_LATEX_ENVIRONMENT for any unknown name.
+@End Implementation
 
 Process called "get_environment_hir_type" that takes env_name as String returns Integer:
     If proc string_equals from StringCore with env_name, "itemize":
@@ -500,6 +717,28 @@ Note: ================================================================
 Note: Command Translation
 Note: ================================================================
 
+@Reasoning:
+Top-level command dispatcher with two layers: first checks for well-
+known text-formatting commands (`\textbf`, `\textit`, `\emph`,
+`\underline`, `\texttt`) and routes to translate_text_format with a
+specific HIR type for each; second falls through to a generic
+HIR.HIR_CALL representation for any other command. Text-formatting
+commands get their own HIR types because backends typically need to
+emit different markup (`<b>` vs `<i>` vs `<em>` in HTML, `**` vs `*`
+in Markdown) - whereas generic `\command{args}` just becomes a call
+node the backend can pattern-match on name.
+@End Reasoning
+
+@Implementation:
+Reads command_name from parser offset 8. Sequence of string_equals
+tests against "\\textbf"/"\\textit"/"\\emph"/"\\underline"/"\\texttt",
+each tail-calling translate_text_format with HIR_LATEX_TEXT_BOLD/ITALIC/
+EMPH/UNDERLINE/TYPEWRITER respectively. Fallthrough: allocates a 40-byte
+HIR node tagged HIR.HIR_CALL with command_name at offset 8. Reads
+args_list at parser offset 16, calls translate_argument_list, writes
+hir_args at offset 16. Calls add_to_module. Returns hir_node.
+@End Implementation
+
 Process called "translate_command" that takes translator_ptr as Integer, command_ptr as Integer returns Integer:
     Let command_name be proc read_string from Memory with command_ptr, 8
 
@@ -543,6 +782,25 @@ Process called "translate_command" that takes translator_ptr as Integer, command
     Return hir_node
 End Process
 
+@Reasoning:
+Shared helper for all text-formatting commands. Two-channel storage:
+the plain text (for backends that can render the formatting inline
+on a string) AND the recursive nested HIR content (for backends that
+need to walk nested formatting like `\textbf{hello \emph{world}}`).
+Storing both costs little extra memory and saves a re-translation
+pass when the backend changes strategy.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged with the passed hir_type. Reads
+args_list from parser offset 16, gets first_arg via
+ListCore.get_from_list at index 0. Extracts text via
+extract_text_from_argument and writes it at HIR offset 8. Then calls
+translate_argument_content(translator_ptr, first_arg) to produce the
+nested HIR tree and writes it at HIR offset 16. Calls add_to_module.
+Returns hir_node.
+@End Implementation
+
 Process called "translate_text_format" that takes translator_ptr as Integer, command_ptr as Integer, hir_type as Integer returns Integer:
     Note: Create HIR text formatting node
     Let hir_node be proc allocate from Memory with 32
@@ -567,6 +825,21 @@ Note: ================================================================
 Note: Math Mode Translation
 Note: ================================================================
 
+@Reasoning:
+Inline math (`$...$` or `\(...\)`) flows within prose at character
+level - the HIR_LATEX_MATH_INLINE tag distinguishes it from display
+math because backends typically use different markup (e.g., MathML
+`<math display="inline">` vs `<math display="block">`).
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR_LATEX_MATH_INLINE. Reads
+content_list from parser offset 8, calls
+translate_math_content(translator_ptr, content_list) to produce a
+recursive HIR list of math nodes. Writes the list at HIR offset 8.
+Calls add_to_module. Returns hir_node.
+@End Implementation
+
 Process called "translate_math_inline" that takes translator_ptr as Integer, math_ptr as Integer returns Integer:
     Note: Create HIR inline math node
     Let hir_node be proc allocate from Memory with 32
@@ -582,6 +855,21 @@ Process called "translate_math_inline" that takes translator_ptr as Integer, mat
     Return hir_node
 End Process
 
+@Reasoning:
+Display math (`$$...$$`, `\[...\]`, `equation`, `align`) renders as a
+centered block on its own line - structurally identical at HIR level
+to inline math, with only the type tag (HIR_LATEX_MATH_DISPLAY)
+distinguishing them. Same content shape so a single math-content
+walker handles both.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR_LATEX_MATH_DISPLAY. Reads
+content_list from parser offset 8, calls translate_math_content to
+produce recursive HIR. Writes the list at HIR offset 8. Calls
+add_to_module. Returns hir_node.
+@End Implementation
+
 Process called "translate_math_display" that takes translator_ptr as Integer, math_ptr as Integer returns Integer:
     Note: Create HIR display math node
     Let hir_node be proc allocate from Memory with 32
@@ -596,6 +884,22 @@ Process called "translate_math_display" that takes translator_ptr as Integer, ma
 
     Return hir_node
 End Process
+
+@Reasoning:
+Math content has its own dispatcher distinct from text content because
+the same parser-node types behave differently in math mode: a NODE_COMMAND
+in math context might be `\frac` (translate_math_frac) while in text it
+would be a generic `\command`. Returning a List of translated nodes
+lets callers iterate or serialise as a sequence.
+@End Reasoning
+
+@Implementation:
+Creates empty hir_content_list. If content_list is null, returns the
+empty list. Otherwise loops index 0 to count-1: reads node_ptr via
+ListCore.get_from_list, calls translate_math_node (NOT translate_node)
+on it, appends non-zero results to hir_content_list. Returns
+hir_content_list.
+@End Implementation
 
 Process called "translate_math_content" that takes translator_ptr as Integer, content_list as Integer returns Integer:
     Let hir_content_list be proc create_list from ListCore
@@ -620,6 +924,24 @@ Process called "translate_math_content" that takes translator_ptr as Integer, co
 
     Return hir_content_list
 End Process
+
+@Reasoning:
+Math-mode-specific dispatcher: branches on parser node_type to route
+commands to translate_math_command (which knows the math-mode command
+semantics), text blocks to translate_math_text (which treats them as
+identifier-typed variables/symbols rather than literal text), and
+super/subscript nodes to their specialised translators. Falls through
+to the general translate_node for unrecognised types, ensuring nested
+math constructs never get silently dropped.
+@End Reasoning
+
+@Implementation:
+Null-guards node_ptr. Reads node_type at offset 0. Dispatches:
+NODE_COMMAND -> translate_math_command; NODE_TEXT_BLOCK ->
+translate_math_text; NODE_MATH_SUPERSCRIPT -> translate_math_superscript;
+NODE_MATH_SUBSCRIPT -> translate_math_subscript. Default returns
+translate_node(translator_ptr, node_ptr) as the catch-all.
+@End Implementation
 
 Process called "translate_math_node" that takes translator_ptr as Integer, node_ptr as Integer returns Integer:
     If node_ptr is equal to 0:
@@ -651,6 +973,26 @@ Process called "translate_math_node" that takes translator_ptr as Integer, node_
     Note: Default: translate as regular node
     Return proc translate_node with translator_ptr, node_ptr
 End Process
+
+@Reasoning:
+Math commands divide into structurally distinct shapes that need
+dedicated translators: `\frac{n}{d}` (binary, produces a fraction),
+`\sqrt[n]{x}` (radicand with optional degree), big operators like
+`\sum`, `\int`, `\prod`, `\lim` (decorated with limits via metadata).
+The rest fall through to the generic HIR.HIR_CALL form. Splitting
+specialised cases out lets math-backends emit native semantics for
+common idioms while still supporting the long tail of math packages.
+@End Reasoning
+
+@Implementation:
+Reads command_name from parser offset 8. Cascading string_equals tests:
+"\\frac" -> translate_math_frac; "\\sqrt" -> translate_math_sqrt;
+"\\sum"/"\\int"/"\\prod"/"\\lim" -> translate_math_operator with
+HIR_LATEX_MATH_SUM/INT/PROD/LIMIT respectively. Fallthrough:
+allocates 40-byte HIR_CALL node with command_name at offset 8;
+translates args_list (parser offset 16) into hir_args; writes at
+offset 16. Returns hir_node.
+@End Implementation
 
 Process called "translate_math_command" that takes translator_ptr as Integer, command_ptr as Integer returns Integer:
     Let command_name be proc read_string from Memory with command_ptr, 8
@@ -697,6 +1039,22 @@ Process called "translate_math_command" that takes translator_ptr as Integer, co
     Return hir_node
 End Process
 
+@Reasoning:
+`\frac{n}{d}` has exactly two arguments: numerator and denominator,
+positional. We preserve them as separate HIR sub-trees (not strings)
+so nested fractions like `\frac{\frac{a}{b}}{c}` translate correctly
+with full recursion. Storing at distinct HIR offsets (8 and 16) lets
+backends access either side without iterating an arg list.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR_LATEX_MATH_FRAC. Reads
+args_list from parser offset 16. Gets numerator_arg at index 0,
+translates via translate_argument_content, writes at HIR offset 8.
+Gets denominator_arg at index 1, translates, writes at offset 16.
+Returns hir_node.
+@End Implementation
+
 Process called "translate_math_frac" that takes translator_ptr as Integer, frac_ptr as Integer returns Integer:
     Note: Create HIR fraction node
     Let hir_node be proc allocate from Memory with 32
@@ -715,6 +1073,23 @@ Process called "translate_math_frac" that takes translator_ptr as Integer, frac_
 
     Return hir_node
 End Process
+
+@Reasoning:
+`\sqrt[n]{x}` covers both square root (`\sqrt{x}`, default n=2) and nth
+root (`\sqrt[n]{x}`). The [n] is an OPTIONAL bracketed argument that
+appears BEFORE the required {x}; we treat its absence as root_degree=0
+(meaning "use default sqrt visualisation"). The radicand always comes
+as args[0].
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR_LATEX_MATH_SQRT. Reads
+args_list from parser offset 16. Gets radicand_arg at index 0,
+translates via translate_argument_content, writes at HIR offset 8.
+Initialises root_degree=0. If get_list_size(args_list) > 1, gets
+degree_arg at index 1, translates, assigns to root_degree. Writes
+root_degree at HIR offset 16. Returns hir_node.
+@End Implementation
 
 Process called "translate_math_sqrt" that takes translator_ptr as Integer, sqrt_ptr as Integer returns Integer:
     Note: Create HIR square root node
@@ -738,6 +1113,31 @@ Process called "translate_math_sqrt" that takes translator_ptr as Integer, sqrt_
 
     Return hir_node
 End Process
+
+@Reasoning:
+Big operators (`\sum_{i=0}^{n} x_i`, `\int_0^1 f(x) dx`, `\prod`,
+`\lim`) carry three semantic pieces: subscript (lower limit / index
+binding), superscript (upper limit), and operand (the expression
+following the operator). LaTeX's parser attaches subscript/superscript
+via the metadata side channel (parser offset 24) because they're
+SYNTACTICALLY children of the operator command but APPEAR as
+separate `_{...}` and `^{...}` notation. We harvest both from metadata
+and translate them as full HIR sub-trees.
+@End Reasoning
+
+@Implementation:
+Allocates a 48-byte HIR node tagged with hir_type. Initialises
+subscript_ptr=0, superscript_ptr=0. Reads metadata at parser offset 24;
+if non-zero: reads has_subscript at metadata offset 0, if non-zero
+reads subscript_content at metadata offset 8 and translates via
+translate_argument_content into subscript_ptr; reads has_superscript at
+metadata offset 16, if non-zero reads superscript_content at metadata
+offset 24 and translates into superscript_ptr. Writes subscript_ptr at
+HIR offset 8 and superscript_ptr at offset 16. Reads args_list at
+parser offset 16; if non-zero and has elements, translates args[0] as
+operand_content. Writes operand_content at HIR offset 24. Returns
+hir_node.
+@End Implementation
 
 Process called "translate_math_operator" that takes translator_ptr as Integer, op_ptr as Integer, hir_type as Integer returns Integer:
     Note: Create HIR math operator node (sum, integral, product, limit)
@@ -786,6 +1186,19 @@ Process called "translate_math_operator" that takes translator_ptr as Integer, o
     Return hir_node
 End Process
 
+@Reasoning:
+Standalone superscript node (`x^{...}` not attached to a big operator
+- those go through translate_math_operator). Content is a math
+expression that gets recursively translated through
+translate_math_content so nested formulas in the exponent work.
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte HIR node tagged HIR_LATEX_MATH_SUPERSCRIPT. Reads
+content_list from parser offset 8, calls translate_math_content. Writes
+the resulting HIR list at offset 8. Returns hir_node.
+@End Implementation
+
 Process called "translate_math_superscript" that takes translator_ptr as Integer, sup_ptr as Integer returns Integer:
     Note: Create HIR superscript node
     Let hir_node be proc allocate from Memory with 24
@@ -798,6 +1211,18 @@ Process called "translate_math_superscript" that takes translator_ptr as Integer
     Return hir_node
 End Process
 
+@Reasoning:
+Standalone subscript node (`x_{...}`) - the subscript counterpart to
+translate_math_superscript. Same content-walking pattern; only the
+HIR type tag differs.
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte HIR node tagged HIR_LATEX_MATH_SUBSCRIPT. Reads
+content_list from parser offset 8, calls translate_math_content. Writes
+result at HIR offset 8. Returns hir_node.
+@End Implementation
+
 Process called "translate_math_subscript" that takes translator_ptr as Integer, sub_ptr as Integer returns Integer:
     Note: Create HIR subscript node
     Let hir_node be proc allocate from Memory with 24
@@ -809,6 +1234,20 @@ Process called "translate_math_subscript" that takes translator_ptr as Integer, 
 
     Return hir_node
 End Process
+
+@Reasoning:
+In math mode, text blocks are NOT prose - they're identifiers
+representing variables (x, n, alpha) or symbols. We tag them as
+HIR.HIR_IDENTIFIER so backends emit the math-italic style that
+distinguishes math variables from regular text. This is why math-mode
+needs a separate text dispatcher from prose text.
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte HIR node tagged HIR.HIR_IDENTIFIER. Reads text
+content from parser offset 8 via read_string, writes at HIR offset 8.
+Returns hir_node.
+@End Implementation
 
 Process called "translate_math_text" that takes translator_ptr as Integer, text_ptr as Integer returns Integer:
     Note: Math text (variables, symbols)
@@ -824,6 +1263,24 @@ End Process
 Note: ================================================================
 Note: Citation and Reference Translation
 Note: ================================================================
+
+@Reasoning:
+`\cite[note]{key}` produces a bibliography citation; the key references
+an entry in the .bib file. We track each citation in the translator's
+citation_table (offset 40) so post-translation passes can verify all
+cited keys actually exist in the bibliography and emit "unused
+citation" warnings for entries that never appear. The optional note
+is preserved for backends that render inline notes.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR_LATEX_CITATION. Reads key_arg
+from parser offset 8, extracts cite_key, writes at HIR offset 8. Calls
+track_citation(translator_ptr, cite_key) to enroll in citation_table.
+Reads note_arg at parser offset 16; if non-zero extracts note_text
+(else ""), writes at HIR offset 16. Calls add_to_module. Returns
+hir_node.
+@End Implementation
 
 Process called "translate_citation" that takes translator_ptr as Integer, cite_ptr as Integer returns Integer:
     Note: Create HIR citation node
@@ -851,6 +1308,24 @@ Process called "translate_citation" that takes translator_ptr as Integer, cite_p
     Return hir_node
 End Process
 
+@Reasoning:
+`\ref{label}` produces a cross-reference that resolves to the label's
+counter value (section number, equation number, etc.) at typeset time.
+Forward references to labels not yet seen are common, so we verify
+existence against the label_table at HIR-build time and emit a warning
+(NOT an error) for unknown labels - the user might fix the label
+later, and erroring out would block translation entirely.
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte HIR node tagged HIR_LATEX_REFERENCE. Reads
+label_arg from parser offset 8, extracts ref_label, writes at HIR
+offset 8. Calls check_label_exists(translator_ptr, ref_label); if 0,
+builds warning "Reference to undefined label: <label>" via
+string_concat and calls add_warning. Calls add_to_module. Returns
+hir_node.
+@End Implementation
+
 Process called "translate_reference" that takes translator_ptr as Integer, ref_ptr as Integer returns Integer:
     Note: Create HIR reference node
     Let hir_node be proc allocate from Memory with 24
@@ -873,6 +1348,23 @@ Process called "translate_reference" that takes translator_ptr as Integer, ref_p
     Return hir_node
 End Process
 
+@Reasoning:
+`\label{name}` attaches an anchor to the current location so subsequent
+`\ref` calls can resolve to it. We track each label in the
+translator's label_table (offset 32) for two reasons: (1) to populate
+the cross-reference machinery that translate_reference consults; (2)
+to detect duplicate labels which silently break LaTeX's resolution
+and need to surface as warnings.
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte HIR node tagged HIR_LATEX_LABEL. Reads name_arg
+from parser offset 8, extracts label_name, writes at HIR offset 8.
+Calls track_label(translator_ptr, label_name) which adds it to the
+label_table and emits a duplicate-label warning if already present.
+Calls add_to_module. Returns hir_node.
+@End Implementation
+
 Process called "translate_label" that takes translator_ptr as Integer, label_ptr as Integer returns Integer:
     Note: Create HIR label node
     Let hir_node be proc allocate from Memory with 24
@@ -894,6 +1386,24 @@ End Process
 Note: ================================================================
 Note: List Item Translation
 Note: ================================================================
+
+@Reasoning:
+`\item` inside itemize/enumerate/description environments produces one
+list entry. Description lists support an optional `[label]` (e.g.
+`\item[Foo]` -> labelled "Foo"); itemize and enumerate ignore it but
+the parser preserves it anyway. The item body is a list of content
+nodes recursively translated.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte HIR node tagged HIR.HIR_BLOCK (items render as
+nested blocks within their containing list environment). Reads
+label_arg from parser offset 8; if non-zero extracts text into
+label_text (else ""), writes at HIR offset 8. Reads content_list at
+parser offset 16, builds hir_content by looping each child through
+translate_node and appending non-zero results. Writes hir_content at
+HIR offset 16. Calls add_to_module. Returns hir_node.
+@End Implementation
 
 Process called "translate_list_item" that takes translator_ptr as Integer, item_ptr as Integer returns Integer:
     Note: Create HIR list item node
@@ -937,6 +1447,19 @@ Note: ================================================================
 Note: Text Block Translation
 Note: ================================================================
 
+@Reasoning:
+Plain text in document body. Stored as HIR.HIR_LITERAL so backends
+can output it verbatim (after backend-specific escaping for special
+characters in the target format). Note this is the prose-text path;
+translate_math_text handles math-mode text differently.
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte HIR node tagged HIR.HIR_LITERAL. Reads text
+content from parser offset 8 via read_string, writes at HIR offset 8.
+Calls add_to_module. Returns hir_node.
+@End Implementation
+
 Process called "translate_text_block" that takes translator_ptr as Integer, text_ptr as Integer returns Integer:
     Note: Create HIR text literal node
     Let hir_node be proc allocate from Memory with 24
@@ -953,6 +1476,22 @@ End Process
 Note: ================================================================
 Note: Argument Processing Helpers
 Note: ================================================================
+
+@Reasoning:
+Common helper for translating a list of LaTeX command arguments into
+a list of HIR sub-trees. Used by every command translator that takes
+multiple args (citations, references, sections, etc.). Returning an
+empty list when args_list is null keeps callers' code uniform - no
+null-check required at the call site.
+@End Reasoning
+
+@Implementation:
+Creates an empty hir_args list via ListCore.create_list. If args_list
+is null, returns hir_args (empty). Otherwise loops index 0 to count-1:
+reads arg_ptr via ListCore.get_from_list, calls
+translate_argument_content, appends result to hir_args. Returns
+hir_args.
+@End Implementation
 
 Process called "translate_argument_list" that takes translator_ptr as Integer, args_list as Integer returns Integer:
     Let hir_args be proc create_list from ListCore
@@ -973,6 +1512,24 @@ Process called "translate_argument_list" that takes translator_ptr as Integer, a
 
     Return hir_args
 End Process
+
+@Reasoning:
+LaTeX command arguments wrap their content in a NODE_ARGUMENT box.
+This translator UNWRAPS the box and treats the contained list as a
+HIR block. Non-argument nodes (passed accidentally or from edge
+cases in the parser) fall through to direct translate_node which is
+the safe path.
+@End Reasoning
+
+@Implementation:
+Null-guards arg_ptr (returns 0). Reads node_type at offset 0. If NOT
+NODE_ARGUMENT, tail-calls translate_node. Otherwise reads
+content_list at arg offset 16. If content_list is null, returns 0.
+Allocates a 24-byte HIR_BLOCK node. Creates hir_content list. Loops
+content_list translating each child via translate_node, appending
+non-zero results to hir_content. Writes hir_content at HIR block
+offset 8. Returns hir_block.
+@End Implementation
 
 Process called "translate_argument_content" that takes translator_ptr as Integer, arg_ptr as Integer returns Integer:
     If arg_ptr is equal to 0:
@@ -1015,6 +1572,25 @@ Process called "translate_argument_content" that takes translator_ptr as Integer
 
     Return hir_block
 End Process
+
+@Reasoning:
+String-only extraction from an argument, ignoring nested HIR
+structure. Used where the consumer needs a plain string (package
+names, section titles, label names, citation keys) rather than full
+HIR. Walks all NODE_TEXT_BLOCK children and concatenates their text;
+non-text children (nested commands, etc.) are silently skipped
+because a string representation of a nested command isn't meaningful.
+@End Reasoning
+
+@Implementation:
+Null-guards arg_ptr (returns ""). Reads node_type at offset 0. If
+NOT NODE_ARGUMENT: if it IS NODE_TEXT_BLOCK, returns its text via
+read_string at offset 8; otherwise returns "". For NODE_ARGUMENT,
+reads content_list at offset 16 (returns "" if null). Loops index
+0..count-1: reads content_node, tests its node_type; if it's
+NODE_TEXT_BLOCK, reads the text and string_concats it onto result.
+Returns the accumulated result.
+@End Implementation
 
 Process called "extract_text_from_argument" that takes arg_ptr as Integer returns String:
     If arg_ptr is equal to 0:
@@ -1062,6 +1638,23 @@ Note: ================================================================
 Note: Label and Citation Tracking
 Note: ================================================================
 
+@Reasoning:
+Label-table maintenance. Each `\label{name}` must produce a unique
+entry - LaTeX silently uses the first definition and ignores
+subsequent ones, but we WARN explicitly because this is almost
+certainly a user error (typically caused by copy-pasted sections).
+We use linear scan rather than a hash because label_tables are
+small (dozens to low hundreds per document).
+@End Reasoning
+
+@Implementation:
+Reads label_table at translator offset 32. Loops index 0..count-1
+comparing each existing_label against label_name via string_equals.
+On match, builds warning "Duplicate label: <name>" via string_concat
+and calls add_warning, returns 0 (not added). After full loop with
+no match, calls ListCore.add_to_list to append label_name. Returns 1.
+@End Implementation
+
 Process called "track_label" that takes translator_ptr as Integer, label_name as String returns Integer:
     Let label_table be proc read_integer from Memory with translator_ptr, 32
 
@@ -1086,6 +1679,19 @@ Process called "track_label" that takes translator_ptr as Integer, label_name as
     Return 1
 End Process
 
+@Reasoning:
+Label-existence test used by translate_reference to detect forward-
+references to labels that never get defined. Linear scan matches
+track_label's storage strategy (small list, no hashing). Returns
+Integer 0/1 boolean so callers can use simple equality tests.
+@End Reasoning
+
+@Implementation:
+Reads label_table at translator offset 32. Loops index 0..count-1
+calling string_equals on each existing_label vs label_name. Returns 1
+on first match. Returns 0 after exhausting the list with no match.
+@End Implementation
+
 Process called "check_label_exists" that takes translator_ptr as Integer, label_name as String returns Integer:
     Let label_table be proc read_integer from Memory with translator_ptr, 32
 
@@ -1102,6 +1708,22 @@ Process called "check_label_exists" that takes translator_ptr as Integer, label_
 
     Return 0
 End Process
+
+@Reasoning:
+Citation-table maintenance. Unlike labels, duplicate citations are
+NORMAL and not warned - a single source can be cited many times. We
+maintain the table as a set (deduplicating) so downstream cross-
+checking against the .bib file can ask "is this key cited at all?"
+without inflating counts by citation frequency.
+@End Reasoning
+
+@Implementation:
+Reads citation_table at translator offset 40. Loops index 0..count-1
+calling string_equals on each existing_key vs cite_key. On match
+returns 0 (not added because already present, but NOT a warning).
+After full loop without match, calls ListCore.add_to_list to append
+cite_key. Returns 1.
+@End Implementation
 
 Process called "track_citation" that takes translator_ptr as Integer, cite_key as String returns Integer:
     Let citation_table be proc read_integer from Memory with translator_ptr, 40
@@ -1129,6 +1751,22 @@ Note: ================================================================
 Note: Module Management
 Note: ================================================================
 
+@Reasoning:
+Central registration point that every top-level translator calls to
+enroll its produced HIR node in the module's items list. Centralising
+this means changing the module-storage layout in the future only
+touches this one function. Null hir_node is rejected (returns 0)
+because callers conventionally pass 0 to indicate "translation
+produced nothing" - we don't want zero-entries polluting the items
+list.
+@End Reasoning
+
+@Implementation:
+Null-guards hir_node (returns 0). Reads module_ptr at translator
+offset 0, then items_list at module offset 16. Calls
+ListCore.add_to_list to append hir_node. Returns 1.
+@End Implementation
+
 Process called "add_to_module" that takes translator_ptr as Integer, hir_node as Integer returns Integer:
     If hir_node is equal to 0:
         Return 0
@@ -1146,11 +1784,35 @@ Note: ================================================================
 Note: Error and Warning Handling
 Note: ================================================================
 
+@Reasoning:
+Hard-error reporter. Errors are collected into a list (offset 8 of
+translator) rather than aborting on the first one so a single
+translation run surfaces every problem the user needs to fix - tools
+that re-run on each save become much more useful with this.
+@End Reasoning
+
+@Implementation:
+Reads errors_list at translator offset 8. Calls
+ListCore.add_to_list(errors_list, message). Returns 1.
+@End Implementation
+
 Process called "add_error" that takes translator_ptr as Integer, message as String returns Integer:
     Let errors_list be proc read_integer from Memory with translator_ptr, 8
     proc add_to_list from ListCore with errors_list, message
     Return 1
 End Process
+
+@Reasoning:
+Warning reporter. Warnings differ from errors: they surface
+possibly-wrong situations (undefined refs, duplicate labels) but
+don't fail translation. Stored at translator offset 16, paralleling
+the errors-list pattern.
+@End Reasoning
+
+@Implementation:
+Reads warnings_list at translator offset 16. Calls
+ListCore.add_to_list(warnings_list, message). Returns 1.
+@End Implementation
 
 Process called "add_warning" that takes translator_ptr as Integer, message as String returns Integer:
     Let warnings_list be proc read_integer from Memory with translator_ptr, 16
@@ -1158,13 +1820,41 @@ Process called "add_warning" that takes translator_ptr as Integer, message as St
     Return 1
 End Process
 
+@Reasoning:
+Public accessor exposing the errors list to outside code (CLI driver,
+test harness, IDE) so it can render diagnostics to the user.
+@End Reasoning
+
+@Implementation:
+Reads and returns the errors_list pointer at translator offset 8.
+@End Implementation
+
 Process called "get_errors" that takes translator_ptr as Integer returns Integer:
     Return proc read_integer from Memory with translator_ptr, 8
 End Process
 
+@Reasoning:
+Public accessor for the warnings list, mirroring get_errors.
+@End Reasoning
+
+@Implementation:
+Reads and returns the warnings_list pointer at translator offset 16.
+@End Implementation
+
 Process called "get_warnings" that takes translator_ptr as Integer returns Integer:
     Return proc read_integer from Memory with translator_ptr, 16
 End Process
+
+@Reasoning:
+Boolean predicate exposing whether the last translation produced any
+errors. Used by the driver to decide whether to proceed with codegen
+(only when has_errors returns 0).
+@End Reasoning
+
+@Implementation:
+Reads errors_list at translator offset 8, then count via
+ListCore.get_list_size. Returns 1 if count > 0, else 0.
+@End Implementation
 
 Process called "has_errors" that takes translator_ptr as Integer returns Integer:
     Let errors_list be proc read_integer from Memory with translator_ptr, 8

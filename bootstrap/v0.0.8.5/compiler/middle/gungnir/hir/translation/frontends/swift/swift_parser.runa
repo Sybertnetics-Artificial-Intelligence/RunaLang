@@ -85,11 +85,25 @@ Note: ==========================================================================
 Note: PARSER STRUCTURE
 Note: ============================================================================
 
+@Reasoning:
+Minimal parser state: a tokens list, current position cursor, and an
+errors list. No current_token cache — the parser uses peek_token to
+read positions[position] each time. Trades a small per-peek cost for
+simplicity and clearer semantics during error recovery.
+@End Reasoning
+
 Type called "SwiftParser":
     tokens as Integer            Note: Token list
     position as Integer          Note: Current position in token list
     errors as Integer            Note: List of parse errors
 End Type
+
+@Reasoning:
+Generic AST node: type tag, a single payload value (string or int
+depending on kind), a children list for structural sub-nodes, and an
+attributes dictionary for the dozens of optional Swift declaration
+modifiers. Wide-flat shape keeps the per-construct parsers concise.
+@End Reasoning
 
 Type called "SwiftASTNode":
     node_type as Integer         Note: AST node type constant
@@ -101,6 +115,12 @@ End Type
 Note: ============================================================================
 Note: PARSER INITIALIZATION
 Note: ============================================================================
+
+@Reasoning:
+Constructs a parser from the lexer's token list with position 0 and
+an empty errors list. The tokens list is borrowed, not copied — caller
+must keep it alive for the parser's lifetime.
+@End Reasoning
 
 Process called "create_swift_parser" takes tokens as Integer returns Integer:
     Note: Create new Swift parser
@@ -118,6 +138,13 @@ Process called "create_swift_parser" takes tokens as Integer returns Integer:
 
     Return parser
 End Process
+
+@Reasoning:
+Top-level entry: walks the token stream collecting declarations
+(import, function, var/let, class, struct, enum, protocol, extension,
+typealias) into the source-file AST node. Skips newlines between
+declarations because Swift uses them as statement terminators.
+@End Reasoning
 
 Process called "parse_swift_source_file" takes parser as Integer returns Integer:
     Note: Parse Swift source file (top-level declarations)
@@ -165,6 +192,12 @@ Note: ==========================================================================
 Note: TOKEN HANDLING
 Note: ============================================================================
 
+@Reasoning:
+Returns the full token record at the current position without
+advancing. Used when the parser needs both the type and the lexeme,
+unlike peek_token_type which strips to just the kind.
+@End Reasoning
+
 Process called "peek_token" takes parser as Integer returns Integer:
     Note: Look at current token without advancing
 
@@ -179,6 +212,11 @@ Process called "peek_token" takes parser as Integer returns Integer:
     Return proc list_get from ListOps with tokens, position
 End Process
 
+@Reasoning:
+Cheaper variant of peek_token that extracts only the type tag. Used by
+the dispatch sites that don't care about the lexeme.
+@End Reasoning
+
 Process called "peek_token_type" takes parser as Integer returns Integer:
     Note: Get type of current token
 
@@ -190,6 +228,12 @@ Process called "peek_token_type" takes parser as Integer returns Integer:
     Return proc memory_get_int64 from Layout with token, 0
 End Process
 
+@Reasoning:
+Increments position by 1. Returns the new position so callers can use
+it as the index of the token they just consumed if they need it later
+for error reporting.
+@End Reasoning
+
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Move to next token
 
@@ -199,6 +243,12 @@ Process called "advance_token" takes parser as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Shift-on-match: consumes the current token if it matches expected,
+records a parse error and leaves position unchanged otherwise.
+Returns 1/0 boolean so callers can compose it in conditional chains.
+@End Reasoning
 
 Process called "expect_token" takes parser as Integer, expected as Integer returns Integer:
     Note: Expect specific token type and advance
@@ -212,6 +262,13 @@ Process called "expect_token" takes parser as Integer, expected as Integer retur
     proc advance_token from parser
     Return 1
 End Process
+
+@Reasoning:
+Swift treats newlines as statement terminators within blocks but allows
+declarations to span multiple lines. This helper consumes a run of
+newline tokens so callers can opt into the "newlines-as-whitespace"
+mode where appropriate (between declarations, after open braces).
+@End Reasoning
 
 Process called "skip_newlines" takes parser as Integer returns Integer:
     Note: Skip any newline tokens
@@ -238,6 +295,12 @@ Note: ==========================================================================
 Note: AST NODE CREATION
 Note: ============================================================================
 
+@Reasoning:
+Allocates a SwiftASTNode with the supplied type tag and zero-
+initialised other fields. The children list and attributes dict are
+created lazily by set_* helpers so leaf nodes do not pay the cost.
+@End Reasoning
+
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     Note: Create AST node
 
@@ -254,12 +317,24 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Stores a single payload value into the node's value slot.
+Interpretation (string handle vs integer literal vs token pointer) is
+caller-determined by the node's type tag.
+@End Reasoning
+
 Process called "set_ast_value" takes node as Integer, value as Integer returns Integer:
     Note: Set node value
 
     proc memory_set_int64 from Layout with node, 8, value
     Return 1
 End Process
+
+@Reasoning:
+Overwrites the entire children list (versus add_ast_child which
+appends). Used when the children list was constructed externally and
+must be installed atomically, e.g., after a sub-parser returns a list.
+@End Reasoning
 
 Process called "set_ast_children" takes node as Integer, children as Integer returns Integer:
     Note: Set node children list
@@ -268,6 +343,12 @@ Process called "set_ast_children" takes node as Integer, children as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+Appends a single child to the node's children list, lazily allocating
+the list on first use. The typical case across this file — block-
+structured constructs accumulate their statements one at a time.
+@End Reasoning
+
 Process called "add_ast_child" takes node as Integer, child as Integer returns Integer:
     Note: Add child to node
 
@@ -275,6 +356,13 @@ Process called "add_ast_child" takes node as Integer, child as Integer returns I
     proc list_append from ListOps with children, child
     Return 1
 End Process
+
+@Reasoning:
+Sets a key/value pair in the node's attributes dictionary, lazily
+allocating the dict. Used for Swift's many optional modifiers (public,
+private, fileprivate, internal, open, final, override, mutating,
+static, class, weak, unowned, lazy, dynamic, @objc, etc.).
+@End Reasoning
 
 Process called "set_ast_attribute" takes node as Integer, key as Integer, value as Integer returns Integer:
     Note: Set node attribute
@@ -287,6 +375,14 @@ End Process
 Note: ============================================================================
 Note: DECLARATION PARSING
 Note: ============================================================================
+
+@Reasoning:
+Top-level declaration dispatcher. Peeks the leading token (or sequence
+of modifier tokens) to choose between import / func / var / let /
+class / struct / enum / protocol / extension / typealias parsers.
+Bare modifier prefixes route through parse_modified_decl which then
+re-dispatches once the modifiers are consumed.
+@End Reasoning
 
 Process called "parse_declaration" takes parser as Integer returns Integer:
     Note: Parse top-level declaration
@@ -383,6 +479,13 @@ Process called "parse_declaration" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+import [kind] module [.submodule...] [.member] — captures the optional
+import kind (class, struct, func, etc.), the dotted module path, and an
+optional specific imported member. Modules with submodules are stored
+as a dot-separated string for simplicity.
+@End Reasoning
+
 Process called "parse_import_decl" takes parser as Integer returns Integer:
     Note: Parse import declaration (import Foundation, import UIKit.UIView)
 
@@ -429,6 +532,15 @@ Process called "parse_import_decl" takes parser as Integer returns Integer:
 
     Return decl
 End Process
+
+@Reasoning:
+Collects a run of access modifiers, attribute markers (@objc, @available,
+@available, etc.), and declaration modifiers (final, override, static)
+preceding a declaration, then dispatches to the appropriate parse_*_decl
+based on the trailing keyword. Stores all collected modifiers as
+attributes on the resulting node so the modifiers don't have to be
+re-detected during semantic analysis.
+@End Reasoning
 
 Process called "parse_modified_decl" takes parser as Integer returns Integer:
     Note: Parse declaration with access/modifier keywords
@@ -524,6 +636,14 @@ Process called "parse_modified_decl" takes parser as Integer returns Integer:
     Return decl
 End Process
 
+@Reasoning:
+func name<Generics>(params) -> ReturnType where ... { body }. Parses
+the name, optional generic parameter list, parenthesised parameter
+list with labels, optional return type annotation, optional where
+clause, and the body block. Async and throws modifiers are stored as
+attributes for downstream effect tracking.
+@End Reasoning
+
 Process called "parse_function_decl" takes parser as Integer returns Integer:
     Note: Parse function declaration
 
@@ -591,6 +711,14 @@ Process called "parse_function_decl" takes parser as Integer returns Integer:
     Return decl
 End Process
 
+@Reasoning:
+var declaration: mutable storage. Captures name, optional type
+annotation, optional initialiser expression, and optional property
+accessors block (get/set/willSet/didSet for stored vs computed
+properties). Property observers are detected by the trailing
+brace-block presence after the name/type/initialiser.
+@End Reasoning
+
 Process called "parse_var_decl" takes parser as Integer returns Integer:
     Note: Parse variable declaration (var x: Int = 5)
 
@@ -634,6 +762,13 @@ Process called "parse_var_decl" takes parser as Integer returns Integer:
     Return decl
 End Process
 
+@Reasoning:
+let declaration: immutable binding. Same shape as parse_var_decl (name,
+optional type, optional initialiser, optional accessors), but the
+resulting AST node uses a different type tag so codegen knows to emit
+read-only storage and the type checker can reject reassignment.
+@End Reasoning
+
 Process called "parse_let_decl" takes parser as Integer returns Integer:
     Note: Parse constant declaration (let x: Int = 5)
 
@@ -668,6 +803,14 @@ Process called "parse_let_decl" takes parser as Integer returns Integer:
 
     Return decl
 End Process
+
+@Reasoning:
+class Name<Generics>: Inheritance { body }. Captures name, generic
+parameters, base class + adopted protocols (combined inheritance list
+in Swift), optional where clause, and the member list inside the
+braces. Members go through parse_declaration recursively so nested
+classes and member functions / properties parse uniformly.
+@End Reasoning
 
 Process called "parse_class_decl" takes parser as Integer returns Integer:
     Note: Parse class declaration
@@ -740,6 +883,13 @@ Process called "parse_class_decl" takes parser as Integer returns Integer:
     Return decl
 End Process
 
+@Reasoning:
+struct Name<Generics>: Protocols { body }. Same overall shape as
+parse_class_decl but tagged as struct so downstream semantic analysis
+applies value-type semantics (auto-synthesized init, no inheritance
+except protocols).
+@End Reasoning
+
 Process called "parse_struct_decl" takes parser as Integer returns Integer:
     Note: Parse struct declaration
 
@@ -810,6 +960,13 @@ Process called "parse_struct_decl" takes parser as Integer returns Integer:
 
     Return decl
 End Process
+
+@Reasoning:
+enum Name<Generics>: RawType { cases }. Captures name, generic
+parameters, optional raw-value type or adopted protocols, and the case
+list (each via parse_enum_case so associated-value tuples are
+handled). Also allows methods/computed-properties as members.
+@End Reasoning
 
 Process called "parse_enum_decl" takes parser as Integer returns Integer:
     Note: Parse enum declaration
@@ -884,6 +1041,13 @@ Process called "parse_enum_decl" takes parser as Integer returns Integer:
     Return decl
 End Process
 
+@Reasoning:
+protocol Name: Inheritance { requirements }. Captures name, optional
+parent protocol list, optional associatedtype declarations, and member
+requirements (which use the same syntax as full member definitions
+but without bodies — defaults are also permitted).
+@End Reasoning
+
 Process called "parse_protocol_decl" takes parser as Integer returns Integer:
     Note: Parse protocol declaration
 
@@ -940,6 +1104,14 @@ Process called "parse_protocol_decl" takes parser as Integer returns Integer:
 
     Return decl
 End Process
+
+@Reasoning:
+extension TypeName: Protocols where Constraints { members } — adds
+methods, computed properties, nested types, and protocol conformances
+to an existing type. The extended type can be a built-in or a custom
+declared one; constraints in the where clause restrict generic
+extensions.
+@End Reasoning
 
 Process called "parse_extension_decl" takes parser as Integer returns Integer:
     Note: Parse extension declaration
@@ -1005,6 +1177,12 @@ Process called "parse_extension_decl" takes parser as Integer returns Integer:
     Return decl
 End Process
 
+@Reasoning:
+typealias Name<Generics> = Type — a named type abbreviation. Captures
+name, optional generic parameters, and the underlying type expression
+through parse_type. Pure compile-time construct, no runtime impact.
+@End Reasoning
+
 Process called "parse_typealias_decl" takes parser as Integer returns Integer:
     Note: Parse typealias declaration
 
@@ -1038,6 +1216,15 @@ Note: - parse_expression (binary, unary, call, member access, closures, etc.)
 Note: - parse_type (named, optional, array, dictionary, function, tuple, generic)
 Note: - parse_pattern (identifier, tuple, optional, enum case)
 Note: - Helper functions for parameters, generics, where clauses, etc.
+
+@Reasoning:
+Statement dispatcher: if/else, guard, while, repeat-while, for-in,
+switch, break, continue, fallthrough, return, throw, defer, do/catch,
+labeled statements, expression statements. Swift's control-flow
+constructs are statements (not expressions like Rust), so this is the
+single dispatch point for everything that can appear in a function
+body.
+@End Reasoning
 
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse Swift statement (all statement types)
@@ -1210,12 +1397,27 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Convenience entry that calls parse_binary_expression with min_precedence
+= 0, effectively asking for the full expression at the lowest binding
+power.
+@End Reasoning
+
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse Swift expression with full operator precedence and postfix operators
 
     Note: Parse binary expression with precedence (starts with primary, then handles operators)
     Return proc parse_binary_expression with parser, 0
 End Process
+
+@Reasoning:
+Pratt parser: parses a unary expression, then while the next binary
+operator's precedence >= min_precedence, consumes the operator and
+recurses with the appropriate precedence (prec for right-associative,
+prec+1 for left). Returns when no further operator binds tighter,
+which leaves the caller in a clean state to handle the surrounding
+context.
+@End Reasoning
 
 Process called "parse_binary_expression" takes parser as Integer, min_precedence as Integer returns Integer:
     Note: Parse binary expression with operator precedence climbing
@@ -1252,6 +1454,16 @@ Process called "parse_binary_expression" takes parser as Integer, min_precedence
 
     Return left
 End Process
+
+@Reasoning:
+Returns Swift operator precedence per the standard library precedence
+groups (AssignmentPrecedence < TernaryPrecedence < DefaultPrecedence <
+LogicalDisjunctionPrecedence < LogicalConjunctionPrecedence <
+ComparisonPrecedence < NilCoalescingPrecedence < CastingPrecedence <
+RangeFormationPrecedence < AdditionPrecedence < MultiplicationPrecedence
+< BitwiseShiftPrecedence). Returns 0 for non-operators to terminate
+the climb.
+@End Reasoning
 
 Process called "get_operator_precedence" takes token_type as Integer returns Integer:
     Note: Return operator precedence (higher number = higher precedence)
@@ -1311,6 +1523,13 @@ Process called "get_operator_precedence" takes token_type as Integer returns Int
     Return 0
 End Process
 
+@Reasoning:
+Consumes any leading unary prefix operators (-, +, !, ~, &, try, await,
+prefix custom operators), then parses the underlying postfix
+expression. Stacked prefix operators bind right-to-left, so this is
+naturally implemented as a single recursive call.
+@End Reasoning
+
 Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Note: Parse unary expression (prefix operators)
 
@@ -1348,6 +1567,14 @@ Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Note: Parse postfix expression
     Return proc parse_postfix_expression from parser
 End Process
+
+@Reasoning:
+Handles every trailing operator that extends an already-parsed primary:
+function application (args), subscript [args], member access .id or
+.member, force-unwrap !, optional-chain ?., implicit member ($N),
+optional chaining ?. Postfix operators left-associate so this is a
+loop, not recursion.
+@End Reasoning
 
 Process called "parse_postfix_expression" takes parser as Integer returns Integer:
     Note: Parse postfix expression (calls, subscripts, member access, optional chain, force unwrap)
@@ -1454,6 +1681,14 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
 
     Return expr
 End Process
+
+@Reasoning:
+Every leaf expression form. Literals (Int/Float/String/interpolation/
+nil/true/false/Bool/regex), identifiers, self, super, parenthesised
+expressions, tuples, array literals, dictionary literals, closures,
+trailing-closure shorthand, if/switch expressions (Swift 5.9+), and
+the .case implicit-member shorthand for enum cases.
+@End Reasoning
 
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
     Note: Parse primary expression (literals, identifiers, parenthesized, arrays, dictionaries, tuples)
@@ -1643,6 +1878,15 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Return 0
 End Process
 
+@Reasoning:
+Parses a Swift type expression. Built-in types (Int, Float, etc.),
+user-defined types with optional generic arguments (Array<T>,
+Dictionary<K,V>), tuple types ((A, B)), function types
+((P) -> R, (P) async throws -> R), optionals (T?), implicitly-
+unwrapped optionals (T!), some/any existentials, protocol composition
+(A & B), and metatype references (T.Type, T.self).
+@End Reasoning
+
 Process called "parse_type" takes parser as Integer returns Integer:
     Note: Parse Swift type annotation (all type forms)
 
@@ -1743,6 +1987,13 @@ Process called "parse_type" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+After a base type is recognised, this helper consumes any postfix
+modifiers: ? for optional, ! for implicitly-unwrapped optional, .Type
+for metatype, .self for instance metatype access. Stacks left-to-
+right: T?? is double-optional, T?.Type is the metatype of optional T.
+@End Reasoning
+
 Process called "parse_type_suffix" takes parser as Integer, base_type as Integer returns Integer:
     Note: Parse type suffixes (optional, function return, etc.)
 
@@ -1783,12 +2034,27 @@ End Process
 
 Note: Helper functions (abbreviated)
 
+@Reasoning:
+Parses a comma-separated parameter list inside (). Each parameter has
+an optional external label (or _), an internal name, a type
+annotation, and optional default value. Variadic (...) and inout
+modifiers are also recognised. Empty () is permitted for zero-arg
+functions.
+@End Reasoning
+
 Process called "parse_parameter_list" takes parser as Integer returns Integer:
     Note: Parse function parameter list
 
     Let parameters be proc create_list from ListOps
     Return parameters
 End Process
+
+@Reasoning:
+{ statements } block. Consumes the opening brace, parses statements
+via parse_statement until the closing brace, expects the closing
+brace. Used for function/method bodies and for control-flow construct
+bodies (if/while/for).
+@End Reasoning
 
 Process called "parse_block" takes parser as Integer returns Integer:
     Note: Parse code block (returns list of statements)
@@ -1825,12 +2091,26 @@ Process called "parse_block" takes parser as Integer returns Integer:
     Return statements
 End Process
 
+@Reasoning:
+<T, U: Protocol, V: T.AssocType, W where W: P> — comma-separated
+type parameters each with an optional inheritance bound (:Type), with
+the where clause appearing at the end and applying constraints to one
+or more of the parameters.
+@End Reasoning
+
 Process called "parse_generic_parameters" takes parser as Integer returns Integer:
     Note: Parse generic parameter clause <T, U>
 
     Let params be proc create_list from ListOps
     Return params
 End Process
+
+@Reasoning:
+": Type1, Type2, Type3" — the comma-separated list of base class
+and/or adopted protocols. Swift permits at most one base class
+(which must be first), with the rest being protocols. Validation of
+that ordering is left to the semantic pass.
+@End Reasoning
 
 Process called "parse_inheritance_list" takes parser as Integer returns Integer:
     Note: Parse inheritance/conformance list
@@ -1839,11 +2119,26 @@ Process called "parse_inheritance_list" takes parser as Integer returns Integer:
     Return types
 End Process
 
+@Reasoning:
+"where T: P, U == V.AssocType, ..." — additional generic constraints
+that don't fit the inline "T: P" form. Each constraint is either a
+conformance (T: P) or a same-type (T == U) clause. Stored as a
+flat list of constraint nodes.
+@End Reasoning
+
 Process called "parse_where_clause" takes parser as Integer returns Integer:
     Note: Parse where clause
 
     Return proc create_ast_node from SWIFT_WHERE_CLAUSE
 End Process
+
+@Reasoning:
+{ get { ... } set(name) { ... } willSet { ... } didSet { ... } } — the
+accessor block of a computed or observed property. Each accessor has
+an optional explicit parameter (set/willSet) and a body. Order is not
+enforced by the parser since the semantic pass validates which
+combinations are legal.
+@End Reasoning
 
 Process called "parse_property_accessors" takes parser as Integer returns Integer:
     Note: Parse property get/set/willSet/didSet
@@ -1851,6 +2146,15 @@ Process called "parse_property_accessors" takes parser as Integer returns Intege
     Let accessors be proc create_list from ListOps
     Return accessors
 End Process
+
+@Reasoning:
+case name[(label: Type, ...)] [= rawValue]. Captures the case name,
+optional associated-value tuple (each component with optional label
+and a type), and optional raw value for RawRepresentable enums. The
+two forms are mutually exclusive but both syntactic forms are
+recognised here so a clear semantic error can be produced if both
+appear.
+@End Reasoning
 
 Process called "parse_enum_case" takes parser as Integer returns Integer:
     Note: Parse enum case declaration
@@ -1863,6 +2167,13 @@ End Process
 Note: ============================================================================
 Note: ERROR HANDLING
 Note: ============================================================================
+
+@Reasoning:
+Appends a diagnostic to the parser's errors list (offset 16). Unlike
+some other parsers in this codebase, Swift parser keeps every error
+because Swift's tooling expects per-diagnostic detail (Xcode shows
+them all inline), not just the first.
+@End Reasoning
 
 Process called "add_parse_error" takes parser as Integer, message as Integer returns Integer:
     Note: Add parse error to error list

@@ -51,6 +51,19 @@ Note: ==========================================================================
 Note: C# Code Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Carries the four pieces of state every emit_* helper needs: the C#
+emitter that owns the output buffer, the running indent level, the
+arena that owns transient allocations, and an error list accumulating
+non-fatal diagnostics.
+@End Reasoning
+
+@Implementation:
+4 x i64 record (32 bytes — see CONTEXT_SIZE constant). offsets: 0 =
+emitter handle, 8 = indent_level, 16 = arena handle, 24 = errors
+List handle.
+@End Implementation
+
 Type called "CSharpGenContext":
     emitter as Integer         Note: C# emitter for output
     indent_level as Integer    Note: Current indentation level
@@ -59,6 +72,20 @@ Type called "CSharpGenContext":
 End Type
 
 Constant CONTEXT_SIZE as Integer is 32
+
+@Reasoning:
+Allocates the context record, the underlying C# emitter, and the
+errors list together so callers get a ready-to-use context. Two-step
+fallback rolls back the context allocation if the emitter allocation
+fails.
+@End Reasoning
+
+@Implementation:
+Allocates CONTEXT_SIZE bytes; returns 0 on failure. Allocates a C#
+emitter; rollbacks if that fails. Writes emitter (0), indent_level=0
+(8), arena (16). Allocates the errors list via ListOps.create_list
+and stores at offset 24.
+@End Implementation
 
 Process called "create_csharp_gen_context" takes arena as Integer returns Integer:
     Note: Create C# code generation context
@@ -86,6 +113,18 @@ Process called "create_csharp_gen_context" takes arena as Integer returns Intege
     Return context
 End Process
 
+@Reasoning:
+Releases the three heap allocations owned by the context — emitter,
+errors list, and the context record itself — in the reverse order of
+acquisition. Arena is borrowed and intentionally not freed.
+@End Reasoning
+
+@Implementation:
+Null guard. Frees emitter via Emitter.destroy_csharp_emitter when
+non-null; frees errors via ListOps.destroy_list; finally deallocates
+the context record.
+@End Implementation
+
 Process called "destroy_csharp_gen_context" takes context as Integer returns Integer:
     Note: Destroy C# code generation context
 
@@ -108,6 +147,15 @@ Process called "destroy_csharp_gen_context" takes context as Integer returns Int
     Return 1
 End Process
 
+@Reasoning:
+Bump indent depth by one. C# convention is 4 spaces per level; the
+emitter applies the visual indentation lazily based on this counter.
+@End Reasoning
+
+@Implementation:
+Reads i64 at offset 8 of context, stores back +1.
+@End Implementation
+
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -116,6 +164,16 @@ Process called "increase_indent" takes context as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Companion to increase_indent that floors at zero so mismatched
+indent/dedent pairs cannot drive the counter negative.
+@End Reasoning
+
+@Implementation:
+Reads level at offset 8; if > 0, stores level - 1; otherwise no-op.
+Returns 1.
+@End Implementation
 
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
@@ -133,14 +191,27 @@ Note: ==========================================================================
 Note: Main Generation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Top-level facade that converts a complete HIR dictionary into a freshly
+allocated C# source buffer. Owns the generation context lifecycle so callers
+never see a half-initialised emitter: any failure inside context creation
+returns 0 (sentinel meaning "no output") rather than leaking partial state.
+The output buffer survives destruction of the context because get_output
+detaches it from the emitter before destroy_csharp_gen_context frees the
+emitter itself.
+@End Reasoning
+
+@Implementation:
+Null-guards the input HIR (returns 0). Creates a generation context bound
+to the supplied arena; if context allocation fails, returns 0. Dispatches
+generate_node which walks the HIR tree emitting C# tokens. Reads the
+emitter pointer from context offset 0 and harvests the assembled output
+buffer via get_output. Tears down the context (which releases the emitter
+internals) before returning the detached output pointer.
+@End Implementation
+
 Process called "generate_csharp_from_hir" takes hir as Integer, arena as Integer returns Integer:
     Note: Generate C# code from HIR dictionary
-
-    @Reasoning:
-    This is the main entry point for HIR → C# code generation. It creates a
-    generation context, processes the HIR, and returns the complete C# source
-    code as a string suitable for output or compilation.
-    @End Reasoning
 
     If hir is equal to 0:
         Return 0
@@ -165,6 +236,23 @@ End Process
 Note: ============================================================================
 Note: Node Generation Dispatcher
 Note: ============================================================================
+
+@Reasoning:
+The HIR node here is a Dictionary keyed by string; the "_type" entry
+selects which generator to invoke. Using string keys (rather than
+integer constants) keeps this backend decoupled from the central HIR
+node-type enum and lets the C# emitter consume HIR produced from
+multiple sources.
+@End Reasoning
+
+@Implementation:
+Null guard. Reads node_type via Dict.get_dict_string_value(hir,
+"_type"). Linear chain of strings_equal comparisons against each
+"csharp_*" string, dispatching to the corresponding generate_* helper:
+program, namespace, using, class, struct, interface, enum, method,
+field, etc. Returns 1 by default to indicate the dispatcher itself
+succeeded.
+@End Implementation
 
 Process called "generate_node" takes context as Integer, hir as Integer returns Integer:
     Note: Dispatch node generation based on HIR type
@@ -405,6 +493,19 @@ Note: ==========================================================================
 Note: Program and Namespace Generation
 Note: ============================================================================
 
+@Reasoning:
+The HIR program root holds a "members" list containing top-level
+usings, namespaces, and classes. Each is dispatched through
+generate_node so namespace/class generation can recursively cover
+nested declarations.
+@End Reasoning
+
+@Implementation:
+Reads the "members" HIR list via Dict.get_dict_hir_value. If absent,
+returns 1. Otherwise iterates each member and dispatches via
+generate_node.
+@End Implementation
+
 Process called "generate_program" takes context as Integer, hir as Integer returns Integer:
     Note: Generate C# program from HIR
 
@@ -429,6 +530,18 @@ Process called "generate_program" takes context as Integer, hir as Integer retur
 
     Return 1
 End Process
+
+@Reasoning:
+`namespace Name { ... }`. Block-style namespaces (not file-scoped)
+match the older C# style and are universally supported, so we always
+emit them with braces.
+@End Reasoning
+
+@Implementation:
+Reads "name" from HIR. Emits `namespace <name>` line, opening brace
+on next line. Indents. Iterates "members" via generate_node. Dedents
+and emits closing brace.
+@End Implementation
 
 Process called "generate_namespace" takes context as Integer, hir as Integer returns Integer:
     Note: Generate namespace declaration
@@ -477,6 +590,18 @@ Process called "generate_namespace" takes context as Integer, hir as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+`using Some.Namespace;` directive. Aliases (`using X = Y;`) and
+static usings (`using static X;`) are emitted via the optional
+"alias" and "is_static" entries on the HIR dict.
+@End Reasoning
+
+@Implementation:
+Reads "namespace" and optional "alias"/"is_static". Emits `using `
+optionally followed by `static `, then namespace path, optionally
+` = alias`, closing with `;`.
+@End Implementation
+
 Process called "generate_using" takes context as Integer, hir as Integer returns Integer:
     Note: Generate using directive
 
@@ -506,6 +631,19 @@ End Process
 Note: ============================================================================
 Note: Type Declaration Generation
 Note: ============================================================================
+
+@Reasoning:
+Class declaration with modifiers, optional generic type parameters,
+optional base class and interfaces, and a member list. Emits
+`[modifiers] class Name<T>[ : base, interface] { members... }`.
+@End Reasoning
+
+@Implementation:
+Reads "modifiers", "name", "type_parameters", "base", "interfaces",
+"members". Emits modifiers, `class`, name, type parameter list if
+present, base/interfaces with `:` prefix, opening brace, indented
+member generation via generate_node, dedent, closing brace.
+@End Implementation
 
 Process called "generate_class" takes context as Integer, hir as Integer returns Integer:
     Note: Generate class declaration
@@ -638,6 +776,18 @@ Process called "generate_class" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+C# struct definition. Same shape as class but emits the `struct`
+keyword and structs only implement interfaces (no base class), so
+the base portion is omitted from the emitted preamble.
+@End Reasoning
+
+@Implementation:
+Mirrors generate_class but with `struct` keyword. Reads modifiers,
+name, type_parameters, interfaces, members. Emits modifiers, `struct`,
+name, type params, `:` interface list, braces, indented member loop.
+@End Implementation
+
 Process called "generate_struct" takes context as Integer, hir as Integer returns Integer:
     Note: Generate struct declaration
 
@@ -691,6 +841,19 @@ Process called "generate_struct" takes context as Integer, hir as Integer return
 
     Return 1
 End Process
+
+@Reasoning:
+Interface declaration: `[modifiers] interface IName[ : IBase, ...] {
+members }`. Bases for interfaces are themselves interfaces only
+(no class inheritance), but the syntactic position is the same as a
+struct's base list.
+@End Reasoning
+
+@Implementation:
+Reads modifiers, name, type_parameters, base interfaces, members.
+Emits modifiers, `interface`, name, type params, base list with `:`
+prefix, braces, indented member generation.
+@End Implementation
 
 Process called "generate_interface" takes context as Integer, hir as Integer returns Integer:
     Note: Generate interface declaration
@@ -767,6 +930,19 @@ Process called "generate_interface" takes context as Integer, hir as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+`enum Name[ : underlying_type] { value1[ = expr], value2, ... }`.
+Underlying integer type is optional (defaults to int). Each enumerator
+may have an explicit constant expression.
+@End Reasoning
+
+@Implementation:
+Reads modifiers, name, optional underlying_type, and members list.
+Emits modifiers, `enum`, name, optional `:` underlying_type, braces.
+For each member: name, optional ` = <value_expr>`, trailing comma
+between but not after last.
+@End Implementation
+
 Process called "generate_enum" takes context as Integer, hir as Integer returns Integer:
     Note: Generate enum declaration
 
@@ -827,6 +1003,18 @@ Process called "generate_enum" takes context as Integer, hir as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+`[modifiers] delegate ReturnType Name<T>(parameters);`. Delegates are
+type declarations not block constructs, so the helper closes with `;`
+rather than braces.
+@End Reasoning
+
+@Implementation:
+Reads modifiers, return_type, name, type_parameters, parameters.
+Emits modifiers, `delegate `, return type via generate_type, name,
+optional generic params, parenthesised parameter list, `;`.
+@End Implementation
+
 Process called "generate_delegate" takes context as Integer, hir as Integer returns Integer:
     Note: Generate delegate declaration
 
@@ -883,6 +1071,20 @@ End Process
 Note: ============================================================================
 Note: Member Generation
 Note: ============================================================================
+
+@Reasoning:
+Method declaration: `[modifiers] ReturnType Name<T>(params) [where
+constraints] { body }`. Constructors are detected by an empty return
+type and the body may be a block or expression-bodied (=> expr).
+@End Reasoning
+
+@Implementation:
+Reads modifiers, return_type, name, type_parameters, parameters,
+constraints, body. Emits modifiers, return type (if non-null), name,
+generic params if any, parameter list, where-constraints clause if
+present, then either a brace-enclosed body (via generate_block) or
+expression body via emit `=> <expr>;`.
+@End Implementation
 
 Process called "generate_method" takes context as Integer, hir as Integer returns Integer:
     Note: Generate method declaration
@@ -969,6 +1171,19 @@ Process called "generate_method" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+Field declaration covers both simple fields and auto-properties.
+`[modifiers] Type Name [= initializer];` for fields; properties
+emit `{ get; set; }` blocks when the HIR includes accessor entries.
+@End Reasoning
+
+@Implementation:
+Reads modifiers, type, name, optional initializer, optional getter/
+setter accessor blocks. Emits modifiers, type via generate_type,
+name. If property (has accessors), emits `{ get; set; }` style block.
+Otherwise emits optional ` = <initializer>` and `;`.
+@End Implementation
+
 Process called "generate_field" takes context as Integer, hir as Integer returns Integer:
     Note: Generate field declaration
 
@@ -1021,14 +1236,31 @@ Process called "generate_field" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+C# properties are a distinct construct from fields and methods - they must
+be emitted with their accessor block ({ get; set; }) even when the bodies
+are implicit. This generator handles the full property surface: visibility,
+modifier soup (static/virtual/override), explicit type, name, get/set
+presence, and optional initialiser. Auto-properties emit "get; set;" without
+bodies; properties with explicit accessors fall through to the same syntax
+because at this layer we only care that the accessors EXIST in the HIR -
+their bodies are emitted by the dispatcher elsewhere.
+@End Reasoning
+
+@Implementation:
+Reads emitter (offset 0) and indent level (offset 8) from the context.
+Emits leading indentation. Pulls "access", "static", "virtual", "override"
+flag-strings from the HIR dict; each non-zero string is emitted verbatim
+with a trailing space. Emits the type subtree (recursive generate_node)
+then the property name. Opens "{ " and conditionally appends "get; " and/or
+"set; " depending on which accessor keys are present in the HIR dict.
+Closes with "}". If an "initializer" subtree is present, appends " = "
+followed by the initialiser expression and a terminating ";". Always
+emits a trailing newline so the next member starts on a fresh line.
+@End Implementation
+
 Process called "generate_property" takes context as Integer, hir as Integer returns Integer:
     Note: Generate property declaration
-
-    @Reasoning:
-    Properties are a distinctive C# feature. We generate them with proper
-    get/set accessor syntax, supporting both auto-properties and properties
-    with custom accessor implementations.
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
     Let indent be proc memory_get_int64 from Layout with context, 8
@@ -1093,6 +1325,18 @@ Process called "generate_property" takes context as Integer, hir as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+`[modifiers] event DelegateType EventName;` declaration for an
+observer-pattern subscription point. Optional explicit add/remove
+accessors are handled via the same accessor-block path as properties.
+@End Reasoning
+
+@Implementation:
+Reads modifiers, delegate_type, name, optional accessors. Emits
+modifiers, `event `, type, name. If accessors present emits braced
+add/remove block; otherwise terminates with `;`.
+@End Implementation
+
 Process called "generate_event" takes context as Integer, hir as Integer returns Integer:
     Note: Generate event declaration
 
@@ -1135,6 +1379,17 @@ Note: ==========================================================================
 Note: Type Generation
 Note: ============================================================================
 
+@Reasoning:
+Bare type-name emitter for the simplest case where the HIR node
+carries just a "name" string. Generic, array, and nullable forms have
+their own dedicated emitters.
+@End Reasoning
+
+@Implementation:
+Reads emitter from context. Reads "name" string from the HIR dict.
+If non-null, emits it. Returns 1.
+@End Implementation
+
 Process called "generate_type" takes context as Integer, hir as Integer returns Integer:
     Note: Generate basic type
 
@@ -1147,6 +1402,17 @@ Process called "generate_type" takes context as Integer, hir as Integer returns 
 
     Return 1
 End Process
+
+@Reasoning:
+Parametric type `Name<T1, T2, ...>`. Uses C# angle bracket syntax with
+comma-separated type arguments.
+@End Reasoning
+
+@Implementation:
+Reads "name" and "type_arguments" list. Emits name, `<`, iterates
+arguments dispatching to generate_node with `, ` between them, then
+`>`.
+@End Implementation
 
 Process called "generate_generic_type" takes context as Integer, hir as Integer returns Integer:
     Note: Generate generic type
@@ -1183,6 +1449,17 @@ Process called "generate_generic_type" takes context as Integer, hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Multi-rank arrays use comma-separated brackets: int[,] is rank 2,
+int[,,] is rank 3. The HIR carries the rank as a string for
+flexibility; rank-1 emits plain `[]`.
+@End Reasoning
+
+@Implementation:
+Reads "element_type" and recurses generate_node. Emits `[`. Reads
+"rank" string, parses to int, emits (rank-1) commas. Closes with `]`.
+@End Implementation
+
 Process called "generate_array_type" takes context as Integer, hir as Integer returns Integer:
     Note: Generate array type
 
@@ -1212,6 +1489,16 @@ Process called "generate_array_type" takes context as Integer, hir as Integer re
     Return 1
 End Process
 
+@Reasoning:
+`T?` syntax represents Nullable<T> for value types and a
+nullable-reference annotation for reference types in modern C#.
+Implementation just appends `?` after the underlying type.
+@End Reasoning
+
+@Implementation:
+Reads "underlying_type" and recurses generate_node. Emits `?`.
+@End Implementation
+
 Process called "generate_nullable_type" takes context as Integer, hir as Integer returns Integer:
     Note: Generate nullable type
 
@@ -1226,6 +1513,17 @@ Process called "generate_nullable_type" takes context as Integer, hir as Integer
 
     Return 1
 End Process
+
+@Reasoning:
+Comma-separated list of generic type parameters. Reused across class,
+struct, interface, method, and delegate declarations.
+@End Reasoning
+
+@Implementation:
+Null guard returns 1. Reads list length, iterates each parameter via
+get_from_list and dispatches generate_node, with `, ` separators
+between adjacent items.
+@End Implementation
 
 Process called "generate_type_parameter_list" takes context as Integer, type_params as Integer returns Integer:
     Note: Generate type parameter list for generics
@@ -1256,6 +1554,18 @@ End Process
 Note: ============================================================================
 Note: Statement Generation
 Note: ============================================================================
+
+@Reasoning:
+`{ stmts... }` block delimited by braces. Each statement is indented
+one level deeper than the surrounding context, and the closing brace
+matches the outer indent.
+@End Reasoning
+
+@Implementation:
+Emits `{` on its own line, calls increase_indent. Iterates "statements"
+list dispatching generate_node on each. Calls decrease_indent and
+emits closing `}` on its own line.
+@End Implementation
 
 Process called "generate_block" takes context as Integer, hir as Integer returns Integer:
     Note: Generate block statement
@@ -1295,6 +1605,18 @@ Process called "generate_block" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+`if (cond) then [else else_body]`. C# requires parenthesised
+condition. Else is optional and dispatched recursively so else-if
+chains work via the parser pre-flattening into sub-if HIR nodes.
+@End Reasoning
+
+@Implementation:
+Reads "condition", "then", "else" from HIR. Emits `if (`, condition
+via generate_node, `) `, then-body via generate_node. If else
+present, emits ` else `, recurses on else-body.
+@End Implementation
+
 Process called "generate_if_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate if statement
 
@@ -1327,6 +1649,17 @@ Process called "generate_if_statement" takes context as Integer, hir as Integer 
 
     Return 1
 End Process
+
+@Reasoning:
+C-style for with three optional clauses. Each missing clause emits
+just the semicolon so the structure stays well-formed.
+@End Reasoning
+
+@Implementation:
+Reads "initializer", "condition", "increment", "body". Emits
+`for (` + initializer expression (or empty) + `;` + condition + `;` +
+increment + `) `. Then recurses generate_node on the body.
+@End Implementation
 
 Process called "generate_for_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate for statement
@@ -1367,6 +1700,17 @@ Process called "generate_for_statement" takes context as Integer, hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+`foreach (Type var in collection) body`. Standard C# collection
+iteration; the variable type may be `var` for inferred typing.
+@End Reasoning
+
+@Implementation:
+Reads "var_type", "variable", "collection", "body". Emits `foreach (`,
+type via generate_node, space, variable name, ` in `, collection via
+generate_node, `) `, body via generate_node.
+@End Implementation
+
 Process called "generate_foreach_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate foreach statement
 
@@ -1405,6 +1749,15 @@ Process called "generate_foreach_statement" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+`while (cond) body`. Head-tested loop with parenthesised condition.
+@End Reasoning
+
+@Implementation:
+Reads "condition" and "body". Emits `while (`, condition expression
+via generate_node, `) `, body via generate_node.
+@End Implementation
+
 Process called "generate_while_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate while statement
 
@@ -1429,6 +1782,16 @@ Process called "generate_while_statement" takes context as Integer, hir as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+`do body while (cond);`. Tail-tested loop. Body runs at least once
+before the condition is checked.
+@End Reasoning
+
+@Implementation:
+Reads "body" and "condition". Emits `do `, body via generate_node,
+` while (`, condition via generate_node, `);`.
+@End Implementation
 
 Process called "generate_do_while_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate do-while statement
@@ -1458,6 +1821,19 @@ Process called "generate_do_while_statement" takes context as Integer, hir as In
 
     Return 1
 End Process
+
+@Reasoning:
+`switch (expr) { case val: stmts break; ... default: stmts break; }`.
+Each case clause is emitted with its `case <value>:` header and the
+list of statements that follow.
+@End Reasoning
+
+@Implementation:
+Reads "expression" and "cases" list. Emits `switch (`, expression
+via generate_node, `) {`, newline + indent. For each case: emits
+`case <value>:` or `default:`, indents, generates statement list,
+dedents. Closes with `}`.
+@End Implementation
 
 Process called "generate_switch_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate switch statement
@@ -1508,6 +1884,18 @@ Process called "generate_switch_statement" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+`try { body } [catch (ExType ename) { body }]* [finally { body }]`.
+Multiple catch clauses are allowed; finally is optional but must be
+last when present.
+@End Reasoning
+
+@Implementation:
+Reads "try_body", "catches" list, "finally_body". Emits `try ` + try
+block via generate_node. For each catch: emits ` catch (Type name) `
++ block. If finally_body present, emits ` finally ` + finally block.
+@End Implementation
+
 Process called "generate_try_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate try-catch-finally statement
 
@@ -1551,6 +1939,16 @@ Process called "generate_try_statement" takes context as Integer, hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+`return [expr];`. Bare `return;` is legal for void methods. The
+expression is optional and gated on its presence in the HIR.
+@End Reasoning
+
+@Implementation:
+Reads optional "value". Emits `return`. If value present, emits a
+space and the expression via generate_node. Closes with `;`.
+@End Implementation
+
 Process called "generate_return_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate return statement
 
@@ -1572,6 +1970,15 @@ Process called "generate_return_statement" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+`break;` keyword exits the innermost enclosing loop or switch arm.
+No payload, so this is a one-line emission.
+@End Reasoning
+
+@Implementation:
+Emits `break;` followed by newline.
+@End Implementation
+
 Process called "generate_break_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate break statement
 
@@ -1585,6 +1992,15 @@ Process called "generate_break_statement" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+`continue;` skips to the next iteration of the innermost loop. Like
+break, this is just a keyword + semicolon.
+@End Reasoning
+
+@Implementation:
+Emits `continue;` followed by newline.
+@End Implementation
+
 Process called "generate_continue_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate continue statement
 
@@ -1597,6 +2013,16 @@ Process called "generate_continue_statement" takes context as Integer, hir as In
 
     Return 1
 End Process
+
+@Reasoning:
+`throw [expr];`. Bare `throw;` rethrows the current exception in a
+catch context; otherwise the expression is the exception to raise.
+@End Reasoning
+
+@Implementation:
+Reads optional "exception". Emits `throw`. If exception present, emits
+a space and the expression via generate_node. Closes with `;`.
+@End Implementation
 
 Process called "generate_throw_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate throw statement
@@ -1618,6 +2044,22 @@ Process called "generate_throw_statement" takes context as Integer, hir as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+`lock (obj) body` - C# synchronisation primitive. obj must be a
+reference-typed expression; body executes while holding the monitor.
+@End Reasoning
+
+@Implementation:
+Reads "expression" and "body". Emits `lock (`, expression via
+generate_node, `) `, body via generate_node.
+@End Implementation
+
+@Security_Scope:
+The emitted statement enforces exclusive access at runtime. Compiler
+itself does not analyse for deadlock potential between multiple
+locks — that is the responsibility of downstream static analysers.
+@End Security_Scope
 
 Process called "generate_lock_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate lock statement
@@ -1644,6 +2086,17 @@ Process called "generate_lock_statement" takes context as Integer, hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+An expression used in statement position; C# requires the trailing
+semicolon to distinguish it from an expression that contributes to a
+parent expression.
+@End Reasoning
+
+@Implementation:
+Reads "expression". Dispatches to generate_node, then emits `;` and
+a newline.
+@End Implementation
+
 Process called "generate_expression_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate expression statement
 
@@ -1662,6 +2115,17 @@ Process called "generate_expression_statement" takes context as Integer, hir as 
 
     Return 1
 End Process
+
+@Reasoning:
+`Type name [= init];` or `var name = init;` form for local variables.
+The HIR may carry either explicit or inferred types.
+@End Reasoning
+
+@Implementation:
+Reads "type" (may be the literal "var" keyword), "name", optional
+"initializer". Emits type via generate_node, space, name, optional
+` = <initializer>`, `;`.
+@End Implementation
 
 Process called "generate_var_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate variable declaration
@@ -1698,6 +2162,17 @@ Note: ==========================================================================
 Note: Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+Infix `left op right`. Operator is the spelling as-is from HIR (e.g.
+`+`, `&&`, `??`); no remapping needed because C# uses the same
+symbolic forms as the HIR carries.
+@End Reasoning
+
+@Implementation:
+Reads "left", "operator", "right". Emits left via generate_node,
+space, operator string, space, right via generate_node.
+@End Implementation
+
 Process called "generate_binary_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate binary expression
 
@@ -1725,6 +2200,17 @@ Process called "generate_binary_expression" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Prefix unary (`!`, `-`, `+`, `~`, `++`, `--`). Postfix forms are
+recognised by an "is_postfix" flag; emission order swaps when set.
+@End Reasoning
+
+@Implementation:
+Reads "operator", "operand", optional "is_postfix". For postfix:
+emits operand then operator. For prefix: emits operator then operand.
+Both via generate_node.
+@End Implementation
+
 Process called "generate_unary_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate unary expression
 
@@ -1742,6 +2228,17 @@ Process called "generate_unary_expression" takes context as Integer, hir as Inte
 
     Return 1
 End Process
+
+@Reasoning:
+`target op value` where op is `=` or a compound form (+=, -=, *=,
+etc.). The operator string is read from HIR so all compound
+assignments share the same emission path.
+@End Reasoning
+
+@Implementation:
+Reads "target", "operator", "value". Emits target via generate_node,
+space, operator (e.g. `=`, `+=`), space, value via generate_node.
+@End Implementation
 
 Process called "generate_assignment_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate assignment expression
@@ -1771,6 +2268,17 @@ Process called "generate_assignment_expression" takes context as Integer, hir as
 
     Return 1
 End Process
+
+@Reasoning:
+`callee(arg1, arg2, ...)` invocation. Method-call shape is already
+encoded by callee being a member-access expression, so a single
+emit path handles both function and method calls.
+@End Reasoning
+
+@Implementation:
+Reads "callee" and "arguments" list. Emits callee via generate_node,
+`(`, comma-separated argument expressions via generate_node, `)`.
+@End Implementation
 
 Process called "generate_call_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate call expression
@@ -1807,6 +2315,16 @@ Process called "generate_call_expression" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+`object.member`. Standard C# dot-access syntax. Used for property
+reads, method references, and namespace-qualified type access.
+@End Reasoning
+
+@Implementation:
+Reads "object" and "member". Emits object via generate_node, `.`,
+member name string.
+@End Implementation
+
 Process called "generate_member_access_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate member access expression
 
@@ -1826,6 +2344,16 @@ Process called "generate_member_access_expression" takes context as Integer, hir
 
     Return 1
 End Process
+
+@Reasoning:
+`object[index1, index2, ...]` for arrays and indexers. Multiple
+indices support multi-dimensional arrays and indexer overloads.
+@End Reasoning
+
+@Implementation:
+Reads "object" and "indices" list. Emits object via generate_node,
+`[`, comma-separated index expressions via generate_node, `]`.
+@End Implementation
 
 Process called "generate_index_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate index expression
@@ -1848,6 +2376,18 @@ Process called "generate_index_expression" takes context as Integer, hir as Inte
 
     Return 1
 End Process
+
+@Reasoning:
+`new Type(args)` for constructor invocation. Object initializers
+(`{ Field = Value, ... }`) and collection initializers
+(`{ a, b, c }`) are emitted via optional "initializer" HIR entry.
+@End Reasoning
+
+@Implementation:
+Emits `new `, type via generate_node, `(`, comma-separated constructor
+arguments via generate_node, `)`. If initializer present, emits a
+following `{ ... }` block populated from initializer entries.
+@End Implementation
 
 Process called "generate_new_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate new expression
@@ -1886,6 +2426,19 @@ Process called "generate_new_expression" takes context as Integer, hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+C# lambdas: `(p1, p2) => body` or `p1 => body` for single-parameter
+forms. Bodies may be an expression or a brace-enclosed block. The
+emitter picks `(...)` parens when there are zero or multiple params,
+or any explicit-typed param.
+@End Reasoning
+
+@Implementation:
+Reads "parameters" list and "body". Emits `(`, comma-separated
+parameters (each as Type name or just name), `) =>`, then body
+(expression via generate_node or block via generate_block).
+@End Implementation
+
 Process called "generate_lambda_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate lambda expression
 
@@ -1921,6 +2474,18 @@ Process called "generate_lambda_expression" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Ternary `cond ? then : else`. Whole expression is parenthesised by
+the caller if precedence requires it; here we emit just the
+underlying form.
+@End Reasoning
+
+@Implementation:
+Reads "condition", "then_branch", "else_branch". Emits condition via
+generate_node, ` ? `, then via generate_node, ` : `, else via
+generate_node.
+@End Implementation
+
 Process called "generate_conditional_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate conditional (ternary) expression
 
@@ -1948,6 +2513,16 @@ Process called "generate_conditional_expression" takes context as Integer, hir a
     Return 1
 End Process
 
+@Reasoning:
+`await expr` is a prefix operator that yields control until the
+awaited task completes. The enclosing method must itself be `async`,
+which is validated separately.
+@End Reasoning
+
+@Implementation:
+Reads "expression". Emits `await `, the expression via generate_node.
+@End Implementation
+
 Process called "generate_await_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate await expression
 
@@ -1963,6 +2538,16 @@ Process called "generate_await_expression" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emits a bare identifier reference. The HIR carries the canonical
+name; C# identifier rules match Runa's, so the lexeme can be emitted
+without escaping.
+@End Reasoning
+
+@Implementation:
+Reads "name" string from HIR. If non-null, emits it via emit_string.
+@End Implementation
+
 Process called "generate_identifier" takes context as Integer, hir as Integer returns Integer:
     Note: Generate identifier
 
@@ -1975,6 +2560,17 @@ Process called "generate_identifier" takes context as Integer, hir as Integer re
 
     Return 1
 End Process
+
+@Reasoning:
+Bootstrap-form literal emission: the HIR builder is expected to have
+already produced the C# lexeme (quotes for strings, suffix for typed
+numerics) so the emitter just pass-through writes the value string.
+@End Reasoning
+
+@Implementation:
+Reads "value" string from HIR. If non-null, emits it verbatim via
+emit_string. Returns 1.
+@End Implementation
 
 Process called "generate_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate literal

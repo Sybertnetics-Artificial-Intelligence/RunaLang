@@ -23,6 +23,9 @@ Note: ================================================================
 Note: Emitter State
 Note: ================================================================
 
+@Reasoning:
+The emitter is the orchestrator across four pipeline stages (lexer, parser, translator, backend); holding their pointers lets a caller inspect any stage's state after the pipeline runs, which is essential for diagnostic reporting and incremental editing. error_list and warning_list aggregate diagnostics across all stages so the consumer sees a single unified view rather than four separate queries.
+@End Reasoning
 Type called "MakefileEmitter":
     source_file_path as String  Note: Path to source Makefile
     error_list as Integer  Note: Pointer to list of errors across all stages
@@ -39,6 +42,9 @@ Note: ================================================================
 Note: Diagnostic Types
 Note: ================================================================
 
+@Reasoning:
+A diagnostic record carries everything the formatter needs: severity (info/warning/error), message text, file location, and originating pipeline stage. Bundling stage with the diagnostic lets consumers filter by stage ("show only translator warnings") without re-walking the source emitter.
+@End Reasoning
 Type called "Diagnostic":
     severity as Integer  Note: 0 = info, 1 = warning, 2 = error
     message as String
@@ -52,11 +58,10 @@ Note: ================================================================
 Note: Emitter Initialization
 Note: ================================================================
 
+@Reasoning:
+The emitter is allocated as a 72-byte struct (9 slots) so all stage pointers and diagnostic lists live in one heap allocation; this keeps cache locality high during pipeline execution. Stage pointers (lexer/parser/translator/backend) are left null and only created on demand because some entry points (validate_makefile) need only the early stages.
+@End Reasoning
 Process called "create_emitter" that takes nothing returns Integer:
-    @Reasoning
-    Create and initialize a Makefile emitter for translation operations.
-    @End Reasoning
-
     Let emitter_ptr be proc allocate from Memory with 72
 
     Note: Initialize source file path
@@ -86,11 +91,13 @@ Note: ================================================================
 Note: Makefile → AST (Lexing and Parsing)
 Note: ================================================================
 
+@Reasoning:
+Lexing and parsing are coupled into one entry point because makefile tokens are not consumable independently of the parser's state (TAB tokens are only meaningful in recipe context). We check lexer errors before invoking the parser so the parser is never fed an inconsistent token stream; the same gate appears after parsing so a partial AST is never written to the emitter.
+@End Reasoning
+@Security_Scope:
+makefile_source is untrusted user input; lexer and parser both append to their own diagnostic lists rather than aborting, so a malformed makefile produces a clean error report instead of a crash.
+@End Security_Scope
 Process called "parse_makefile" that takes emitter_ptr as Integer, makefile_source as String returns Integer:
-    @Reasoning
-    Parse Makefile source code into an AST. Returns 1 on success, 0 on failure.
-    @End Reasoning
-
     Note: Create and run lexer
     Let lexer_ptr be proc create_lexer from MakefileLexer
     proc write_integer from Memory with emitter_ptr, 24, lexer_ptr
@@ -133,12 +140,10 @@ Note: ================================================================
 Note: AST → HIR Translation
 Note: ================================================================
 
+@Reasoning:
+AST-to-HIR translation is a separate stage because some callers want the AST only (linting, formatting); requiring a prior parse_makefile keeps each stage focused on a single concern. The null-AST guard emits an explicit diagnostic so misuse (calling translate before parse) shows up as a translator-stage error instead of a silent failure.
+@End Reasoning
 Process called "translate_to_hir" that takes emitter_ptr as Integer returns Integer:
-    @Reasoning
-    Translate the AST to HIR. Returns 1 on success, 0 on failure.
-    Requires parse_makefile to have been called first.
-    @End Reasoning
-
     Note: Get AST root
     Let ast_root be proc read_integer from Memory with emitter_ptr, 56
 
@@ -182,12 +187,10 @@ Note: ================================================================
 Note: HIR → Makefile Generation
 Note: ================================================================
 
+@Reasoning:
+HIR-to-Makefile generation is the inverse of translate_to_hir; we return the empty string on failure rather than a sentinel value because the empty makefile is unambiguously invalid (a real makefile always has at least one rule or directive). The backend's own error_list captures the specific failure cause.
+@End Reasoning
 Process called "generate_makefile" that takes emitter_ptr as Integer returns String:
-    @Reasoning
-    Generate Makefile source code from HIR. Returns empty string on failure.
-    Requires translate_to_hir to have been called first.
-    @End Reasoning
-
     Note: Get HIR root
     Let hir_root be proc read_integer from Memory with emitter_ptr, 64
 
@@ -225,14 +228,10 @@ Note: ================================================================
 Note: High-Level Translation Operations
 Note: ================================================================
 
+@Reasoning:
+The "with_emitter" variant exists so callers managing a long-lived emitter (e.g., an LSP that wants persistent diagnostic history) can run the pipeline without paying the create/teardown cost per call. Short-circuit returns on each stage failure ensure the emitter's state remains consistent with what was actually accomplished.
+@End Reasoning
 Process called "makefile_to_hir_with_emitter" that takes emitter_ptr as Integer, makefile_source as String returns Integer:
-    @Reasoning
-    Complete Makefile → HIR translation pipeline using a caller-supplied emitter.
-    Returns HIR root pointer or 0 on failure. This is the multi-arg internal
-    form that orchestrates an existing MakefileEmitter; the single-arg
-    `makefile_to_hir` below is what the central dispatcher calls.
-    @End Reasoning
-
     Note: Parse Makefile source
     Let parse_success be proc parse_makefile with emitter_ptr, makefile_source
 
@@ -252,14 +251,10 @@ Process called "makefile_to_hir_with_emitter" that takes emitter_ptr as Integer,
     Return hir_root
 End Process
 
+@Reasoning:
+HIR-to-Makefile lives in the emitter so the backend diagnostics aggregate with any prior stages' diagnostics; writing hir_root into the emitter slot before calling generate_makefile gives the backend a stable handle and keeps the emitter's get_hir_root accessor consistent with what was actually emitted.
+@End Reasoning
 Process called "hir_to_makefile_with_emitter" that takes emitter_ptr as Integer, hir_root as Integer returns String:
-    @Reasoning
-    Complete HIR → Makefile translation pipeline using a caller-supplied
-    emitter. Returns Makefile source or empty string on failure. This is the
-    multi-arg internal form; the single-arg `hir_to_makefile` below is what
-    the central dispatcher calls.
-    @End Reasoning
-
     Note: Store HIR root in emitter
     proc write_integer from Memory with emitter_ptr, 64, hir_root
 
@@ -277,35 +272,26 @@ Note: the canonical single-arg shape. These wrappers create a fresh emitter,
 Note: run the pipeline, and return the result so the dispatcher does not
 Note: need to manage emitter lifecycles.
 
+@Reasoning:
+The single-arg shape is what the central translation dispatcher in translation.runa calls; keeping it as a thin wrapper around create_emitter + with_emitter avoids duplicating pipeline logic while letting callers who don't need emitter lifecycle management ignore it entirely.
+@End Reasoning
 Process called "makefile_to_hir" that takes makefile_source as String returns Integer:
-    @Reasoning
-    Single-arg dispatcher entry point. Creates a fresh emitter, runs the
-    Makefile -> HIR pipeline, and returns the HIR root pointer or 0 on
-    failure.
-    @End Reasoning
-
     Let emitter_ptr be proc create_emitter
     Return proc makefile_to_hir_with_emitter with emitter_ptr, makefile_source
 End Process
 
+@Reasoning:
+Single-arg HIR-to-Makefile entry point mirrors makefile_to_hir; the dispatcher contract is symmetric so both directions of translation are interchangeable from the caller's perspective.
+@End Reasoning
 Process called "hir_to_makefile" that takes hir_root as Integer returns String:
-    @Reasoning
-    Single-arg dispatcher entry point. Creates a fresh emitter, runs the
-    HIR -> Makefile pipeline, and returns the generated Makefile source or
-    the empty string on failure.
-    @End Reasoning
-
     Let emitter_ptr be proc create_emitter
     Return proc hir_to_makefile_with_emitter with emitter_ptr, hir_root
 End Process
 
+@Reasoning:
+Round-trip translation is the standard golden-output test mechanism: parse, translate to HIR, then re-emit and diff against the original (modulo formatting). It's also useful as a normalizer — the output is what the canonical formatter would produce for the same semantic content. Both stages share the same emitter so diagnostics from either direction accumulate.
+@End Reasoning
 Process called "round_trip_translate" that takes emitter_ptr as Integer, makefile_source as String returns String:
-    @Reasoning
-    Perform round-trip translation: Makefile → HIR → Makefile.
-    Useful for testing, normalization, and validation.
-    Returns regenerated Makefile source or empty string on failure.
-    @End Reasoning
-
     Note: Parse and translate to HIR
     Let hir_root be proc makefile_to_hir_with_emitter with emitter_ptr, makefile_source
 
@@ -323,11 +309,10 @@ Note: ================================================================
 Note: Diagnostic Management
 Note: ================================================================
 
+@Reasoning:
+The seven-arg shape collects every diagnostic field at the call site so the resulting record is fully populated; downstream consumers (format_diagnostic, IDE) can render exactly one consistent format. Severity >= 2 routes to error_list, < 2 to warning_list, so a future "info" severity (0) lands in warning_list which is intentional because the IDE shows warnings and infos with the same UI treatment.
+@End Reasoning
 Process called "add_diagnostic" that takes emitter_ptr as Integer, severity as Integer, message as String, file_path as String, line as Integer, column as Integer, stage as String returns Integer:
-    @Reasoning
-    Add a diagnostic message to the appropriate list (error or warning).
-    @End Reasoning
-
     Let diag_ptr be proc allocate from Memory with 48
 
     proc write_integer from Memory with diag_ptr, 0, severity
@@ -350,11 +335,10 @@ Process called "add_diagnostic" that takes emitter_ptr as Integer, severity as I
     Return 1
 End Process
 
+@Reasoning:
+Stage-specific diagnostic lists (lexer, parser, translator, backend) use their own field layouts so we deliberately re-extract message/line/column at known offsets and reformat them through add_diagnostic; this normalizes everything to the emitter's diagnostic format and tags each record with the originating stage for downstream filtering.
+@End Reasoning
 Process called "merge_diagnostics" that takes emitter_ptr as Integer, diag_list as Integer, stage as String, severity as Integer returns Integer:
-    @Reasoning
-    Merge diagnostics from a stage-specific error/warning list into the emitter's lists.
-    @End Reasoning
-
     Let count be proc get_list_size from ListCore with diag_list
     Let index be 0
 
@@ -376,30 +360,26 @@ Process called "merge_diagnostics" that takes emitter_ptr as Integer, diag_list 
     Return 1
 End Process
 
+@Reasoning:
+Error count is exposed as an accessor so the underlying representation (list, set, or deduped buffer) can change without breaking consumers; the same applies to warnings. Two separate accessors avoid forcing callers to split a single combined list.
+@End Reasoning
 Process called "get_error_count" that takes emitter_ptr as Integer returns Integer:
-    @Reasoning
-    Get total number of errors across all stages.
-    @End Reasoning
-
     Let error_list be proc read_integer from Memory with emitter_ptr, 8
     Return proc get_list_size from ListCore with error_list
 End Process
 
+@Reasoning:
+Warning count mirrors error count; warnings are tracked separately because IDE and CLI surfaces treat them differently (warnings are suppressible, errors are not).
+@End Reasoning
 Process called "get_warning_count" that takes emitter_ptr as Integer returns Integer:
-    @Reasoning
-    Get total number of warnings across all stages.
-    @End Reasoning
-
     Let warning_list be proc read_integer from Memory with emitter_ptr, 16
     Return proc get_list_size from ListCore with warning_list
 End Process
 
+@Reasoning:
+The combined diagnostic list is built fresh each call rather than cached so consumers receive a coherent snapshot; errors come first to match the convention that severity descending is the most useful display order. The function allocates a new list and shares pointers to the underlying diagnostic records (no deep copy) because diagnostics are immutable after add_diagnostic.
+@End Reasoning
 Process called "get_diagnostics" that takes emitter_ptr as Integer returns Integer:
-    @Reasoning
-    Get combined list of all diagnostics (errors and warnings).
-    Returns pointer to new list containing all diagnostics sorted by severity.
-    @End Reasoning
-
     Let all_diagnostics be proc create_list from ListCore
 
     Note: Add all errors first
@@ -427,11 +407,10 @@ Process called "get_diagnostics" that takes emitter_ptr as Integer returns Integ
     Return all_diagnostics
 End Process
 
+@Reasoning:
+The diagnostic format follows the conventional "path:line:col: severity [stage]: message" layout used by GCC/Clang/MSVC so IDEs and editors can parse it with their standard regexes. The leading location is omitted when file_path is empty so synthetic diagnostics (e.g., "no AST available") don't render with a misleading "0:0" prefix.
+@End Reasoning
 Process called "format_diagnostic" that takes diag_ptr as Integer returns String:
-    @Reasoning
-    Format a diagnostic message for display.
-    @End Reasoning
-
     Let severity be proc read_integer from Memory with diag_ptr, 0
     Let message be proc read_string from Memory with diag_ptr, 8
     Let file_path be proc read_string from Memory with diag_ptr, 16
@@ -478,49 +457,44 @@ Note: ================================================================
 Note: Stage-Specific Error Retrieval
 Note: ================================================================
 
+@Reasoning:
+Lexer errors live at offset 40 of the lexer struct (its established field layout); we read directly because the lexer is part of this emitter's lifecycle and the offset is stable for the duration. Returning the raw list pointer (not a copy) is safe because merge_diagnostics iterates without mutating.
+@End Reasoning
 Process called "get_lexer_errors" that takes lexer_ptr as Integer returns Integer:
-    @Reasoning
-    Get errors from the lexer stage.
-    @End Reasoning
-
     Note: Access lexer error list
     Let error_list be proc read_integer from Memory with lexer_ptr, 40
     Return error_list
 End Process
 
+@Reasoning:
+Parser errors mirror lexer errors — same offset 40, same direct read — because the parser and lexer share a common error-list convention by design. Keeping the accessor symmetric lets merge_diagnostics treat them uniformly.
+@End Reasoning
 Process called "get_parser_errors" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Get errors from the parser stage.
-    @End Reasoning
-
     Note: Access parser error list
     Let error_list be proc read_integer from Memory with parser_ptr, 40
     Return error_list
 End Process
 
+@Reasoning:
+The translator exposes its error list through a module API rather than a struct offset because its internal layout is not part of the stable ABI; the indirection via MakefileToHIR.get_error_count insulates this orchestrator from translator refactors.
+@End Reasoning
 Process called "get_translator_errors" that takes translator_ptr as Integer returns Integer:
-    @Reasoning
-    Get errors from the translator stage.
-    @End Reasoning
-
     Let error_list be proc get_error_count from MakefileToHIR with translator_ptr
     Return error_list
 End Process
 
+@Reasoning:
+Translator warnings parallel translator errors via a separate accessor because the translator may emit warnings (e.g., deprecated syntax) that are not errors. Symmetric API shape with get_translator_errors keeps merge_diagnostics' contract uniform.
+@End Reasoning
 Process called "get_translator_warnings" that takes translator_ptr as Integer returns Integer:
-    @Reasoning
-    Get warnings from the translator stage.
-    @End Reasoning
-
     Let warning_list be proc get_warning_count from MakefileToHIR with translator_ptr
     Return warning_list
 End Process
 
+@Reasoning:
+The backend error list lives at offset 32 (backend's smaller struct than lexer/parser); the direct read works because this emitter is the backend's sole owner. Backend errors typically reflect HIR-shape violations that the translator failed to catch.
+@End Reasoning
 Process called "get_backend_errors" that takes backend_ptr as Integer returns Integer:
-    @Reasoning
-    Get errors from the backend stage.
-    @End Reasoning
-
     Let error_list be proc read_integer from Memory with backend_ptr, 32
     Return error_list
 End Process
@@ -529,36 +503,32 @@ Note: ================================================================
 Note: Utility Functions
 Note: ================================================================
 
+@Reasoning:
+The source file path is stored on the emitter so every diagnostic emitted afterwards is automatically stamped with it via merge_diagnostics; callers using read-from-string entry points may legitimately leave the path empty, in which case format_diagnostic suppresses the location prefix.
+@End Reasoning
 Process called "set_source_file_path" that takes emitter_ptr as Integer, file_path as String returns Integer:
-    @Reasoning
-    Set the source file path for diagnostic reporting.
-    @End Reasoning
-
     proc write_string from Memory with emitter_ptr, 0, file_path
     Return 1
 End Process
 
+@Reasoning:
+The AST accessor returns 0 when parse_makefile has not been called or failed; callers must check for 0 before dereferencing. Direct memory read at offset 56 (the documented ast_root slot).
+@End Reasoning
 Process called "get_ast_root" that takes emitter_ptr as Integer returns Integer:
-    @Reasoning
-    Get the AST root node. Returns 0 if not available.
-    @End Reasoning
-
     Return proc read_integer from Memory with emitter_ptr, 56
 End Process
 
+@Reasoning:
+The HIR accessor parallels get_ast_root with offset 64; returning 0 signals translation has not run or has failed, distinguishing "no HIR yet" from "HIR is empty" (an empty HIR root would still be a valid non-zero pointer).
+@End Reasoning
 Process called "get_hir_root" that takes emitter_ptr as Integer returns Integer:
-    @Reasoning
-    Get the HIR root node. Returns 0 if not available.
-    @End Reasoning
-
     Return proc read_integer from Memory with emitter_ptr, 64
 End Process
 
+@Reasoning:
+has_errors is a boolean wrapper around get_error_count so callers expressing "did anything go wrong?" don't need to compare against 0; the return is 1/0 rather than the count so it's directly usable as a condition value.
+@End Reasoning
 Process called "has_errors" that takes emitter_ptr as Integer returns Integer:
-    @Reasoning
-    Check if any errors occurred during translation. Returns 1 if errors exist, 0 otherwise.
-    @End Reasoning
-
     Let error_count be proc get_error_count from emitter_ptr
 
     If error_count is greater than 0:
@@ -572,12 +542,13 @@ Note: ================================================================
 Note: Public API - Convenience Functions
 Note: ================================================================
 
+@Reasoning:
+The file-path convenience wrapper bundles read-file + pipeline so command-line tools don't reimplement the file-IO boilerplate. We use the empty-string-on-failure convention from read_file_to_string to short-circuit on missing/unreadable files, returning 0 rather than running the pipeline against empty input.
+@End Reasoning
+@Security_Scope:
+file_path is treated as untrusted; read_file_to_string is responsible for path validation. The emitter stores file_path on the source_file_path slot so diagnostics carry the user's original (potentially relative) path string for correct IDE source navigation.
+@End Security_Scope
 Process called "parse_makefile_file" that takes file_path as String returns Integer:
-    @Reasoning
-    Convenience function to parse a Makefile from a file path.
-    Returns HIR root or 0 on failure.
-    @End Reasoning
-
     Note: Read file content
     Let makefile_source be proc read_file_to_string from StringCore with file_path
 
@@ -594,12 +565,10 @@ Process called "parse_makefile_file" that takes file_path as String returns Inte
     Return hir_root
 End Process
 
+@Reasoning:
+The inverse file-IO convenience: HIR -> source -> file in one call. We check for empty generated source before writing because writing an empty file would silently overwrite an existing makefile with nothing; returning 0 forces the caller to investigate the diagnostic stream.
+@End Reasoning
 Process called "generate_makefile_file" that takes hir_root as Integer, output_path as String returns Integer:
-    @Reasoning
-    Convenience function to generate a Makefile and write to a file.
-    Returns 1 on success, 0 on failure.
-    @End Reasoning
-
     Note: Create emitter and generate
     Let emitter_ptr be proc create_emitter
 
@@ -615,12 +584,10 @@ Process called "generate_makefile_file" that takes hir_root as Integer, output_p
     Return write_success
 End Process
 
+@Reasoning:
+File-to-file round-trip wraps round_trip_translate with both file-IO ends; this is the canonical entry point for makefile-format normalization tools. The dual empty-string checks guard against both failed reads and failed regeneration so no output file is created on any stage's failure.
+@End Reasoning
 Process called "translate_makefile_file" that takes input_path as String, output_path as String returns Integer:
-    @Reasoning
-    Convenience function for round-trip translation from file to file.
-    Returns 1 on success, 0 on failure.
-    @End Reasoning
-
     Note: Read input file
     Let makefile_source be proc read_file_to_string from StringCore with input_path
 
@@ -648,32 +615,26 @@ Note: ================================================================
 Note: Public API - Main Entry Points
 Note: ================================================================
 
+@Reasoning:
+This is the primary external-API entry point; the name reflects the abstract operation rather than the internal emitter mechanics. We deliberately allocate a fresh emitter per call so callers using the public API don't have to think about lifecycle management.
+@End Reasoning
 Process called "translate_from_makefile" that takes makefile_source as String returns Integer:
-    @Reasoning
-    Primary public API: Translate Makefile source to HIR.
-    Returns HIR root pointer or 0 on failure.
-    @End Reasoning
-
     Let emitter_ptr be proc create_emitter
     Return proc makefile_to_hir_with_emitter with emitter_ptr, makefile_source
 End Process
 
+@Reasoning:
+Symmetric to translate_from_makefile but for the HIR-to-source direction; both share the same per-call emitter creation convention so neither requires lifecycle knowledge from external callers.
+@End Reasoning
 Process called "translate_to_makefile" that takes hir_root as Integer returns String:
-    @Reasoning
-    Primary public API: Translate HIR to Makefile source.
-    Returns Makefile source string or empty string on failure.
-    @End Reasoning
-
     Let emitter_ptr be proc create_emitter
     Return proc hir_to_makefile_with_emitter with emitter_ptr, hir_root
 End Process
 
+@Reasoning:
+Validation is parsing without semantic analysis or HIR generation; the parse_makefile return value (1/0) is already the validation answer. We use a temporary emitter so the validator is safe to call from any context (e.g., a lint hook) without affecting other in-flight translations.
+@End Reasoning
 Process called "validate_makefile" that takes makefile_source as String returns Integer:
-    @Reasoning
-    Validate Makefile syntax by attempting to parse it.
-    Returns 1 if valid, 0 if invalid.
-    @End Reasoning
-
     Let emitter_ptr be proc create_emitter
     Let parse_success be proc parse_makefile with emitter_ptr, makefile_source
 

@@ -80,6 +80,21 @@ Note: ==========================================================================
 Note: Token Structure
 Note: ============================================================================
 
+@Reasoning:
+A token record produced by next_token and consumed by the SwiftUI
+parser. Carries enough metadata for parser-side recovery and
+diagnostic reporting: type discriminator, the byte span pointing into
+the original source (not an owned copy), and (line, column) of the
+first byte. The lexeme pointer is shared with the source buffer so
+the parser must not free the source for the lifetime of any token.
+@End Reasoning
+
+@Implementation:
+40-byte record (5 x i64). Offsets: 0 token_type (TOKEN_* constant), 8
+lexeme pointer (source + start_position), 16 lexeme_length, 24 line,
+32 column. All fields are populated by create_token; ownership of the
+record itself is the caller's.
+@End Implementation
 Type called "SwiftUIToken":
     token_type as Integer      Note: Token type constant
     lexeme as Integer          Note: Pointer to lexeme string
@@ -92,6 +107,22 @@ Note: ==========================================================================
 Note: Lexer State
 Note: ============================================================================
 
+@Reasoning:
+Lexer state for SwiftUI. Separates the live cursor (position, line,
+column) from a saved token-start cursor (start_position, start_line,
+start_column) so make_token can attach the correct location to a token
+whose first byte was consumed many bytes ago. The 1-based line/column
+convention follows editor expectations for diagnostics.
+@End Reasoning
+
+@Implementation:
+64-byte record (8 x i64). Offsets: 0 source (borrowed pointer to source
+text), 8 source_length (cached at create), 16 position (byte cursor,
+0-based), 24 line (1-based), 32 column (1-based), 40 start_position
+(saved cursor at the start of the current token), 48 start_line, 56
+start_column. Created only via create_swiftui_lexer; record ownership
+is the caller's.
+@End Implementation
 Type called "SwiftUILexer":
     source as Integer          Note: Source code pointer
     source_length as Integer   Note: Source code length
@@ -107,6 +138,22 @@ Note: ==========================================================================
 Note: Lexer Creation
 Note: ============================================================================
 
+@Reasoning:
+Allocates and primes the lexer record. source_length is cached once
+via StringCore.string_length so the hot peek/advance path avoids
+repeated length probes. position starts at 0, line and column start
+at 1 to match editor 1-based diagnostics. The token-start cursors
+mirror the live cursor so mark_token_start is never required before
+the first scan.
+@End Reasoning
+
+@Implementation:
+Reads source length, allocates 64 bytes; on OOM returns 0. Writes
+source (offset 0), source_length (offset 8), zero position (offset
+16), 1 line (offset 24), 1 column (offset 32), 0 start_position
+(offset 40), 1 start_line (offset 48), 1 start_column (offset 56).
+Returns the lexer record handle.
+@End Implementation
 Process called "create_swiftui_lexer" takes source as Integer returns Integer:
     Note: Create SwiftUI lexer
 
@@ -135,6 +182,18 @@ Note: ==========================================================================
 Note: Character Examination
 Note: ============================================================================
 
+@Reasoning:
+Non-consuming read of the current byte. Returns 0 at EOF so the
+caller can branch on '== 0' rather than maintaining a separate
+end-of-input flag. The source is assumed not to contain real NUL
+bytes (SwiftUI/Swift source is conventional UTF-8 text).
+@End Reasoning
+
+@Implementation:
+Reads position from offset 16 and source_length from offset 8. If
+position >= source_length returns 0. Otherwise reads byte at
+source+position via memory_get_byte.
+@End Implementation
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -151,6 +210,18 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Multi-byte lookahead used for two-character tokens ("->" arrow, "//"
+and "/*" comments, "*/" block-comment close). Reading past EOF
+returns 0 like peek_char so the caller's branch logic stays uniform.
+@End Reasoning
+
+@Implementation:
+Reads position from offset 16 and source_length from offset 8.
+Computes target_pos = position + offset; if target_pos >= source_length
+returns 0. Otherwise reads byte at source+target_pos. Offset is a
+relative byte distance, not a token count.
+@End Implementation
 Process called "peek_ahead" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek ahead at character at offset
 
@@ -168,6 +239,20 @@ Process called "peek_ahead" takes lexer as Integer, offset as Integer returns In
     Return char
 End Process
 
+@Reasoning:
+Consumes one byte and updates the line/column cursor. LF (10) is the
+only newline form handled - the lexer treats CR (13) as whitespace
+(see skip_whitespace) without resetting column, which is acceptable
+because pure CR line endings are not used by modern macOS/iOS toolchain
+output. This avoids double-counting "\r\n" as two lines.
+@End Reasoning
+
+@Implementation:
+Reads peek_char first so the routine can branch on the consumed byte
+before mutating the cursor. Advances position by 1. On LF (10) bumps
+line by 1 and resets column to 1; otherwise bumps column by 1.
+Returns the consumed byte.
+@End Implementation
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character
 
@@ -197,6 +282,18 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+Identifier-start classifier for SwiftUI. Swift permits Unicode
+identifiers (S 2.5) but this lexer targets the ASCII subset that
+covers the canonical SwiftUI corpus; non-ASCII identifier characters
+fall through to TOKEN_ERROR. Underscore is included because Swift
+identifiers may start with '_'.
+@End Reasoning
+
+@Implementation:
+ASCII range checks: 65..90 ('A'..'Z'), 97..122 ('a'..'z'), or
+exactly 95 ('_'). Each match returns 1; else 0.
+@End Implementation
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -219,6 +316,16 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII digit classifier used both by scan_number (literal scanning)
+and as part of is_alphanumeric (identifier-tail). Hex/binary/octal
+literal prefixes (0x/0b/0o) are not implemented here; the bootstrap
+SwiftUI corpus only needs decimal integers and floats.
+@End Reasoning
+
+@Implementation:
+Range check 48..57 ('0'..'9'); returns 1 on match, 0 otherwise.
+@End Implementation
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is a digit
 
@@ -231,6 +338,16 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-tail classifier: Swift identifier tail characters include
+letters, digits, and underscore. Reuses is_alpha (which already
+accepts underscore) so the routine is simply the OR of two specialists.
+@End Reasoning
+
+@Implementation:
+Delegates to is_alpha; on match returns 1. Else delegates to is_digit
+and returns its boolean directly.
+@End Implementation
 Process called "is_alphanumeric" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
 
@@ -243,6 +360,17 @@ Process called "is_alphanumeric" takes char as Integer returns Integer:
     Return digit_check
 End Process
 
+@Reasoning:
+Inter-token separator classifier. Includes space (32), tab (9), LF
+(10), and CR (13). LF/CR both count as whitespace; the line-bumping
+on LF happens inside advance_char so this classifier itself stays
+location-agnostic.
+@End Reasoning
+
+@Implementation:
+Four equality checks against the four whitespace codepoints; returns
+1 on any match, 0 otherwise.
+@End Implementation
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace
 
@@ -266,6 +394,27 @@ Note: ==========================================================================
 Note: Skip Whitespace and Comments
 Note: ============================================================================
 
+@Reasoning:
+Skips inter-token whitespace and both Swift comment forms (// to EOL,
+/* ... */ block, no nesting because the bootstrap subset omits Swift's
+nested-block-comment feature) in a single outer loop so the cursor
+lands at the first interesting byte regardless of how comments and
+whitespace are interleaved.
+@End Reasoning
+
+@Implementation:
+Outer infinite loop. Per iteration: if peek_char is_whitespace, advance
+one byte and continue. Otherwise check for '/' at the cursor: '//'
+enters a sub-loop consuming bytes until LF or EOF; '/*' enters a
+sub-loop consuming bytes until '*/' or EOF (EOF terminates unclosed
+block comments without error here - higher layers detect unmatched
+sentinel). Anything else breaks the outer loop. Returns 1.
+@End Implementation
+
+@Security_Scope:
+Source is untrusted; unbounded comment scanners are EOF-guarded so a
+malformed unclosed block comment cannot spin past the buffer.
+@End Security_Scope
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace and comments
 
@@ -334,6 +483,18 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Heap-allocates a single 40-byte SwiftUIToken initialised from the five
+caller-supplied fields. The token holds a borrowed lexeme pointer into
+the source; this routine does not copy the bytes, so the caller must
+preserve the source buffer until the token is freed.
+@End Reasoning
+
+@Implementation:
+Layout.allocate(40); OOM returns 0. Writes token_type at offset 0,
+lexeme pointer at offset 8, lexeme_length at offset 16, line at
+offset 24, column at offset 32. Returns the new token handle.
+@End Implementation
 Process called "create_token" takes token_type as Integer, lexeme as Integer, lexeme_length as Integer, line as Integer, column as Integer returns Integer:
     Note: Create token
 
@@ -353,6 +514,17 @@ Process called "create_token" takes token_type as Integer, lexeme as Integer, le
     Return token
 End Process
 
+@Reasoning:
+Snapshot the live cursor (position, line, column) into the
+start_position/start_line/start_column slots so a subsequent make_token
+attributes the produced token to the location of its first byte even
+after the cursor has advanced through the token body.
+@End Reasoning
+
+@Implementation:
+Reads position (16), line (24), column (32). Writes them to
+start_position (40), start_line (48), start_column (56). Returns 1.
+@End Implementation
 Process called "mark_token_start" takes lexer as Integer returns Integer:
     Note: Mark start of new token
 
@@ -367,6 +539,20 @@ Process called "mark_token_start" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Finalises a token using the snapshotted start cursor and the current
+live cursor. The lexeme pointer is computed as source+start_position;
+the length is current_position - start_position. This way scanners
+need not carry the lexeme pointer/length manually - they just mark the
+start once and let make_token compute the span.
+@End Reasoning
+
+@Implementation:
+Reads source (0), start_pos (40), current_pos (16), start_line (48),
+start_column (56). Computes lexeme = source + start_pos and
+lexeme_length = current_pos - start_pos. Delegates to create_token
+with (token_type, lexeme, lexeme_length, start_line, start_column).
+@End Implementation
 Process called "make_token" takes lexer as Integer, token_type as Integer returns Integer:
     Note: Create token from current lexer state
 
@@ -386,6 +572,26 @@ Note: ==========================================================================
 Note: String Scanning
 Note: ============================================================================
 
+@Reasoning:
+Scans a Swift string literal: opens with '"', closes with '"', allows
+backslash escapes (the body of the escape is consumed as two bytes
+without semantic interpretation - escape decoding is a later pass's
+job). Unterminated strings and EOF inside the literal produce a
+TOKEN_ERROR token so the parser can surface a diagnostic.
+@End Reasoning
+
+@Implementation:
+Marks token start, then consumes the opening '"'. Loop body: EOF
+(char 0) returns a TOKEN_ERROR token. Closing '"' (34) is consumed
+and breaks. Backslash (92) is consumed; if the next byte is non-zero
+it is also consumed as the escape payload. Otherwise the byte is
+consumed plain. On clean exit make_token emits a TOKEN_STRING.
+@End Implementation
+
+@Security_Scope:
+Source is untrusted; explicit EOF check inside the loop prevents
+runaway scanning on unterminated literals.
+@End Security_Scope
 Process called "scan_string" takes lexer as Integer returns Integer:
     Note: Scan string literal
 
@@ -422,6 +628,22 @@ Note: ==========================================================================
 Note: Number Scanning
 Note: ============================================================================
 
+@Reasoning:
+Scans a numeric literal: integer body, optionally followed by '.' +
+fractional digits. The '.' is only consumed as a decimal point if the
+next byte is a digit; this prevents incorrectly absorbing
+member-access dots like '0.padding' into the literal. No exponent or
+suffix support because the bootstrap SwiftUI corpus only uses simple
+decimal literals.
+@End Reasoning
+
+@Implementation:
+Marks token start. Outer integer-digits loop consumes is_digit bytes.
+Peeks for '.'; if found, peek_ahead(1) is checked - on is_digit
+consumes the '.' and runs a fractional-digits loop. Final make_token
+emits TOKEN_NUMBER for both integer and float forms; the downstream
+parser can split them by inspecting the lexeme bytes.
+@End Implementation
 Process called "scan_number" takes lexer as Integer returns Integer:
     Note: Scan number literal (integer or float)
 
@@ -469,6 +691,19 @@ Note: ==========================================================================
 Note: Keyword and Identifier Scanning
 Note: ============================================================================
 
+@Reasoning:
+Scans an identifier/keyword/view-type lexeme. The caller has verified
+the first byte is is_alpha; this scanner consumes the run of
+is_alphanumeric bytes (which includes underscore via is_alpha) and
+then delegates to classify_identifier to decide whether the lexeme is
+a keyword, view type, boolean literal, or plain identifier.
+@End Reasoning
+
+@Implementation:
+Marks token start. Loop consumes peek_char while is_alphanumeric
+returns 1. Tail-calls classify_identifier which produces the actual
+token with the appropriate TOKEN_* discriminator.
+@End Implementation
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Note: Scan identifier or keyword
 
@@ -490,6 +725,25 @@ Process called "scan_identifier" takes lexer as Integer returns Integer:
     Return proc classify_identifier from lexer
 End Process
 
+@Reasoning:
+Decides which TOKEN_* discriminator to attach to an already-scanned
+identifier lexeme. Swift reserved words and SwiftUI conventional names
+(some, View, body, true/false, ...) become TOKEN_KEYWORD or
+TOKEN_BOOLEAN. The capitalised SwiftUI view types (Text, VStack, ...)
+become TOKEN_VIEW_TYPE - parser benefits from this lexical
+discrimination because view bodies need to be parsed as DSL fragments.
+Length-bucketing avoids redundant string compares against keywords of
+the wrong length.
+@End Reasoning
+
+@Implementation:
+Computes lexeme pointer (source+start_position) and length
+(current_position - start_position). Per-length branches call
+check_keyword for each reserved word of that length; on match emits
+the appropriate token type via make_token. After all keyword checks
+fail, delegates to check_view_type for the capitalised view-type
+namespace. Unmatched lexemes fall through to TOKEN_IDENTIFIER.
+@End Implementation
 Process called "classify_identifier" takes lexer as Integer returns Integer:
     Note: Classify identifier as keyword, view type, or identifier
 
@@ -573,6 +827,22 @@ Process called "classify_identifier" takes lexer as Integer returns Integer:
     Return proc make_token with lexer, TOKEN_IDENTIFIER
 End Process
 
+@Reasoning:
+Byte-equal string comparison specialised to the keyword-check use case.
+Length mismatch short-circuits to 0 because callers have already
+length-bucketed but pass the keyword's length anyway as a sanity guard.
+@End Reasoning
+
+@Implementation:
+Length compare; mismatch returns 0. Byte-by-byte loop via
+memory_get_byte; any mismatch returns 0. Falls off the loop returning
+1 only when every byte matches.
+@End Implementation
+
+@Performance_Hints:
+O(L) in the lexeme length but length-bucketing in callers keeps the
+amortised cost dominated by short keywords (3-6 bytes).
+@End Performance_Hints
 Process called "check_keyword" takes lexeme as Integer, lex_len as Integer, keyword as Integer, key_len as Integer returns Integer:
     Note: Check if lexeme matches keyword
 
@@ -595,6 +865,21 @@ Process called "check_keyword" takes lexeme as Integer, lex_len as Integer, keyw
     Return 1
 End Process
 
+@Reasoning:
+Identifies SwiftUI built-in view type names: Text, VStack, HStack,
+ZStack, Button, Spacer, Image, Color, Rectangle. The lexer classifies
+these distinctly from regular identifiers because the SwiftUI parser
+treats their occurrence as the start of a declarative view expression
+(eligible for the trailing-closure DSL form). Length-bucketing keeps
+each lookup O(1) in keyword count.
+@End Reasoning
+
+@Implementation:
+Per-length switch with check_keyword calls. Length 4: Text. Length 5:
+Image, Color. Length 6: VStack, HStack, ZStack, Button, Spacer.
+Length 9: Rectangle. Any match returns 1; falls through to 0
+otherwise.
+@End Implementation
 Process called "check_view_type" takes lexeme as Integer, length as Integer returns Integer:
     Note: Check if identifier is a SwiftUI view type
 
@@ -660,6 +945,32 @@ Note: ==========================================================================
 Note: Main Token Scanner
 Note: ============================================================================
 
+@Reasoning:
+Main scanner entry. Skips whitespace and comments, then dispatches by
+the first byte: punctuation (single-char delimiters), '->' (arrow,
+needs lookahead), '=' (equals), '"' (string), digit (number), alpha
+(identifier/keyword/view). Unknown bytes produce TOKEN_ERROR so
+unrecognised input does not stall the lexer indefinitely.
+@End Reasoning
+
+@Implementation:
+Calls skip_whitespace then peek_char. EOF (char 0): mark and emit
+TOKEN_EOF. Each punctuation byte (40 '(', 41 ')', 123 '{', 125 '}',
+91 '[', 93 ']', 46 '.', 44 ',', 58 ':', 59 ';', 64 '@', 36 '$') is
+its own branch that marks, advances, and emits the matching TOKEN_*.
+For '-' the routine checks peek_ahead(1) == '>' to emit TOKEN_ARROW
+(consuming both bytes). '=' emits TOKEN_EQUALS. '"' delegates to
+scan_string. Digits delegate to scan_number. is_alpha delegates to
+scan_identifier. Fallthrough marks, advances one byte, emits
+TOKEN_ERROR.
+@End Implementation
+
+@Security_Scope:
+Source is untrusted; the TOKEN_ERROR fallthrough ensures unrecognised
+bytes can never spin the lexer because each iteration consumes at
+least one byte before re-entering the dispatcher (caller is expected
+to surface TOKEN_ERROR as a diagnostic and continue).
+@End Security_Scope
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
 

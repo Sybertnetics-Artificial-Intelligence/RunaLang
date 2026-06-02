@@ -80,6 +80,14 @@ Note: ==========================================================================
 Note: Parser Structure
 Note: ============================================================================
 
+@Reasoning:
+Compact 40-byte parser state. previous_token is kept alongside
+current_token so error recovery can reference what was just
+consumed without re-scanning. error_count is a plain counter
+(not a list) because JS parser diagnostics are emitted to a
+separate reporter; this field just gates "stop parsing after N
+errors" heuristics. arena is the bump-alloc region for AST nodes.
+@End Reasoning
 Type called "JavaScriptParser":
     lexer as Integer            Note: Lexer instance
     current_token as Integer    Note: Current token
@@ -92,6 +100,12 @@ Note: ==========================================================================
 Note: Parser Creation and Initialization
 Note: ============================================================================
 
+@Reasoning:
+Allocates the 40-byte parser struct and creates a fresh JS lexer
+over the given source. If the lexer creation fails we roll back
+by deallocating the parser to avoid leaking. The first token is
+immediately read so peek_token_type works on the very first call.
+@End Reasoning
 Process called "create_javascript_parser" takes source as Integer, arena as Integer returns Integer:
     Note: Create JavaScript parser from source code
 
@@ -121,6 +135,12 @@ Process called "create_javascript_parser" takes source as Integer, arena as Inte
     Return parser
 End Process
 
+@Reasoning:
+Frees the parser's owned lexer then the parser struct itself.
+AST nodes are NOT freed here because they live in the arena
+which is owned by the caller (typical pattern: AST outlives the
+parser; the arena cleanup releases all nodes in O(1)).
+@End Reasoning
 Process called "destroy_javascript_parser" takes parser as Integer returns Integer:
     Note: Destroy JavaScript parser and cleanup
 
@@ -143,6 +163,12 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Saves the current token as previous_token (for error recovery),
+then pulls the next token from the lexer and stores it as
+current_token. Single-token lookahead, no token buffer; the
+lexer keeps the source position invariant across the swap.
+@End Reasoning
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Move to next token
 
@@ -157,6 +183,11 @@ Process called "advance_token" takes parser as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Non-destructive read of current_token's type. Returns TOKEN_EOF
+when current_token is null (lexer exhausted) so callers can use
+a single "while token != EOF" loop without separate null checks.
+@End Reasoning
 Process called "peek_token_type" takes parser as Integer returns Integer:
     Note: Get current token type without advancing
 
@@ -171,6 +202,12 @@ Process called "peek_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Returns the raw lexeme string pointer (offset 8 of the token).
+The pointer remains valid only until the next advance_token,
+so callers that need to retain it must copy. Returns 0 when no
+current token exists.
+@End Reasoning
 Process called "peek_token_lexeme" takes parser as Integer returns Integer:
     Note: Get current token lexeme
 
@@ -185,6 +222,12 @@ Process called "peek_token_lexeme" takes parser as Integer returns Integer:
     Return lexeme
 End Process
 
+@Reasoning:
+Non-consuming match predicate used by parsers to decide branches.
+Returns 1 on equal, 0 on mismatch. Does not advance the token
+stream; callers must follow with advance_token if they want to
+consume on success.
+@End Reasoning
 Process called "check_token_type" takes parser as Integer, expected as Integer returns Integer:
     Note: Check if current token matches expected type
 
@@ -197,6 +240,12 @@ Process called "check_token_type" takes parser as Integer, expected as Integer r
     Return 0
 End Process
 
+@Reasoning:
+Consume-on-match. If the current token matches expected, advance
+and return 1. On mismatch, report a parse error (incrementing
+error_count) but do NOT advance - this lets caller-level error
+recovery decide whether to skip tokens or bail.
+@End Reasoning
 Process called "expect_token" takes parser as Integer, expected as Integer, error_msg as Integer returns Integer:
     Note: Consume token of expected type or report error
 
@@ -212,6 +261,13 @@ Process called "expect_token" takes parser as Integer, expected as Integer, erro
     Return 1
 End Process
 
+@Reasoning:
+Minimal error reporter for the bootstrap path - just bumps the
+error_count. The full diagnostic with file/line/message is
+emitted by the higher-level parser driver that wraps this; we
+intentionally don't store the message string here to keep the
+parser struct allocation-free during recovery.
+@End Reasoning
 Process called "report_parse_error" takes parser as Integer, message as Integer returns Integer:
     Note: Report parse error
 
@@ -225,6 +281,13 @@ Note: ==========================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Allocates a fixed-layout 48-byte AST node with six 8-byte slots:
+type tag (0), name pointer (8), children-array pointer (16),
+child count (24), metadata (32), reserved (40). All zero-init
+except the type tag. This wide layout supports every JS AST kind
+without per-kind allocation, simplifying memory management.
+@End Reasoning
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     Note: Create AST node with type
 
@@ -245,6 +308,11 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Writes the name pointer into slot 8. Does NOT copy the string -
+ownership transfer is up to the caller. Returns 0 on null node
+input.
+@End Reasoning
 Process called "set_node_name" takes node as Integer, name as Integer returns Integer:
     Note: Set node name/identifier
 
@@ -257,6 +325,21 @@ Process called "set_node_name" takes node as Integer, name as Integer returns In
     Return 1
 End Process
 
+@Reasoning:
+Growable children array using realloc-on-append semantics: each
+addition allocates a (count+1)-sized buffer, copies old entries
+over, and frees the old buffer. O(N^2) total cost for N appends,
+acceptable for typical JS AST sizes. Both arguments are guarded
+against null. The first child allocates an initial 8-byte buffer.
+@End Reasoning
+
+@Performance_Hints:
+Realloc-each-append is quadratic. Pathological inputs (programs
+with thousands of statements at one nesting level) will pay an
+O(N^2) cost. Acceptable for bootstrap; a growth factor of 2
+would make this amortized O(N) but requires tracking capacity
+separately from count.
+@End Performance_Hints
 Process called "add_node_child" takes node as Integer, child as Integer returns Integer:
     Note: Add child node to node's children list
 
@@ -297,6 +380,13 @@ Process called "add_node_child" takes node as Integer, child as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Single-pair attribute slot (offset 32) holding key/value. Note:
+this implementation only stores one attribute per node - subsequent
+calls return early without overwriting. JS nodes that need
+multiple attributes (e.g. function modifiers) use multiple
+metadata fields or fold them into the name string.
+@End Reasoning
 Process called "set_node_attribute" takes node as Integer, key as Integer, value as Integer returns Integer:
     Note: Set node attribute (metadata)
 
@@ -321,13 +411,15 @@ Note: ==========================================================================
 Note: Program and Module Parsing
 Note: ============================================================================
 
+@Reasoning:
+Public entry point. Allocates a 64KB arena, creates the parser,
+and loops parsing top-level statements until EOF. On a parse
+error that returns 0 from parse_top_level_statement, we advance
+one token and try again - simple panic-mode error recovery that
+tries to resynchronize at the next valid statement start.
+@End Reasoning
 Process called "parse_javascript" takes source as Integer returns Integer:
     Note: Parse JavaScript source into AST
-
-    @Reasoning:
-    JavaScript programs consist of a sequence of statements and declarations.
-    We parse top-level constructs: functions, classes, variables, imports, exports.
-    @End Reasoning
 
     Let arena be proc allocate from Layout with 65536
     Let parser be proc create_javascript_parser with source, arena
@@ -360,6 +452,13 @@ Process called "parse_javascript" takes source as Integer returns Integer:
     Return program
 End Process
 
+@Reasoning:
+First-token dispatch for top-level constructs. Recognizes function,
+class, const/let/var declarations, import/export, and async
+function. Fallback dispatches to parse_statement which handles
+expression statements and control flow. The dispatch order matches
+typical declaration frequency for cache-friendliness.
+@End Reasoning
 Process called "parse_top_level_statement" takes parser as Integer returns Integer:
     Note: Parse top-level statement or declaration
 
@@ -404,13 +503,16 @@ Note: ==========================================================================
 Note: Function Parsing
 Note: ============================================================================
 
+@Reasoning:
+"function name(params) { body }" or "function* name" (generator).
+The leading "function" keyword has already been peeked by the
+dispatcher; we consume it here, then check for the "*" marker
+that turns this into a generator. The is_generator flag is
+attached as a node attribute, not a child, because it's a boolean
+property not an AST sub-element.
+@End Reasoning
 Process called "parse_function_declaration" takes parser as Integer returns Integer:
     Note: Parse function declaration
-
-    @Reasoning:
-    JavaScript functions: function name(params) { body }
-    Can be async, generator (*), or both
-    @End Reasoning
 
     proc advance_token from parser
 
@@ -456,6 +558,13 @@ Process called "parse_function_declaration" takes parser as Integer returns Inte
     Return function_node
 End Process
 
+@Reasoning:
+"async function ..." dispatcher. Consumes "async", expects
+"function", then delegates to parse_function_declaration to do
+the actual parsing, and finally tags the result node with the
+"async" attribute. Sharing the function parser keeps the
+async-related logic in one place.
+@End Reasoning
 Process called "parse_async_function" takes parser as Integer returns Integer:
     Note: Parse async function
 
@@ -469,14 +578,16 @@ Process called "parse_async_function" takes parser as Integer returns Integer:
     Return function_node
 End Process
 
+@Reasoning:
+"(params) => body" arrow functions. The caller has already
+collected the parameter list (because the disambiguation between
+arrow function and parenthesized expression requires lookahead);
+it passes that list in. The body is either a block (after "{")
+or a single expression. We expect the "=>" token; subsequent
+parsing dispatches on the next token.
+@End Reasoning
 Process called "parse_arrow_function" takes parser as Integer, params as Integer returns Integer:
     Note: Parse arrow function: (params) => expr or params => expr
-
-    @Reasoning:
-    Arrow functions: (x, y) => x + y or x => x * 2
-    Single param without parens: x => ...
-    Multiple params or no params need parens: () => ... or (x, y) => ...
-    @End Reasoning
 
     Let arrow_node be proc create_ast_node from JS_ARROW_FUNCTION
 
@@ -508,6 +619,14 @@ Process called "parse_arrow_function" takes parser as Integer, params as Integer
     Return arrow_node
 End Process
 
+@Reasoning:
+Returns a fixed-capacity (100 slots) array of JS_PARAM nodes
+terminated by a 0 sentinel. Handles three parameter forms: plain
+identifier, identifier with default value (=expr), and rest
+parameter (...name). Rest must be last (per ES spec); we enforce
+this by breaking the loop after consuming a rest. Comma-separated
+or terminated by ")".
+@End Reasoning
 Process called "parse_parameter_list" takes parser as Integer returns Integer:
     Note: Parse function parameter list
 
@@ -567,12 +686,16 @@ Note: ==========================================================================
 Note: Class Parsing
 Note: ============================================================================
 
+@Reasoning:
+"class Name extends Base { members }" - the "class" keyword is
+consumed first, then required IDENTIFIER for the class name. An
+optional "extends Base" clause is stored as a string attribute
+on the class node (not as a child) because the base is a single
+identifier reference, not a fully-parsed expression. Members
+are then parsed in a loop until the closing brace.
+@End Reasoning
 Process called "parse_class_declaration" takes parser as Integer returns Integer:
     Note: Parse class declaration
-
-    @Reasoning:
-    ES6 classes: class Name extends Base { constructor() {} methods... }
-    @End Reasoning
 
     proc advance_token from parser
 
@@ -609,6 +732,14 @@ Process called "parse_class_declaration" takes parser as Integer returns Integer
     Return class_node
 End Process
 
+@Reasoning:
+Class members can be prefixed with static, async, and * (generator)
+modifiers in that order, all optional. We absorb each modifier
+then dispatch to parse_method_definition. Modifier flags become
+attributes on the returned method node so the AST consumer sees a
+single normalized shape regardless of which modifiers were
+present.
+@End Reasoning
 Process called "parse_class_member" takes parser as Integer returns Integer:
     Note: Parse class method, getter, setter, or field
 
@@ -684,6 +815,13 @@ Process called "parse_class_member" takes parser as Integer returns Integer:
     Return method_node
 End Process
 
+@Reasoning:
+"name(params) { body }" form used inside classes and object
+literals. Same shape as a function declaration but without the
+"function" keyword (since context makes it implicit). The method
+name can be an identifier (constructor, methodName) or a computed
+property which the upstream caller has already resolved.
+@End Reasoning
 Process called "parse_method_definition" takes parser as Integer returns Integer:
     Note: Parse method definition
 
@@ -721,6 +859,14 @@ Note: ==========================================================================
 Note: Variable Declaration Parsing
 Note: ============================================================================
 
+@Reasoning:
+"const/let/var name = expr [, name = expr]*". The kind keyword
+is recorded as a node attribute because all three forms share the
+same JS_VARIABLE_DECL kind; they differ only in scoping rules.
+Initializer is optional for var/let but required for const (the
+spec requires it; we don't enforce that here - the type checker
+will).
+@End Reasoning
 Process called "parse_variable_declaration" takes parser as Integer returns Integer:
     Note: Parse variable declaration (var, let, const)
 
@@ -776,6 +922,13 @@ Note: ==========================================================================
 Note: Statement Parsing
 Note: ============================================================================
 
+@Reasoning:
+General statement dispatcher: branches on keyword tokens to the
+appropriate sub-parser (if, for, while, do, switch, try, return,
+throw, break, continue) and falls through to
+parse_expression_statement for bare expressions. Blocks
+( "{ ... }" ) are detected and routed to parse_block_statement.
+@End Reasoning
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse statement
 
@@ -828,6 +981,12 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Return proc parse_expression_statement from parser
 End Process
 
+@Reasoning:
+"{ stmt; stmt; ... }" - matches braces and parses each contained
+statement as a child of the JS_BLOCK_STMT node. JS does not require
+semicolons (ASI - automatic semicolon insertion); each statement
+handles its own terminator (or lack thereof).
+@End Reasoning
 Process called "parse_block_statement" takes parser as Integer returns Integer:
     Note: Parse block statement { ... }
 
@@ -854,6 +1013,13 @@ Process called "parse_block_statement" takes parser as Integer returns Integer:
     Return block
 End Process
 
+@Reasoning:
+"if (cond) stmt [else stmt]". Three potential children: condition,
+then-branch, optional else-branch. The body of each branch is a
+single statement (which may be a block); we don't require braces.
+JS_IF_STMT thus has either 2 or 3 children depending on whether
+else is present.
+@End Reasoning
 Process called "parse_if_statement" takes parser as Integer returns Integer:
     Note: Parse if statement
 
@@ -881,6 +1047,13 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
     Return if_stmt
 End Process
 
+@Reasoning:
+JS has three for-loop forms: C-style "for(init; cond; upd)",
+"for(var x in obj)" iteration, and "for(var x of iter)"
+iteration. We use single-token lookahead after the init expression
+to distinguish them. Each form produces a distinct child layout on
+the JS_FOR_STMT (or JS_FOR_IN/JS_FOR_OF) node.
+@End Reasoning
 Process called "parse_for_statement" takes parser as Integer returns Integer:
     Note: Parse for statement (for, for-in, for-of)
 
@@ -970,6 +1143,10 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
     Return for_stmt
 End Process
 
+@Reasoning:
+"while (cond) body" - two children: condition expression, body
+statement. Pre-test loop semantics.
+@End Reasoning
 Process called "parse_while_statement" takes parser as Integer returns Integer:
     Note: Parse while statement
 
@@ -989,6 +1166,12 @@ Process called "parse_while_statement" takes parser as Integer returns Integer:
     Return while_stmt
 End Process
 
+@Reasoning:
+"do body while (cond)" - post-test loop. The body executes once
+before the condition is first checked. We parse body then expect
+"while", then condition. Differs from while in node kind and in
+the runtime behavior even though child layout is identical.
+@End Reasoning
 Process called "parse_do_while_statement" takes parser as Integer returns Integer:
     Note: Parse do-while statement
 
@@ -1016,6 +1199,12 @@ Process called "parse_do_while_statement" takes parser as Integer returns Intege
     Return do_while_stmt
 End Process
 
+@Reasoning:
+"switch (expr) { case A: ... default: ... }" - discriminant
+expression first child, then a mix of case and default clauses.
+JavaScript switch uses strict equality (===) for case matching
+and supports fallthrough (no implicit break).
+@End Reasoning
 Process called "parse_switch_statement" takes parser as Integer returns Integer:
     Note: Parse switch statement
 
@@ -1054,6 +1243,12 @@ Process called "parse_switch_statement" takes parser as Integer returns Integer:
     Return switch_stmt
 End Process
 
+@Reasoning:
+"case VAL: stmts" - case value as first child, body statements as
+subsequent children up to the next case/default/closing brace.
+Multiple statements in one case land in the same node's children
+list; no implicit block.
+@End Reasoning
 Process called "parse_case_clause" takes parser as Integer returns Integer:
     Note: Parse case clause
 
@@ -1088,6 +1283,12 @@ Process called "parse_case_clause" takes parser as Integer returns Integer:
     Return case_clause
 End Process
 
+@Reasoning:
+"default: stmts" - the default branch has no value, only body
+statements. The JS spec requires exactly one default per switch
+(at most); the parser doesn't enforce that here but the AST
+consumer can.
+@End Reasoning
 Process called "parse_default_clause" takes parser as Integer returns Integer:
     Note: Parse default clause
 
@@ -1120,6 +1321,12 @@ Process called "parse_default_clause" takes parser as Integer returns Integer:
     Return default_clause
 End Process
 
+@Reasoning:
+"try { } catch (e) { } finally { }" - try block, optional catch
+clause with optional binding identifier, optional finally block.
+JS catch's exception binding is also optional in modern ES, hence
+the lookahead after "catch" for "(" before "{".
+@End Reasoning
 Process called "parse_try_statement" takes parser as Integer returns Integer:
     Note: Parse try-catch-finally statement
 
@@ -1164,6 +1371,13 @@ Process called "parse_try_statement" takes parser as Integer returns Integer:
     Return try_stmt
 End Process
 
+@Reasoning:
+"return [expr];" - bare return (no expression) is valid and
+means return undefined. We check whether a semicolon or newline
+immediately follows "return" before attempting to parse an
+expression, matching JS's ASI (automatic semicolon insertion)
+rule for return.
+@End Reasoning
 Process called "parse_return_statement" takes parser as Integer returns Integer:
     Note: Parse return statement
 
@@ -1187,6 +1401,11 @@ Process called "parse_return_statement" takes parser as Integer returns Integer:
     Return return_stmt
 End Process
 
+@Reasoning:
+"throw expr;" - the expression is mandatory in JS (unlike return).
+ASI does not apply to throw - a newline between throw and the
+expression is a syntax error per spec. We don't enforce that here.
+@End Reasoning
 Process called "parse_throw_statement" takes parser as Integer returns Integer:
     Note: Parse throw statement
 
@@ -1206,6 +1425,11 @@ Process called "parse_throw_statement" takes parser as Integer returns Integer:
     Return throw_stmt
 End Process
 
+@Reasoning:
+"break [label];" - optional label for labeled-loop break. We
+check for an identifier after "break" before parsing the label;
+if absent, we emit a plain JS_BREAK_STMT.
+@End Reasoning
 Process called "parse_break_statement" takes parser as Integer returns Integer:
     Note: Parse break statement
 
@@ -1222,6 +1446,9 @@ Process called "parse_break_statement" takes parser as Integer returns Integer:
     Return break_stmt
 End Process
 
+@Reasoning:
+"continue [label];" - mirror of parse_break_statement.
+@End Reasoning
 Process called "parse_continue_statement" takes parser as Integer returns Integer:
     Note: Parse continue statement
 
@@ -1238,6 +1465,13 @@ Process called "parse_continue_statement" takes parser as Integer returns Intege
     Return continue_stmt
 End Process
 
+@Reasoning:
+Wraps a free-standing expression in a statement node. Used for
+function-call statements, assignments at statement position, etc.
+The expression must produce a non-trivial side effect to be
+useful; we don't validate that here (could be a TC39 warning
+later).
+@End Reasoning
 Process called "parse_expression_statement" takes parser as Integer returns Integer:
     Note: Parse expression statement
 
@@ -1259,12 +1493,25 @@ Note: ==========================================================================
 Note: Expression Parsing
 Note: ============================================================================
 
+@Reasoning:
+Top of the expression precedence ladder. Delegates to
+parse_assignment_expression which is the lowest-precedence
+binary-style operator above the comma operator (which JS supports
+but we treat as a statement-list construct, not a true binary op).
+@End Reasoning
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse expression (comma operator lowest precedence)
 
     Return proc parse_assignment_expression from parser
 End Process
 
+@Reasoning:
+Right-associative assignment. Parses a conditional expression
+first, then peeks for an assignment operator (=, +=, -=, etc.).
+On match, recursively parses another assignment expression as the
+right side - the recursion is what gives right-associativity
+("a = b = c" parses as "a = (b = c)").
+@End Reasoning
 Process called "parse_assignment_expression" takes parser as Integer returns Integer:
     Note: Parse assignment expression
 
@@ -1310,6 +1557,12 @@ Process called "parse_assignment_expression" takes parser as Integer returns Int
     Return expr
 End Process
 
+@Reasoning:
+"cond ? then : else" ternary. Right-associative
+("a ? b : c ? d : e" = "a ? b : (c ? d : e)"). The recursive call
+for the else branch goes back through assignment_expression so
+the right side can contain another assignment.
+@End Reasoning
 Process called "parse_conditional_expression" takes parser as Integer returns Integer:
     Note: Parse conditional expression (ternary)
 
@@ -1333,6 +1586,12 @@ Process called "parse_conditional_expression" takes parser as Integer returns In
     Return expr
 End Process
 
+@Reasoning:
+"a || b" - left-associative binary. Parses logical-and first
+then loops consuming "||" tokens. Logical-or short-circuits at
+runtime (b not evaluated if a is truthy) but that's a runtime
+semantic; we parse it like a regular left-assoc binary.
+@End Reasoning
 Process called "parse_logical_or_expression" takes parser as Integer returns Integer:
     Note: Parse logical OR expression (||)
 
@@ -1359,6 +1618,10 @@ Process called "parse_logical_or_expression" takes parser as Integer returns Int
     Return left
 End Process
 
+@Reasoning:
+"a && b" - precedence level above logical-or, below bitwise-or.
+Short-circuits at runtime like ||. Left-associative.
+@End Reasoning
 Process called "parse_logical_and_expression" takes parser as Integer returns Integer:
     Note: Parse logical AND expression (&&)
 
@@ -1385,6 +1648,12 @@ Process called "parse_logical_and_expression" takes parser as Integer returns In
     Return left
 End Process
 
+@Reasoning:
+"a | b" - bitwise OR. JS bitwise ops coerce operands to 32-bit
+signed integers, then operate, then return a 32-bit result. The
+parser doesn't enforce this; backend code generation handles the
+coercion when lowering.
+@End Reasoning
 Process called "parse_bitwise_or_expression" takes parser as Integer returns Integer:
     Note: Parse bitwise OR expression (|)
 
@@ -1411,6 +1680,9 @@ Process called "parse_bitwise_or_expression" takes parser as Integer returns Int
     Return left
 End Process
 
+@Reasoning:
+"a ^ b" - bitwise XOR. Same 32-bit coercion rules as bitwise OR.
+@End Reasoning
 Process called "parse_bitwise_xor_expression" takes parser as Integer returns Integer:
     Note: Parse bitwise XOR expression (^)
 
@@ -1437,6 +1709,9 @@ Process called "parse_bitwise_xor_expression" takes parser as Integer returns In
     Return left
 End Process
 
+@Reasoning:
+"a & b" - bitwise AND. Higher precedence than XOR per JS spec.
+@End Reasoning
 Process called "parse_bitwise_and_expression" takes parser as Integer returns Integer:
     Note: Parse bitwise AND expression (&)
 
@@ -1463,6 +1738,12 @@ Process called "parse_bitwise_and_expression" takes parser as Integer returns In
     Return left
 End Process
 
+@Reasoning:
+"a == b", "a != b", "a === b", "a !== b". The triple-equals
+forms are strict equality (no type coercion); the double-equals
+forms use abstract equality (coerce, then compare). All four
+share precedence and associativity.
+@End Reasoning
 Process called "parse_equality_expression" takes parser as Integer returns Integer:
     Note: Parse equality expression (==, !=, ===, !==)
 
@@ -1506,6 +1787,12 @@ Process called "parse_equality_expression" takes parser as Integer returns Integ
     Return left
 End Process
 
+@Reasoning:
+"<, <=, >, >=, instanceof, in". JS bundles the relational
+comparison operators with the "instanceof" and "in" keywords
+because they share precedence. instanceof checks prototype chain;
+in checks property presence on an object.
+@End Reasoning
 Process called "parse_relational_expression" takes parser as Integer returns Integer:
     Note: Parse relational expression (<, >, <=, >=, in, instanceof)
 
@@ -1557,6 +1844,11 @@ Process called "parse_relational_expression" takes parser as Integer returns Int
     Return left
 End Process
 
+@Reasoning:
+"<<, >>, >>>". The triple ">>>" is JS's unsigned right shift -
+right-fills with zero rather than sign-extending. The lexer
+emits >>> as one token; we just dispatch on token type.
+@End Reasoning
 Process called "parse_shift_expression" takes parser as Integer returns Integer:
     Note: Parse shift expression (<<, >>, >>>)
 
@@ -1596,6 +1888,11 @@ Process called "parse_shift_expression" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+"+ -" precedence level. Note that "+" is overloaded in JS - for
+strings it concatenates, for numbers it adds. Parser doesn't
+distinguish; the runtime/backend does.
+@End Reasoning
 Process called "parse_additive_expression" takes parser as Integer returns Integer:
     Note: Parse additive expression (+, -)
 
@@ -1631,6 +1928,11 @@ Process called "parse_additive_expression" takes parser as Integer returns Integ
     Return left
 End Process
 
+@Reasoning:
+"* / % **". JS's "**" is the exponentiation operator (ES7); we
+include it at the multiplicative precedence here for simplicity,
+though spec-strictly it has its own level just above "*".
+@End Reasoning
 Process called "parse_multiplicative_expression" takes parser as Integer returns Integer:
     Note: Parse multiplicative expression (*, /, %)
 
@@ -1670,6 +1972,13 @@ Process called "parse_multiplicative_expression" takes parser as Integer returns
     Return left
 End Process
 
+@Reasoning:
+Prefix unary ops: "!, -, +, ~, typeof, void, delete, ++var, --var,
+await". Also detects async arrow function expressions starting
+with "async" keyword. The pre-increment/decrement forms produce
+JS_UPDATE_EXPR with a prefix flag, distinguished from postfix in
+parse_postfix_expression.
+@End Reasoning
 Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Note: Parse unary expression (!, -, +, ~, ++, --, typeof, void, delete, await)
 
@@ -1769,6 +2078,12 @@ Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Return proc parse_postfix_expression from parser
 End Process
 
+@Reasoning:
+Handles member access, function calls, computed indexing, and
+postfix ++/-- chained off a primary expression. Builds the
+LeftHandSide expression by left-folding chained accesses:
+"obj.a.b()[c]++" produces nested member/call/index nodes.
+@End Reasoning
 Process called "parse_postfix_expression" takes parser as Integer returns Integer:
     Note: Parse postfix expression (++, --, call, member access)
 
@@ -1878,6 +2193,14 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
     Return expr
 End Process
 
+@Reasoning:
+Base case of the expression precedence ladder. Recognizes:
+literals (number, string, boolean, null, undefined, regex),
+template strings, identifiers, this, super, new expression,
+function expressions, array literals, object literals,
+parenthesized expressions. Each maps to a specific JS_*
+node kind so consumers can dispatch on it.
+@End Reasoning
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
     Note: Parse primary expression (literals, identifiers, arrays, objects)
 
@@ -1988,6 +2311,12 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Return 0
 End Process
 
+@Reasoning:
+"[e1, e2, ...rest, , empty]" - JS array literals support holes
+(empty slots), spread elements, and trailing commas. We add each
+element as a child; holes get an explicit JS_HOLE marker child
+so positions are preserved.
+@End Reasoning
 Process called "parse_array_literal" takes parser as Integer returns Integer:
     Note: Parse array literal [1, 2, 3]
 
@@ -2029,6 +2358,13 @@ Process called "parse_array_literal" takes parser as Integer returns Integer:
     Return array
 End Process
 
+@Reasoning:
+"{ key: value, shorthand, method() {}, [computed]: val, ...spread }".
+JS object literals support many forms: shorthand properties (just
+identifier), method shorthand, computed keys via [expr], spread.
+Each property is parsed via parse_property which returns a node
+tagged with its property kind.
+@End Reasoning
 Process called "parse_object_literal" takes parser as Integer returns Integer:
     Note: Parse object literal {key: value}
 
@@ -2070,6 +2406,13 @@ Process called "parse_object_literal" takes parser as Integer returns Integer:
     Return object
 End Process
 
+@Reasoning:
+Parses a single object literal property. Detects the kind from
+the leading token: identifier (shorthand or "key: val"), string
+literal (always "key: val"), "[" (computed key). The full
+shape - key and optional value - is captured as a JS_PROPERTY
+node with two children.
+@End Reasoning
 Process called "parse_property" takes parser as Integer returns Integer:
     Note: Parse object property
 
@@ -2096,6 +2439,13 @@ Process called "parse_property" takes parser as Integer returns Integer:
     Return property_node
 End Process
 
+@Reasoning:
+Anonymous or named function expression: "function [name](args)
+{ body }" used in value position. Same shape as a function
+declaration but produces a JS_FUNCTION_EXPR node so the AST
+consumer knows this binds to the surrounding expression context,
+not the surrounding scope.
+@End Reasoning
 Process called "parse_function_expression" takes parser as Integer returns Integer:
     Note: Parse function expression
 
@@ -2135,6 +2485,12 @@ Process called "parse_function_expression" takes parser as Integer returns Integ
     Return function_node
 End Process
 
+@Reasoning:
+"new Constructor(args)". Parens are optional in JS for zero-arg
+constructor calls but we always expect them here; if missing, the
+parens are added later by a higher-level fix-up. Constructor
+itself is a member expression to support "new ns.Type()".
+@End Reasoning
 Process called "parse_new_expression" takes parser as Integer returns Integer:
     Note: Parse new expression
 
@@ -2176,6 +2532,13 @@ Process called "parse_new_expression" takes parser as Integer returns Integer:
     Return new_expr
 End Process
 
+@Reasoning:
+"obj.prop" or "obj[expr]" chain. Used by parse_new_expression to
+build the constructor reference before the argument list. Static
+dotted accesses produce JS_MEMBER_EXPR with a string key;
+bracket-indexed accesses also produce JS_MEMBER_EXPR but with an
+expression child.
+@End Reasoning
 Process called "parse_member_expression" takes parser as Integer returns Integer:
     Note: Parse member expression without call
 
@@ -2219,6 +2582,14 @@ Process called "parse_member_expression" takes parser as Integer returns Integer
     Return expr
 End Process
 
+@Reasoning:
+"(expr)" - the trickiest disambiguation in JS parsing because
+"(a, b) => ..." is an arrow function with a parameter list while
+"(a, b)" alone is a comma-sequence expression. We use lookahead:
+after the closing paren, if the next token is "=>" we treat the
+content as a parameter list (built into JS_PARAM nodes), otherwise
+as a grouped expression.
+@End Reasoning
 Process called "parse_parenthesized_expression" takes parser as Integer returns Integer:
     Note: Parse parenthesized expression or arrow function
 
@@ -2310,6 +2681,13 @@ Note: ==========================================================================
 Note: Import/Export Parsing
 Note: ============================================================================
 
+@Reasoning:
+ES module imports take many shapes: default ("import x from 'm'"),
+named ("import {a, b as c} from 'm'"), namespace ("import * as ns
+from 'm'"), and side-effect only ("import 'm'"). We dispatch on
+the token after "import" to pick the form, then attach the parsed
+specifiers as children of the JS_IMPORT_DECL.
+@End Reasoning
 Process called "parse_import_declaration" takes parser as Integer returns Integer:
     Note: Parse import declaration
 
@@ -2357,6 +2735,13 @@ Process called "parse_import_declaration" takes parser as Integer returns Intege
     Return import_node
 End Process
 
+@Reasoning:
+ES module exports: default ("export default expr"), named
+("export { a, b }"), declaration ("export const x = 1"), re-export
+("export * from 'm'", "export { a } from 'm'"). The kind is
+recorded as an attribute on JS_EXPORT_DECL; the actual exported
+binding(s) are children.
+@End Reasoning
 Process called "parse_export_declaration" takes parser as Integer returns Integer:
     Note: Parse export declaration
 

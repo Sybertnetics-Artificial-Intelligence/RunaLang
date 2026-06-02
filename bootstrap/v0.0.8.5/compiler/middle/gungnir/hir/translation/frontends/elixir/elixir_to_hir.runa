@@ -2,6 +2,16 @@ Note: Elixir to HIR Translator for Translation Translation System
 Note: Converts Elixir AST to High-level Intermediate Representation
 
 Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_parser.runa" as ElixirParser
+@Reasoning:
+The Elixir translator's state mirrors the language's core abstractions:
+a symbol table for definitions, dual module/function context pointers
+for nested scoping, pattern variable bindings, and four OTP-specific
+tracking dictionaries (process_context, actor_model_info,
+supervision_tree, otp_behaviors) plus genserver_state and ets_tables.
+The fan-out is necessary because Elixir's actor model and OTP
+behaviours require cross-cutting analysis that cannot be expressed in
+the AST alone.
+@End Reasoning
 Type called "ElixirToHIRTranslator":
     symbol_table as Integer  Note: Maps symbols to HIR nodes
     current_module as Integer  Note: Current module context
@@ -15,6 +25,13 @@ Type called "ElixirToHIRTranslator":
     ets_tables as Integer  Note: ETS table usage tracking
 End Type
 
+@Reasoning:
+The constructor creates each tracking dictionary eagerly so the
+translation walkers never have to test for null subsystem handles on
+the hot path. current_module and current_function start as 0 because
+walking begins outside any module/function; defmodule and def
+translators save/restore these pointers across nested scopes.
+@End Reasoning
 Process called "create_elixir_to_hir_translator" returns Integer:
     Note: Create new Elixir to HIR translator instance
 
@@ -33,6 +50,15 @@ Process called "create_elixir_to_hir_translator" returns Integer:
     Return translator
 End Process
 
+@Reasoning:
+The central dispatcher uses a Match construct to route each Elixir AST
+kind to its specialised translator. The kinds span both core Elixir
+constructs (def, case, with, for) and OTP constructs (receive, spawn,
+send, GenServer.call/cast, Supervisor.start) because the translator
+preserves actor model semantics through HIR. Unknown kinds fall back
+to create_hir_unknown which produces a typed sentinel rather than
+crashing.
+@End Reasoning
 Process called "translate_elixir_to_hir" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir AST to HIR with actor model and OTP support
 
@@ -122,6 +148,14 @@ Process called "translate_elixir_to_hir" takes translator as Integer, ast as Int
     End Match
 End Process
 
+@Reasoning:
+defmodule lowers to a HIR "module" dict. The module context is pushed
+before walking children so nested defs see the active module via
+translator.current_module; it is restored at the end so sibling
+modules each have a fresh context. After the body is translated we
+run extract_otp_behavior_info to scan for `use GenServer` and similar
+constructs and tag the module accordingly.
+@End Reasoning
 Process called "translate_defmodule" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir module definition to HIR
 
@@ -169,6 +203,15 @@ Process called "translate_defmodule" takes translator as Integer, ast as Integer
     Return hir_module
 End Process
 
+@Reasoning:
+def lowers to a HIR "function" dict. Elixir functions are uniquely
+identified by name+arity (the same name can have different clauses
+for different arities), so both are stored on the HIR node. Pattern
+clauses and guards are translated via dedicated helpers because each
+can contain bound variables that must be tracked in
+translator.pattern_variables. OTP callback detection runs at the end
+via check_otp_callback to tag init/handle_call/handle_cast/etc.
+@End Reasoning
 Process called "translate_def" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir function definition to HIR
 
@@ -215,6 +258,12 @@ Process called "translate_def" takes translator as Integer, ast as Integer retur
     Return hir_function
 End Process
 
+@Reasoning:
+case lowers to a HIR "pattern_match" rather than a generic "match" so
+the gungnir lowering can distinguish source-level case from generated
+matches (e.g. desugared with-statement). Each clause is delegated to
+translate_case_clause which handles the pattern/guard/body trio.
+@End Reasoning
 Process called "translate_case" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir case expression with pattern matching
 
@@ -247,6 +296,15 @@ Process called "translate_case" takes translator as Integer, ast as Integer retu
     Return hir_case
 End Process
 
+@Reasoning:
+A case clause is the pattern-guard-body triple. The pattern translator
+populates translator.pattern_variables with names bound by the pattern;
+those bindings remain visible to translate_guard_expression and
+translate_elixir_to_hir for the body. The HIR "match_clause" tag is
+consumed by gungnir to lower into the destination language's pattern
+matching construct (Elixir->Erlang or Elixir->Ruby cases follow
+different code paths).
+@End Reasoning
 Process called "translate_case_clause" takes translator as Integer, clause as Integer returns Integer:
     Note: Translate single case clause with pattern and guard
 
@@ -273,6 +331,14 @@ Process called "translate_case_clause" takes translator as Integer, clause as In
     Return hir_clause
 End Process
 
+@Reasoning:
+Elixir patterns can be variables (binding), composite structures
+(tuple, list, map, struct), literals (atom, number, string), and
+binary patterns. The translator binds variables on first encounter via
+bind_pattern_variable, recurses into composite patterns, and lowers
+literals to direct HIR equivalents. Unknown pattern kinds fall back
+to the main translator so future pattern forms still produce HIR.
+@End Reasoning
 Process called "translate_pattern" takes translator as Integer, pattern as Integer returns Integer:
     Note: Translate Elixir pattern with variable binding
 
@@ -333,6 +399,16 @@ Process called "translate_pattern" takes translator as Integer, pattern as Integ
     End Match
 End Process
 
+@Reasoning:
+receive is the heart of Elixir's actor model: it selects messages
+from the process mailbox by pattern. The HIR captures this as a
+dedicated "actor_receive" node so target emitters can lower it to
+their native concurrency primitive (Go channel select, Erlang
+receive, Java BlockingQueue.poll, etc). The optional 'after' clause
+provides timeout semantics and is preserved as a "timeout_clause"
+sub-node. We also tag the whole node with actor_model=true so
+downstream analysis can identify actor-pattern hotspots.
+@End Reasoning
 Process called "translate_receive" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir receive block for actor message handling
 
@@ -377,6 +453,15 @@ Process called "translate_receive" takes translator as Integer, ast as Integer r
     Return hir_receive
 End Process
 
+@Reasoning:
+Elixir has four spawn variants: bare spawn, spawn_link (linked process
+death propagates), spawn_monitor (sends DOWN messages on exit), and
+Task.start (the OTP supervisor-friendly form). Each variant is
+recorded both via spawn_type and via specific tags (linked, monitored,
+otp_task) so the destination emitter can choose the right runtime
+construct. track_process_spawn records the call site in process_context
+for later actor-graph analysis.
+@End Reasoning
 Process called "translate_spawn" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir spawn for process creation
 
@@ -420,6 +505,13 @@ Process called "translate_spawn" takes translator as Integer, ast as Integer ret
     Return hir_spawn
 End Process
 
+@Reasoning:
+send routes a message to a target process (PID or registered name).
+Both target and message are arbitrary expressions, so they recurse
+through the main translator. The actor_model=true tag matches what
+translate_receive emits, allowing graph-based actor analysis to pair
+sends with their corresponding receive arms.
+@End Reasoning
 Process called "translate_send" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir send for message passing
 
@@ -441,6 +533,14 @@ Process called "translate_send" takes translator as Integer, ast as Integer retu
     Return hir_send
 End Process
 
+@Reasoning:
+GenServer.call is synchronous OTP messaging: it sends a request and
+waits for a reply. Unlike bare send/receive, the timeout is part of
+the call signature so the HIR preserves it as a dedicated field. The
+otp_behavior=genserver tag lets the destination emitter generate the
+appropriate platform-specific synchronous-RPC code (Erlang gen_server,
+Akka ask pattern, etc).
+@End Reasoning
 Process called "translate_genserver_call" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate GenServer.call for synchronous OTP communication
 
@@ -464,6 +564,14 @@ Process called "translate_genserver_call" takes translator as Integer, ast as In
     Return hir_call
 End Process
 
+@Reasoning:
+The |> operator passes its left operand as the first argument to its
+right operand's function call. We lower this to a HIR
+"function_composition" with composition_type=pipe so target emitters
+that lack a native pipe (most languages) can render it as a sequence
+of nested calls while emitters that have one (F#, Elm, modern Java's
+chained streams) can preserve the readable form.
+@End Reasoning
 Process called "translate_pipe" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir pipe operator |>
 
@@ -484,6 +592,14 @@ Process called "translate_pipe" takes translator as Integer, ast as Integer retu
     Return hir_pipe
 End Process
 
+@Reasoning:
+Elixir's for-comprehension fuses iteration, pattern matching, and
+filtering into a single expression. We lower the generators (left-arrow
+clauses), filters (boolean guards), and the body into a HIR
+"list_comprehension" so target emitters can choose how to render this:
+Python list comprehension, JavaScript Array.flatMap, Java streams,
+etc. The actual generator translation happens in translate_generator.
+@End Reasoning
 Process called "translate_for_comprehension" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir for comprehension
 
@@ -530,6 +646,13 @@ Process called "translate_for_comprehension" takes translator as Integer, ast as
     Return hir_comprehension
 End Process
 
+@Reasoning:
+Tuples are heterogeneous fixed-size collections; Elixir uses them
+extensively for tagged returns ({:ok, value}, {:error, reason}). The
+HIR "tuple" node preserves order and arity so target emitters can
+render the appropriate destination type (Python tuple, Rust tuple,
+Java record).
+@End Reasoning
 Process called "translate_tuple" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir tuple
 
@@ -556,6 +679,13 @@ Process called "translate_tuple" takes translator as Integer, ast as Integer ret
     Return hir_tuple
 End Process
 
+@Reasoning:
+Elixir maps are key-value collections with arbitrary key types. The
+HIR "map" node carries a "pairs" list where each pair is its own dict
+with key/value fields - this preserves the original ordering for
+emitters that want to render to languages with ordered maps
+(JavaScript objects, Java LinkedHashMap, Rust IndexMap).
+@End Reasoning
 Process called "translate_map" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Elixir map
 
@@ -590,27 +720,61 @@ End Process
 
 Note: Helper processes for Elixir to HIR translation
 
+@Reasoning:
+HIR dictionary nodes are 32 bytes: enough for a small struct with
+type tag, child list pointer, value pointer, and metadata. Larger
+nodes resize on first insertion; the 32-byte starting size matches
+what most simple translation outputs need without an immediate grow.
+@End Reasoning
 Process called "create_hir_dict" returns Integer:
     Note: Create HIR dictionary node
     Return proc memory_allocate from Layout with 32
 End Process
 
+@Reasoning:
+HIR list storage uses a small 16-byte header pointing to a backing
+array. The header carries the count and capacity slots; the array is
+allocated on first insert. The 16-byte minimum matches the v0.0.8.5
+HIR list-header layout shared by every translator.
+@End Reasoning
 Process called "create_list" returns Integer:
     Note: Create list for HIR storage
     Return proc memory_allocate from Layout with 16
 End Process
 
+@Reasoning:
+Helper-dict storage (24 bytes) is smaller than create_hir_dict because
+the tracking dictionaries (pattern_variables, process_context, OTP
+bookkeeping) need fewer header slots than full HIR nodes. The 24-byte
+layout reserves one count slot, one capacity slot, and one bucket
+pointer slot.
+@End Reasoning
 Process called "create_dict" returns Integer:
     Note: Create dictionary for storage
     Return proc memory_allocate from Layout with 24
 End Process
 
+@Reasoning:
+Pattern bindings tagged "bound" mark each variable name that has been
+introduced by a pattern arm. The translator consults this dictionary
+during guard expression translation to distinguish bound pattern
+variables (which can be referenced by guards) from free identifiers
+(which must resolve via module-level lookup).
+@End Reasoning
 Process called "bind_pattern_variable" takes translator as Integer, var_name as String returns Integer:
     Note: Bind variable in pattern matching context
     proc set_dict_value with translator.pattern_variables, var_name, "bound"
     Return 1
 End Process
 
+@Reasoning:
+Each spawn call site is recorded under a unique id in process_context.
+This enables post-translation actor-graph analysis: knowing which
+modules spawn which workers lets downstream tooling visualise the
+process topology and detect supervisor missing-links. The id is
+generated externally so this routine remains side-effect-pure relative
+to its inputs.
+@End Reasoning
 Process called "track_process_spawn" takes translator as Integer, spawn_info as Integer returns Integer:
     Note: Track process spawning for actor model analysis
     Let spawn_id be proc generate_unique_id
@@ -618,6 +782,14 @@ Process called "track_process_spawn" takes translator as Integer, spawn_info as 
     Return 1
 End Process
 
+@Reasoning:
+OTP behaviours (GenServer, Supervisor, GenStage, etc.) are declared
+inside a module via `use Behaviour`. We scan the body statements
+looking for `use` nodes that resolve to known OTP behaviours and
+record the binding in translator.otp_behaviors plus tag the module
+itself with otp_behavior=<name>. This metadata lets target emitters
+emit the correct lifecycle and callback hooks.
+@End Reasoning
 Process called "extract_otp_behavior_info" takes translator as Integer, module_hir as Integer, body as Integer returns Integer:
     Note: Extract OTP behavior information from module body
 
@@ -640,6 +812,15 @@ Process called "extract_otp_behavior_info" takes translator as Integer, module_h
     Return 1
 End Process
 
+@Reasoning:
+OTP callback functions are identified by both name and arity:
+init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2 for
+GenServer, and init/1 for Supervisor (disambiguated by checking
+is_supervisor_module on the enclosing module). Tagging the HIR
+function with the canonical otp_callback name lets target emitters
+generate the appropriate interface implementation in languages with
+explicit OTP-like frameworks (e.g. Akka actors, Java BehaviorSubject).
+@End Reasoning
 Process called "check_otp_callback" takes translator as Integer, function_hir as Integer, name as String, arity as Integer returns Integer:
     Note: Check if function is an OTP callback and mark appropriately
 

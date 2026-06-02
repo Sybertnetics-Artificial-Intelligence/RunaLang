@@ -229,15 +229,13 @@ Note: ==========================================================================
 Note: Parser Creation and Management
 Note: ============================================================================
 
+@Reasoning:
+The parser is a 32-byte struct holding the token list pointer, the cursor position, an error message slot, and the has_error flag; bundling these into one allocation keeps cursor advance/peek O(1) without dict lookups. Tokens_ptr is borrowed (not copied) because the lexer owns the token list for the duration of parsing.
+@End Reasoning
+@Implementation:
+Field layout: 0=tokens_ptr, 8=current_position, 16=error_message, 24=has_error. Position is initialized to 0 (first token); has_error to 0 (clean). The error_message slot holds an empty string sentinel rather than null so set_error can overwrite without needing to allocate on first use.
+@End Implementation
 Process called "create_parser" that takes tokens_ptr as Integer returns Integer:
-    @Reasoning
-    Create a new Makefile parser instance with the given token list.
-    @End Reasoning
-
-    @Implementation
-    Allocate parser structure and initialize with token list.
-    @End Implementation
-
     Let parser_ptr be proc allocate from Memory with 32
 
     proc write_integer from Memory with parser_ptr, 0, tokens_ptr
@@ -248,15 +246,10 @@ Process called "create_parser" that takes tokens_ptr as Integer returns Integer:
     Return parser_ptr
 End Process
 
+@Reasoning:
+The parser only owns its own 32-byte struct; tokens_ptr is borrowed from the lexer so deallocation does not touch the token list. Single free is sufficient because the error_message slot stores either the empty-string sentinel or a literal string from set_error (not a heap copy).
+@End Reasoning
 Process called "free_parser" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Free the parser structure.
-    @End Reasoning
-
-    @Implementation
-    Deallocate parser memory.
-    @End Implementation
-
     proc deallocate from Memory with parser_ptr
     Return 1
 End Process
@@ -265,15 +258,10 @@ Note: ==========================================================================
 Note: Token Access Functions
 Note: ============================================================================
 
+@Reasoning:
+The parser reads the token at the cursor without mutating it; separating peek from advance lets recursive-descent productions look at the next token before committing to a branch. Returning 0 when position is past end is handled at the get_from_list level, which keeps this hot accessor branch-free.
+@End Reasoning
 Process called "current_token" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Get the current token without advancing.
-    @End Reasoning
-
-    @Implementation
-    Retrieve token at current position from token list.
-    @End Implementation
-
     Let tokens_ptr be proc read_integer from Memory with parser_ptr, 0
     Let position be proc read_integer from Memory with parser_ptr, 8
 
@@ -281,15 +269,10 @@ Process called "current_token" that takes parser_ptr as Integer returns Integer:
     Return token_ptr
 End Process
 
+@Reasoning:
+Look-ahead with an explicit offset (rather than just peek-next) is required for makefile parsing because variable assignments ("VAR = value", "VAR := value", "VAR += value") need at least 2 tokens of look-ahead to disambiguate from target rules. Letting the caller pass an arbitrary offset avoids per-arity peek wrappers.
+@End Reasoning
 Process called "peek_token" that takes parser_ptr as Integer, offset as Integer returns Integer:
-    @Reasoning
-    Look ahead at a token without advancing.
-    @End Reasoning
-
-    @Implementation
-    Retrieve token at current position + offset from token list.
-    @End Implementation
-
     Let tokens_ptr be proc read_integer from Memory with parser_ptr, 0
     Let position be proc read_integer from Memory with parser_ptr, 8
     Let peek_pos be position plus offset
@@ -298,15 +281,10 @@ Process called "peek_token" that takes parser_ptr as Integer, offset as Integer 
     Return token_ptr
 End Process
 
+@Reasoning:
+Cursor advance is just a position bump; bounds checking is intentionally deferred to current_token/get_from_list so the common case (advance in the middle of a valid token stream) stays branch-free. Returning 1 lets the caller chain advance into a single statement context but the value is otherwise unused.
+@End Reasoning
 Process called "advance" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Move to the next token in the stream.
-    @End Reasoning
-
-    @Implementation
-    Increment current position counter.
-    @End Implementation
-
     Let position be proc read_integer from Memory with parser_ptr, 8
     Set position to position plus 1
     proc write_integer from Memory with parser_ptr, 8, position
@@ -314,15 +292,10 @@ Process called "advance" that takes parser_ptr as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+End-of-stream is detected by either a null token pointer (cursor past list end) OR an explicit TOKEN_EOF; supporting both gives the parser tolerance against lexers that elide the trailing EOF token. The dual check is unified here so productions can write `is_at_end` rather than duplicate the two-condition test.
+@End Reasoning
 Process called "is_at_end" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Check if we have reached the end of the token stream.
-    @End Reasoning
-
-    @Implementation
-    Check if current token is EOF token.
-    @End Implementation
-
     Let token_ptr be proc current_token from parser_ptr
     If token_ptr is equal to 0:
         Return 1
@@ -336,15 +309,10 @@ Process called "is_at_end" that takes parser_ptr as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+expect combines a type check with a conditional advance, which is the canonical recursive-descent primitive ("eat this terminal or error out"). Returning 0 on mismatch lets callers propagate the failure up without exception machinery; set_error records the mismatch so the final reporter can show it.
+@End Reasoning
 Process called "expect" that takes parser_ptr as Integer, expected_type as Integer returns Integer:
-    @Reasoning
-    Verify current token matches expected type and consume it.
-    @End Reasoning
-
-    @Implementation
-    Check token type, set error if mismatch, advance if match.
-    @End Implementation
-
     Let token_ptr be proc current_token from parser_ptr
     If token_ptr is equal to 0:
         proc set_error with parser_ptr, "Unexpected end of file"
@@ -361,15 +329,10 @@ Process called "expect" that takes parser_ptr as Integer, expected_type as Integ
     Return 1
 End Process
 
+@Reasoning:
+Error state is sticky: set_error overwrites previous messages so the FIRST error is replaced by the most recent one. This is intentional because subsequent errors typically cascade from the first, and the most recent diagnostic is closer to the cursor's actual position. has_error becomes the gate for parse_makefile to skip further work after a fatal stop.
+@End Reasoning
 Process called "set_error" that takes parser_ptr as Integer, message as String returns Integer:
-    @Reasoning
-    Record a parser error message.
-    @End Reasoning
-
-    @Implementation
-    Store error message and set error flag.
-    @End Implementation
-
     proc write_string from Memory with parser_ptr, 16, message
     proc write_integer from Memory with parser_ptr, 24, 1
     Return 1
@@ -379,15 +342,10 @@ Note: ==========================================================================
 Note: Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Makefiles permit blank lines and comment lines between top-level constructs; skip_newlines absorbs both so productions only see meaningful tokens. We treat comments as if they were newlines because makefile comments span exactly one line, so eating them is identical to eating their terminating newline.
+@End Reasoning
 Process called "skip_newlines" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Skip all consecutive newline tokens.
-    @End Reasoning
-
-    @Implementation
-    Loop through tokens consuming all newlines and comments.
-    @End Implementation
-
     Let continue be 1
     While continue is equal to 1:
         Let is_end be proc is_at_end from parser_ptr
@@ -412,15 +370,10 @@ Process called "skip_newlines" that takes parser_ptr as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Makefile values (right-hand sides of assignments, recipe lines) span a single line but contain multiple tokens; we concatenate lexemes with single spaces between them, mirroring how Make itself collapses whitespace in expanded variables. The leading-empty-string check avoids a stray leading space on the first token.
+@End Reasoning
 Process called "consume_until_newline" that takes parser_ptr as Integer returns String:
-    @Reasoning
-    Consume all tokens until newline and return as concatenated string.
-    @End Reasoning
-
-    @Implementation
-    Build string from all tokens until newline or EOF.
-    @End Implementation
-
     Let result be ""
 
     Let continue be 1
@@ -452,15 +405,10 @@ Process called "consume_until_newline" that takes parser_ptr as Integer returns 
     Return result
 End Process
 
+@Reasoning:
+The lexeme is stored at offset 8 of every token record (offset 0 is the token type). Returning empty string on null token guards productions against a missing-current-token bug during error-recovery paths.
+@End Reasoning
 Process called "get_token_lexeme" that takes token_ptr as Integer returns String:
-    @Reasoning
-    Extract the lexeme string from a token.
-    @End Reasoning
-
-    @Implementation
-    Read lexeme field from token structure.
-    @End Implementation
-
     If token_ptr is equal to 0:
         Return ""
     End If
@@ -473,15 +421,10 @@ Note: ==========================================================================
 Note: Statement Parsing Functions
 Note: ============================================================================
 
+@Reasoning:
+Makefile assignments come in four flavors with distinct semantics: = (recursive expansion), := (immediate expansion), += (append), and ?= (conditional). Distinct ASSIGN_* tags propagate to the AST so downstream emitters (HIR, target makefile output) can preserve the exact form. The optional `override` prefix is captured as a flag because it modifies any of the four forms.
+@End Reasoning
 Process called "parse_variable_assignment" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Parse a variable assignment: VAR = value, VAR := value, VAR += value, VAR ?= value.
-    @End Reasoning
-
-    @Implementation
-    Extract variable name, assignment operator, and value.
-    @End Implementation
-
     Note: Check for override prefix
     Let override_flag be 0
     Let token_ptr be proc current_token from parser_ptr
@@ -553,15 +496,13 @@ Process called "parse_variable_assignment" that takes parser_ptr as Integer retu
     Return node_ptr
 End Process
 
+@Reasoning:
+A target rule has three structurally distinct sections separated by punctuation: targets (before the colon), prerequisites (between colon and either pipe or newline), and order-only prerequisites (after pipe). The single-colon vs double-colon distinction is captured because they differ semantically (double-colon allows multiple independent rules for the same target). Inline recipes (after semicolon) and tab-indented recipes (next lines) both populate recipes_list so the AST is uniform downstream.
+@End Reasoning
+@Implementation:
+Pattern-rule detection scans target lexemes for "%" because Make's pattern stem syntax is the only way to introduce parameterization. Order-only prereqs use a separate list rather than a flag-per-element because dependency ordering matters for build correctness and traversal cost is lower with two lists than one mixed list with predicates.
+@End Implementation
 Process called "parse_target_rule" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Parse a target rule: target [target2 ...]: [dependencies] [| order-only-deps]
-    @End Reasoning
-
-    @Implementation
-    Extract targets, dependencies, and check for double-colon rules.
-    @End Implementation
-
     Let token_ptr be proc current_token from parser_ptr
     Let line_num be proc read_integer from Memory with token_ptr, 24
     Let col_num be proc read_integer from Memory with token_ptr, 32
@@ -757,15 +698,10 @@ Process called "parse_target_rule" that takes parser_ptr as Integer returns Inte
     Return node_ptr
 End Process
 
+@Reasoning:
+Makefile conditionals come in four flavors (ifeq/ifneq for value comparison, ifdef/ifndef for variable existence); the cond_type discriminator preserves the form so the conditional can be re-emitted faithfully. ifdef/ifndef take a single operand while ifeq/ifneq take a parenthesized pair (or two quoted strings); the operand parser branches on that distinction. The optional else block uses a null else_list to distinguish "no else" from "empty else" — both produce no statements but the AST should reflect what the user wrote.
+@End Reasoning
 Process called "parse_conditional" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Parse a conditional: ifeq, ifneq, ifdef, ifndef with optional else.
-    @End Reasoning
-
-    @Implementation
-    Parse condition, then block, optional else block, and endif.
-    @End Implementation
-
     Let token_ptr be proc current_token from parser_ptr
     Let token_type be proc read_integer from Memory with token_ptr, 0
     Let line_num be proc read_integer from Memory with token_ptr, 24
@@ -886,15 +822,10 @@ Process called "parse_conditional" that takes parser_ptr as Integer returns Inte
     Return node_ptr
 End Process
 
+@Reasoning:
+include/sinclude/-include differ only in error semantics: include errors out on a missing file, sinclude and -include do not. We capture that distinction as a silent flag rather than separate node types because the file list and parsing logic are otherwise identical. The filename list is stored as a list because Make supports multiple files in a single include directive.
+@End Reasoning
 Process called "parse_include_directive" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Parse an include directive: include filename or -include filename.
-    @End Reasoning
-
-    @Implementation
-    Extract include type and file names.
-    @End Implementation
-
     Let token_ptr be proc current_token from parser_ptr
     Let token_type be proc read_integer from Memory with token_ptr, 0
     Let line_num be proc read_integer from Memory with token_ptr, 24
@@ -926,15 +857,10 @@ Process called "parse_include_directive" that takes parser_ptr as Integer return
     Return node_ptr
 End Process
 
+@Reasoning:
+export/unexport share the same grammar (directive keyword followed by an optional variable list) but invert the resulting environment effect; we capture that as an unexport flag rather than two node types. An empty variable list is legal (export with no args exports all variables) and is represented by a null vars_list to distinguish it from an explicit empty list.
+@End Reasoning
 Process called "parse_export_directive" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Parse an export/unexport directive.
-    @End Reasoning
-
-    @Implementation
-    Extract export type and variable names.
-    @End Implementation
-
     Let token_ptr be proc current_token from parser_ptr
     Let token_type be proc read_integer from Memory with token_ptr, 0
     Let line_num be proc read_integer from Memory with token_ptr, 24
@@ -969,15 +895,10 @@ Process called "parse_export_directive" that takes parser_ptr as Integer returns
     Return node_ptr
 End Process
 
+@Reasoning:
+A define block is Make's only multi-line variable assignment; its content preserves embedded newlines (concatenated with "\n") so the resulting variable expands to a literal multi-line string. The assign_type after the variable name is optional and defaults to SIMPLE; when present it modifies expansion semantics like normal assignments.
+@End Reasoning
 Process called "parse_define_block" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Parse a define block: define VAR ... endef.
-    @End Reasoning
-
-    @Implementation
-    Extract variable name and multi-line content until endef.
-    @End Implementation
-
     Let token_ptr be proc current_token from parser_ptr
     Let line_num be proc read_integer from Memory with token_ptr, 24
     Let col_num be proc read_integer from Memory with token_ptr, 32
@@ -1059,15 +980,13 @@ Note: ==========================================================================
 Note: Main Parsing Functions
 Note: ============================================================================
 
+@Reasoning:
+Statement classification is keyword-driven for directives (if*/include/export/define/override) but requires lookahead-1 for identifier-prefixed lines because "VAR = value" and "target: deps" both start with TOKEN_IDENTIFIER. The lookahead checks the assignment-operator family vs colon to discriminate; unknown statement lines fall through to skip-to-newline so parser recovery is bounded.
+@End Reasoning
+@Implementation:
+The dispatch order matters: conditionals and directives must be checked before identifier-based dispatch because some directives (PHONY, SUFFIXES) might otherwise be confused with target identifiers. Special targets are routed to parse_target_rule because they share rule syntax with regular targets.
+@End Implementation
 Process called "parse_statement" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Parse a single Makefile statement (assignment, rule, directive, conditional).
-    @End Reasoning
-
-    @Implementation
-    Determine statement type and delegate to appropriate parser.
-    @End Implementation
-
     proc skip_newlines from parser_ptr
 
     Let is_end be proc is_at_end from parser_ptr
@@ -1139,15 +1058,10 @@ Process called "parse_statement" that takes parser_ptr as Integer returns Intege
     Return 0
 End Process
 
+@Reasoning:
+The top-level parse loop iterates parse_statement until end-of-tokens; each statement is appended to the root's statements list. We check has_error after each parse_statement returning 0 so the loop exits immediately on a fatal error rather than spinning on an unrecoverable position; non-zero returns keep parsing because the root AST should aggregate as many recoverable statements as possible.
+@End Reasoning
 Process called "parse_makefile" that takes parser_ptr as Integer returns Integer:
-    @Reasoning
-    Parse a complete Makefile into an AST.
-    @End Reasoning
-
-    @Implementation
-    Parse all statements and build root AST node.
-    @End Implementation
-
     Let root_ptr be proc allocate from Memory with 32
     proc write_integer from Memory with root_ptr, 0, NODE_MAKEFILE
 

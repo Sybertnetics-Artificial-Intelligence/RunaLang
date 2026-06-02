@@ -51,6 +51,23 @@ Note: ==========================================================================
 Note: C# to HIR Translation Context
 Note: ============================================================================
 
+@Reasoning:
+Threads the per-translation-pass state - the arena that backs all HIR
+dictionary and list allocations, the enclosing namespace/class for
+resolving member-access semantics, and a list of accumulated errors -
+through every translate_* helper. Keeping current_namespace and
+current_class as Integer pointers (not strings) lets translation update
+them in O(1) via memory_set_int64 as the recursion enters and exits
+declarations.
+@End Reasoning
+
+@Implementation:
+32-byte record (CONTEXT_SIZE) laid out as:
+- arena @0 - arena allocator pointer
+- current_namespace @8 - string pointer (set in translate_namespace)
+- current_class @16 - string pointer (set in translate_class)
+- errors @24 - list pointer initialized by create_csharp_to_hir_context
+@End Implementation
 Type called "CSharpToHIRContext":
     arena as Integer           Note: Arena for allocations
     current_namespace as Integer  Note: Current namespace name
@@ -60,6 +77,20 @@ End Type
 
 Constant CONTEXT_SIZE as Integer is 32
 
+@Reasoning:
+Constructor establishes the four-field context invariants: arena set,
+namespace and class zero (no enclosing declaration yet), errors list
+ready to receive append. Decoupled from translate_csharp_to_hir so tests
+or alternative drivers can build a context without invoking the full
+top-level translator.
+@End Reasoning
+
+@Implementation:
+Allocates CONTEXT_SIZE bytes via Layout.allocate; returns 0 on
+allocation failure. Stores arena @0, 0 @8 (current_namespace), 0 @16
+(current_class). Creates an empty list via ListOps.create_list and
+stores it at @24 (errors). Returns the context pointer.
+@End Implementation
 Process called "create_csharp_to_hir_context" takes arena as Integer returns Integer:
     Note: Create C# to HIR translation context
 
@@ -79,6 +110,19 @@ Process called "create_csharp_to_hir_context" takes arena as Integer returns Int
     Return context
 End Process
 
+@Reasoning:
+Releases the errors list (which owns nodes that are not arena-allocated)
+and the context record itself. The arena itself is not destroyed because
+arena lifetime is controlled by the caller and may outlive a single
+translation pass.
+@End Reasoning
+
+@Implementation:
+Returns 1 immediately if context is 0 (idempotent on null). Reads
+errors at offset 24; if non-zero calls ListOps.destroy_list to release
+the list and any owned references. Deallocates the context record via
+Layout.deallocate. Returns 1.
+@End Implementation
 Process called "destroy_csharp_to_hir_context" takes context as Integer returns Integer:
     Note: Destroy C# to HIR translation context
 
@@ -100,6 +144,26 @@ Note: ==========================================================================
 Note: Main Translation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Public entry point for the C# frontend. The arena parameter is required
+because every transient string and HIR fragment allocated during the
+walk lives off the caller-provided arena - on completion the caller
+resets the arena in one O(1) operation rather than walking and freeing
+each HIR node. Decoupling translation context lifetime from the arena
+keeps the per-translation state struct small while still letting the
+nested walkers allocate freely.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately when ast is null so callers can pipe a missing
+AST through without a separate guard. Constructs a fresh
+CSharpToHirContext via create_csharp_to_hir_context (which binds the
+arena, initialises the diagnostics list, etc.) and bails out with 0 if
+construction fails. Then dispatches the root node through translate_node,
+which is the polymorphic CSHARP_* dispatcher. The context is destroyed
+before returning the resulting HIR root so context-owned scratch state
+is released even though arena-backed HIR data lives on.
+@End Implementation
 Process called "translate_csharp_to_hir" takes ast as Integer, arena as Integer returns Integer:
     Note: Translate complete C# AST to HIR
 
@@ -131,6 +195,24 @@ Note: ==========================================================================
 Note: Node Translation Dispatcher
 Note: ============================================================================
 
+@Reasoning:
+Single dispatcher routing every C# AST node kind to its specialized
+translator based on the CSHARP_* enum tag from the parser. Funneling
+through one switch means new node kinds need exactly one new arm here
+plus a new translate_* helper, and recursive descent (e.g. translating
+nested expressions) routes back here so structurally similar nodes
+reuse the same path.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately for a 0 node. Reads the node kind tag via
+Parser.get_node_type. Tests against each CSHARP_* constant in order:
+program, namespace, using, class, struct, interface, enum, method,
+field, property, event, delegate, type, generic_type, then all
+statement node types, then all expression node types. Falls through to
+returning 0 for unrecognized kinds so unsupported nodes degrade
+silently rather than crashing the pass.
+@End Implementation
 Process called "translate_node" takes context as Integer, node as Integer returns Integer:
     Note: Dispatch node translation based on node type
 
@@ -323,6 +405,20 @@ Note: ==========================================================================
 Note: Program and Namespace Translation
 Note: ============================================================================
 
+@Reasoning:
+Root translation: the C# program AST becomes the root HIR dictionary
+tagged "csharp_program" with a members list containing every top-level
+declaration (namespaces, top-level classes, etc.) the parser produced.
+Null members from children that fail to translate are filtered so the
+list stays dense.
+@End Reasoning
+
+@Implementation:
+Creates HIR dict, sets _type = "csharp_program". Iterates the children
+via get_child_count/get_child from Parser. Each child is recursively
+translate_node'd; non-zero results are appended to the members list.
+Stores members at HIR key "members". Returns the dict.
+@End Implementation
 Process called "translate_program" takes context as Integer, node as Integer returns Integer:
     Note: Translate C# program node to HIR
 
@@ -350,6 +446,21 @@ Process called "translate_program" takes context as Integer, node as Integer ret
     Return hir
 End Process
 
+@Reasoning:
+A C# namespace becomes a dict tagged "csharp_namespace" with a name
+field plus the standard members list. The procedure also updates
+context.current_namespace (offset 8) so any nested members can see the
+enclosing namespace name when they recurse - without this side effect
+the type-resolution context would be lost for inner declarations.
+@End Reasoning
+
+@Implementation:
+Builds HIR dict with _type "csharp_namespace". Reads the node's name;
+when non-zero stores it at "name" and updates context offset 8 to the
+same string. Then walks children recursively (same shape as
+translate_program) collecting non-null translations into a members
+list stored under "members".
+@End Implementation
 Process called "translate_namespace" takes context as Integer, node as Integer returns Integer:
     Note: Translate namespace declaration to HIR
 
@@ -383,6 +494,20 @@ Process called "translate_namespace" takes context as Integer, node as Integer r
     Return hir
 End Process
 
+@Reasoning:
+`using X.Y;` and `using A = X.Y;` are both encoded as the same node
+kind by the parser, with the alias form distinguished by an "alias"
+attribute. The HIR mirrors this: a single dict carrying the namespace
+string plus an optional alias - this avoids two distinct HIR node
+kinds for what is really one directive with a modifier.
+@End Reasoning
+
+@Implementation:
+Creates dict tagged "csharp_using". Reads the parsed namespace name
+into "namespace". Reads optional "alias" attribute via
+Parser.get_node_attribute; when present stores it at HIR key "alias".
+Returns the dict.
+@End Implementation
 Process called "translate_using" takes context as Integer, node as Integer returns Integer:
     Note: Translate using directive to HIR
 
@@ -406,6 +531,28 @@ Note: ==========================================================================
 Note: Type Declaration Translation
 Note: ============================================================================
 
+@Reasoning:
+C# classes carry many independent dimensions - access modifier,
+static/abstract/sealed/partial flags, generic type parameters,
+inheritance, interfaces, and a member list - each surfaced by the
+parser as separate attributes or typed children. This procedure flattens
+all of them into a single HIR dict; the base-class-vs-interfaces
+distinction is resolved by position: the first CSHARP_TYPE child is
+the base class, all subsequent CSHARP_TYPE children are interfaces.
+@End Reasoning
+
+@Implementation:
+Sets _type = "csharp_class", reads name into "name" and updates
+context.current_class (offset 16). Reads access attribute into "access".
+For each of static/abstract/sealed/partial: reads attribute; if present
+stores HIR string "true". Reads type_parameters attribute into HIR
+"type_parameters". First pass over children: tracks found_base flag;
+the first CSHARP_TYPE child becomes "base_class", subsequent CSHARP_TYPE
+children are appended to base_types list and stored at "interfaces" if
+non-empty. Second pass over children: any non-CSHARP_TYPE child is
+recursively translate_node'd (methods, fields, properties, events) and
+appended to the members list stored at "members". Returns the dict.
+@End Implementation
 Process called "translate_class" takes context as Integer, node as Integer returns Integer:
     Note: Translate class declaration to HIR
 
@@ -503,6 +650,20 @@ Process called "translate_class" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
+@Reasoning:
+C# structs share their entire surface syntax (modifiers, generics,
+base/interface lists, members) with classes - the only semantic
+distinction is value-vs-reference semantics, captured by the _type tag.
+This procedure delegates translation to translate_class, then overrides
+_type to "csharp_struct" so all the class-translation logic is reused
+verbatim without duplication.
+@End Reasoning
+
+@Implementation:
+Calls translate_class with the same context and node. If the resulting
+HIR dict is non-zero, overwrites its "_type" string value to
+"csharp_struct" via set_dict_string_value. Returns the dict.
+@End Implementation
 Process called "translate_struct" takes context as Integer, node as Integer returns Integer:
     Note: Translate struct declaration to HIR
 
@@ -515,6 +676,22 @@ Process called "translate_struct" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+Interfaces cannot inherit (only implement), so the base-class-vs-
+interfaces disambiguation logic from translate_class is unnecessary
+here: every CSHARP_TYPE child is a base interface, stored at
+"base_interfaces". Member translation excludes type-children so the
+member list contains only method signatures and properties.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_interface". Reads name, access, type_parameters
+attributes (no static/abstract/sealed/partial - interfaces never have
+them). First child pass: every CSHARP_TYPE child translates and appends
+to base_interfaces; stored at HIR key "base_interfaces" if non-empty.
+Second child pass: every non-CSHARP_TYPE child translates (method
+signatures, properties) and appends to members. Returns the dict.
+@End Implementation
 Process called "translate_interface" takes context as Integer, node as Integer returns Integer:
     Note: Translate interface declaration to HIR
 
@@ -583,6 +760,19 @@ Process called "translate_interface" takes context as Integer, node as Integer r
     Return hir
 End Process
 
+@Reasoning:
+C# enums are simpler than classes/interfaces: name + access + list of
+enum values. No generic parameters, no inheritance shape needed (the
+underlying integral type is a parser concern not surfaced here). Each
+child is an enum value with optional explicit numeric assignment,
+handled by the recursive translate_node call.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_enum". Reads name and access. Iterates every child
+calling translate_node and appending non-null results to a values list,
+which is stored at HIR key "values". Returns the dict.
+@End Implementation
 Process called "translate_enum" takes context as Integer, node as Integer returns Integer:
     Note: Translate enum declaration to HIR
 
@@ -621,6 +811,20 @@ Process called "translate_enum" takes context as Integer, node as Integer return
     Return hir
 End Process
 
+@Reasoning:
+A C# delegate declaration is essentially a typed function signature
+that can be stored as a value. The HIR encodes it as a dict with a
+return type (first child) plus a parameters list (children 1..N).
+Position-based child ordering avoids needing a dedicated parameter-
+container node from the parser.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_delegate". Reads name and access attributes. Child
+0 is treated as the return type and translate_node'd into "return_type".
+Children 1..(child_count-1) are translated and appended to a parameters
+list stored at "parameters". Returns the dict.
+@End Implementation
 Process called "translate_delegate" takes context as Integer, node as Integer returns Integer:
     Note: Translate delegate declaration to HIR
 
@@ -670,6 +874,24 @@ Note: ==========================================================================
 Note: Member Translation
 Note: ============================================================================
 
+@Reasoning:
+Methods carry the most modifier surface of any C# declaration kind:
+access, static, virtual, override, abstract, async - all orthogonal and
+stored as separate HIR keys so backends can query them individually.
+The body is always the last child (positional convention from the
+parser); everything between the first child (return type) and the last
+(body) is a parameter.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_method". Reads name and access. For each modifier
+flag (static, virtual, override, abstract, async): if the attribute is
+non-zero, stores HIR key with string "true". Reads child 0 as the
+return type, translate_node into "return_type". Computes body_index =
+child_count - 1. Iterates children 1..body_index-1 collecting non-null
+translations into parameters (stored at "parameters"). If child_count > 1,
+translates the last child as "body". Returns the dict.
+@End Implementation
 Process called "translate_method" takes context as Integer, node as Integer returns Integer:
     Note: Translate method declaration to HIR
 
@@ -748,6 +970,20 @@ Process called "translate_method" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+Fields combine a type and an optional initializer with the usual
+class-member modifiers plus readonly/const which are field-specific.
+The type is always the first child; an initializer (if present) is
+child 1. Separating const from readonly preserves the C# distinction
+(const is compile-time, readonly is post-construction immutability).
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_field". Reads name and access. Per modifier
+(static, readonly, const): on non-zero attribute stores HIR string
+"true". Child 0 translates to "type". If child_count > 1, child 1
+translates to "initializer". Returns the dict.
+@End Implementation
 Process called "translate_field" takes context as Integer, node as Integer returns Integer:
     Note: Translate field declaration to HIR
 
@@ -799,6 +1035,30 @@ Process called "translate_field" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
+@Reasoning:
+C# properties carry richer semantics than fields: they have separate
+get/set accessor bodies, access modifiers, polymorphism flags
+(virtual/override), and an optional static modifier. The HIR
+representation must round-trip all of these so backends that lack
+native properties (most languages) can still synthesise the equivalent
+getter/setter method pair, and backends that do support them (Kotlin,
+Swift, etc.) can emit them directly. Storing each accessor as a nested
+HIR fragment under "get"/"set" rather than as string blobs lets later
+passes manipulate the bodies through the normal HIR walker.
+@End Reasoning
+
+@Implementation:
+Creates an HIR dictionary tagged "_type" = "csharp_property" so backends
+can distinguish properties from fields and methods. Copies the property
+name from the AST, then conditionally writes "access", "static",
+"virtual", "override" attribute strings if the parser annotated them.
+The first child is the type node, translated recursively and stored
+under "type". The "get" and "set" accessor children are retrieved by
+attribute lookup (not by ordinal index, because C# properties allow
+either or both to be omitted) and stored under their respective HIR
+keys after recursive translation. Returns the assembled HIR dictionary
+to the caller.
+@End Implementation
 Process called "translate_property" takes context as Integer, node as Integer returns Integer:
     Note: Translate property declaration to HIR
 
@@ -871,6 +1131,19 @@ Process called "translate_property" takes context as Integer, node as Integer re
     Return hir
 End Process
 
+@Reasoning:
+C# events are field-shaped declarations of a delegate type. They share
+the static modifier with regular fields but never have const/readonly.
+The delegate type (the event's signature) is the first and only child;
+add/remove accessors when present surface as attributes rather than
+separate child nodes.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_event". Reads name, access. If static attribute is
+non-zero stores HIR "static" = "true". If child_count > 0, translates
+child 0 as the delegate type into HIR key "type". Returns the dict.
+@End Implementation
 Process called "translate_event" takes context as Integer, node as Integer returns Integer:
     Note: Translate event declaration to HIR
 
@@ -910,6 +1183,16 @@ Note: ==========================================================================
 Note: Type Translation
 Note: ============================================================================
 
+@Reasoning:
+The minimal type form: just a name (e.g. `int`, `string`, or any
+non-generic user type). Specialised forms (generics, arrays, nullables)
+have their own translate_* helpers; this one is the leaf case.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_type" with the parser's node name copied into HIR
+key "name". Returns the dict.
+@End Implementation
 Process called "translate_type" takes context as Integer, node as Integer returns Integer:
     Note: Translate basic type to HIR
 
@@ -924,6 +1207,18 @@ Process called "translate_type" takes context as Integer, node as Integer return
     Return hir
 End Process
 
+@Reasoning:
+Generic types take the form `Name<T1, T2, ...>`. The HIR encodes Name
+as a single string and the type arguments as an ordered list, each
+translated recursively so nested generics like `List<Dictionary<K, V>>`
+round-trip correctly.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_generic_type". Reads name into HIR "name". Iterates
+every child via translate_node and appends non-null results to a
+type_args list, stored at HIR key "type_arguments". Returns the dict.
+@End Implementation
 Process called "translate_generic_type" takes context as Integer, node as Integer returns Integer:
     Note: Translate generic type to HIR
 
@@ -956,6 +1251,18 @@ Process called "translate_generic_type" takes context as Integer, node as Intege
     Return hir
 End Process
 
+@Reasoning:
+Array types in C# are parameterized by their element type and dimension
+count (rank): `int[]` is rank 1, `int[,]` is rank 2. Both pieces of
+information must survive translation because the backend's array
+emission depends on both.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_array_type". Child 0 translates to HIR key
+"element_type". Reads "rank" attribute via get_node_attribute; when
+non-zero stores it as HIR string "rank". Returns the dict.
+@End Implementation
 Process called "translate_array_type" takes context as Integer, node as Integer returns Integer:
     Note: Translate array type to HIR
 
@@ -980,6 +1287,17 @@ Process called "translate_array_type" takes context as Integer, node as Integer 
     Return hir
 End Process
 
+@Reasoning:
+`T?` in C# represents either Nullable<T> for value types or a nullable
+reference type, depending on T's category. The HIR preserves this as a
+wrapper around the underlying T so downstream lowering can choose the
+right runtime representation per category.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_nullable_type". Child 0 translates to HIR key
+"underlying_type". Returns the dict.
+@End Implementation
 Process called "translate_nullable_type" takes context as Integer, node as Integer returns Integer:
     Note: Translate nullable type to HIR
 
@@ -1002,6 +1320,19 @@ Note: ==========================================================================
 Note: Statement Translation
 Note: ============================================================================
 
+@Reasoning:
+A `{ ... }` block is a statement container with no semantics beyond
+sequencing and scoping its children. HIR encodes it uniformly as a
+statements list so downstream optimization passes can iterate without
+caring whether a block came from a method body, an if-then arm, or a
+nested compound block.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_block". Iterates children via translate_node and
+appends non-null translations to a statements list stored at HIR key
+"statements". Returns the dict.
+@End Implementation
 Process called "translate_block" takes context as Integer, node as Integer returns Integer:
     Note: Translate block statement to HIR
 
@@ -1028,6 +1359,18 @@ Process called "translate_block" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
+@Reasoning:
+If statements take three positional children: condition (0), then-branch
+(1), and optional else-branch (2). Encoding them by position rather than
+named children matches the parser's output shape exactly and lets a
+missing else degrade to a missing HIR key.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_if". Translates child 0 into "condition", child 1
+into "then_branch", and (when child_count > 2) child 2 into
+"else_branch". Returns the dict.
+@End Implementation
 Process called "translate_if_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate if statement to HIR
 
@@ -1057,6 +1400,19 @@ Process called "translate_if_statement" takes context as Integer, node as Intege
     Return hir
 End Process
 
+@Reasoning:
+A C# for loop has four positional pieces: initializer, condition,
+increment, body. Each piece can be missing (`for(;;)`), and the HIR
+preserves that flexibility by only setting the corresponding HIR key
+when the child exists.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_for". For each of the four children in order,
+translates into HIR keys "initializer", "condition", "increment",
+"body" when child_count is strictly greater than the index. Returns
+the dict.
+@End Implementation
 Process called "translate_for_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate for statement to HIR
 
@@ -1092,6 +1448,19 @@ Process called "translate_for_statement" takes context as Integer, node as Integ
     Return hir
 End Process
 
+@Reasoning:
+foreach captures the iteration variable name on the node itself (since
+it is a single identifier defined inline) and the type, collection, and
+body as positional children. The HIR mirrors all four pieces so the
+backend can emit IEnumerator-driven iteration with the correct
+variable type.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_foreach". Reads node name into HIR "variable".
+Translates child 0 into "type", child 1 into "collection", child 2
+into "body" when each exists. Returns the dict.
+@End Implementation
 Process called "translate_foreach_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate foreach statement to HIR
 
@@ -1126,6 +1495,16 @@ Process called "translate_foreach_statement" takes context as Integer, node as I
     Return hir
 End Process
 
+@Reasoning:
+A C# while loop is condition-then-body. Encoded with positional
+children to keep the shape uniform with for/do-while and avoid a
+separate condition-vs-body shape per loop kind.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_while". Translates child 0 into "condition" and,
+if child_count > 1, child 1 into "body". Returns the dict.
+@End Implementation
 Process called "translate_while_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate while statement to HIR
 
@@ -1149,6 +1528,17 @@ Process called "translate_while_statement" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+do-while inverts the child order compared to while: body comes first
+(child 0), condition second (child 1), because that matches the source
+ordering and lets the parser emit both loop kinds with the same number
+of children but distinct semantics encoded by _type and key naming.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_do_while". Translates child 0 into "body" and, if
+child_count > 1, child 1 into "condition". Returns the dict.
+@End Implementation
 Process called "translate_do_while_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate do-while statement to HIR
 
@@ -1172,6 +1562,19 @@ Process called "translate_do_while_statement" takes context as Integer, node as 
     Return hir
 End Process
 
+@Reasoning:
+A switch consists of the discriminant expression followed by an
+arbitrary number of case-arms. Child 0 is always the discriminant;
+children 1..N-1 are case nodes that the dispatcher will eventually
+recurse into. Storing the cases as a list keeps the count flexible.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_switch". Translates child 0 into HIR
+"expression". For each child from index 1 to child_count-1, recursively
+translates and appends non-null results to a cases list, stored at HIR
+"cases". Returns the dict.
+@End Implementation
 Process called "translate_switch_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate switch statement to HIR
 
@@ -1205,6 +1608,24 @@ Process called "translate_switch_statement" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+A try block followed by zero-or-more catch clauses and an optional
+finally block. The parser flattens all of them into the children of one
+node and tags each clause's kind, so this translator does two passes:
+the first gathers CSHARP_CATCH_CLAUSE children into a list, the second
+finds the (at most one) CSHARP_FINALLY_CLAUSE and stops at the first
+match. Two passes are clearer than one pass with conditional list
+assembly and break.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_try". Child 0 translates to "try_block". First
+pass over children 1..N: nodes whose type equals CSHARP_CATCH_CLAUSE
+are translated and appended to catches; stored at "catch_clauses" if
+the list is non-empty. Second pass over children 1..N: the first node
+whose type equals CSHARP_FINALLY_CLAUSE is translated, stored at
+"finally_block", and the loop breaks. Returns the dict.
+@End Implementation
 Process called "translate_try_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate try-catch-finally statement to HIR
 
@@ -1261,6 +1682,17 @@ Process called "translate_try_statement" takes context as Integer, node as Integ
     Return hir
 End Process
 
+@Reasoning:
+`return;` and `return expr;` differ only in whether an expression
+child is present. Missing expression maps to a missing HIR
+"expression" key so the consumer can distinguish void-return from
+value-return purely by key presence.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_return". If child_count > 0, translates child 0
+into HIR "expression". Returns the dict.
+@End Implementation
 Process called "translate_return_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate return statement to HIR
 
@@ -1278,6 +1710,15 @@ Process called "translate_return_statement" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+`break` is purely a control-flow marker - no expression, no children
+required - so the HIR is just the tagged dict and the consumer
+interprets it as "exit innermost loop or switch".
+@End Reasoning
+
+@Implementation:
+Returns a dict whose only field is _type = "csharp_break".
+@End Implementation
 Process called "translate_break_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate break statement to HIR
 
@@ -1287,6 +1728,14 @@ Process called "translate_break_statement" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+`continue` mirrors break: a tag-only control-flow marker that the
+backend lowers to a jump-to-loop-condition. No children needed.
+@End Reasoning
+
+@Implementation:
+Returns a dict whose only field is _type = "csharp_continue".
+@End Implementation
 Process called "translate_continue_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate continue statement to HIR
 
@@ -1296,6 +1745,17 @@ Process called "translate_continue_statement" takes context as Integer, node as 
     Return hir
 End Process
 
+@Reasoning:
+`throw expr;` carries the exception expression as child 0; `throw;`
+(rethrow inside catch) has no children. Missing expression maps to a
+missing HIR key so the backend can pick the rethrow code path
+positively.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_throw". If child_count > 0, translates child 0
+into HIR "expression". Returns the dict.
+@End Implementation
 Process called "translate_throw_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate throw statement to HIR
 
@@ -1313,6 +1773,24 @@ Process called "translate_throw_statement" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+`lock(expr) body` acquires a monitor on expr around body. Two
+positional children: the lock target (child 0) and the body (child 1).
+This is the only C# statement that pairs a synchronization primitive
+with a body, so it gets its own _type rather than being lowered to a
+try/finally with Monitor.Enter/Exit at this level.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_lock". Translates child 0 into HIR "expression",
+and (when child_count > 1) child 1 into HIR "body". Returns the dict.
+@End Implementation
+
+@Security_Scope:
+The lock expression is preserved verbatim from the source AST. The
+parser is responsible for refusing constants or null as lock targets;
+this translator does not add a runtime check.
+@End Security_Scope
 Process called "translate_lock_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate lock statement to HIR
 
@@ -1336,6 +1814,18 @@ Process called "translate_lock_statement" takes context as Integer, node as Inte
     Return hir
 End Process
 
+@Reasoning:
+An expression statement is just an expression evaluated for its side
+effects (e.g. a method call, assignment, or ++/-- operation in
+statement position). Wrapping it in a dedicated HIR kind preserves the
+distinction between a statement-context expression and a value-context
+expression so the backend can drop the result correctly.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_expression_statement". If child_count > 0,
+translates child 0 into HIR "expression". Returns the dict.
+@End Implementation
 Process called "translate_expression_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate expression statement to HIR
 
@@ -1353,6 +1843,19 @@ Process called "translate_expression_statement" takes context as Integer, node a
     Return hir
 End Process
 
+@Reasoning:
+A local variable declaration carries the name on the node itself and
+the type and optional initializer as positional children. Encoding the
+initializer as a separate child (rather than inline in the declaration
+expression) keeps the HIR consistent with field declarations, which
+share the same shape.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_var_declaration". Reads node name into HIR "name".
+Translates child 0 into "type" if present and (when child_count > 1)
+child 1 into "initializer". Returns the dict.
+@End Implementation
 Process called "translate_var_declaration" takes context as Integer, node as Integer returns Integer:
     Note: Translate variable declaration to HIR
 
@@ -1385,6 +1888,19 @@ Note: ==========================================================================
 Note: Expression Translation
 Note: ============================================================================
 
+@Reasoning:
+The C# parser produces one binary-expression node kind for all
+operators (+, -, &&, ==, etc.) with the operator carried as an
+attribute. This keeps the AST shallow and lets the HIR mirror that
+shape: one _type plus an operator string plus two children. Backends
+that want operator-specific behavior key off the "operator" HIR field.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_binary_expr". Reads "operator" attribute and stores
+at HIR "operator". Translates child 0 into "left", child 1 into
+"right" when present. Returns the dict.
+@End Implementation
 Process called "translate_binary_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate binary expression to HIR
 
@@ -1413,6 +1929,18 @@ Process called "translate_binary_expression" takes context as Integer, node as I
     Return hir
 End Process
 
+@Reasoning:
+Unary operators (`-x`, `!x`, `~x`, `++x`, `--x`, `x++`, `x--`) all
+share the same single-operand shape. The operator string distinguishes
+them; postfix vs prefix increment/decrement is encoded in the operator
+attribute by the parser (e.g. "post_++" vs "pre_++").
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_unary_expr". Reads "operator" attribute into HIR
+"operator". Translates child 0 into HIR "operand" when present.
+Returns the dict.
+@End Implementation
 Process called "translate_unary_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate unary expression to HIR
 
@@ -1435,6 +1963,20 @@ Process called "translate_unary_expression" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+Assignment expressions (`x = y`, `x += y`, `x ??= y`, etc.) are
+distinguished from binary expressions because C# treats them as
+right-associative and they require an lvalue on the left. The compound
+assignment operator is preserved on the HIR via the "operator" string
+so lowering passes can expand `x += y` into `x = x + y` correctly.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_assignment". Reads "operator" attribute (e.g.
+"=", "+=", "-=") into HIR "operator". Translates child 0 (the
+lvalue) into "target", child 1 (the rvalue) into "value". Returns the
+dict.
+@End Implementation
 Process called "translate_assignment_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate assignment expression to HIR
 
@@ -1463,6 +2005,18 @@ Process called "translate_assignment_expression" takes context as Integer, node 
     Return hir
 End Process
 
+@Reasoning:
+A method or delegate call has a callee (first child) and zero or more
+arguments (subsequent children). Encoding by position avoids needing a
+separate argument-list node from the parser.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_call". Translates child 0 into HIR "callee".
+Iterates children 1..(child_count-1), translates each and appends
+non-null results to arguments, stored at HIR "arguments". Returns the
+dict.
+@End Implementation
 Process called "translate_call_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate call expression to HIR
 
@@ -1496,6 +2050,18 @@ Process called "translate_call_expression" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+`obj.member` access encodes the member name on the node (it's an
+identifier already resolved by the parser) and the receiver object as
+child 0. The HIR mirrors that: "member" string field plus "object"
+HIR value.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_member_access". Reads node name into HIR
+"member". Translates child 0 into HIR "object" when present.
+Returns the dict.
+@End Implementation
 Process called "translate_member_access_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate member access expression to HIR
 
@@ -1518,6 +2084,16 @@ Process called "translate_member_access_expression" takes context as Integer, no
     Return hir
 End Process
 
+@Reasoning:
+`obj[index]` shares the receiver-then-key shape with member access but
+the key is an expression (the index) rather than a static name, so it
+gets its own _type with two HIR-valued positional pieces.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_index". Translates child 0 into HIR "object",
+child 1 into HIR "index" when present. Returns the dict.
+@End Implementation
 Process called "translate_index_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate index expression to HIR
 
@@ -1541,6 +2117,20 @@ Process called "translate_index_expression" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+`new Foo(args)` allocates an instance and invokes its constructor. The
+first child is the type to construct; the remaining children are
+constructor arguments. Same positional shape as a call but with type
+instead of callee at position 0 - the distinct _type lets backends
+emit allocation followed by constructor invocation rather than a plain
+call.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_new". Translates child 0 into HIR "type".
+Iterates children 1..(child_count-1) translating each into the
+arguments list, stored at HIR "arguments". Returns the dict.
+@End Implementation
 Process called "translate_new_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate new expression to HIR
 
@@ -1574,6 +2164,19 @@ Process called "translate_new_expression" takes context as Integer, node as Inte
     Return hir
 End Process
 
+@Reasoning:
+Lambdas have an arbitrary number of parameters followed by exactly one
+body expression. The parser keeps them in one flat children list with
+the body always last; this translator splits at child_count - 1 so it
+doesn't need a separate parameter-count attribute.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_lambda". body_index = child_count - 1. Iterates
+children 0..body_index-1 translating into the parameters list (stored
+at HIR "parameters"). When child_count > 0 translates child
+[body_index] into HIR "body". Returns the dict.
+@End Implementation
 Process called "translate_lambda_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate lambda expression to HIR
 
@@ -1607,6 +2210,18 @@ Process called "translate_lambda_expression" takes context as Integer, node as I
     Return hir
 End Process
 
+@Reasoning:
+The ternary `cond ? then : else` has three positional pieces. Encoding
+them as separate HIR keys (rather than two children of an if-like
+shape) preserves the expression nature and lets backends emit it as a
+select instruction rather than a control-flow if.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_conditional". Translates child 0 into "condition",
+child 1 into "true_expression", child 2 into "false_expression" when
+each is present. Returns the dict.
+@End Implementation
 Process called "translate_conditional_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate conditional (ternary) expression to HIR
 
@@ -1636,6 +2251,17 @@ Process called "translate_conditional_expression" takes context as Integer, node
     Return hir
 End Process
 
+@Reasoning:
+`await expr` wraps a single expression and signals a suspension point
+in the async state machine. A dedicated _type lets the backend (or a
+later lowering pass) rewrite the surrounding method into a state
+machine while leaving the operand expression unchanged.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_await". If child_count > 0, translates child 0
+into HIR "expression". Returns the dict.
+@End Implementation
 Process called "translate_await_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate await expression to HIR
 
@@ -1653,6 +2279,16 @@ Process called "translate_await_expression" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+A bare identifier (variable reference, member-name fragment, etc.)
+needs only its name preserved. Name-resolution to a specific binding
+happens in a later semantic pass, not here.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_identifier" with the node's name stored at HIR
+"name". Returns the dict.
+@End Implementation
 Process called "translate_identifier" takes context as Integer, node as Integer returns Integer:
     Note: Translate identifier to HIR
 
@@ -1667,6 +2303,19 @@ Process called "translate_identifier" takes context as Integer, node as Integer 
     Return hir
 End Process
 
+@Reasoning:
+Literals carry their textual value plus a category tag (int, long,
+float, double, string, char, bool, null). The textual form is kept as
+emitted by the parser so suffixes (`123L`, `4.5f`, `0xff`) survive
+round-trip; the literal_type discriminator lets the backend select the
+right runtime representation.
+@End Reasoning
+
+@Implementation:
+Dict tagged "csharp_literal". Reads node name as the literal text into
+HIR "value". Reads "literal_type" attribute; when non-zero stores it
+at HIR "literal_type". Returns the dict.
+@End Implementation
 Process called "translate_literal" takes context as Integer, node as Integer returns Integer:
     Note: Translate literal to HIR
 

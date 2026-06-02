@@ -140,6 +140,29 @@ Note: ==========================================================================
 Note: F# Parser State and Structure
 Note: ============================================================================
 
+@Reasoning:
+F# parsing is more involved than a typical LL(1) parser because the
+language is layout-sensitive (indentation matters inside modules and
+type bodies) and produces a large AST. The parser carries an arena
+allocator so AST nodes can be bulk-released after parsing without
+walking the tree to free individual nodes. indent_level is tracked
+separately from position so layout-sensitive productions can compare
+the current token's column against the enclosing block's indent.
+@End Reasoning
+
+@Implementation:
+64-byte record laid out as:
+- tokens @0 - List of token integers from the lexer
+- position @8 - Index into the tokens list
+- current_token @16 - Cached token at position (refreshed by
+  advance_token)
+- token_count @24 - Length of tokens list, captured at construction
+- error_message @32 - Pointer to error message string (or 0)
+- has_error @40 - Sticky 1 on first parse error
+- indent_level @48 - Tracks the current indentation column
+- arena @56 - Arena for AST node allocations, released by
+  destroy_fsharp_parser
+@End Implementation
 Type called "FSharpParser":
     tokens as Integer           Note: List of tokens from lexer
     position as Integer         Note: Current position in token list
@@ -155,6 +178,28 @@ Note: ==========================================================================
 Note: Parser Creation and Management
 Note: ============================================================================
 
+@Reasoning:
+F# is layout-sensitive (indentation matters for let/in, match arms,
+record fields, etc.) so the parser must thread an indent_level
+counter alongside the conventional position cursor. Caching the current
+token in the struct (offset 16) makes the inner loop avoid a second
+list_get when only the type is needed to make a continuation decision.
+The arena pinned to the parser owns every AST node allocated during
+this parse so the whole subtree can be released in a single O(1)
+destroy_arena call, regardless of how deep the program nests.
+@End Reasoning
+
+@Implementation:
+Allocates a 64-byte FSharpParser struct (8 fields x 8 bytes). On
+allocation failure returns 0 so callers see the same handle pattern as
+the rest of the system. Writes token_list at offset 0, zeros position
+(8), reads list_length once into offset 24, and pre-loads the first
+token into offset 16 when count > 0 (otherwise leaves it 0). The
+error_message (32), has_error (40), and indent_level (48) slots are
+zeroed, then a fresh Layout arena is created and stored at offset 56.
+The arena is the AST-node owner; the token_list pointer at offset 0 is
+borrowed - the lexer keeps ownership of it.
+@End Implementation
 Process called "create_fsharp_parser" takes token_list as Integer returns Integer:
     Note: Create F# parser instance
 
@@ -195,6 +240,18 @@ Process called "create_fsharp_parser" takes token_list as Integer returns Intege
     Return parser
 End Process
 
+@Reasoning:
+Releases both the AST-node arena and the parser record itself. The
+arena release is what frees every AST node in O(1) regardless of tree
+depth - that's the entire reason the parser uses an arena rather than
+per-node Layout.allocate.
+@End Reasoning
+
+@Implementation:
+Returns 1 immediately on null parser. Reads arena at offset 56; if
+non-zero calls destroy_arena to release every node allocated through
+arena_allocate. Deallocates the parser record itself. Returns 1.
+@End Implementation
 Process called "destroy_fsharp_parser" takes parser as Integer returns Integer:
     Note: Destroy F# parser and free resources
 
@@ -215,12 +272,36 @@ Note: ==========================================================================
 Note: Token Access and Navigation
 Note: ============================================================================
 
+@Reasoning:
+Returns the parser's cached lookahead token. Cached (rather than
+re-reading from the list each call) because every grammar production
+checks current_token at least once, often several times in the same
+helper.
+@End Reasoning
+
+@Implementation:
+Reads parser offset 16 (current_token) and returns it directly.
+@End Implementation
 Process called "current_token" takes parser as Integer returns Integer:
     Note: Get current token
 
     Return proc memory_get_int64 from Layout with parser, 16
 End Process
 
+@Reasoning:
+Multi-step lookahead used by productions that need to distinguish
+ambiguous forms (e.g. `()` unit value vs `(expr)` parenthesised
+expression both start with `(`). Returns 0 when peeking past the end
+so callers can compare against any expected token without first
+checking bounds.
+@End Reasoning
+
+@Implementation:
+Reads position (offset 8), token_count (offset 24). Computes peek_pos
+= position + offset. If peek_pos >= token_count, returns 0 (EOF
+sentinel). Otherwise reads tokens (offset 0) as a list and returns
+list_get(tokens, peek_pos).
+@End Implementation
 Process called "peek_token" takes parser as Integer, offset as Integer returns Integer:
     Note: Peek token at offset from current position
 
@@ -236,6 +317,20 @@ Process called "peek_token" takes parser as Integer, offset as Integer returns I
     Return proc list_get from List with tokens, peek_pos
 End Process
 
+@Reasoning:
+Consumes one token by incrementing position and refreshing the cached
+current_token slot. Setting current_token to 0 past EOF lets
+productions terminate on null-token tests rather than needing a
+separate at_eof helper.
+@End Reasoning
+
+@Implementation:
+Reads position and token_count. If position >= token_count returns 0
+(already at EOF, no-op). Otherwise increments position by 1 and
+stores it back. If the new position is still within bounds, reads
+tokens[position] and caches it at offset 16. Otherwise zeros offset
+16. Returns 1.
+@End Implementation
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -261,6 +356,18 @@ Process called "advance_token" takes parser as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Implements the "this token MUST be present" contract for mandatory
+keywords (e.g. `then` after `if cond`). On mismatch sets the sticky
+error flag and returns 0 so the rest of the parse continues building
+a partial tree the caller can still inspect for diagnostics.
+@End Reasoning
+
+@Implementation:
+Reads current_token. If equal to expected_token advances and returns
+1. Otherwise calls set_parse_error with a generic "Unexpected token"
+message and returns 0.
+@End Implementation
 Process called "consume_token" takes parser as Integer, expected_token as Integer returns Integer:
     Note: Consume expected token or report error
 
@@ -279,6 +386,23 @@ Note: ==========================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Every AST node has the same fixed 48-byte layout and is arena-
+allocated so creation is essentially a pointer bump. Zero-
+initializing every field at construction means consumers can rely on
+0 to mean "absent" for value, children, parent, and metadata without
+needing extra null checks at field set points.
+@End Reasoning
+
+@Implementation:
+Reads arena from parser offset 56. Allocates 48 bytes via
+arena_allocate. Returns 0 on allocation failure. Zeros all six
+fields:
+- node_type @0 (set to the provided type)
+- value @8, children @16, child_count @24, parent @32, metadata @40
+  (all zero).
+Returns the node pointer.
+@End Implementation
 Process called "create_ast_node" takes parser as Integer, node_type as Integer returns Integer:
     Note: Create AST node with specified type
 
@@ -300,6 +424,24 @@ Process called "create_ast_node" takes parser as Integer, node_type as Integer r
     Return node
 End Process
 
+@Reasoning:
+Children are stored in a fixed-size array allocated lazily on first
+add. The current implementation allocates an 8-slot array (64 bytes)
+on demand and never grows it - this is sufficient for every F#
+production in the parser but it does mean nodes with more than eight
+children would silently truncate. The parser only constructs such
+arrays for the productions that actually need them, keeping the
+common-case overhead at zero.
+@End Reasoning
+
+@Implementation:
+Returns 0 if parent or child is 0. Reads children pointer at parent
+offset 16 and child_count at offset 24. If children is 0, allocates
+an 8*8 byte array via Layout.allocate (start with 8 slots) and
+stores the pointer at offset 16. Writes child at children +
+child_count*8. Sets child's parent backpointer at child offset 32 to
+parent. Updates parent's child_count to child_count + 1. Returns 1.
+@End Implementation
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Note: Add child node to parent AST node
 
@@ -336,6 +478,16 @@ Process called "add_child" takes parent as Integer, child as Integer returns Int
     Return 1
 End Process
 
+@Reasoning:
+Null-safe value setter so productions that conditionally store a
+value (e.g. variable patterns whose identifier token is the value)
+don't need to null-check first.
+@End Reasoning
+
+@Implementation:
+Returns 0 if node is 0. Otherwise stores value at node offset 8.
+Returns 1.
+@End Implementation
 Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
     Note: Set value of AST node
 
@@ -351,6 +503,18 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Records the first parse error and sets a sticky flag so subsequent
+productions can short-circuit. We don't overwrite an already-set
+error message in this implementation because the first error is
+typically the most useful, but the sticky flag is what callers
+actually test.
+@End Reasoning
+
+@Implementation:
+Stores message at parser offset 32 (error_message) and writes 1 to
+offset 40 (has_error). Returns 1.
+@End Implementation
 Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
     Note: Set parse error message
 
@@ -359,6 +523,16 @@ Process called "set_parse_error" takes parser as Integer, message as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+Returns the sticky error flag for callers that need to abort
+post-hoc (e.g. parse_fsharp_source destroys the parser and returns 0
+if any error was raised during parsing).
+@End Reasoning
+
+@Implementation:
+Returns the integer at parser offset 40 (has_error). 0 means no
+error; 1 means at least one set_parse_error call was made.
+@End Implementation
 Process called "has_parse_error" takes parser as Integer returns Integer:
     Note: Check if parser has error
 
@@ -492,6 +666,28 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Return 0
 End Process
 
+@Reasoning:
+Application sits between primary expressions and the operator precedence
+ladder. Because juxtaposition is the highest-precedence operator after
+field/index access, this layer iterates greedily over primaries until it
+hits a token that cannot start a new argument - the seven terminators
+chosen (TOKEN_PIPE_RIGHT/LEFT, TOKEN_SEMICOLON, the three right brackets,
+TOKEN_EOF) are exactly the tokens that mark a precedence-level boundary,
+a sequence point, or end-of-input. Building application nodes one
+argument at a time keeps the tree left-associative without recursion.
+@End Reasoning
+
+@Implementation:
+Parses one primary into expr as the seed. Enters an infinite While 1
+loop: reads current_token, breaks on any of the seven terminator tokens.
+Otherwise calls parse_primary_expression for the next argument; if that
+returns 0 (no primary at the cursor) also breaks. Allocates a new
+AST_APPLICATION node via the parser's arena, adds expr as the left
+child and arg as the right child, then assigns the new node back to
+expr so the next iteration applies on top of it. Returns whatever expr
+ended up as - a single primary if no arguments followed, or a left-
+nested application tree of arbitrary depth.
+@End Implementation
 Process called "parse_application_expression" takes parser as Integer returns Integer:
     Note: Parse function application with proper left-associativity
 
@@ -544,6 +740,30 @@ Process called "parse_application_expression" takes parser as Integer returns In
     Return expr
 End Process
 
+@Reasoning:
+The pipeline layer sits one level below parse_expression's keyword
+dispatch and one level above parse_application_expression. Both pipeline
+forms (forward `|>` and back `<|`) are exposed as AST_PIPE_EXPRESSION
+nodes with the operator token stored as the node's value so a later
+HIR pass can distinguish them without re-tokenising. Threading the
+right-hand `<|` arm through parse_pipeline_expression (recursive) gives
+right-associativity, while threading the right-hand `|>` arm through
+parse_application_expression (non-recursive) keeps `|>` left-associative
+as the F# spec requires.
+@End Reasoning
+
+@Implementation:
+Parses one application expression as the seed (expr). In a While 1
+loop, reads current_token. If TOKEN_PIPE_RIGHT (|>): advances, parses
+another application expression as right_expr (non-recursive, so the
+chain accumulates left-associatively), allocates AST_PIPE_EXPRESSION,
+attaches expr/right_expr as children, sets the node value to
+TOKEN_PIPE_RIGHT, and reassigns expr. If TOKEN_PIPE_LEFT (<|): advances,
+recursively calls parse_pipeline_expression for the RHS (so `<|`
+right-associates), builds the same node shape with TOKEN_PIPE_LEFT as
+the value, and reassigns expr. Any other token breaks the loop and the
+accumulated expr is returned to the caller.
+@End Implementation
 Process called "parse_pipeline_expression" takes parser as Integer returns Integer:
     Note: Parse pipeline expressions with |> and <| operators
 
@@ -590,6 +810,28 @@ Process called "parse_pipeline_expression" takes parser as Integer returns Integ
     Return expr
 End Process
 
+@Reasoning:
+Top-level expression dispatcher. Keyword-led expressions (`fun`,
+`let`, `match`, `if`, `try`, `while`, `for`, `function`) each have
+their own production; everything else falls through to
+parse_pipeline_expression which handles the precedence ladder. The
+order of tests matches F# operator precedence at the keyword-prefix
+level - none of the keywords overlap so a flat sequence is correct.
+@End Reasoning
+
+@Implementation:
+Reads current_token. Dispatches:
+- TOKEN_FUN -> parse_lambda_expression
+- TOKEN_LET -> parse_let_expression
+- TOKEN_MATCH -> parse_match_expression
+- TOKEN_IF -> parse_if_expression
+- TOKEN_TRY -> parse_try_expression
+- TOKEN_WHILE -> parse_while_expression
+- TOKEN_FOR -> parse_for_expression
+- TOKEN_FUNCTION -> parse_function_expression
+- otherwise: parse_pipeline_expression (handles `|>` chains and
+  underlying operator precedence).
+@End Implementation
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse general F# expression
 
@@ -643,6 +885,38 @@ Note: ==========================================================================
 Note: F# Pattern Parsing
 Note: ============================================================================
 
+@Reasoning:
+F# patterns appear in three positions (match arms, fun parameters, let
+bindings) and share one grammar with eleven shape variants: wildcards,
+variables (with optional `as`-aliases), literals across four kinds,
+tuples, lists, arrays, records, constructor applications. Dispatching
+all of them through one entry point keeps the recursive cases (tuples
+nest patterns, constructor args nest patterns, etc.) self-routing. The
+explicit token-by-token dispatch is preferred over a tag map because
+the relative ordering of the tests is itself the disambiguation - e.g.
+TOKEN_TYPE_NAME must be checked after the literal branches so that
+constructor names do not accidentally match a literal token shape.
+@End Reasoning
+
+@Implementation:
+Reads current_token. Dispatches by token:
+- TOKEN_UNDERSCORE -> AST_PATTERN_WILDCARD, advance, return.
+- TOKEN_IDENTIFIER -> AST_PATTERN_VARIABLE storing the identifier as
+  the node value. Then peeks for TOKEN_AS; if present builds an
+  AST_PATTERN_AS with the original variable as first child and the
+  aliasing identifier as second child.
+- TOKEN_INTEGER/STRING/TRUE/FALSE -> AST_PATTERN_LITERAL with the token
+  stored as the value.
+- TOKEN_LEFT_PAREN -> tuple: builds AST_PATTERN_TUPLE, parses first
+  inner pattern, then loops adding patterns while TOKEN_COMMA is seen,
+  consumes TOKEN_RIGHT_PAREN.
+- TOKEN_LEFT_BRACKET / TOKEN_LEFT_ARRAY / TOKEN_LEFT_BRACE -> delegates
+  to parse_list_pattern, parse_array_pattern, parse_record_pattern.
+- TOKEN_TYPE_NAME -> AST_PATTERN_CONSTRUCTOR storing the type-name
+  token; if followed by `(` parses a comma-separated arg pattern list
+  and consumes the matching `)`.
+- Any other token -> set_parse_error("Expected pattern") and return 0.
+@End Implementation
 Process called "parse_pattern" takes parser as Integer returns Integer:
     Note: Parse F# patterns for match expressions and function parameters
 
@@ -791,6 +1065,19 @@ Process called "parse_pattern" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+F# match arms allow a `when` guard expression after the pattern.
+This helper checks for `when` after a plain pattern and, if present,
+wraps both into an AST_PATTERN_GUARD node so the consumer always
+sees one piece per case regardless of guard presence.
+@End Reasoning
+
+@Implementation:
+Calls parse_pattern. If the next token is TOKEN_WHEN, consumes it,
+parses an expression for the guard, builds an AST_PATTERN_GUARD with
+the pattern as child 0 and the guard expression as child 1, and
+returns that node. Otherwise returns the bare pattern.
+@End Implementation
 Process called "parse_pattern_with_guard" takes parser as Integer returns Integer:
     Note: Parse pattern with optional when guard
 
@@ -817,6 +1104,24 @@ Note: ==========================================================================
 Note: F# Specific Expression Parsing
 Note: ============================================================================
 
+@Reasoning:
+F# lambdas use `fun p1 p2 ... -> body` with one or more parameters,
+each parsed as a pattern (so destructuring lambdas like
+`fun (x, y) -> x + y` work). The body comes after `->` and is a
+single expression - multi-statement bodies are achieved by sequencing
+expressions inside the body recursively.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_FUN, creates AST_LAMBDA. Parameter loop: parses
+patterns and adds them as children until TOKEN_ARROW is seen. The
+loop has two TOKEN_ARROW tests (top of loop and after parse_pattern)
+so the arrow can break the loop regardless of where it appears.
+Consumes TOKEN_ARROW. Parses the body via parse_expression and
+appends it as the final child. Returns the lambda node. The body is
+distinguished from parameters by position: it's always the last child
+because every prior child was a pattern parsed before the arrow.
+@End Implementation
 Process called "parse_lambda_expression" takes parser as Integer returns Integer:
     Note: Parse lambda expression (fun parameters -> body)
 
@@ -849,6 +1154,29 @@ Process called "parse_lambda_expression" takes parser as Integer returns Integer
     Return lambda_node
 End Process
 
+@Reasoning:
+`match expr with | p1 -> e1 | p2 -> e2 ...` is encoded as an
+AST_MATCH_EXPRESSION whose first child is the scrutinee expression
+and remaining children are case-nodes (each an AST_PATTERN_GUARD
+holding the pattern and its arm expression). Reusing
+AST_PATTERN_GUARD as the case-container is intentional: it already
+carries the pattern + expression pair, so no dedicated case node is
+needed even when no `when` guard is present.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_MATCH. Creates AST_MATCH_EXPRESSION. Parses the
+scrutinee via parse_expression and appends. Consumes TOKEN_WITH.
+Case loop:
+- Optional leading TOKEN_PIPE is consumed if present so both
+  `match x with A -> ...` and `match x with | A -> ...` parse.
+- Parses a pattern-with-guard, consumes TOKEN_ARROW, parses the
+  result expression.
+- Creates an AST_PATTERN_GUARD with the pattern and result as
+  children, appends to the match node.
+- Continues while the next token is TOKEN_PIPE; breaks otherwise.
+Returns the match node.
+@End Implementation
 Process called "parse_match_expression" takes parser as Integer returns Integer:
     Note: Parse match expression (match expr with cases)
 
@@ -894,6 +1222,22 @@ Process called "parse_match_expression" takes parser as Integer returns Integer:
     Return match_node
 End Process
 
+@Reasoning:
+F# `if/then/else/elif` is an expression (not a statement) so every
+branch produces a value. The AST stores condition, then-branch,
+then optional else-branch as children. `elif` is handled by
+recursively parsing another if-expression and attaching it as a
+child after the then-branch.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_IF. Creates AST_IF_EXPRESSION. Parses condition,
+appends. Consumes TOKEN_THEN. Parses then expression, appends. Reads
+current_token once into `current`; if TOKEN_ELSE, advances and parses
+the else expression, appends. If current is TOKEN_ELIF (note: this
+check uses the same captured `current`), recursively calls
+parse_if_expression and appends the result. Returns the if node.
+@End Implementation
 Process called "parse_if_expression" takes parser as Integer returns Integer:
     Note: Parse if-then-else expression
 
@@ -927,6 +1271,21 @@ Process called "parse_if_expression" takes parser as Integer returns Integer:
     Return if_node
 End Process
 
+@Reasoning:
+F# let-expressions combine one primary binding with zero or more
+sibling bindings (each introduced by `and`), and optionally an `in
+expr` clause. The `and`-chain supports mutually recursive function
+definitions; the trailing `in` is required when the let appears in
+an expression context but optional in module-level let bindings.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LET. Creates AST_LET_EXPRESSION. Parses the first
+let-binding via parse_let_binding and appends. Loop while current
+token is TOKEN_AND: advances, parses another binding, appends.
+Reads current; if TOKEN_IN, advances and parses the trailing
+expression via parse_expression, appends. Returns the let node.
+@End Implementation
 Process called "parse_let_expression" takes parser as Integer returns Integer:
     Note: Parse let expression (let bindings in expr)
 
@@ -961,6 +1320,29 @@ Process called "parse_let_expression" takes parser as Integer returns Integer:
     Return let_node
 End Process
 
+@Reasoning:
+F# `try ... with | pat -> ... finally ...` allows both exception
+handling (via `with` patterns, like match) and an optional `finally`
+cleanup block. The AST stores try-body first, then alternating
+pattern-guarded handler children (one per match arm), then optionally
+the finally expression at the end. Handler arms use AST_PATTERN_GUARD
+shapes for the same uniform reason as match arms.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_TRY, creates AST_TRY_EXPRESSION, parses the try body
+and appends. Outer loop reads current_token; if TOKEN_WITH, advances
+and runs an inner loop:
+- consume optional TOKEN_PIPE
+- parse pattern-with-guard
+- consume TOKEN_ARROW
+- parse handler expression
+- build AST_PATTERN_GUARD(pattern, handler), append to try node
+- continue inner loop only while next token is TOKEN_PIPE.
+Outer loop otherwise breaks. Reads current; if TOKEN_FINALLY,
+advances and parses the finally expression, appends. Returns the
+try node.
+@End Implementation
 Process called "parse_try_expression" takes parser as Integer returns Integer:
     Note: Parse try-catch-finally expression
 
@@ -1019,6 +1401,22 @@ Note: ==========================================================================
 Note: F# Declaration Parsing
 Note: ============================================================================
 
+@Reasoning:
+A let-binding consists of an optional `rec` keyword, a pattern (which
+for function definitions includes the function name and parameters
+as a curried pattern), an `=`, and an expression. The `rec` flag is
+stored in the node's value slot using TOKEN_REC as a sentinel so the
+node itself can be self-describing rather than needing a sibling
+flag.
+@End Reasoning
+
+@Implementation:
+Creates AST_LET_BINDING. Reads current; if TOKEN_REC, advances and
+stores TOKEN_REC as the binding node's value via set_node_value.
+Parses pattern via parse_pattern and appends. Consumes TOKEN_EQUAL.
+Parses expression via parse_expression and appends. Returns the
+binding node.
+@End Implementation
 Process called "parse_let_binding" takes parser as Integer returns Integer:
     Note: Parse let binding (let pattern = expression)
 
@@ -1044,6 +1442,25 @@ Process called "parse_let_binding" takes parser as Integer returns Integer:
     Return binding_node
 End Process
 
+@Reasoning:
+F# type declarations have four kinds (record, discriminated union,
+class, interface) plus a type-abbreviation form, all introduced by
+`type Name = ...`. The lookahead after `=` disambiguates which kind
+based on the first token: `{` -> record, `|` -> union, `class` ->
+class, `interface` -> interface, anything else -> abbreviation. This
+makes the dispatch decision purely LL(1).
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_TYPE. Creates AST_TYPE_DECLARATION. Reads the type
+name from the current token, stores it as the node value, advances.
+Consumes TOKEN_EQUAL. Reads current_token; if TOKEN_LEFT_BRACE
+dispatches to parse_record_type, if TOKEN_PIPE to parse_union_type,
+if TOKEN_CLASS to parse_class_type, if TOKEN_INTERFACE to
+parse_interface_type. In each case, appends the result as a single
+child and returns. Otherwise (no special-form token), falls through
+to parse_type_expression which handles the type-abbreviation case.
+@End Implementation
 Process called "parse_type_declaration" takes parser as Integer returns Integer:
     Note: Parse type declaration
 
@@ -1096,6 +1513,21 @@ Process called "parse_type_declaration" takes parser as Integer returns Integer:
     Return type_node
 End Process
 
+@Reasoning:
+F# modules are similar to namespaces but are also values - a module
+is a singleton instance of a synthesized type. The body is parsed as
+a sequence of declarations until EOF; nested module termination is
+detected by indent comparison in a full implementation but this
+parser uses EOF or declaration-failure as the boundary, matching the
+parse_program loop's approach.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_MODULE. Creates AST_MODULE. Reads module name token,
+stores as node value, advances. Consumes TOKEN_EQUAL. Loop until
+TOKEN_EOF: calls parse_declaration; if non-zero, appends; on 0,
+breaks (failure or unrecognized form). Returns the module node.
+@End Implementation
 Process called "parse_module_declaration" takes parser as Integer returns Integer:
     Note: Parse module declaration
 
@@ -1132,6 +1564,24 @@ Note: ==========================================================================
 Note: F# Program Structure Parsing
 Note: ============================================================================
 
+@Reasoning:
+Top-level declaration dispatcher. Selects between module, namespace,
+open, type, let-binding, and val-declaration based on the leading
+keyword. The decision is purely LL(1) since every supported leading
+keyword is distinct - no further lookahead is needed.
+@End Reasoning
+
+@Implementation:
+Reads current_token and dispatches:
+- TOKEN_MODULE -> parse_module_declaration
+- TOKEN_NAMESPACE -> parse_namespace_declaration
+- TOKEN_OPEN -> parse_open_statement
+- TOKEN_TYPE -> parse_type_declaration
+- TOKEN_LET -> parse_let_binding (top-level let is a binding without
+  the surrounding let-expression wrapper)
+- TOKEN_VAL -> parse_value_declaration
+- otherwise: set_parse_error "Expected declaration", return 0.
+@End Implementation
 Process called "parse_declaration" takes parser as Integer returns Integer:
     Note: Parse top-level declaration
 
@@ -1171,6 +1621,28 @@ Process called "parse_declaration" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+The program-level loop must tolerate intervening trivia (blank lines
+and both comment styles) because F# allows them between declarations.
+Recovery on a failing declaration is critical: returning early on the
+first failure would lose every later declaration in a multi-error
+parse. Instead the loop checks whether the failure raised a hard
+parse_error - in which case we propagate it - or simply returned 0
+because the current token wasn't recognized, in which case we advance
+one token and try again so unknown noise can't deadlock the parser.
+@End Reasoning
+
+@Implementation:
+Allocates an AST_PROGRAM root via the arena. In a While 1 loop:
+- Reads current_token; breaks on TOKEN_EOF.
+- Advances past TOKEN_NEWLINE, TOKEN_LINE_COMMENT, TOKEN_BLOCK_COMMENT
+  with Continue so trivia never reaches parse_declaration.
+- Calls parse_declaration. On success, adds the returned declaration
+  as a child of program_node. On failure (declaration == 0), reads
+  has_parse_error; if true returns 0 to propagate the hard error,
+  otherwise advances one token to skip the offending input and resume.
+Returns the populated AST_PROGRAM root.
+@End Implementation
 Process called "parse_program" takes parser as Integer returns Integer:
     Note: Parse complete F# program
 
@@ -1220,6 +1692,23 @@ Note: ==========================================================================
 Note: Helper Functions for Complex Constructs
 Note: ============================================================================
 
+@Reasoning:
+F# list literals use `[e1; e2; e3]` with semicolons (not commas) so
+they don't conflict with tuple syntax inside the brackets. The empty
+case `[]` is handled by detecting TOKEN_RIGHT_BRACKET immediately
+after the opener.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LEFT_BRACKET. Creates AST_LIST_EXPRESSION. Reads
+current; if TOKEN_RIGHT_BRACKET, advances and returns the empty
+list node. Otherwise enters a loop:
+- parses an expression, appends as child
+- if next is TOKEN_SEMICOLON, advances and continues
+- if next is TOKEN_RIGHT_BRACKET, advances and breaks
+- otherwise reports "Expected ';' or ']'" and returns 0.
+Returns the list node.
+@End Implementation
 Process called "parse_list_expression" takes parser as Integer returns Integer:
     Note: Parse list literal [1; 2; 3]
 
@@ -1256,6 +1745,19 @@ Process called "parse_list_expression" takes parser as Integer returns Integer:
     Return list_node
 End Process
 
+@Reasoning:
+Minimal type-expression parser accepting a single identifier or
+type-name token (e.g. `int`, `string`, `MyClass`). Function types
+with `->`, generics, and tuple types are not handled here; this
+helper is the leaf case for type abbreviations and field-type
+positions where only a name is meaningful.
+@End Reasoning
+
+@Implementation:
+Reads current_token. If TOKEN_IDENTIFIER or TOKEN_TYPE_NAME, creates
+AST_TYPE_NAME, stores the token as its value, advances, returns the
+node. Otherwise reports "Expected type" and returns 0.
+@End Implementation
 Process called "parse_type_expression" takes parser as Integer returns Integer:
     Note: Parse type expression
 
@@ -1279,6 +1781,21 @@ Process called "parse_type_expression" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+F# array literals use `[|e1; e2|]` so they are distinguishable from
+list literals at the lexer level (TOKEN_LEFT_ARRAY / TOKEN_RIGHT_ARRAY
+are dedicated multi-character tokens). The empty form `[||]` is
+handled by the same immediate-close path as empty lists.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LEFT_ARRAY. Creates AST_ARRAY_EXPRESSION. If
+TOKEN_RIGHT_ARRAY follows immediately, advances and returns the
+empty array node. Otherwise the same expression-and-separator loop
+as parse_list_expression but with TOKEN_RIGHT_ARRAY as the
+terminator. On unexpected token, reports "Expected ';' or '|]'" and
+returns 0. Returns the array node.
+@End Implementation
 Process called "parse_array_expression" takes parser as Integer returns Integer:
     Note: Parse array literal [|1; 2; 3|]
 
@@ -1315,6 +1832,30 @@ Process called "parse_array_expression" takes parser as Integer returns Integer:
     Return array_node
 End Process
 
+@Reasoning:
+Record literals use `{field = value; field = value}` syntax. Each
+field becomes an AST_LET_BINDING child of the record node (reusing
+the binding shape because a record field is conceptually a named
+value assignment). Field names must be identifier tokens; non-
+identifier tokens produce a parse error rather than silently
+accepting arbitrary expressions as keys.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LEFT_BRACE. Creates AST_RECORD_EXPRESSION. Empty
+case: TOKEN_RIGHT_BRACE -> advance and return. Field loop:
+- reads field_name; if not TOKEN_IDENTIFIER reports "Expected field
+  name" and returns 0
+- advances past the identifier
+- consumes TOKEN_EQUAL
+- parses the field value via parse_expression
+- creates AST_LET_BINDING with field_name as node value and the
+  value expression as a child, appends to the record node
+- on TOKEN_SEMICOLON advances and continues
+- on TOKEN_RIGHT_BRACE advances and breaks
+- otherwise reports "Expected ';' or '}'" and returns 0.
+Returns the record node.
+@End Implementation
 Process called "parse_record_expression" takes parser as Integer returns Integer:
     Note: Parse record expression {field = value; ...}
 
@@ -1367,6 +1908,19 @@ Process called "parse_record_expression" takes parser as Integer returns Integer
     Return record_node
 End Process
 
+@Reasoning:
+F# code quotations `<@ expr @>` capture an expression as a typed AST
+value at runtime, enabling metaprogramming. The expression inside is
+parsed as a normal expression - the quotation just wraps it in a
+distinct AST kind so semantic analysis can lift the contained tree
+to a runtime representation.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LEFT_QUOTE. Creates AST_QUOTE_EXPRESSION. Parses the
+inner expression via parse_expression and appends. Consumes
+TOKEN_RIGHT_QUOTE. Returns the quote node.
+@End Implementation
 Process called "parse_quotation_expression" takes parser as Integer returns Integer:
     Note: Parse quotation expression <@ expr @>
 
@@ -1383,6 +1937,18 @@ Process called "parse_quotation_expression" takes parser as Integer returns Inte
     Return quote_node
 End Process
 
+@Reasoning:
+F# while-loops always evaluate to unit so they are expressions in
+the syntactic sense but their body is essentially imperative. The
+`done` terminator (not common in modern F# but supported by the
+grammar) is required by this parser.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_WHILE. Creates AST_WHILE_EXPRESSION. Parses
+condition via parse_expression, appends. Consumes TOKEN_DO. Parses
+body, appends. Consumes TOKEN_DONE. Returns the while node.
+@End Implementation
 Process called "parse_while_expression" takes parser as Integer returns Integer:
     Note: Parse while expression (while condition do body done)
 
@@ -1405,6 +1971,22 @@ Process called "parse_while_expression" takes parser as Integer returns Integer:
     Return while_node
 End Process
 
+@Reasoning:
+F# for-loops bind a single iteration variable and walk an iterable
+expression. The variable becomes the first child (as an
+AST_IDENTIFIER carrying the name), the iterable is the second child,
+and the body is the third. Position-based child ordering keeps the
+node shape simple and matches the other looping constructs.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_FOR. Creates AST_FOR_EXPRESSION. Reads var_token;
+if not TOKEN_IDENTIFIER reports "Expected variable name" and
+returns 0. Builds AST_IDENTIFIER with the variable token as value
+and appends. Advances. Consumes TOKEN_IN. Parses the iterable
+expression, appends. Consumes TOKEN_DO. Parses the body, appends.
+Consumes TOKEN_DONE. Returns the for node.
+@End Implementation
 Process called "parse_for_expression" takes parser as Integer returns Integer:
     Note: Parse for expression (for var in expr do body done)
 
@@ -1441,6 +2023,24 @@ Process called "parse_for_expression" takes parser as Integer returns Integer:
     Return for_node
 End Process
 
+@Reasoning:
+F# `function p1 -> e1 | p2 -> e2` is sugar for `fun x -> match x
+with p1 -> e1 | p2 -> e2`. The parser materializes this as an
+AST_LAMBDA whose children are pattern-guarded case nodes - the same
+shape match expressions use - because downstream lowering recognizes
+that shape uniformly.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_FUNCTION. Creates AST_LAMBDA. Case loop:
+- consume optional TOKEN_PIPE if present
+- parse pattern-with-guard
+- consume TOKEN_ARROW
+- parse arm expression
+- build AST_PATTERN_GUARD(pattern, expr), append to the lambda
+- continue while next token is TOKEN_PIPE, otherwise break.
+Returns the lambda node.
+@End Implementation
 Process called "parse_function_expression" takes parser as Integer returns Integer:
     Note: Parse function expression (function pattern -> expr)
 
@@ -1474,6 +2074,20 @@ Process called "parse_function_expression" takes parser as Integer returns Integ
     Return function_node
 End Process
 
+@Reasoning:
+Pattern context counterpart to parse_list_expression: same bracket-
+and-semicolon syntax but elements are patterns (which include
+wildcards, variables, literals, and constructors) rather than
+expressions. AST_PATTERN_LIST identifies the pattern context.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LEFT_BRACKET. Creates AST_PATTERN_LIST. Empty case:
+TOKEN_RIGHT_BRACKET -> advance and return. Otherwise loop parsing
+patterns separated by TOKEN_SEMICOLON, terminating on
+TOKEN_RIGHT_BRACKET, with the same error handling shape as
+parse_list_expression. Returns the pattern node.
+@End Implementation
 Process called "parse_list_pattern" takes parser as Integer returns Integer:
     Note: Parse list pattern [x; y; z]
 
@@ -1510,6 +2124,19 @@ Process called "parse_list_pattern" takes parser as Integer returns Integer:
     Return list_pattern
 End Process
 
+@Reasoning:
+Array-pattern counterpart of parse_array_expression. Uses
+TOKEN_LEFT_ARRAY / TOKEN_RIGHT_ARRAY delimiters and AST_PATTERN_ARRAY
+as the node kind. Pattern elements may include wildcards, variables,
+literals, and other patterns.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LEFT_ARRAY. Creates AST_PATTERN_ARRAY. Empty case:
+TOKEN_RIGHT_ARRAY -> advance and return. Otherwise loop parsing
+patterns separated by TOKEN_SEMICOLON, terminating on
+TOKEN_RIGHT_ARRAY. Returns the pattern node.
+@End Implementation
 Process called "parse_array_pattern" takes parser as Integer returns Integer:
     Note: Parse array pattern [|x; y; z|]
 
@@ -1546,6 +2173,27 @@ Process called "parse_array_pattern" takes parser as Integer returns Integer:
     Return array_pattern
 End Process
 
+@Reasoning:
+Record patterns `{field = pat; field = pat}` destructure records.
+Each field becomes an AST_PATTERN_VARIABLE node carrying the field
+name in its value slot, with the field's sub-pattern attached as a
+child. This shape lets the value-slot carry the identifier without
+introducing an extra label-node kind.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LEFT_BRACE. Creates AST_PATTERN_RECORD. Empty case:
+TOKEN_RIGHT_BRACE -> advance and return. Field loop:
+- reads field_name; rejects if not TOKEN_IDENTIFIER
+- advances past identifier
+- consumes TOKEN_EQUAL
+- parses the field's sub-pattern via parse_pattern
+- creates AST_PATTERN_VARIABLE with field_name as the value and the
+  sub-pattern as a child, appends to record pattern
+- on TOKEN_SEMICOLON continues; on TOKEN_RIGHT_BRACE advances and
+  breaks; otherwise reports "Expected ';' or '}'" and returns 0.
+Returns the pattern node.
+@End Implementation
 Process called "parse_record_pattern" takes parser as Integer returns Integer:
     Note: Parse record pattern {field = pattern; ...}
 
@@ -1598,6 +2246,27 @@ Process called "parse_record_pattern" takes parser as Integer returns Integer:
     Return record_pattern
 End Process
 
+@Reasoning:
+Record type declarations look like `{field: type; field: type}`,
+distinguishing themselves from record values (which use `=` between
+field and value) by the colon. Field declarations are stored as
+AST_VALUE_DECLARATION children (reusing the val-shape because a
+record field is conceptually a named-typed-slot).
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LEFT_BRACE. Creates AST_RECORD_TYPE. Loop:
+- if current is TOKEN_RIGHT_BRACE, advance and break (empty / end)
+- reads field_name; rejects if not TOKEN_IDENTIFIER
+- advances past identifier
+- consumes TOKEN_COLON
+- parses field type via parse_type_expression
+- creates AST_VALUE_DECLARATION with field_name as value and the
+  field type as a child, appends to record type
+- on TOKEN_SEMICOLON continues; on TOKEN_RIGHT_BRACE advances and
+  breaks; otherwise reports error and returns 0.
+Returns the record type node.
+@End Implementation
 Process called "parse_record_type" takes parser as Integer returns Integer:
     Note: Parse record type {field: type; ...}
 
@@ -1649,6 +2318,26 @@ Process called "parse_record_type" takes parser as Integer returns Integer:
     Return record_type
 End Process
 
+@Reasoning:
+F# discriminated unions use `| Case1 | Case2 of type1 | Case3 of
+(type1 * type2)` syntax. Each case becomes an AST_TYPE_NAME node
+holding the constructor name as its value, with the optional payload
+type as a child when `of` is present. Cases without payload have
+no children; this lets a single shape model both shapes.
+@End Reasoning
+
+@Implementation:
+Creates AST_UNION_TYPE. Case loop:
+- consume optional TOKEN_PIPE
+- reads case_name; rejects if not TOKEN_TYPE_NAME
+- advances
+- creates AST_TYPE_NAME with the case name as its value
+- if next token is TOKEN_OF, advances and parses the payload type
+  via parse_type_expression, attaches as child
+- appends the case node to the union type
+- continues while next token is TOKEN_PIPE, otherwise breaks.
+Returns the union type node.
+@End Implementation
 Process called "parse_union_type" takes parser as Integer returns Integer:
     Note: Parse discriminated union type | Case1 | Case2 of type
 
@@ -1691,6 +2380,22 @@ Process called "parse_union_type" takes parser as Integer returns Integer:
     Return union_type
 End Process
 
+@Reasoning:
+F# class types are bracketed with `class ... end` after the `=` of
+their type declaration. Body members come in three flavors (member
+methods, val-properties, let-bindings for fields/methods) handled by
+parse_class_member. Unrecognized tokens at member-position are
+skipped via a one-token advance to keep parsing progressing rather
+than blocking on a single bad input.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_CLASS. Creates AST_CLASS_TYPE. Loop:
+- on TOKEN_END advances and breaks
+- calls parse_class_member; if non-zero appends as child
+- on 0 advances one token (to avoid infinite loop on unknown input).
+Returns the class type node.
+@End Implementation
 Process called "parse_class_type" takes parser as Integer returns Integer:
     Note: Parse class type declaration
 
@@ -1717,6 +2422,20 @@ Process called "parse_class_type" takes parser as Integer returns Integer:
     Return class_type
 End Process
 
+@Reasoning:
+Interface types use `interface ... end` containing abstract member
+declarations and val-property signatures. Same skeleton as
+parse_class_type but uses parse_interface_member, which only accepts
+those two kinds of declaration (no concrete let-bindings allowed in
+an interface).
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_INTERFACE. Creates AST_INTERFACE_TYPE. Loop:
+TOKEN_END breaks; parse_interface_member's result is appended when
+non-zero, otherwise one token is consumed to skip past unknown input.
+Returns the interface type node.
+@End Implementation
 Process called "parse_interface_type" takes parser as Integer returns Integer:
     Note: Parse interface type declaration
 
@@ -1743,6 +2462,21 @@ Process called "parse_interface_type" takes parser as Integer returns Integer:
     Return interface_type
 End Process
 
+@Reasoning:
+Three class-member kinds dispatch by leading keyword: `member`
+introduces a method (parse_method_declaration), `val` introduces a
+property (parse_property_declaration), `let` introduces a field or
+private method (parse_let_binding). Anything else is a parse error
+at member position.
+@End Reasoning
+
+@Implementation:
+Reads current_token. If TOKEN_MEMBER, advances and returns
+parse_method_declaration. If TOKEN_VAL, returns
+parse_property_declaration directly (it consumes its own keyword).
+If TOKEN_LET, returns parse_let_binding directly. Otherwise reports
+"Expected class member" and returns 0.
+@End Implementation
 Process called "parse_class_member" takes parser as Integer returns Integer:
     Note: Parse class member (method, property, field)
 
@@ -1768,6 +2502,19 @@ Process called "parse_class_member" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Interface members are restricted to abstract method signatures
+(`abstract` keyword) and val-property signatures. Concrete bindings
+(`let`) and `member` (which implies a body) are not allowed because
+interfaces have no implementations.
+@End Reasoning
+
+@Implementation:
+Reads current_token. If TOKEN_ABSTRACT, advances and returns
+parse_method_declaration. If TOKEN_VAL, returns
+parse_property_declaration. Otherwise reports "Expected interface
+member" and returns 0.
+@End Implementation
 Process called "parse_interface_member" takes parser as Integer returns Integer:
     Note: Parse interface member (abstract method or property)
 
@@ -1788,6 +2535,24 @@ Process called "parse_interface_member" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Method declarations take the shape `name [(params)] [: returnType]`.
+Parameter parens are optional (a no-arg member can omit them);
+return type is also optional. Each parameter is parsed as a full
+pattern so destructuring parameters work. Parameters and the
+optional return type are stored as siblings under the method node,
+with the return type (when present) always appearing last.
+@End Reasoning
+
+@Implementation:
+Creates AST_METHOD_DECLARATION. Reads method_name; rejects if not
+TOKEN_IDENTIFIER. Stores name as node value, advances. If next is
+TOKEN_LEFT_PAREN, enters parameter loop until TOKEN_RIGHT_PAREN:
+parses a pattern, appends as child, accepts TOKEN_COMMA between
+params; TOKEN_RIGHT_PAREN advances and breaks. After params, if next
+is TOKEN_COLON advances and parses return type via
+parse_type_expression, appends. Returns the method node.
+@End Implementation
 Process called "parse_method_declaration" takes parser as Integer returns Integer:
     Note: Parse method declaration
 
@@ -1840,6 +2605,19 @@ Process called "parse_method_declaration" takes parser as Integer returns Intege
     Return method_node
 End Process
 
+@Reasoning:
+Property declarations use `val name: Type` syntax. This procedure
+consumes the leading `val` keyword and rejects the declaration if
+the identifier or its type annotation is missing - both are
+mandatory for a property declaration to be meaningful.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_VAL. Creates AST_PROPERTY_DECLARATION. Reads
+property_name; rejects if not TOKEN_IDENTIFIER. Stores name as node
+value, advances. Consumes TOKEN_COLON. Parses property type via
+parse_type_expression, appends as child. Returns the property node.
+@End Implementation
 Process called "parse_property_declaration" takes parser as Integer returns Integer:
     Note: Parse property declaration
 
@@ -1865,6 +2643,19 @@ Process called "parse_property_declaration" takes parser as Integer returns Inte
     Return property_node
 End Process
 
+@Reasoning:
+Top-level value declarations also use `val name: Type` syntax but
+produce AST_VALUE_DECLARATION rather than AST_PROPERTY_DECLARATION
+so semantic analysis can tell module-level signatures apart from
+type-body properties.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_VAL. Creates AST_VALUE_DECLARATION. Reads
+value_name; rejects if not TOKEN_IDENTIFIER. Stores name as node
+value, advances. Consumes TOKEN_COLON. Parses value type via
+parse_type_expression, appends. Returns the value node.
+@End Implementation
 Process called "parse_value_declaration" takes parser as Integer returns Integer:
     Note: Parse value declaration
 
@@ -1890,6 +2681,20 @@ Process called "parse_value_declaration" takes parser as Integer returns Integer
     Return value_node
 End Process
 
+@Reasoning:
+Namespaces in F# group declarations without introducing values (so
+unlike modules, they cannot contain `let` bindings at the top level
+- only types and modules). This parser is more permissive and
+simply iterates declarations until EOF or parse failure; semantic
+analysis enforces the restriction later.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_NAMESPACE. Creates AST_NAMESPACE. Reads namespace
+name, stores as node value, advances. Loop until TOKEN_EOF: calls
+parse_declaration; if non-zero appends as child; on 0 breaks.
+Returns the namespace node.
+@End Implementation
 Process called "parse_namespace_declaration" takes parser as Integer returns Integer:
     Note: Parse namespace declaration
 
@@ -1920,6 +2725,18 @@ Process called "parse_namespace_declaration" takes parser as Integer returns Int
     Return namespace_node
 End Process
 
+@Reasoning:
+`open Module.Path` brings a module or namespace's names into scope.
+The full dotted path is captured as a single token by the lexer and
+stored as the node value. Semantic analysis resolves the path against
+known modules.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_OPEN. Creates AST_OPEN. Reads the module/namespace
+name token, stores it as the node value via set_node_value,
+advances. Returns the open node.
+@End Implementation
 Process called "parse_open_statement" takes parser as Integer returns Integer:
     Note: Parse open statement
 
@@ -1939,6 +2756,27 @@ Note: ==========================================================================
 Note: Main F# Parsing Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Sole public entry point for the F# parser. Couples three responsibilities
+that callers should not have to coordinate themselves: parser-instance
+construction, the actual parse_program walk, and post-parse error
+checking. Centralising the error check here means a translation-error
+path always cleans up the parser before returning 0, and success
+returns the AST_PROGRAM root directly so callers can hand it straight
+to fsharp_to_hir.
+@End Reasoning
+
+@Implementation:
+Creates a parser via create_fsharp_parser bound to the supplied
+token_list. Returns 0 immediately if creation failed. Calls
+parse_program to drive the recursive descent. Reads has_parse_error
+on the parser; if a hard error was set during the walk, destroys the
+parser (and its arena) and returns 0 so callers can not observe a
+partially-constructed tree. On the clean path, destroys the parser and
+returns ast_root. Note: any callers that want to hold the AST past the
+parser lifetime are responsible for cloning the tree into their own
+arena before the destroy invalidates the parser-owned arena nodes.
+@End Implementation
 Process called "parse_fsharp_source" takes token_list as Integer returns Integer:
     Note: Main entry point for parsing F# source code
 

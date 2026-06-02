@@ -54,6 +54,13 @@ Note: ===================================================================
 Note: PARSER STATE
 Note: ===================================================================
 
+@Reasoning:
+The HCL parser carries minimal state: the token list (produced by
+the lexer), the current position into that list, and a cached
+current_token handle to avoid repeated list_get calls on the hot
+path. Position-based iteration is preferred over token streams
+because HCL's recursive descent never needs unbounded lookback.
+@End Reasoning
 Type called "HCLParser":
     tokens as Integer
     position as Integer
@@ -64,6 +71,14 @@ Note: ===================================================================
 Note: AST NODE STRUCTURE
 Note: ===================================================================
 
+@Reasoning:
+The HCL AST node is intentionally generic: a type tag, an optional
+value (literal payload or identifier name), a child list for nested
+nodes, and a metadata list for ancillary information (block labels,
+attribute keys, function names, etc.). The uniform shape lets the
+parser allocate one node type and treat the tree polymorphically
+throughout traversal.
+@End Reasoning
 Type called "ASTNode":
     node_type as Integer
     value as Integer
@@ -75,6 +90,12 @@ Note: ===================================================================
 Note: PARSER CREATION
 Note: ===================================================================
 
+@Reasoning:
+The constructor primes current_token with the first token (or 0 for
+empty input) so the very first current_type call has data to inspect.
+Empty token lists are tolerated; current_type degrades to TOKEN_EOF
+and parsing terminates cleanly.
+@End Reasoning
 Process called "create_hcl_parser" takes tokens as Integer returns Integer:
     Let parser be a value of type HCLParser with
         tokens as tokens,
@@ -90,6 +111,13 @@ Process called "create_hcl_parser" takes tokens as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+Each AST node is constructed with empty children/metadata lists so
+later parse routines can append without null checks. The default
+value is the empty string because most nodes do not carry an
+identifier or literal payload; nodes that need one overwrite it via
+ast_set_value.
+@End Reasoning
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     Let node be a value of type ASTNode with
         node_type as node_type,
@@ -99,26 +127,59 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Trivial mutator wrapping the field assignment so call sites read more
+naturally (ast_set_value vs Set node.value to ...). Kept as an
+explicit Process so the AST API surface is symmetric with the
+ast_node_* readers.
+@End Reasoning
 Process called "ast_set_value" takes node as ASTNode, value as Integer:
     Set node.value to value
 End Process
 
+@Reasoning:
+Appends to the children list in declaration order, which matches
+HCL's source order semantics: a configuration's top-level items must
+be emitted by the universal translator in the order they appeared.
+@End Reasoning
 Process called "ast_add_child" takes node as ASTNode, child as Integer:
     proc list_append from ListCore with node.children, child
 End Process
 
+@Reasoning:
+Direct field reader for the node's type tag. The tag is used by the
+HIR lowering layer to dispatch each node kind to its specialised
+translator; keeping this as an explicit accessor lets the AST struct
+layout evolve without touching every consumer.
+@End Reasoning
 Process called "ast_node_type" takes node as ASTNode returns Integer:
     Return node.node_type
 End Process
 
+@Reasoning:
+Reader for the node's value (identifier name or literal payload).
+Returns the stored Integer handle; the caller interprets it based on
+the node's type tag (string handle for string literals, name handle
+for identifiers, etc.).
+@End Reasoning
 Process called "ast_node_value" takes node as ASTNode returns Integer:
     Return node.value
 End Process
 
+@Reasoning:
+Indexed child accessor. Bounds checking is delegated to list_get
+which returns 0 for out-of-range indices, so the HIR lowering can
+detect the end-of-children sentinel without a separate count check.
+@End Reasoning
 Process called "ast_node_child" takes node as ASTNode, index as Integer returns Integer:
     Return proc list_get from ListCore with node.children, index
 End Process
 
+@Reasoning:
+Child-count accessor. Used by traversal loops to bound their
+iteration; the loop body then uses ast_node_child to fetch each
+indexed child.
+@End Reasoning
 Process called "ast_node_child_count" takes node as ASTNode returns Integer:
     Return proc list_length from ListCore with node.children
 End Process
@@ -127,6 +188,12 @@ Note: ===================================================================
 Note: TOKEN NAVIGATION
 Note: ===================================================================
 
+@Reasoning:
+advance bumps the position and refreshes current_token from the
+token list. It never decrements; recursive-descent grammars only
+need forward progress. Out-of-range positions leave current_token
+unchanged, allowing the next current_type call to detect EOF cleanly.
+@End Reasoning
 Process called "advance" takes parser as Integer:
     Set parser.position to parser.position plus 1
     Let token_count be proc list_length from ListCore with parser.tokens
@@ -136,6 +203,11 @@ Process called "advance" takes parser as Integer:
     End If
 End Process
 
+@Reasoning:
+The null guard converts a null current_token (e.g. uninitialised parser
+or position past end) into TOKEN_EOF so every grammar production can
+treat EOF uniformly without dereferencing a null token.
+@End Reasoning
 Process called "current_type" takes parser as Integer returns Integer:
     If parser.current_token is equal to 0:
         Return Lexer.TOKEN_EOF
@@ -143,6 +215,14 @@ Process called "current_type" takes parser as Integer returns Integer:
     Return proc hcl_token_type from Lexer with parser.current_token
 End Process
 
+@Reasoning:
+expect implements the "consume token of expected type" idiom: it
+returns the consumed token (advancing the position) on a match, or
+0 on mismatch so callers can surface a parse error. The 0 return is
+preferred over throwing because HCL parse errors are recoverable -
+the universal translator continues to consume input to find more
+diagnostics.
+@End Reasoning
 Process called "expect" takes parser as Integer, expected_type as Integer returns Integer:
     Let token_type be proc current_type from parser
     If token_type is not equal to expected_type:
@@ -155,6 +235,14 @@ Process called "expect" takes parser as Integer, expected_type as Integer return
     Return token
 End Process
 
+@Reasoning:
+HCL's grammar treats newlines as statement terminators in some
+positions and as whitespace in others. The parser uses skip_newlines
+to consume them between top-level items and block bodies. Comments
+are also consumed here because HCL comments are syntactically
+equivalent to newlines for grammar purposes - they cannot appear
+mid-expression.
+@End Reasoning
 Process called "skip_newlines" takes parser as Integer:
     Let token_type be proc current_type from parser
     While token_type is equal to Lexer.TOKEN_NEWLINE:
@@ -173,6 +261,13 @@ Note: ===================================================================
 Note: TOP-LEVEL PARSING
 Note: ===================================================================
 
+@Reasoning:
+The top-level production is a sequence of config items separated by
+newlines. The loop terminates at TOKEN_EOF. The local 'i' variable
+emulates a Break out of the otherwise-conditional - HCL grammar
+sometimes encounters EOF after skipping newlines and needs to bail
+without parsing an item.
+@End Reasoning
 Process called "parse_hcl_configuration" takes parser as Integer returns Integer:
     Let config be proc create_ast_node from HCL_CONFIGURATION
 
@@ -205,6 +300,13 @@ Process called "parse_hcl_configuration" takes parser as Integer returns Integer
     Return config
 End Process
 
+@Reasoning:
+HCL config items are either blocks (resource, variable, output, etc.)
+or top-level attributes. The dispatcher recognises Terraform-specific
+block keywords (resource, variable, output, module, provider,
+data, locals, terraform) and routes them to parse_block with the
+appropriate block-type tag. Anything else is parsed as an attribute.
+@End Reasoning
 Process called "parse_config_item" takes parser as Integer returns Integer:
     Let token_type be proc current_type from parser
 
@@ -259,6 +361,14 @@ Note: ===================================================================
 Note: BLOCK PARSING
 Note: ===================================================================
 
+@Reasoning:
+HCL blocks have the form: keyword "label1" "label2" { body }. The
+parser consumes the leading keyword (already classified by the
+caller), then collects zero or more string labels (e.g.
+'resource "aws_instance" "web"' has two labels), then parses the
+brace-delimited body. Labels are stored in the metadata list while
+the body items go into children.
+@End Reasoning
 Process called "parse_block" takes parser as Integer, block_type as Integer returns Integer:
     Let block be proc create_ast_node from block_type
 
@@ -337,6 +447,12 @@ Process called "parse_block" takes parser as Integer, block_type as Integer retu
     Return block
 End Process
 
+@Reasoning:
+Inside a block body, each item is either a nested block (identifier
+followed by { without =) or an attribute (identifier = expr). The
+parser uses one-token lookahead to disambiguate: a peek for { after
+the identifier triggers nested block parsing, otherwise attribute.
+@End Reasoning
 Process called "parse_block_item" takes parser as Integer returns Integer:
     Let token_type be proc current_type from parser
 
@@ -363,6 +479,12 @@ Note: ===================================================================
 Note: ATTRIBUTE PARSING
 Note: ===================================================================
 
+@Reasoning:
+Attributes are name = expression pairs. The parser captures the
+identifier into the node's value, consumes the '=' (via expect), and
+recurses into parse_expression to build the value subtree which is
+appended as the single child.
+@End Reasoning
 Process called "parse_attribute" takes parser as Integer returns Integer:
     Let attr be proc create_ast_node from HCL_ATTRIBUTE
 
@@ -398,10 +520,24 @@ Note: ===================================================================
 Note: EXPRESSION PARSING
 Note: ===================================================================
 
+@Reasoning:
+parse_expression is the entry point of the HCL expression grammar.
+It immediately delegates to parse_conditional (the highest-precedence
+construct that can wrap a full expression). This indirection lets
+the grammar be reordered in one place when new top-level constructs
+are added.
+@End Reasoning
 Process called "parse_expression" takes parser as Integer returns Integer:
     Return proc parse_conditional from parser
 End Process
 
+@Reasoning:
+HCL's ternary form is 'cond ? then_expr : else_expr'. The parser
+first parses a logical-or expression (the precedence below
+conditional), then peeks for '?'; if present, it captures the then
+and else branches by recursing back into parse_conditional, giving
+right-associativity for chained ternaries.
+@End Reasoning
 Process called "parse_conditional" takes parser as Integer returns Integer:
     Let expr be proc parse_logical_or from parser
 
@@ -432,6 +568,13 @@ Process called "parse_conditional" takes parser as Integer returns Integer:
     Return expr
 End Process
 
+@Reasoning:
+Left-associative parser for the || operator. The While loop collects
+all || operands at this precedence level into a left-leaning binary
+tree, matching HCL's evaluation order. The loop only proceeds while
+the next token is ||; any other operator returns control to the
+caller in the precedence hierarchy.
+@End Reasoning
 Process called "parse_logical_or" takes parser as Integer returns Integer:
     Let left be proc parse_logical_and from parser
 
@@ -457,6 +600,11 @@ Process called "parse_logical_or" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Counterpart to parse_logical_or but for the && operator, one level
+deeper in precedence. Same left-associative loop pattern: collect
+operands while the next token is &&.
+@End Reasoning
 Process called "parse_logical_and" takes parser as Integer returns Integer:
     Let left be proc parse_equality from parser
 
@@ -482,6 +630,11 @@ Process called "parse_logical_and" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Equality operators (==, !=) one precedence level below logical-and.
+The branch on operator distinguishes the two; both are left-
+associative so the standard collect-loop pattern applies.
+@End Reasoning
 Process called "parse_equality" takes parser as Integer returns Integer:
     Let left be proc parse_comparison from parser
 
@@ -525,6 +678,11 @@ Process called "parse_equality" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Comparison operators (<, <=, >, >=) at the level below equality.
+Standard precedence-climbing loop with operator dispatch into the
+correct HCL_* op tag.
+@End Reasoning
 Process called "parse_comparison" takes parser as Integer returns Integer:
     Let left be proc parse_additive from parser
 
@@ -611,6 +769,11 @@ Process called "parse_comparison" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Additive operators (+ and -) below comparison. The same precedence-
+climbing pattern; HCL's '+' is overloaded for numeric addition and
+string concatenation (resolved at evaluation time, not parse time).
+@End Reasoning
 Process called "parse_additive" takes parser as Integer returns Integer:
     Let left be proc parse_multiplicative from parser
 
@@ -661,6 +824,12 @@ Process called "parse_additive" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Multiplicative operators (*, /, %). Tighter binding than additive
+so it sits one level down in the recursive-descent chain. HCL treats
+% as integer modulo only; non-integer operands are a runtime error
+that the parser does not check.
+@End Reasoning
 Process called "parse_multiplicative" takes parser as Integer returns Integer:
     Let left be proc parse_unary from parser
 
@@ -729,6 +898,12 @@ Process called "parse_multiplicative" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Unary operators (-, !) bind tighter than binary operators. The
+parser builds a unary-op node when it sees one of these tokens; the
+operand is parsed via parse_postfix to correctly compose with index
+and call expressions (-arr[0] == -(arr[0]) not (-arr)[0]).
+@End Reasoning
 Process called "parse_unary" takes parser as Integer returns Integer:
     Let token_type be proc current_type from parser
 
@@ -761,6 +936,14 @@ Process called "parse_unary" takes parser as Integer returns Integer:
     Return proc parse_postfix from parser
 End Process
 
+@Reasoning:
+Postfix operators are attribute access (.attr), index (expr[idx]),
+splat (.*), and function call (expr(args)). They left-associate by
+wrapping the running expression in a new postfix node each iteration.
+Splat handling is special: it captures the rest of the postfix chain
+into a single splat node so the universal translator can lower it
+to language-specific spread semantics.
+@End Reasoning
 Process called "parse_postfix" takes parser as Integer returns Integer:
     Let expr be proc parse_primary from parser
 
@@ -865,6 +1048,14 @@ Process called "parse_postfix" takes parser as Integer returns Integer:
     Return expr
 End Process
 
+@Reasoning:
+Primary expressions are the atomic building blocks: literals (number,
+string, bool, null), identifiers, parenthesised sub-expressions, list
+and object literals, for-expressions, and heredoc strings. The
+dispatcher classifies on the current token type and routes to the
+appropriate constructor. Unknown primaries return 0 so error
+recovery can advance past the broken token.
+@End Reasoning
 Process called "parse_primary" takes parser as Integer returns Integer:
     Let token_type be proc current_type from parser
 
@@ -965,6 +1156,12 @@ Process called "parse_primary" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+HCL list literals are bracketed comma-separated expression sequences:
+[a, b, c]. Trailing commas are allowed (and emitted by 'terraform fmt')
+so the parser tolerates them. Newlines between elements are
+permitted, which is why skip_newlines runs between iterations.
+@End Reasoning
 Process called "parse_list" takes parser as Integer returns Integer:
     Let list be proc create_ast_node from HCL_LIST
 
@@ -995,6 +1192,13 @@ Process called "parse_list" takes parser as Integer returns Integer:
     Return list
 End Process
 
+@Reasoning:
+HCL object literals are brace-enclosed key=value or key:value pairs.
+Both '=' and ':' are accepted as separators; HCL's parser
+intentionally permits this overlap to bridge between attribute-style
+and JSON-style syntax. Each pair becomes a child node with the key
+in value and the expression as the only child.
+@End Reasoning
 Process called "parse_object" takes parser as Integer returns Integer:
     Let obj be proc create_ast_node from HCL_OBJECT
 
@@ -1062,6 +1266,13 @@ Process called "parse_object" takes parser as Integer returns Integer:
     Return obj
 End Process
 
+@Reasoning:
+HCL for-expressions are list/object comprehensions:
+[for v in coll : expr] or {for k, v in coll : k => expr}. The parser
+collects the iteration variable(s), the collection expression, and
+the body expression. The bracket/brace type of the surrounding pair
+determines whether this is a list or object comprehension.
+@End Reasoning
 Process called "parse_for_expression" takes parser as Integer returns Integer:
     Let for_expr be proc create_ast_node from HCL_FOR_EXPR
 
@@ -1119,10 +1330,21 @@ Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
 
+@Reasoning:
+Snake-case public alias for create_hcl_parser, matching the naming
+convention expected by the universal translation dispatcher. The
+dispatcher uses underscore-prefixed module names and uniform
+snake_case operations across all frontends.
+@End Reasoning
 Process called "hcl_parser_create" takes tokens as Integer returns Integer:
     Return proc create_hcl_parser from tokens
 End Process
 
+@Reasoning:
+Snake-case public alias for parse_hcl_configuration. Same dispatcher-
+naming convention as hcl_parser_create. The body delegates to the
+canonical implementation.
+@End Reasoning
 Process called "hcl_parse_configuration" takes parser as Integer returns Integer:
     Return proc parse_hcl_configuration from parser
 End Process

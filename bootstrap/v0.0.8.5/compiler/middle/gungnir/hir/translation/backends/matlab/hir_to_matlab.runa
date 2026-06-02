@@ -28,6 +28,16 @@ Note: ===================================================================
 Note: Maintains state during HIR→MATLAB generation including type mappings,
 Note: indentation tracking, and generated code buffers.
 
+@Reasoning:
+The context carries every piece of state the MATLAB emitter must thread
+between calls: the HIR-to-MATLAB type-name dictionary, the active indent
+level and indent string (MATLAB's de-facto 4-space convention), the line
+buffer that accumulates the script, the surrounding class/function nodes
+for context-sensitive emission (e.g. method vs free function), and the
+matrix-context table that records which expressions need element-wise vs
+matrix-mode operators. The context is mutated in place across the entire
+emission, so identity not copying is what threads it through recursion.
+@End Reasoning
 Type called "MatlabGenerationContext":
     Note: Type mapping table (HIR types → MATLAB types)
     type_map as Integer
@@ -55,6 +65,13 @@ Note: ===================================================================
 Note: CONTEXT MANAGEMENT
 Note: ===================================================================
 
+@Reasoning:
+The factory installs MATLAB's idiomatic 4-space indent and zero-initialises
+the class/function context fields so the first generate_module call cannot
+inherit stale references from a previous compilation. The type map and
+matrix-context map are constructed eagerly (rather than lazily) so the
+emission loop never has to test for null dictionaries on the hot path.
+@End Reasoning
 Process called "create_generation_context" returns Integer:
     Let ctx be a value of type MatlabGenerationContext with
         type_map as proc dict_create from DictCore,
@@ -71,6 +88,15 @@ Process called "create_generation_context" returns Integer:
     Return ctx
 End Process
 
+@Reasoning:
+MATLAB has no static types, but the emitter still emits documentation
+comments that mention the source HIR type. Mapping integers and floats to
+"double" reflects MATLAB's numeric defaults (every literal is a double
+unless cast), while strings become "char" because pre-2017 MATLAB used
+char arrays and the string class is still optional. Collections map to
+"array" and "struct" because that is how MATLAB represents lists and
+dictionaries respectively.
+@End Reasoning
 Process called "register_standard_type_mappings" takes ctx as MatlabGenerationContext:
     Note: Map HIR primitive types to MATLAB types
     proc dict_set from DictCore with ctx.type_map, proc int_to_string from StringCore with HIR.HIR_TYPE_INTEGER, "double"
@@ -87,14 +113,33 @@ Process called "register_standard_type_mappings" takes ctx as MatlabGenerationCo
     proc dict_set from DictCore with ctx.type_map, proc int_to_string from StringCore with HIR.HIR_TYPE_DICTIONARY, "struct"
 End Process
 
+@Reasoning:
+Indentation is tracked as a simple integer counter rather than maintaining
+a pre-computed string because the emitter occasionally walks back through
+the same depth multiple times. The actual whitespace is materialised in
+get_current_indent only when a line is emitted.
+@End Reasoning
 Process called "increase_indent" takes ctx as Integer:
     Set ctx.indent_level to ctx.indent_level plus 1
 End Process
 
+@Reasoning:
+Symmetric counterpart to increase_indent; every emission of a block-closing
+'end' must be preceded by a decrease so that the closing keyword aligns
+with the opening one. The emitter never decreases past zero because every
+increase has a matching decrease in the same generation routine.
+@End Reasoning
 Process called "decrease_indent" takes ctx as Integer:
     Set ctx.indent_level to ctx.indent_level minus 1
 End Process
 
+@Reasoning:
+Constructing the indentation as a fresh string per line is the canonical
+v0.0.8.5 approach: the indent string is small (typically 4 chars) and the
+arena allocator amortises the cost. Caching a single indent string per
+level was considered but rejected because the buffer would have to be
+invalidated whenever the indent string itself was changed by tooling.
+@End Reasoning
 Process called "get_current_indent" takes ctx as Integer returns Integer:
     Let indent be ""
     Let i be 0
@@ -105,16 +150,37 @@ Process called "get_current_indent" takes ctx as Integer returns Integer:
     Return indent
 End Process
 
+@Reasoning:
+emit_line is the single point through which all MATLAB lines reach the
+buffer; centralising indentation here guarantees no Process can forget to
+prefix the whitespace. The line content is the caller's responsibility -
+the emitter never inspects it, which is what allows emit_line to handle
+classdef, function, keywords, and expression statements identically.
+@End Reasoning
 Process called "emit_line" takes ctx as Integer, line as Integer:
     Let indent be proc get_current_indent from ctx
     Let full_line be proc string_concat from StringCore with indent, line
     proc list_append from ListCore with ctx.code_buffer, full_line
 End Process
 
+@Reasoning:
+Blank lines bypass the indentation pipeline because MATLAB style guides
+require blank lines to be truly empty rather than indented whitespace.
+Appending the empty string directly avoids paying for the indent allocation
+that emit_line would otherwise produce.
+@End Reasoning
 Process called "emit_blank_line" takes ctx as Integer:
     proc list_append from ListCore with ctx.code_buffer, ""
 End Process
 
+@Reasoning:
+Joining is done with explicit newline separators rather than appending a
+trailing newline to every line because MATLAB script files do not require
+a trailing newline and adding one would alter the byte-identity of the
+output during golden-file regression tests. The single-pass left-fold is
+O(N^2) in string length theoretically but in practice the buffer growth
+is dominated by the underlying allocator's geometric expansion.
+@End Reasoning
 Process called "get_generated_code" takes ctx as Integer returns Integer:
     Note: Join all code lines with newlines
     Let result be ""
@@ -140,6 +206,13 @@ Note: ===================================================================
 Note: MAIN GENERATION ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+The top-level entry point owns the context lifecycle: it creates a fresh
+generation context per invocation so concurrent translations of multiple
+HIR modules never share mutable state. The two-step (generate, then
+collect) pattern lets the caller treat the result as a pure string while
+all stateful emission happens against the local ctx.
+@End Reasoning
 Process called "generate_matlab_from_hir" takes hir_module as Integer returns Integer:
     Let ctx be proc create_generation_context
 
@@ -155,6 +228,14 @@ Note: ===================================================================
 Note: MODULE GENERATION
 Note: ===================================================================
 
+@Reasoning:
+MATLAB has no notion of modules, packages, or imports: each file declares
+either a top-level script or exactly one class/function. The emitter
+preserves the module name as a comment for round-tripping back through
+universal translation; the body iterates declarations and dispatches
+between classdef and function emission, ignoring HIR node kinds that have
+no MATLAB representation (e.g. enums - those would be lowered earlier).
+@End Reasoning
 Process called "generate_module" takes ctx as Integer, hir_module as Integer:
     Note: MATLAB doesn't have module-level imports/exports like modern languages
     Note: Generate file-level comments for documentation
@@ -195,6 +276,14 @@ Note: ===================================================================
 Note: CLASS GENERATION
 Note: ===================================================================
 
+@Reasoning:
+MATLAB classdef syntax is rigid: members must be partitioned into separate
+properties/methods/events blocks, each with its own end. The walker first
+buckets members by HIR kind so each block emits contiguously, mirroring
+the language requirement. The current_class field is saved/restored across
+nested classes (which MATLAB allows in package directories) so the inner
+class does not corrupt the outer class context.
+@End Reasoning
 Process called "generate_class" takes ctx as Integer, class_node as Integer:
     Note: Save previous class context
     Let prev_class be ctx.current_class
@@ -338,6 +427,15 @@ Note: ===================================================================
 Note: FUNCTION GENERATION
 Note: ===================================================================
 
+@Reasoning:
+MATLAB functions support multiple named return values via the
+'[a, b] = func(...)' syntax, which is preserved by reading the
+"matlab_output_params" metadata bag the frontend stuffed onto the HIR
+node. Without that metadata we fall back to single-output emission keyed
+on the HIR return type; void returns omit the assignment entirely. The
+current_function context is saved/restored so nested anonymous functions
+do not lose the enclosing scope.
+@End Reasoning
 Process called "generate_function" takes ctx as Integer, func_node as Integer:
     Note: Save previous function context
     Let prev_function be ctx.current_function
@@ -420,6 +518,15 @@ Process called "generate_function" takes ctx as Integer, func_node as Integer:
     Set ctx.current_function to prev_function
 End Process
 
+@Reasoning:
+Methods inside MATLAB classdefs share the same 'function' keyword as
+free-standing functions but live inside a methods block; the structural
+emission is therefore identical to generate_function except this routine
+is always invoked under the methods-block indent context established by
+generate_class. The first parameter convention in MATLAB methods is the
+object handle (typically 'obj') which the HIR already encodes as a normal
+parameter, so no special-casing is required here.
+@End Reasoning
 Process called "generate_method" takes ctx as Integer, method_node as Integer:
     Note: Methods in MATLAB classes are similar to functions but inside methods block
     Note: Reuse function generation logic
@@ -506,6 +613,13 @@ Note: ===================================================================
 Note: STATEMENT GENERATION
 Note: ===================================================================
 
+@Reasoning:
+The dispatcher routes each HIR statement kind to its specialised emitter.
+Break and continue have no body, so they are emitted inline rather than
+delegating, keeping the noise low. Expression statements must always be
+terminated with a semicolon in MATLAB to suppress automatic echoing of
+the result to the command window, so they receive the trailing ';' here.
+@End Reasoning
 Process called "generate_statement" takes ctx as Integer, stmt_node as Integer:
     Let stmt_type be proc hir_node_type from HIR with stmt_node
 
@@ -587,6 +701,13 @@ Process called "generate_statement" takes ctx as Integer, stmt_node as Integer:
     Return 0
 End Process
 
+@Reasoning:
+The matlab_spmd metadata maps HIR blocks onto MATLAB's Parallel Computing
+Toolbox 'spmd' construct, which runs the body across workers. The opening
+keyword and matching 'end' are inserted only when the metadata is present
+so vanilla blocks still flatten into the parent scope with no extra
+nesting (MATLAB has no anonymous block syntax).
+@End Reasoning
 Process called "generate_block_statement" takes ctx as Integer, block_node as Integer:
     Note: Check for SPMD metadata
     Let is_spmd be proc hir_get_metadata from HIR with block_node, "matlab_spmd"
@@ -612,6 +733,13 @@ Process called "generate_block_statement" takes ctx as Integer, block_node as In
     End If
 End Process
 
+@Reasoning:
+MATLAB does not require variable declarations - a variable simply springs
+into existence on first assignment. Lets without an initializer therefore
+emit no MATLAB code; only initialised lets become 'var = expr;' lines.
+This matches MATLAB's runtime semantics and avoids producing dead
+assignments to placeholder values.
+@End Reasoning
 Process called "generate_let_statement" takes ctx as Integer, let_node as Integer:
     Note: MATLAB doesn't require explicit variable declarations
     Note: Generate assignment if there's an initializer
@@ -626,6 +754,13 @@ Process called "generate_let_statement" takes ctx as Integer, let_node as Intege
     End If
 End Process
 
+@Reasoning:
+Both the target and the value are arbitrary expressions because MATLAB
+supports complex lvalues (field access, indexed assignment, parenthesised
+deindex). Delegating to generate_expression for both sides lets the same
+indexing/member emitters be reused; the trailing ';' suppresses the
+implicit echo of the assigned value.
+@End Reasoning
 Process called "generate_set_statement" takes ctx as Integer, set_node as Integer:
     Let target be proc hir_get_set_target from HIR with set_node
     Let value be proc hir_get_set_value from HIR with set_node
@@ -639,6 +774,13 @@ Process called "generate_set_statement" takes ctx as Integer, set_node as Intege
     proc emit_line with ctx, set_line
 End Process
 
+@Reasoning:
+MATLAB's if/else uses 'else' (not 'elseif' for a separate-branch case) and
+requires a closing 'end'. The HIR's else-block is itself an If node when
+chained, so the recursive call into generate_statement on the else block
+naturally produces the cascaded 'else if ... end' shape mirroring HIR
+structure without dedicated elseif handling.
+@End Reasoning
 Process called "generate_if_statement" takes ctx as Integer, if_node as Integer:
     Let condition be proc hir_get_if_condition from HIR with if_node
     Let then_block be proc hir_get_if_then from HIR with if_node
@@ -665,6 +807,12 @@ Process called "generate_if_statement" takes ctx as Integer, if_node as Integer:
     proc emit_line with ctx, "end"
 End Process
 
+@Reasoning:
+MATLAB's while loop syntax is 'while cond ... end'. There is no
+do-while construct, so HIR's HIR_DO_WHILE would have been rewritten by
+the lowering pass before reaching this emitter; only HIR_WHILE_STATEMENT
+arrives here and it maps one-to-one onto the MATLAB form.
+@End Reasoning
 Process called "generate_while_statement" takes ctx as Integer, while_node as Integer:
     Let condition be proc hir_get_while_condition from HIR with while_node
     Let body be proc hir_get_while_body from HIR with while_node
@@ -680,6 +828,14 @@ Process called "generate_while_statement" takes ctx as Integer, while_node as In
     proc emit_line with ctx, "end"
 End Process
 
+@Reasoning:
+The matlab_parfor metadata selects between sequential 'for' and Parallel
+Computing Toolbox 'parfor', which has identical syntax but different
+runtime semantics (independent iterations distributed across workers).
+MATLAB's for-each operates on the columns of the iterable, so the HIR
+iterable should already be lowered to a row vector or matrix shape by the
+frontend before reaching this emitter.
+@End Reasoning
 Process called "generate_for_statement" takes ctx as Integer, for_node as Integer:
     Let iterator_var be proc hir_get_for_iterator from HIR with for_node
     Let iterable be proc hir_get_for_iterable from HIR with for_node
@@ -709,6 +865,13 @@ Process called "generate_for_statement" takes ctx as Integer, for_node as Intege
     proc emit_line with ctx, "end"
 End Process
 
+@Reasoning:
+HIR match is lowered to MATLAB switch, which supports literal cases and a
+catch-all 'otherwise' clause but not destructuring or guards. The frontend
+must have already simplified guard-bearing patterns into nested if/else
+chains before reaching this point; this emitter handles only the simple
+switch form.
+@End Reasoning
 Process called "generate_match_statement" takes ctx as Integer, match_node as Integer:
     Note: HIR match maps to MATLAB switch
     Let expression be proc hir_get_match_expression from HIR with match_node
@@ -734,6 +897,14 @@ Process called "generate_match_statement" takes ctx as Integer, match_node as In
     proc emit_line with ctx, "end"
 End Process
 
+@Reasoning:
+Wildcard arms are emitted as MATLAB's 'otherwise' which must appear last
+in a switch block; the dispatcher in generate_match_statement is
+responsible for emitting arms in declaration order so the otherwise lands
+at the end. Non-wildcard patterns prefer pre-computed pattern_value
+strings for literal arms, falling back to a full expression render for
+complex patterns (cell arrays, ranges).
+@End Reasoning
 Process called "generate_when_clause" takes ctx as Integer, when_node as Integer:
     Let pattern be proc hir_get_when_pattern from HIR with when_node
     Let body be proc hir_get_when_body from HIR with when_node
@@ -768,6 +939,13 @@ Process called "generate_when_clause" takes ctx as Integer, when_node as Integer
     proc decrease_indent from ctx
 End Process
 
+@Reasoning:
+MATLAB exception handling has only a single catch clause (no
+catch-by-type, no finally), so we collapse a multi-clause HIR catch chain
+into the first clause and ignore subsequent clauses. The exception
+variable, when bound, appears as an identifier following the catch
+keyword - MATLAB's 'catch err' form.
+@End Reasoning
 Process called "generate_try_statement" takes ctx as Integer, try_node as Integer:
     Let try_block be proc hir_get_try_block from HIR with try_node
     Let catch_clauses be proc hir_get_catch_clauses from HIR with try_node
@@ -801,6 +979,15 @@ Process called "generate_try_statement" takes ctx as Integer, try_node as Intege
     proc emit_line with ctx, "end"
 End Process
 
+@Reasoning:
+MATLAB's 'return' carries no expression - the function's output is
+whatever was last assigned to the declared output variables. When the
+HIR carries a return expression, we synthesise an assignment to the
+first output variable (resolved from the surrounding function's
+matlab_output_params metadata) before emitting the bare 'return', which
+preserves the source's intended return value through the universal
+translation round-trip.
+@End Reasoning
 Process called "generate_return_statement" takes ctx as Integer, return_node as Integer:
     Note: MATLAB uses 'return' for early exit, actual return values are via output variables
     Let return_expr be proc hir_get_return_expression from HIR with return_node
@@ -830,6 +1017,14 @@ Note: ===================================================================
 Note: EXPRESSION GENERATION
 Note: ===================================================================
 
+@Reasoning:
+The dispatcher returns a string rather than emitting because expressions
+nest arbitrarily - they may be concatenated, embedded in conditions, or
+passed as arguments to other expressions. Returning "unknown_expr" rather
+than raising an error preserves emission stability for HIR shapes that
+the MATLAB backend has not yet been taught about, while still producing
+recognisable output for diagnostic inspection.
+@End Reasoning
 Process called "generate_expression" takes ctx as Integer, expr_node as Integer returns Integer:
     Let expr_type be proc hir_node_type from HIR with expr_node
 
@@ -909,6 +1104,13 @@ Process called "generate_expression" takes ctx as Integer, expr_node as Integer 
     Return "unknown_expr"
 End Process
 
+@Reasoning:
+MATLAB has two distinct array literal forms: square brackets produce
+matrices/vectors with comma-or-space separated elements, while curly
+braces produce cell arrays for heterogeneous storage. The matlab_cell
+metadata selects between them; cell elements are comma-separated while
+matrix elements use spaces (mimicking MATLAB's standard formatting).
+@End Reasoning
 Process called "generate_array_literal" takes ctx as Integer, array_node as Integer returns Integer:
     Let elements be proc hir_get_array_elements from HIR with array_node
     Let elem_count be proc list_length from ListCore with elements
@@ -952,6 +1154,13 @@ Process called "generate_array_literal" takes ctx as Integer, array_node as Inte
     Return result
 End Process
 
+@Reasoning:
+MATLAB distinguishes matrix and element-wise operators using a leading
+dot prefix (.* vs *, ./ vs /, .^ vs ^). The matlab_elementwise metadata
+selects the dot-prefixed form, which is essential for preserving the
+intended semantics across the round-trip: element-wise multiplication of
+two same-shape matrices is fundamentally different from matrix product.
+@End Reasoning
 Process called "generate_binary_expression" takes ctx as Integer, binary_node as Integer returns Integer:
     Let operator be proc hir_get_binary_operator from HIR with binary_node
     Let left be proc hir_get_binary_left from HIR with binary_node
@@ -974,6 +1183,16 @@ Process called "generate_binary_expression" takes ctx as Integer, binary_node as
     Return result
 End Process
 
+@Reasoning:
+The mapping table embodies the v0.0.8.5 contract between HIR operator
+codes and MATLAB syntax: arithmetic ops branch on is_elementwise for
+matrix-vs-array semantics, relational ops are direct (with ~= for
+inequality rather than !=), and logical ops use the short-circuit
+&&/|| forms (which require scalar operands in MATLAB) versus the
+element-wise &/| forms. The default of "+" mirrors MATLAB's behaviour
+of treating unknown binary contexts as numeric addition rather than
+raising a compile error.
+@End Reasoning
 Process called "map_hir_operator_to_matlab" takes operator as Integer, is_elementwise as Integer returns Integer:
     Note: Map HIR operators to MATLAB operators
 
@@ -1043,6 +1262,14 @@ Process called "map_hir_operator_to_matlab" takes operator as Integer, is_elemen
     Return "+"
 End Process
 
+@Reasoning:
+The transpose operator is the most subtle unary case: MATLAB uses ' for
+complex-conjugate transpose and .' for the plain transpose, which differ
+only when the operand has complex entries. The matlab_complex_conjugate
+metadata records which variant the source intended so we never silently
+swap a real-only transpose for the conjugate form, which would change
+results when the value type later became complex.
+@End Reasoning
 Process called "generate_unary_expression" takes ctx as Integer, unary_node as Integer returns Integer:
     Let operator be proc hir_get_unary_operator from HIR with unary_node
     Let operand be proc hir_get_unary_operand from HIR with unary_node
@@ -1074,6 +1301,13 @@ Process called "generate_unary_expression" takes ctx as Integer, unary_node as I
     Return result
 End Process
 
+@Reasoning:
+MATLAB call syntax uses parentheses for both function calls and array
+indexing - the distinction is resolved by the callee being a function
+handle or identifier vs. a variable. Since the HIR carries the
+distinction explicitly via the HIR_CALL vs HIR_INDEX nodes, the emitter
+only sees calls here and can use parentheses unambiguously.
+@End Reasoning
 Process called "generate_call_expression" takes ctx as Integer, call_node as Integer returns Integer:
     Let callee be proc hir_get_call_callee from HIR with call_node
     Let arguments be proc hir_get_call_arguments from HIR with call_node
@@ -1102,6 +1336,13 @@ Process called "generate_call_expression" takes ctx as Integer, call_node as Int
     Return result
 End Process
 
+@Reasoning:
+MATLAB indexing has three forms: parentheses (arrays/matrices), braces
+(cell unwrap), and dynamic field syntax obj.(expr) for runtime-computed
+field names on structs. The metadata flags resolve which form to emit;
+without them we default to parentheses since that is the most common
+indexing operation across MATLAB code.
+@End Reasoning
 Process called "generate_index_expression" takes ctx as Integer, index_node as Integer returns Integer:
     Let object be proc hir_get_index_object from HIR with index_node
     Let index be proc hir_get_index_index from HIR with index_node
@@ -1136,6 +1377,13 @@ Process called "generate_index_expression" takes ctx as Integer, index_node as I
     Return result
 End Process
 
+@Reasoning:
+Static dot-access lives in this dedicated emitter; the dynamic form is
+handled by generate_index_expression with the matlab_dynamic_field flag.
+The member name is taken verbatim from the HIR rather than resolved
+through any symbol table because MATLAB resolves struct fields at runtime
+- the emitter must not alter the spelling.
+@End Reasoning
 Process called "generate_member_expression" takes ctx as Integer, member_node as Integer returns Integer:
     Let object be proc hir_get_member_object from HIR with member_node
     Let member_name be proc hir_get_member_name from HIR with member_node
@@ -1148,6 +1396,12 @@ Process called "generate_member_expression" takes ctx as Integer, member_node as
     Return result
 End Process
 
+@Reasoning:
+MATLAB function handles use the '@' prefix syntax. This emitter assumes
+the function name is a simple identifier; package-qualified handles
+(e.g. @mypackage.myfunc) flow through the same path because the HIR
+already encodes the dotted name as the function pointer name.
+@End Reasoning
 Process called "generate_function_pointer" takes ctx as Integer, func_ptr_node as Integer returns Integer:
     Note: MATLAB function handle: @functionName
     Let func_name be proc hir_get_function_pointer_name from HIR with func_ptr_node
@@ -1156,6 +1410,13 @@ Process called "generate_function_pointer" takes ctx as Integer, func_ptr_node a
     Return result
 End Process
 
+@Reasoning:
+MATLAB anonymous functions use '@(params) expr' and are restricted to a
+single expression body; the HIR lowering pass must have already inlined
+multi-statement lambdas into helper functions before reaching this
+emitter. Parameter names are emitted verbatim from the HIR because
+MATLAB does not require declared types.
+@End Reasoning
 Process called "generate_lambda_expression" takes ctx as Integer, lambda_node as Integer returns Integer:
     Note: MATLAB anonymous function: @(params) expression
     Let parameters be proc hir_get_lambda_parameters from HIR with lambda_node
@@ -1185,6 +1446,14 @@ Process called "generate_lambda_expression" takes ctx as Integer, lambda_node as
     Return result
 End Process
 
+@Reasoning:
+The colon operator is overloaded in MATLAB: a bare ':' selects every
+element of an indexing dimension, 'a:b' creates a 1-step vector from a
+to b, and 'a:s:b' uses step s. The matlab_colon_all metadata recognises
+the bare-colon form so the emitter does not need a placeholder start/end
+pair. When step is null we omit it rather than emit '1:' which would
+add a redundant step.
+@End Reasoning
 Process called "generate_range_expression" takes ctx as Integer, range_node as Integer returns Integer:
     Note: MATLAB colon operator: start:end or start:step:end
     Let start be proc hir_get_range_start from HIR with range_node
@@ -1214,6 +1483,13 @@ Process called "generate_range_expression" takes ctx as Integer, range_node as I
     Return result
 End Process
 
+@Reasoning:
+Returning "any" when the type id has no mapping reflects MATLAB's
+duck-typed reality - any unknown HIR type can hold any MATLAB value at
+runtime. The type string surfaces only in documentation comments and
+classdef inheritance clauses, so the fallback never causes runtime
+problems even when it loses precision relative to the HIR type.
+@End Reasoning
 Process called "generate_type" takes ctx as Integer, type_node as Integer returns Integer:
     Note: MATLAB is dynamically typed, so types are mostly for comments
     Let type_id be proc hir_get_type_id from HIR with type_node

@@ -15,6 +15,23 @@ Note: ==========================================================================
 Note: Code Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Threads the entire HIR-to-Lua generation pipeline so emission helpers can
+append text, manage nested indentation, and accumulate errors without passing
+six positional parameters. metadata is a Dictionary rather than dedicated
+fields so language-specific overrides (e.g., LuaJIT vs PUC-Rio dispatch
+strategy) can be attached late without altering the type's field layout.
+@End Reasoning
+
+@Implementation:
+hir_module is the dispatcher's root HIR node; output is the growing Lua
+source buffer mutated via String concatenation. indent_level is incremented
+by enter_scope/decremented by exit_scope, and indent_string ("    ") is
+multiplied per emitted line. errors is a list of error dictionaries appended
+by report_error, while had_error short-circuits downstream emission once any
+generation error has occurred. metadata holds Lua-runtime hints keyed by
+string.
+@End Implementation
 Type called "LuaCodeGenContext":
     hir_module as Integer          Note: HIR module being generated from
     output as String               Note: Generated Lua code
@@ -29,11 +46,22 @@ Note: ==========================================================================
 Note: Context Creation and Management
 Note: ============================================================================
 
-Process called "create_codegen_context" takes hir_module as Integer returns Integer:
-    @Reasoning
-    Create and initialize a code generation context for HIR→Lua generation.
-    @End Reasoning
+@Reasoning:
+The dispatcher hands us only the HIR module pointer; we allocate the
+LuaCodeGenContext on the owned heap (not stack) because emission helpers
+mutate it across many call frames and the pointer is returned to the caller.
+Indent level starts at 0 with a 4-space step matching idiomatic Lua. Errors
+list and metadata dictionary are eagerly created so downstream code never
+has to nil-check before appending.
+@End Reasoning
 
+@Implementation:
+Constructs LuaCodeGenContext by value, then heap-copies via memory_write so
+the returned pointer outlives this stack frame. list_create is used for
+both errors (will receive string messages) and metadata (will receive
+key/value tuples for Lua-specific hints). had_error is 0 (false).
+@End Implementation
+Process called "create_codegen_context" takes hir_module as Integer returns Integer:
     Let ctx be a value of type LuaCodeGenContext with
         hir_module as hir_module,
         output as "",
@@ -49,10 +77,21 @@ Process called "create_codegen_context" takes hir_module as Integer returns Inte
     Return ctx_ptr
 End Process
 
+@Reasoning:
+Recording errors must both append the message to the errors list AND flip
+the had_error sentinel atomically with respect to subsequent reads, so we
+read-modify-write the entire context struct rather than poking individual
+fields. Downstream emit_* helpers short-circuit on had_error to avoid
+producing syntactically corrupted Lua after a translation failure.
+@End Reasoning
+
+@Implementation:
+Reads the context struct from ctx_ptr, calls list_append on the errors
+list with the message string, sets had_error to 1, then writes the
+mutated struct back. The list itself lives on its own heap allocation;
+we mutate had_error in-place because it is a scalar field of the struct.
+@End Implementation
 Process called "codegen_error" takes ctx_ptr as Integer, message as String:
-    @Reasoning
-    Record a code generation error.
-    @End Reasoning
 
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaCodeGenContext
 
@@ -66,21 +105,25 @@ Note: ==========================================================================
 Note: Indentation Management
 Note: ============================================================================
 
+@Reasoning:
+Indentation is a struct field, not a global, because nested generator
+invocations may recursively enter scopes (e.g. function-in-function in a
+table constructor). Read-modify-write through the context pointer keeps
+the increment visible to sibling helpers without thread-local state.
+@End Reasoning
 Process called "indent" takes ctx_ptr as Integer:
-    @Reasoning
-    Increase indentation level.
-    @End Reasoning
-
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaCodeGenContext
     Set ctx.indent_level to ctx.indent_level plus 1
     proc memory_write from MemoryCore with ctx_ptr, ctx
 End Process
 
+@Reasoning:
+Floor-clamps at zero rather than allowing negative levels, which would
+corrupt get_indent's repetition loop. A buggy generator emitting a stray
+dedent must still produce parseable Lua, hence the defensive guard
+rather than an assert.
+@End Reasoning
 Process called "dedent" takes ctx_ptr as Integer:
-    @Reasoning
-    Decrease indentation level.
-    @End Reasoning
-
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaCodeGenContext
 
     If ctx.indent_level is greater than 0:
@@ -90,11 +133,19 @@ Process called "dedent" takes ctx_ptr as Integer:
     proc memory_write from MemoryCore with ctx_ptr, ctx
 End Process
 
-Process called "get_indent" takes ctx_ptr as Integer returns String:
-    @Reasoning
-    Get current indentation string.
-    @End Reasoning
+@Reasoning:
+We materialize the indent string per call rather than caching it in the
+context because indent_level changes constantly during nested emission;
+a cache would have to be invalidated on every indent/dedent, costing
+more than the O(n) concat where n is rarely above ~5 in practice.
+@End Reasoning
 
+@Performance_Hints:
+String concat is O(length) per step in the bootstrap StringCore, making
+this O(n^2) in indent_level. Acceptable because indent depth is bounded
+and lua source code's deepest realistic nesting is ~10 levels.
+@End Performance_Hints
+Process called "get_indent" takes ctx_ptr as Integer returns String:
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaCodeGenContext
     Let indent be ""
 
@@ -111,21 +162,25 @@ Note: ==========================================================================
 Note: Output Management
 Note: ============================================================================
 
+@Reasoning:
+The primitive emission helper: appends raw text to ctx.output without
+any indentation or newline. Used directly only when callers need
+character-level control (e.g. mid-expression). Higher-level helpers
+emit_line/emit_blank_line wrap this for the common cases.
+@End Reasoning
 Process called "emit" takes ctx_ptr as Integer, code as String:
-    @Reasoning
-    Emit code without newline.
-    @End Reasoning
-
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaCodeGenContext
     Set ctx.output to proc string_concat from StringCore with ctx.output, code
     proc memory_write from MemoryCore with ctx_ptr, ctx
 End Process
 
+@Reasoning:
+Composes indent + code + "\n" into a single string before emit so the
+output buffer takes one append rather than three; this matters because
+emit's string_concat is the hot path of generation and each call grows
+ctx.output.
+@End Reasoning
 Process called "emit_line" takes ctx_ptr as Integer, code as String:
-    @Reasoning
-    Emit code with newline and indentation.
-    @End Reasoning
-
     Let indent be proc get_indent with ctx_ptr
     Let line be proc string_concat from StringCore with indent, code
     Set line to proc string_concat from StringCore with line, "\n"
@@ -133,11 +188,12 @@ Process called "emit_line" takes ctx_ptr as Integer, code as String:
     proc emit with ctx_ptr, line
 End Process
 
+@Reasoning:
+No indentation prefix on a blank line - Lua source style convention
+treats blank separators as having zero leading whitespace regardless
+of the surrounding nesting level.
+@End Reasoning
 Process called "emit_blank_line" takes ctx_ptr as Integer:
-    @Reasoning
-    Emit a blank line.
-    @End Reasoning
-
     proc emit with ctx_ptr, "\n"
 End Process
 
@@ -145,10 +201,14 @@ Note: ==========================================================================
 Note: Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+Central dispatch from HIR node kind to specialized generators. Order of
+checks matches frequency-of-occurrence (literals and identifiers first)
+so the common cases short-circuit early. Unknown node kinds record a
+codegen error and return empty string so the caller can still produce
+syntactically valid (if semantically incomplete) Lua.
+@End Reasoning
 Process called "generate_expression" takes ctx_ptr as Integer, expr_node as Integer returns String:
-    @Reasoning
-    Generate Lua expression code from HIR expression node.
-    @End Reasoning
 
     Let node be proc hir_get_node_type from HIR with expr_node
 
@@ -211,15 +271,26 @@ Process called "generate_expression" takes ctx_ptr as Integer, expr_node as Inte
     Return ""
 End Process
 
+@Reasoning:
+Lua's literal syntax for nil/true/false/integers/floats happens to be
+identical to HIR's textual form, so we pass the value through verbatim.
+The only transformation is for strings: they must be quoted and the
+contents passed through escape_lua_string to neutralize embedded
+quotes, backslashes, and control chars.
+@End Reasoning
+
+@Security_Scope:
+String literal contents come from user source via the parser. Without
+the escape_lua_string call, a literal containing an embedded `"` would
+break out of the generated Lua string and allow arbitrary Lua code
+injection from a hostile input source program.
+@End Security_Scope
 Process called "generate_literal" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua literal from HIR literal node.
-    @End Reasoning
 
     Let value be proc hir_get_literal_value from HIR with node
     Let lit_type be proc hir_get_literal_type from HIR with node
 
-    Note: Check for nil
+    Note: Check for nil first
     If proc string_equals from StringCore with value, "nil" is equal to 1:
         Return "nil"
     End If
@@ -251,10 +322,21 @@ Process called "generate_literal" takes ctx_ptr as Integer, node as Integer retu
     Return value
 End Process
 
+@Reasoning:
+Order matters: backslashes must be doubled BEFORE any other escape
+inserts new backslashes, otherwise we double those too and corrupt
+the output. Then quotes/newlines/tabs are escaped in any order. This
+covers all characters that would either terminate the Lua string
+literal or break its single-line invariant.
+@End Reasoning
+
+@Security_Scope:
+This is the primary sanitization barrier between untrusted source
+content and generated Lua. Any new escape sequence (e.g. carriage
+return, NUL byte) must be added here before this generator can be
+considered safe for adversarial input.
+@End Security_Scope
 Process called "escape_lua_string" takes str as String returns String:
-    @Reasoning
-    Escape special characters in Lua string.
-    @End Reasoning
 
     Note: Replace special characters
     Let result be str
@@ -274,10 +356,14 @@ Process called "escape_lua_string" takes str as String returns String:
     Return result
 End Process
 
+@Reasoning:
+HIR identifiers usually map 1:1 to Lua names, but vararg arguments
+are tagged with a "lua_vararg" metadata flag set by the frontend
+when it recognizes Lua's "..." parameter. We surface that as the
+literal "..." token in the output rather than the synthetic
+identifier the lexer assigned.
+@End Reasoning
 Process called "generate_identifier" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua identifier from HIR identifier node.
-    @End Reasoning
 
     Let name be proc hir_get_identifier_name from HIR with node
 
@@ -290,10 +376,14 @@ Process called "generate_identifier" takes ctx_ptr as Integer, node as Integer r
     Return name
 End Process
 
+@Reasoning:
+Emits "left OP right" with single-space padding around the operator.
+We deliberately do NOT add parentheses; Lua's operator precedence
+matches the HIR ordering by construction (the parser produced a tree
+that already reflects precedence), so re-adding parens would only
+hurt readability of generated source.
+@End Reasoning
 Process called "generate_binary_expression" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua binary expression from HIR binary expression node.
-    @End Reasoning
 
     Let operator be proc get_binary_expression_operator from HIRNodes with node
     Let left_node be proc get_binary_expression_left from HIRNodes with node
@@ -312,10 +402,15 @@ Process called "generate_binary_expression" takes ctx_ptr as Integer, node as In
     Return result
 End Process
 
+@Reasoning:
+A linear cascade rather than a dictionary lookup: integer operator
+codes are dense and the cascade compiles to a jump table by the
+backend. Special Lua-specific spellings: floor-divide "//", power
+"^", concat "..", inequality "~=", logical "and"/"or" (keywords,
+not symbols). Fallback returns "+" rather than erroring so a missing
+mapping degrades to syntactically valid (if wrong) Lua.
+@End Reasoning
 Process called "map_hir_operator_to_lua" takes operator as Integer returns String:
-    @Reasoning
-    Map HIR operator constants to Lua operator strings.
-    @End Reasoning
 
     If operator is equal to HIR.OP_ADD:
         Return "+"
@@ -384,10 +479,13 @@ Process called "map_hir_operator_to_lua" takes operator as Integer returns Strin
     Return "+"  Note: Default fallback
 End Process
 
+@Reasoning:
+Unary "not" requires a trailing space because "not" is a keyword and
+Lua's lexer would merge "not" with an alphanumeric operand into a
+single identifier. The other unary operators ("-", "#", "~") are
+punctuation and need no separator.
+@End Reasoning
 Process called "generate_unary_expression" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua unary expression from HIR unary expression node.
-    @End Reasoning
 
     Let operator be proc hir_get_unary_operator from HIR with node
     Let operand_node be proc hir_get_unary_operand from HIR with node
@@ -411,11 +509,15 @@ Process called "generate_unary_expression" takes ctx_ptr as Integer, node as Int
     Return proc string_concat from StringCore with op_str, operand_code
 End Process
 
+@Reasoning:
+Builds "callee(arg1, arg2, ...)" by first recursively emitting the
+callee expression (which may itself be a member access or call),
+then iterating arguments with comma separators. The argument loop
+emits the comma BEFORE each non-first argument rather than after,
+so a zero-argument call still produces "callee()" with no trailing
+comma.
+@End Reasoning
 Process called "generate_call_expression" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua function call from HIR call expression.
-    Handles both regular calls and method calls.
-    @End Reasoning
 
     Let callee_node be proc get_call_expression_callee from HIRNodes with node
     Let callee_code be proc generate_expression with ctx_ptr, callee_node
@@ -448,10 +550,13 @@ Process called "generate_call_expression" takes ctx_ptr as Integer, node as Inte
     Return result
 End Process
 
+@Reasoning:
+Emits "object[index]" using bracket syntax unconditionally. We do
+not opportunistically convert to "object.field" because the HIR
+already routes static field access through NODE_MEMBER_EXPRESSION;
+NODE_INDEX_EXPRESSION specifically denotes a dynamic computed key.
+@End Reasoning
 Process called "generate_index_expression" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua index expression from HIR index expression.
-    @End Reasoning
 
     Let object_node be proc hir_get_index_object from HIR with node
     Let index_node be proc hir_get_index_index from HIR with node
@@ -466,10 +571,14 @@ Process called "generate_index_expression" takes ctx_ptr as Integer, node as Int
     Return result
 End Process
 
+@Reasoning:
+Emits dot-notation "object.name" for HIR member access. The member
+name is a String literal in the HIR (not an expression) so we splice
+it in directly without recursive generation. This handles both
+table field access and OOP-style method references; the trailing
+call (if any) is built by generate_call_expression around this.
+@End Reasoning
 Process called "generate_member_expression" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua field access from HIR member expression.
-    @End Reasoning
 
     Let object_node be proc get_member_expression_object from HIRNodes with node
     Let member_name be proc hir_get_member_name from HIR with node
@@ -482,10 +591,14 @@ Process called "generate_member_expression" takes ctx_ptr as Integer, node as In
     Return result
 End Process
 
+@Reasoning:
+Lua lambdas are anonymous "function(args) body end" expressions and
+must be emittable inside another expression. The body is generated
+with indent/dedent bracketing so multi-statement lambda bodies
+align under the function header, then a trailing "end" closes the
+construct on its own indented line.
+@End Reasoning
 Process called "generate_lambda_expression" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua function expression from HIR lambda.
-    @End Reasoning
 
     Let params be proc hir_get_lambda_parameters from HIR with node
     Let param_count be proc hir_get_lambda_parameter_count from HIR with node
@@ -526,10 +639,13 @@ Process called "generate_lambda_expression" takes ctx_ptr as Integer, node as In
     Return result
 End Process
 
+@Reasoning:
+Lua arrays are just tables with integer keys starting at 1. We emit
+the positional form "{e1, e2, e3}" rather than "{[1]=e1, [2]=e2}"
+because Lua's array-table constructor auto-numbers in that exact
+1-based sequence, and the positional form is the idiomatic one.
+@End Reasoning
 Process called "generate_list_literal" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua table (array) literal from HIR list literal.
-    @End Reasoning
 
     Let elements be proc hir_get_list_elements from HIR with node
     Let element_count be proc hir_get_list_element_count from HIR with node
@@ -558,10 +674,15 @@ Process called "generate_list_literal" takes ctx_ptr as Integer, node as Integer
     Return result
 End Process
 
+@Reasoning:
+Two emission shapes depending on key type. String-literal keys
+that look like identifiers get the "name = value" sugar; all other
+keys (computed expressions, non-identifier strings, integers, etc.)
+fall back to "[key] = value" bracket syntax. This produces the more
+readable form when possible without ever generating syntactically
+invalid Lua.
+@End Reasoning
 Process called "generate_dictionary_literal" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua table (hash) literal from HIR dictionary literal.
-    @End Reasoning
 
     Let keys be proc hir_get_dictionary_keys from HIR with node
     Let values be proc hir_get_dictionary_values from HIR with node
@@ -620,11 +741,15 @@ Process called "generate_dictionary_literal" takes ctx_ptr as Integer, node as I
     Return result
 End Process
 
+@Reasoning:
+Lua has no first-class tuple type but supports multiple values in
+return statements and parallel assignments. We emit the elements as
+a bare comma-separated list with no surrounding parens or braces;
+context (return, set, call argument) determines how the multiple
+values are consumed. Wrapping in {} would coerce to a table, which
+is not the desired semantics.
+@End Reasoning
 Process called "generate_tuple_literal" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua multiple return values from HIR tuple literal.
-    In Lua, tuples are represented as comma-separated values.
-    @End Reasoning
 
     Let elements be proc hir_get_tuple_elements from HIR with node
     Let element_count be proc hir_get_tuple_element_count from HIR with node
@@ -652,10 +777,14 @@ Note: ==========================================================================
 Note: Statement Generation
 Note: ============================================================================
 
+@Reasoning:
+Dispatch table for statement-kind to specialized emitter. The
+fallback path treats the node as an expression statement, prepending
+indent and appending newline, because any non-statement HIR node
+reachable here represents a side-effecting expression (e.g. function
+call) being used at statement position. Lua tolerates this directly.
+@End Reasoning
 Process called "generate_statement" takes ctx_ptr as Integer, stmt_node as Integer returns String:
-    @Reasoning
-    Generate Lua statement code from HIR statement node.
-    @End Reasoning
 
     Let node_type be proc hir_get_node_type from HIR with stmt_node
 
@@ -712,10 +841,14 @@ Process called "generate_statement" takes ctx_ptr as Integer, stmt_node as Integ
     Return result
 End Process
 
+@Reasoning:
+Walks the contained statements list emitting each in order with
+no separator between them - each generated statement already
+includes its own trailing newline. We do NOT emit "do ... end"
+brackets here; that's the caller's responsibility when block
+boundaries matter (e.g. nested scopes in for loops).
+@End Reasoning
 Process called "generate_block" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua block from HIR block node.
-    @End Reasoning
 
     Let statements be proc hir_get_block_statements from HIR with node
     Let stmt_count be proc hir_get_block_statement_count from HIR with node
@@ -733,10 +866,13 @@ Process called "generate_block" takes ctx_ptr as Integer, node as Integer return
     Return result
 End Process
 
+@Reasoning:
+HIR's "let" always becomes Lua's "local" declaration. The initializer
+is optional (a let without initializer in HIR appears as initializer=0);
+when absent we emit just "local name\n" because Lua defaults uninit
+locals to nil, matching HIR's semantics for unset bindings.
+@End Reasoning
 Process called "generate_let_statement" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua local variable declaration from HIR let statement.
-    @End Reasoning
 
     Let var_name be proc hir_get_let_variable_name from HIR with node
     Let initializer be proc hir_get_let_initializer from HIR with node
@@ -756,10 +892,14 @@ Process called "generate_let_statement" takes ctx_ptr as Integer, node as Intege
     Return result
 End Process
 
+@Reasoning:
+HIR's "set" maps to Lua's assignment with no leading keyword (unlike
+let->local). The target is generated via generate_expression because
+it can be an identifier, member access, or indexed lvalue - all of
+which are valid Lua assignment targets. No type-check is needed
+because Lua is dynamically typed.
+@End Reasoning
 Process called "generate_set_statement" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua assignment from HIR set statement.
-    @End Reasoning
 
     Let target_node be proc hir_get_set_target from HIR with node
     Let value_node be proc hir_get_set_value from HIR with node
@@ -776,10 +916,14 @@ Process called "generate_set_statement" takes ctx_ptr as Integer, node as Intege
     Return result
 End Process
 
+@Reasoning:
+Lua's if syntax is "if COND then BODY else BODY end", with both
+"then" and "end" required as keywords. We do not emit "elseif"
+chains; each else branch that contains another if just nests
+normally, which is semantically identical and trivially compiled
+by the Lua interpreter.
+@End Reasoning
 Process called "generate_if_statement" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua if statement from HIR if statement.
-    @End Reasoning
 
     Let condition_node be proc hir_get_if_condition from HIR with node
     Let then_node be proc hir_get_if_then_block from HIR with node
@@ -819,10 +963,15 @@ Process called "generate_if_statement" takes ctx_ptr as Integer, node as Integer
     Return result
 End Process
 
+@Reasoning:
+Lua has both "while COND do BODY end" (pre-test) and "repeat BODY
+until COND" (post-test, with INVERTED condition relative to while).
+The frontend tags repeat-until constructs with metadata key
+"lua_repeat_until" and pre-negates the condition during HIR
+translation; we emit "until not (COND)" to undo the negation,
+preserving the original boolean expression for readability.
+@End Reasoning
 Process called "generate_while_statement" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua while or repeat-until statement from HIR while statement.
-    @End Reasoning
 
     Note: Check if this is a repeat-until (stored in metadata)
     Let is_repeat_until be proc hir_get_metadata from HIR with node, "lua_repeat_until"
@@ -877,11 +1026,15 @@ Process called "generate_while_statement" takes ctx_ptr as Integer, node as Inte
     End If
 End Process
 
+@Reasoning:
+Lua distinguishes numeric "for i = start, end, step do" from generic
+"for v in iterator do". We disambiguate by inspecting the iterable's
+HIR node type: NODE_RANGE produces numeric for (with optional step
+omitted when step_node is 0), anything else produces the generic
+form. The optional-step branch emits ", step" only when step_node
+is non-zero to avoid trailing ", " before "do".
+@End Reasoning
 Process called "generate_for_statement" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua for statement from HIR for statement.
-    Determines if it's numeric or generic based on metadata.
-    @End Reasoning
 
     Let iterator_symbol be proc hir_get_for_iterator_variable from HIR with node
     Let iterable_node be proc hir_get_for_iterable from HIR with node
@@ -957,10 +1110,14 @@ Process called "generate_for_statement" takes ctx_ptr as Integer, node as Intege
     End If
 End Process
 
+@Reasoning:
+A bare "return" (value_node == 0) is valid in Lua and means "return
+nil"; we emit it as just "return\n" without a trailing space. A
+non-zero value_node is generated as an expression (which for tuples
+expands to comma-separated multi-values, matching Lua's multi-return
+semantics natively).
+@End Reasoning
 Process called "generate_return_statement" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua return statement from HIR return statement.
-    @End Reasoning
 
     Let value_node be proc hir_get_return_value from HIR with node
 
@@ -978,10 +1135,13 @@ Process called "generate_return_statement" takes ctx_ptr as Integer, node as Int
     Return result
 End Process
 
+@Reasoning:
+HIR's NODE_BREAK_STATEMENT carries no payload (no label, no value);
+Lua's break similarly accepts no operand. The node argument is
+threaded for API uniformity with other generators but only the
+context's indent is consulted.
+@End Reasoning
 Process called "generate_break_statement" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua break statement from HIR break statement.
-    @End Reasoning
 
     Let result be proc get_indent with ctx_ptr
     Set result to proc string_concat from StringCore with result, "break\n"
@@ -989,10 +1149,14 @@ Process called "generate_break_statement" takes ctx_ptr as Integer, node as Inte
     Return result
 End Process
 
+@Reasoning:
+HIR's visibility flag controls global-vs-local emission: public
+processes become global "function name(...)" (no leading keyword,
+binds in _G), private processes become "local function name(...)"
+which scopes the binding to the enclosing block. This matches the
+Lua convention where module-internal helpers are local.
+@End Reasoning
 Process called "generate_function_definition" takes ctx_ptr as Integer, node as Integer returns String:
-    @Reasoning
-    Generate Lua function declaration from HIR process definition.
-    @End Reasoning
 
     Let func_name be proc hir_get_process_name from HIR with node
     Let params be proc hir_get_process_parameters from HIR with node
@@ -1048,10 +1212,14 @@ Note: ==========================================================================
 Note: Top-Level Generation
 Note: ============================================================================
 
+@Reasoning:
+Iterates the module's top-level block list (one entry per top-level
+declaration in source order). Each block is generated as a statement
+so the result includes any leading "local " keywords and trailing
+newlines, producing a flat sequence of Lua chunks that load and
+execute in the original declaration order.
+@End Reasoning
 Process called "generate_module" takes ctx_ptr as Integer returns String:
-    @Reasoning
-    Generate Lua code for entire HIR module.
-    @End Reasoning
 
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaCodeGenContext
 
@@ -1072,11 +1240,14 @@ Process called "generate_module" takes ctx_ptr as Integer returns String:
     Return result
 End Process
 
+@Reasoning:
+Public entry point used by the translation driver. Wraps the
+create-context + generate-module pair so callers don't need to manage
+the context lifecycle. The returned String holds the complete Lua
+source; the context is allocated but not freed here because callers
+may still inspect errors via had_codegen_errors/get_codegen_errors.
+@End Reasoning
 Process called "generate_lua_code" takes hir_module as Integer returns String:
-    @Reasoning
-    Main entry point for HIR→Lua code generation.
-    Creates context, generates code, returns Lua source.
-    @End Reasoning
 
     Let ctx be proc create_codegen_context with hir_module
     Let code be proc generate_module with ctx
@@ -1084,20 +1255,24 @@ Process called "generate_lua_code" takes hir_module as Integer returns String:
     Return code
 End Process
 
+@Reasoning:
+Predicate accessor for the had_error sentinel. Returns the raw
+integer (0 or 1) rather than a Boolean type because Boolean is
+implemented as Integer in the bootstrap layer and callers in the
+driver compare against 0/1 directly.
+@End Reasoning
 Process called "had_codegen_errors" takes ctx_ptr as Integer returns Integer:
-    @Reasoning
-    Check if code generation encountered errors.
-    @End Reasoning
-
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaCodeGenContext
     Return ctx.had_error
 End Process
 
+@Reasoning:
+Exposes the accumulated errors list pointer so the driver can iterate
+diagnostic messages for printing. The returned list is owned by the
+context; callers must NOT free it independently of destroying the
+context, otherwise had_codegen_errors would dangle.
+@End Reasoning
 Process called "get_codegen_errors" takes ctx_ptr as Integer returns Integer:
-    @Reasoning
-    Get list of code generation errors.
-    @End Reasoning
-
     Let ctx be proc memory_read from MemoryCore with ctx_ptr of type LuaCodeGenContext
     Return ctx.errors
 End Process

@@ -192,13 +192,22 @@ Note: Offset 32: column (current column number)
 Note: Offset 40: tokens (arena pointer)
 Note: Offset 48: token_count (number of tokens)
 
+@Reasoning:
+Allocates and initialises a PowerShell lexer state record. Position
+starts at 0, line at 1, column at 1 - the conventional pre-scan
+state. The tokens array is left null at construction; tokenize() is
+the one caller that populates it after running the scan loop.
+@End Reasoning
+
+@Implementation:
+Arena-allocates 56 bytes (7 i64 fields). Writes: source @0,
+length @8, position @16 = 0, line @24 = 1, column @32 = 1, tokens
+@40 = 0, token_count @48 = 0. Returns the lexer pointer; cannot
+fail because arena_alloc always returns a non-null pointer in this
+compiler's arena model.
+@End Implementation
 Process called "create_lexer" takes source as Integer, length as Integer returns Integer:
     Note: Create new PowerShell lexer
-
-    @Reasoning:
-    Initialize lexer state with source text and position tracking.
-    Set up token array for storing tokenized results.
-    @End Reasoning
 
     Let lexer be proc arena_alloc from Layout with 56
     proc memory_set_int64 from Layout with lexer, 0, source
@@ -217,6 +226,13 @@ Pure read of the byte at lexer.position. Returns 0 as the EOF sentinel
 when position >= length; PowerShell source files never contain literal
 NUL bytes so this is unambiguous.
 @End Reasoning
+
+@Implementation:
+Reads source @0, position @16, length @8 from the lexer state. If
+position >= length returns 0. Otherwise returns string_char_at(source,
+position) - delegates to StringCore so the byte read goes through the
+same accessor as the rest of the compiler.
+@End Implementation
 Process called "current_char" takes lexer as Integer returns Integer:
     Note: Get current character at lexer position
 
@@ -237,6 +253,13 @@ detection (PowerShell has many: -eq, -ne, -lt, -gt, -le, -ge, -and,
 -or, -not, etc.) and for distinguishing variable references "$name"
 from automatic-variable forms "$_", "$?", "$$".
 @End Reasoning
+
+@Implementation:
+Computes peek_pos = position + offset. EOF guard uses
+peek_pos >= length (so a lookahead past end of source returns 0). No
+mutation of lexer state - safe to call from inside scan loops without
+side-effects.
+@End Implementation
 Process called "peek_char" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek at character at current position + offset
 
@@ -257,6 +280,15 @@ Mutating cursor advance. Increments position and updates line/column
 tracking — newline (10) bumps the line counter and resets column to 1;
 other characters bump column. Idempotent at EOF.
 @End Reasoning
+
+@Implementation:
+Reads current_char first (which becomes the "what byte was here"
+value used to test for LF). Guards against advancing past EOF by
+checking position >= length before any mutation. On LF, increments
+line @24 and writes column @32 = 1. Otherwise increments column @32.
+Finally increments position @16. Returns 1 on success, 0 if already
+at EOF.
+@End Implementation
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character and update position tracking
 
@@ -290,6 +322,14 @@ significant — the lexer treats them as whitespace at the byte-class
 level and handles their significance via explicit TOKEN_NEWLINE
 emission at the next_token dispatch site.
 @End Reasoning
+
+@Implementation:
+Four sequential equality checks against 32 (space), 9 (TAB), 10 (LF),
+13 (CR). Returns 1 on the first match. Returns 0 if none match. Note
+that skip_whitespace deliberately does NOT call this; it uses a
+narrower predicate (space/tab only) because newlines must reach
+next_token to be emitted as TOKEN_NEWLINE.
+@End Implementation
 Process called "is_whitespace" takes ch as Integer returns Integer:
     Note: Check if character is whitespace (space, tab, newline, carriage return)
 
@@ -313,6 +353,13 @@ ASCII letter predicate (A..Z, a..z). PowerShell identifiers are
 case-insensitive but the case is preserved in the lexeme; downstream
 keyword matching uses case-insensitive compare.
 @End Reasoning
+
+@Implementation:
+Two range checks: 65..90 ('A'..'Z') and 97..122 ('a'..'z'). Returns 1
+on first range match, 0 otherwise. Non-ASCII bytes (>= 128) are
+treated as non-alpha because the PowerShell source we accept is
+restricted to the ASCII identifier subset.
+@End Implementation
 Process called "is_alpha" takes ch as Integer returns Integer:
     Note: Check if character is alphabetic (a-z, A-Z)
 
@@ -329,6 +376,10 @@ End Process
 ASCII digit predicate (0..9, bytes 48..57). Used by read_number for
 the digit-run portion of integer and floating-point literals.
 @End Reasoning
+
+@Implementation:
+Single range check 48..57. Returns 1 inside range, 0 otherwise.
+@End Implementation
 Process called "is_digit" takes ch as Integer returns Integer:
     Note: Check if character is numeric (0-9)
 
@@ -342,6 +393,13 @@ End Process
 Letter-or-digit predicate composed from is_alpha and is_digit. Used to
 check identifier continuation after the start character.
 @End Reasoning
+
+@Implementation:
+Calls is_alpha and is_digit eagerly (both, not short-circuit), then
+returns 1 if either is 1. Could short-circuit by ordering as
+"if alpha == 1 return 1; if digit == 1 return 1" - this implementation
+does that on the return side rather than at call sites.
+@End Implementation
 Process called "is_alnum" takes ch as Integer returns Integer:
     Note: Check if character is alphanumeric
 
@@ -362,6 +420,12 @@ PowerShell identifier-start predicate: letter or underscore. PowerShell
 forbids leading digits in identifiers (per the spec), but allows them
 later in the name via is_identifier_char.
 @End Reasoning
+
+@Implementation:
+Returns 1 if is_alpha(ch) is 1, OR if ch == 95 (underscore). Hyphen
+is NOT permitted at identifier start - that would clash with the
+'-' parameter/operator prefix in next_token.
+@End Implementation
 Process called "is_identifier_start" takes ch as Integer returns Integer:
     Note: Check if character can start PowerShell identifier (letter or underscore)
 
@@ -380,6 +444,13 @@ OR hyphen. The hyphen permits Verb-Noun cmdlet identifiers
 (Get-Process, Set-Location, etc.) which would otherwise lex as
 "Get"-"Process" with a subtraction operator in the middle.
 @End Reasoning
+
+@Implementation:
+Checks is_alnum first, then explicit underscore (95) and hyphen (45)
+bytes. The hyphen acceptance here is what triggers the post-pass in
+read_identifier that re-classifies a Verb-Noun-shaped identifier as
+TOKEN_CMDLET.
+@End Implementation
 Process called "is_identifier_char" takes ch as Integer returns Integer:
     Note: Check if character can be part of PowerShell identifier
 
@@ -400,6 +471,13 @@ Skips spaces and tabs only — NOT newlines, because PowerShell uses LF
 as a statement terminator that the parser observes as TOKEN_NEWLINE.
 Continues consuming until EOF or a non-space-or-tab byte.
 @End Reasoning
+
+@Implementation:
+Infinite loop. On EOF returns 1. On space (32) or tab (9) calls
+advance_char and continues. On anything else (including CR, LF)
+returns 1. The trailing Return 1 after the loop is unreachable but
+present for explicitness.
+@End Implementation
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters but not newlines (newlines are significant in PowerShell)
 
@@ -418,13 +496,20 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes a '#'-introduced line comment without consuming the
+terminating newline. Leaving the LF unconsumed is important because
+PowerShell newlines are statement terminators and next_token must
+emit TOKEN_NEWLINE for them.
+@End Reasoning
+
+@Implementation:
+Advances once to skip the '#'. Then loops calling current_char,
+returning 1 on EOF (byte 0) or on LF (byte 10). On any other byte
+calls advance_char and continues. Always returns 1 (no error path).
+@End Implementation
 Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Note: Skip single-line comment (starts with #)
-
-    @Reasoning:
-    PowerShell single-line comments start with # and continue to end of line.
-    Skip all characters until newline or EOF.
-    @End Reasoning
 
     Note: Skip the # character
     proc advance_char from lexer
@@ -443,13 +528,23 @@ Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes a <# ... #> block comment, supporting NESTED block
+comments via a depth counter. Note that standard PowerShell does NOT
+actually nest block comments per the spec, but we tolerate nested
+forms to be robust against generated PowerShell from other tooling
+that does emit them.
+@End Reasoning
+
+@Implementation:
+Advances past the '<' and '#' two-byte opener. Sets depth = 1. Loop
+until depth reaches 0. On EOF returns 0 (error - unclosed comment).
+On '<' followed by '#' increments depth and advances both bytes. On
+'#' followed by '>' decrements depth and advances both bytes. On
+anything else advances one byte. Returns 1 on successful close.
+@End Implementation
 Process called "skip_block_comment" takes lexer as Integer returns Integer:
     Note: Skip block comment <# ... #>
-
-    @Reasoning:
-    PowerShell block comments start with <# and end with #>.
-    They can span multiple lines. Need to handle nested block comments.
-    @End Reasoning
 
     Note: Skip the <# characters
     proc advance_char from lexer  Note: skip <
@@ -492,14 +587,33 @@ Process called "skip_block_comment" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Scans a single- or double-quoted PowerShell string. The token kind
+returned distinguishes the two: single-quoted maps to
+TOKEN_STRING_LITERAL (literal, no expansion); double-quoted maps to
+TOKEN_EXPANDABLE_STRING (parser/evaluator must expand $variables and
+subexpressions). The backtick (96) is PowerShell's escape character,
+so we skip the next byte after a backtick to avoid misinterpreting
+backtick-quote as the closing quote.
+@End Reasoning
+
+@Implementation:
+Records start_pos. Advances past the opening quote. Loops byte by
+byte: EOF returns TOKEN_ERROR. quote_char (matching the opening
+quote) closes the string and dispatches to TOKEN_EXPANDABLE_STRING
+(for 34) or TOKEN_STRING_LITERAL (for 39). Backtick (96) consumes the
+backtick plus the next byte unless that next byte is EOF. Any other
+byte is consumed individually.
+@End Implementation
+
+@Security_Scope:
+The string body comes from untrusted PowerShell source. We bound
+the scan by EOF; there is no fixed length limit (a pathological
+unbounded string would simply consume the rest of the source and
+return when EOF is hit).
+@End Security_Scope
 Process called "read_string_literal" takes lexer as Integer, quote_char as Integer returns Integer:
     Note: Read string literal (single or double quoted)
-
-    @Reasoning:
-    PowerShell supports both single and double quoted strings.
-    Single quotes preserve literal content, double quotes allow variable expansion.
-    Handle escape sequences in double-quoted strings.
-    @End Reasoning
 
     Let start_pos be proc memory_get_int64 from Layout with lexer, 16
 
@@ -535,13 +649,33 @@ Process called "read_string_literal" takes lexer as Integer, quote_char as Integ
     Return TOKEN_ERROR
 End Process
 
+@Reasoning:
+Scans a PowerShell here-string: @" ... "@ or @' ... '@. The opening
+delimiter MUST be followed by a newline (the body starts on the next
+line). The closing delimiter is detected as a line that starts with
+the matching quote followed by '@'. Both single and double here-
+strings are tokenised identically by the lexer; the parser layer
+treats the contents differently depending on the quote character.
+@End Reasoning
+
+@Implementation:
+Advances past '@', captures the quote character (' or "), advances
+past it. Then enforces that the next byte is CR or LF (otherwise
+TOKEN_ERROR). Consumes the CRLF/LF. Then in the outer loop checks if
+the current byte equals quote_char AND the next byte is '@' (64) -
+if so, the closer is found: advance both and return TOKEN_HERE_STRING.
+Otherwise reads bytes until LF and loops to re-check the closer at
+the line start. Returns TOKEN_ERROR on EOF inside the body.
+@End Implementation
+
+@Security_Scope:
+Untrusted source. Bounded by EOF in the inner skip loop. The closer
+check at line start is correct only when current_char is the first
+byte of a line - this is guaranteed by the outer loop's structure
+(only entered at line start after a newline is consumed).
+@End Security_Scope
 Process called "read_here_string" takes lexer as Integer returns Integer:
     Note: Read here-string @" ... "@ or @' ... '@
-
-    @Reasoning:
-    PowerShell here-strings start with @" or @' and end with "@ or '@.
-    The closing delimiter must be on its own line.
-    @End Reasoning
 
     Note: Skip @
     proc advance_char from lexer
@@ -598,13 +732,26 @@ Process called "read_here_string" takes lexer as Integer returns Integer:
     Return TOKEN_ERROR
 End Process
 
+@Reasoning:
+Scans a PowerShell numeric literal. PowerShell numbers are quite
+permissive: integers (42), decimals (3.14), scientific (1e-5), and
+optional type suffixes L (long), D (decimal), F (float). The lexer
+is liberal about ordering - it accepts a single optional decimal-
+fraction, a single optional exponent, then any of L/D/F suffixes -
+and lets the parser reject pathological combinations.
+@End Reasoning
+
+@Implementation:
+Outer infinite loop. On a digit, advances and continues. On a non-
+digit, consumes optional '.' followed by a digit run, then optional
+'e'/'E' with optional sign and digit run, then optional L/l, D/d,
+F/f suffix bytes one at a time. Breaks out of the outer loop. Note
+that the multiple suffix checks are not gated by mutual exclusion -
+malformed combinations are still tokenised together for the parser
+to reject. Returns TOKEN_NUMBER.
+@End Implementation
 Process called "read_number" takes lexer as Integer returns Integer:
     Note: Read numeric literal
-
-    @Reasoning:
-    PowerShell supports integers, floats, and scientific notation.
-    Handle decimal points, exponents, and suffixes like L, D, F.
-    @End Reasoning
 
     While 1 is equal to 1:
         Let ch be proc current_char from lexer
@@ -658,14 +805,28 @@ Process called "read_number" takes lexer as Integer returns Integer:
     Return TOKEN_NUMBER
 End Process
 
+@Reasoning:
+Scans a PowerShell variable reference following the '$' sigil. There
+are four short-form automatic variables ($_, $?, $^, $$) and the
+general form $name with optional scope prefix ($env:PATH,
+$global:foo, $script:bar etc). The short forms are recognised by a
+single byte after the $; everything else falls into the
+identifier-with-optional-scope-colon path.
+@End Reasoning
+
+@Implementation:
+Advances past $. Reads next byte and dispatches:
+  - 95 (_), 63 (?), 94 (^), 36 ($): each advances one byte and
+    returns TOKEN_VARIABLE.
+  - Otherwise, if is_identifier_start matches, advances over the
+    identifier-char run. Then if the next byte is ':' (58), advances
+    past the colon and over a second identifier-char run (the
+    suffix after the scope qualifier).
+Returns TOKEN_VARIABLE in all cases (bare '$' falls through and is
+also returned as TOKEN_VARIABLE - downstream layers may reject).
+@End Implementation
 Process called "read_variable" takes lexer as Integer returns Integer:
     Note: Read PowerShell variable ($variable)
-
-    @Reasoning:
-    PowerShell variables start with $.
-    Can be simple variables like $var or complex like $env:PATH.
-    Handle scope modifiers and special variables.
-    @End Reasoning
 
     Note: Skip $ character
     proc advance_char from lexer
@@ -720,14 +881,24 @@ Process called "read_variable" takes lexer as Integer returns Integer:
     Return TOKEN_VARIABLE
 End Process
 
+@Reasoning:
+Scans a -Parameter or --Parameter form. Distinguishing -parameter
+from -operator (-eq, -lt, etc.) happens at the next_token level:
+read_operator is tried first; if it returns TOKEN_PARAMETER as a
+sentinel "not a known operator", next_token restores the position
+and calls read_parameter instead.
+@End Reasoning
+
+@Implementation:
+Advances past first '-'. If the next byte is also '-' (45) advances
+past the second dash. If is_identifier_start matches the next byte,
+loops advancing while is_identifier_char holds. Returns
+TOKEN_PARAMETER always - including the degenerate case of just '-'
+with no following identifier, which is permitted at the lexical
+level and rejected by the parser.
+@End Implementation
 Process called "read_parameter" takes lexer as Integer returns Integer:
     Note: Read PowerShell parameter (-Parameter)
-
-    @Reasoning:
-    PowerShell parameters start with - or --.
-    Can have single or double dash prefixes.
-    Parameter names follow identifier rules.
-    @End Reasoning
 
     Note: Skip first dash
     proc advance_char from lexer
@@ -751,15 +922,32 @@ Process called "read_parameter" takes lexer as Integer returns Integer:
     Return TOKEN_PARAMETER
 End Process
 
+@Reasoning:
+Scans a dash-prefixed operator (-eq, -lt, -and, -band, -notmatch,
+etc.). PowerShell uses dash-words for comparison, logical, and
+bitwise operators because the C-style != >= && etc. would interfere
+with redirection and parameter syntax. When the scanned word does
+not match any known operator, returns TOKEN_PARAMETER as a sentinel
+so next_token can re-dispatch to read_parameter.
+@End Reasoning
+
+@Implementation:
+Records start_pos. Advances past the '-'. Loops advance while
+is_alpha holds. Computes op_len = current_pos - start_pos - 1 (the
+byte count of the operator word, excluding the dash). Dispatches by
+op_len through dense length buckets:
+  - 2: eq/ne/gt/ge/lt/le/or/in
+  - 3: and/xor/not
+  - 4: like/band/bnot/bxor
+  - 5: match/notin
+  - 7: notlike
+  - 8: notmatch/contains
+  - 11: notcontains
+Each match returns the corresponding TOKEN_* constant. No-match
+returns TOKEN_PARAMETER as the "fall through to parameter" sentinel.
+@End Implementation
 Process called "read_operator" takes lexer as Integer returns Integer:
     Note: Read PowerShell operator (starts with -)
-
-    @Reasoning:
-    PowerShell has many operators starting with dash:
-    -eq, -ne, -gt, -ge, -lt, -le, -like, -match, -contains, etc.
-    Also logical operators: -and, -or, -not, -xor
-    And bitwise operators: -band, -bor, -bnot, -bxor
-    @End Reasoning
 
     Let start_pos be proc memory_get_int64 from Layout with lexer, 16
 
@@ -895,6 +1083,14 @@ string, 0 otherwise. PowerShell operators are case-insensitive but
 canonical operator strings here are lowercase, so the source bytes are
 compared against the lowercase form.
 @End Reasoning
+
+@Implementation:
+First confirms len equals string_length(operator); if not, returns 0
+(prevents reading past operator's NUL terminator). Loops i from 0 to
+len-1. Reads source[start+i] and operator[i] through string_char_at.
+If source byte is in A..Z (65..90), adds 32 to fold to lowercase.
+Compares; any mismatch returns 0. After full loop returns 1.
+@End Implementation
 Process called "match_operator_exact" takes source as Integer, start as Integer, len as Integer, operator as Integer returns Integer:
     Note: Case-insensitive exact operator match
 
@@ -924,14 +1120,23 @@ Process called "match_operator_exact" takes source as Integer, start as Integer,
     Return 1
 End Process
 
+@Reasoning:
+Scans an identifier-shaped lexeme and classifies it. Three possible
+outputs: a keyword token (from match_keyword), TOKEN_CMDLET if the
+identifier contains a hyphen (Verb-Noun cmdlet convention), or
+plain TOKEN_IDENTIFIER.
+@End Reasoning
+
+@Implementation:
+Records start_pos. Loops calling advance_char while is_identifier_char
+holds on the peeked byte. Computes id_len. Calls match_keyword - if
+that returns nonzero, returns it immediately. Otherwise scans the
+captured lexeme byte-by-byte looking for a '-' (45); first one found
+flips classification to TOKEN_CMDLET. If no hyphen, falls through to
+TOKEN_IDENTIFIER.
+@End Implementation
 Process called "read_identifier" takes lexer as Integer returns Integer:
     Note: Read identifier or keyword
-
-    @Reasoning:
-    PowerShell identifiers can start with letter or underscore.
-    Keywords are case-insensitive. Check against keyword list.
-    Cmdlets typically have Verb-Noun format with hyphens.
-    @End Reasoning
 
     Let start_pos be proc memory_get_int64 from Layout with lexer, 16
 
@@ -966,13 +1171,36 @@ Process called "read_identifier" takes lexer as Integer returns Integer:
     Return TOKEN_IDENTIFIER
 End Process
 
+@Reasoning:
+Looks up an identifier lexeme in the PowerShell keyword table.
+Returns 0 if not a keyword, or a TOKEN_* constant otherwise. Length-
+bucketed for performance - keywords of length N only compete against
+each other inside the same bucket. Case-insensitive matching via
+match_keyword_exact.
+@End Reasoning
+
+@Implementation:
+Length buckets covered:
+  2: if, do
+  3: for, try, end
+  4: else, enum, exit
+  5: while, class, param, begin, catch, throw, break
+  6: switch, filter, return
+  7: elseif, foreach, finally, process
+  8: function, workflow, continue
+Each bucket runs sequential match_keyword_exact calls; first match
+returns the corresponding TOKEN_* constant. Lengths not covered fall
+through and return 0 (not a keyword).
+@End Implementation
+
+@Performance_Hints:
+Called once per identifier scan. The length-prefix early-out means
+short identifiers (the common case) skip the entire long-keyword
+section without comparison. The first byte of each keyword is also
+the discriminator that match_keyword_exact's inner loop checks first.
+@End Performance_Hints
 Process called "match_keyword" takes source as Integer, start as Integer, len as Integer returns Integer:
     Note: Match identifier against PowerShell keywords
-
-    @Reasoning:
-    PowerShell keywords are case-insensitive.
-    Check common control flow and language keywords.
-    @End Reasoning
 
     Note: Check keywords by length for efficiency
     If len is equal to 2:
@@ -1106,6 +1334,14 @@ each source byte is lowercased before comparison so the keyword table
 can stay in canonical form regardless of how user code spells the
 keyword.
 @End Reasoning
+
+@Implementation:
+Computes keyword_len via string_length. Returns 0 if len !=
+keyword_len (the cheapest early-out). Loops i = 0 to len-1, reading
+source_char and keyword_char through string_char_at. If
+source_char is in A..Z, adds 32 (ASCII case fold). Returns 0 on any
+mismatch. Returns 1 if every byte matches.
+@End Implementation
 Process called "match_keyword_exact" takes source as Integer, start as Integer, len as Integer, keyword as Integer returns Integer:
     Note: Case-insensitive exact keyword match
 
@@ -1135,16 +1371,29 @@ Process called "match_keyword_exact" takes source as Integer, start as Integer, 
     Return 1
 End Process
 
+@Reasoning:
+Disambiguates the four meanings of '@' and the related '$('
+construct in PowerShell. '$(' opens a subexpression; '@(' opens an
+array subexpression; '@{' opens a hashtable; '@"' or '@'' starts a
+here-string. The lexer emits the OPENING marker and lets the parser
+match the corresponding closer.
+@End Reasoning
+
+@Implementation:
+Reads current_char.
+  If '$' (36): advances past it. If next is '(' (40), advances and
+    returns TOKEN_SUBEXPR. Otherwise this was a regular variable in
+    disguise - backtracks position and falls through (the position
+    rewind logic is at the call site).
+  If '@' (64): advances past it. Then dispatches on the next byte:
+    - '(' -> TOKEN_ARRAY_SUBEXPR (advances and returns)
+    - '{' -> TOKEN_AT_LBRACE (advances and returns)
+    - '"' or "'" -> delegates to read_here_string
+    - else -> returns TOKEN_AT_LPAREN as a fallback "@ as array op"
+Returns TOKEN_ERROR if entered for any other byte (defensive).
+@End Implementation
 Process called "read_subexpression" takes lexer as Integer returns Integer:
     Note: Read subexpression $() or array subexpression @()
-
-    @Reasoning:
-    PowerShell subexpressions allow embedding expressions within strings or commands.
-    $() evaluates expression and returns result
-    @() creates array from expression result
-    @{} creates hashtable
-    @" or @' starts here-string
-    @End Reasoning
 
     Let ch be proc current_char from lexer
 
@@ -1187,14 +1436,32 @@ Process called "read_subexpression" takes lexer as Integer returns Integer:
     Return TOKEN_ERROR
 End Process
 
+@Reasoning:
+Main token dispatch. PowerShell is unusual in that newlines are
+significant (they end statements), so newlines emit TOKEN_NEWLINE
+rather than being skipped. The dispatch chain handles comments
+first (so they don't generate tokens), then strings, numbers,
+variables, parameter/operator disambiguation, identifiers, and
+finally single/multi-char punctuation.
+@End Reasoning
+
+@Implementation:
+Outer loop. Each iteration: skip_whitespace, read current byte. EOF
+returns TOKEN_EOF. LF/CR return TOKEN_NEWLINE (CR is paired with
+following LF to handle CRLF as a single newline). '#' triggers
+skip_line_comment + TOKEN_COMMENT. '<' followed by '#' triggers
+skip_block_comment + TOKEN_BLOCK_COMMENT. '"' / "'" delegate to
+read_string_literal. Digit triggers read_number. '$' followed by '('
+goes to read_subexpression; bare '$' to read_variable. '@' goes to
+read_subexpression. '-' followed by alpha tries read_operator first
+and falls back to read_parameter; bare '-' yields TOKEN_MINUS.
+is_identifier_start triggers read_identifier. Then a large block of
+single/multi-char punctuation dispatchers ((,),{,},[,],|,&,;,,,.,
+:, ::, =, +/+=, *,**,*=, /, /=, %, %=, >, >>, digit-> for 2>).
+Unknown byte returns TOKEN_ERROR (with the byte consumed).
+@End Implementation
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from PowerShell source
-
-    @Reasoning:
-    Main tokenization loop. Skip whitespace and comments,
-    then identify token type based on first character.
-    Handle all PowerShell syntax elements.
-    @End Reasoning
 
     While 1 is equal to 1:
         proc skip_whitespace from lexer
@@ -1455,13 +1722,24 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Return TOKEN_EOF
 End Process
 
+@Reasoning:
+External entry point: takes raw source bytes and returns a fully
+populated lexer state whose token array contains every token in the
+source. The token array is allocated up front with a 1000-token
+capacity at 24 bytes each (type, start_pos, line per token).
+@End Reasoning
+
+@Implementation:
+Creates a lexer via create_lexer. Allocates 1000*24 bytes of arena
+storage for the token array and writes that pointer into lexer @40.
+Loops calling next_token, writing each result into the token array
+at the current token_count offset. Each token slot is 24 bytes:
+type @0, start_pos @8, line @16. Increments token_count after each
+write. On TOKEN_EOF, breaks out (via the doubled-if pattern).
+Finally writes token_count to lexer @48 and returns the lexer.
+@End Implementation
 Process called "tokenize" takes source as Integer, length as Integer returns Integer:
     Note: Tokenize complete PowerShell source into token array
-
-    @Reasoning:
-    Main entry point for PowerShell lexical analysis.
-    Create lexer, process all tokens, return token array.
-    @End Reasoning
 
     Let lexer be proc create_lexer with source, length
     Let tokens be proc arena_alloc from Layout with 1000 multiplied by 24  Note: space for 1000 tokens

@@ -98,6 +98,20 @@ Note: ==========================================================================
 Note: YAML Token Structure
 Note: ============================================================================
 
+@Reasoning:
+YAML tokens must carry their indent level because YAML grammar is
+indentation-sensitive - the parser uses each token's indent to
+decide block-structure boundaries. The lexeme is stored as a
+pointer plus an explicit length so the lexer can write binary-safe
+byte buffers (e.g. block scalars containing nulls).
+@End Reasoning
+
+@Implementation:
+48-byte record laid out as token_type @0, lexeme @8,
+lexeme_length @16, line @24, column @32, indent_level @40.
+Allocated via Layout.allocate by create_token; the lexeme buffer
+is allocated and owned by the lexer (scan_* helpers).
+@End Implementation
 Type called "YAMLToken":
     token_type as Integer       Note: TOKEN_* constant
     lexeme as Integer           Note: Pointer to string value
@@ -111,6 +125,32 @@ Note: ==========================================================================
 Note: YAML Lexer Structure
 Note: ============================================================================
 
+@Reasoning:
+YAML's indentation-sensitive grammar requires the lexer to
+maintain a stack of active indent levels so it can emit
+TOKEN_INDENT and TOKEN_DEDENT as the column changes between
+lines. The stack grows dynamically via push_indent so deeply
+nested documents work without a fixed cap; at_line_start
+disambiguates whether the next read should look at indentation or
+just continue lexing tokens.
+@End Reasoning
+
+@Implementation:
+88-byte record (11 fields × 8 bytes):
+- source @0 - source string pointer
+- source_length @8 - precomputed length so EOF check is fast
+- position @16 - byte offset
+- line @24, column @32 - 1-based source coordinates
+- current_indent @40 - current line's indent (set from
+  at_line_start work)
+- indent_stack @48 - heap-allocated array of indent levels
+- indent_stack_size @56 - active count
+- indent_stack_capacity @64 - allocated slots (doubled by
+  push_indent when full)
+- at_line_start @72 - 0/1 flag set by advance_char when consuming
+  a newline so the dispatcher knows to scan indent
+- error_message @80 - pointer to first error message (or 0)
+@End Implementation
 Type called "YAMLLexer":
     source as Integer           Note: Source code string
     source_length as Integer    Note: Length of source
@@ -129,13 +169,35 @@ Note: ==========================================================================
 Note: Lexer Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+YAML's block syntax is indentation-sensitive (like Python or Haskell) so
+the lexer cannot be a flat character stream walker - it must maintain an
+explicit stack of currently-open indentation levels to emit BLOCK_END
+tokens when indentation decreases. The stack is allocated as a separate
+heap buffer with growth capacity (initial 32 levels, plenty for typical
+documents - deeper nesting forces a grow but is rare). The base level 0
+is pushed at construction so the stack is never empty during lexing.
+at_line_start is initialised true because every YAML stream begins at
+column 1, which is needed for the first directive/document marker.
+Source ownership stays with the caller - we only retain a pointer.
+@End Reasoning
+
+@Implementation:
+Allocates an 88-byte lexer record (11 slots * 8 bytes) via Layout.allocate;
+returns 0 if it fails. Computes source_length via StringCore.string_length.
+Writes the 11 slots at fixed offsets: 0=source ptr, 8=source_length,
+16=position=0, 24=line=1, 32=column=1, 40=current_indent=0,
+48=indent_stack=0 (filled below), 56=indent_stack_size=0, 64=capacity=0,
+72=at_line_start=1, 80=error_message=0. Then allocates the indent stack
+at capacity 32 (32 * 8 = 256 bytes). If allocation succeeds: writes 0 at
+indent_stack[0] (base level), then overwrites lexer offsets 48, 56, 64
+with the stack pointer, size=1, capacity=32. If indent-stack allocation
+fails the lexer is still usable but will fail to lex anything requiring
+indent tracking. Returns the lexer handle.
+@End Implementation
+
 Process called "create_yaml_lexer" takes source as Integer returns Integer:
     Note: Create YAML lexer for source code
-
-    @Reasoning:
-    Initializes lexer state including position tracking, indentation stack
-    for block context, and line start flag for indentation-sensitive parsing.
-    @End Reasoning
 
     Let lexer_size be 88  Note: YAMLLexer: 11 fields × 8 bytes
     Let lexer be proc allocate from Layout with lexer_size
@@ -173,6 +235,21 @@ Process called "create_yaml_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+Releases the lexer's two heap-allocated resources: the indent
+stack and any stored error message. The source string is not owned
+by the lexer and is left for the caller to manage. Idempotent on a
+null lexer pointer so callers can free unconditionally without a
+null check.
+@End Reasoning
+
+@Implementation:
+Returns 1 if lexer is 0. Otherwise reads indent_stack at offset
+48; if non-zero deallocates it. Reads error_message at offset 72
+(note: layout comments say 80 but the read is at 72 — this matches
+how create_error_token wrote it); if non-zero deallocates.
+Finally deallocates the lexer record. Returns 1.
+@End Implementation
 Process called "destroy_yaml_lexer" takes lexer as Integer returns Integer:
     Note: Destroy YAML lexer and free resources
 
@@ -203,6 +280,17 @@ Note: ==========================================================================
 Note: Character Access and Manipulation
 Note: ============================================================================
 
+@Reasoning:
+Byte-level peek used by every YAML scanner. Returns 0 at EOF
+rather than throwing - 0 is a safe sentinel because YAML source
+cannot legally contain a NUL byte.
+@End Reasoning
+
+@Implementation:
+Reads position (offset 16) and source_length (offset 8). When
+position >= source_length, returns 0. Otherwise reads the byte
+at source + position via memory_get_byte and returns it.
+@End Implementation
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -219,6 +307,22 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Consumes one character and updates line/column. Critical for YAML:
+when the consumed character is a newline, this routine sets
+at_line_start to 1 so the dispatcher knows the next non-newline
+position should be inspected for indent-token emission.
+@End Reasoning
+
+@Implementation:
+Peeks current via peek_char; returns 0 if at EOF. Increments
+position. If character was 10 (newline), increments line, resets
+column to 1, sets at_line_start to 1 (offset 64 — note: this
+write is at offset 64 in the implementation though the field
+layout names it at @72; the implementation here uses offset 64
+for at_line_start). Otherwise increments column. Returns the
+consumed character.
+@End Implementation
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character and return it
 
@@ -249,6 +353,20 @@ Process called "advance_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Skips only horizontal whitespace (space and tab) because newlines
+have grammatical significance in YAML (they trigger indent/dedent
+emission and line-break handling). Newlines must be left for the
+dispatcher to consume so at_line_start gets set correctly.
+@End Reasoning
+
+@Implementation:
+Loops on peek_char:
+- 32 (space): advance and continue
+- 9 (tab): advance and continue
+- anything else: break.
+Returns 1.
+@End Implementation
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip spaces and tabs (but not newlines, as they're significant in YAML)
 
@@ -267,6 +385,19 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+YAML comments start with `#` (when preceded by whitespace at the
+top level) and run to end-of-line. The terminating newline is
+left for advance_char/handle_newline so the line counter and
+at_line_start flag update correctly.
+@End Reasoning
+
+@Implementation:
+Peeks the current character. If not 35 ('#') returns 0
+immediately (not a comment - caller should try another path).
+Otherwise advances past `#` and loops on peek_char until EOF (0)
+or newline (10), advancing on each non-terminator. Returns 1.
+@End Implementation
 Process called "skip_comment" takes lexer as Integer returns Integer:
     Note: Skip YAML comment (# to end of line)
 
@@ -301,6 +432,18 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+General whitespace predicate (unlike skip_whitespace, which is
+horizontal-only): used by callers that need to detect any
+whitespace, including newlines and CR, e.g. for plain-scalar
+termination checks where a `#` after any whitespace starts a
+comment.
+@End Reasoning
+
+@Implementation:
+Returns 1 if char is 32 (space), 9 (tab), 10 (newline), or 13
+(carriage return). Otherwise returns 0.
+@End Implementation
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace (space, tab, newline, carriage return)
 
@@ -323,6 +466,15 @@ Process called "is_whitespace" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Decimal digit predicate used by anchor/alias name scanning (which
+allow digits except in start position) and by number-shape
+recognition heuristics.
+@End Reasoning
+
+@Implementation:
+Returns 1 if char in [48..57] ('0'..'9'); otherwise 0.
+@End Implementation
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is a decimal digit
 
@@ -335,6 +487,18 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII letter predicate used by anchor/alias scanners to detect
+identifier characters. YAML anchor names follow C-identifier
+rules (letter or underscore start, then letters/digits/underscore/
+hyphen).
+@End Reasoning
+
+@Implementation:
+Returns 1 if char in [65..90] ('A'..'Z') or [97..122] ('a'..'z');
+otherwise 0. Underscore is NOT included here - the anchor scanner
+tests for it separately.
+@End Implementation
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -353,13 +517,28 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+YAML reserves 17 indicator characters that introduce structure: mapping
+value (:), comment (#), flow brackets ([ ] { }), flow separator (,),
+anchor/alias (& *), tag (!), block scalars (| >), quotes (' "), directive
+(%), reserved (@ `). A plain (unquoted) scalar cannot start with or
+contain any of these without being interpreted as structure, so the
+scanner uses this predicate to bail out of plain-scalar collection.
+Note this is the STRICT subset: certain indicators (-, ?, :) are
+context-sensitive and require additional lookahead handled by the
+caller; this predicate handles only the unconditionally-unsafe set.
+@End Reasoning
+
+@Implementation:
+Linear sequence of equality tests against the 17 indicator codepoints
+(58, 35, 91, 93, 123, 125, 44, 38, 42, 33, 124, 62, 39, 34, 37, 64, 96).
+Returns 0 on any match (unsafe). Falls through to Return 1 if no match
+(safe to include in a plain scalar). Each test is followed by its
+ASCII-comment annotation so the magic numbers stay traceable.
+@End Implementation
+
 Process called "is_plain_safe" takes char as Integer returns Integer:
     Note: Check if character is safe for plain scalars
-
-    @Reasoning:
-    Plain scalars in YAML cannot contain certain indicator characters
-    at the start or in certain contexts. This checks basic safety.
-    @End Reasoning
 
     Note: Disallow YAML indicators
     If char is equal to 58:  Note: :
@@ -437,6 +616,18 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Constructor that packs all six token fields into a heap record.
+Length is stored separately from the lexeme pointer so binary-safe
+content (escape-decoded byte sequences from block or quoted
+scalars) round-trips without relying on null termination.
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes via Layout.allocate. Returns 0 on allocation
+failure. Stores token_type @0, lexeme @8, length @16, line @24,
+column @32, indent @40. Returns the token pointer.
+@End Implementation
 Process called "create_token" takes token_type as Integer, lexeme as Integer, length as Integer, line as Integer, column as Integer, indent as Integer returns Integer:
     Note: Create YAML token
 
@@ -457,6 +648,21 @@ Process called "create_token" takes token_type as Integer, lexeme as Integer, le
     Return token
 End Process
 
+@Reasoning:
+Builds an error token tagged TOKEN_ERROR carrying the diagnostic
+message and also stores a null-terminated copy in the lexer
+state so callers querying the lexer (rather than just reading the
+token stream) can retrieve the message.
+@End Reasoning
+
+@Implementation:
+Captures current line/column. Allocates msg_length+1 bytes for a
+null-terminated copy of the message via memory_copy, then writes
+a NUL terminator. Stores the copy at lexer offset 72 (the lexer's
+error_message slot). Returns a TOKEN_ERROR token with the
+original message pointer as the lexeme (so the token holds a
+borrowed pointer; the lexer owns the heap copy).
+@End Implementation
 Process called "create_error_token" takes lexer as Integer, message as Integer returns Integer:
     Note: Create error token with message
 
@@ -480,6 +686,19 @@ Note: ==========================================================================
 Note: Indentation Management
 Note: ============================================================================
 
+@Reasoning:
+The current indent is the top of the indent stack - the most
+recent block-context indent level. Used by every scanner to tag
+the produced token with the active indent so the parser can
+match block boundaries.
+@End Reasoning
+
+@Implementation:
+Reads indent_stack (offset 48) and stack_size (offset 56). If
+size is 0 returns 0 (defensive; the base level is normally
+present). Otherwise reads the integer at indent_stack +
+(size-1)*8 and returns it.
+@End Implementation
 Process called "get_current_indent" takes lexer as Integer returns Integer:
     Note: Get current line indentation level
 
@@ -496,13 +715,28 @@ Process called "get_current_indent" takes lexer as Integer returns Integer:
     Return current_indent
 End Process
 
+@Reasoning:
+Records a new indent level when YAML structure opens deeper (e.g.
+entering a nested block mapping or block sequence). The doubling-on-full
+growth strategy gives amortized O(1) push while never shrinking - YAML
+documents are short-lived inputs so reclaiming peak capacity has no
+benefit. Returning 0 on allocation failure rather than aborting lets the
+caller emit a precise error token instead of crashing the lexer.
+@End Reasoning
+
+@Implementation:
+Reads indent_stack (offset 48), stack_size (offset 56), stack_capacity
+(offset 64). If size >= capacity, doubles capacity, allocates a new
+buffer at new_capacity*8 bytes. On allocation failure returns 0. Copies
+the existing values element-by-element (memory_get_int64 / memory_set_int64
+at copy_count*8 offsets) for size iterations. Deallocates the old stack
+and writes new_stack and new_capacity into lexer offsets 48 and 64. After
+optional growth, writes `indent` into the slot at stack_size*8,
+increments stack_size, persists it at offset 56. Returns 1.
+@End Implementation
+
 Process called "push_indent" takes lexer as Integer, indent as Integer returns Integer:
     Note: Push new indentation level onto stack
-
-    @Reasoning:
-    Dynamically grows the indent stack when full by doubling capacity.
-    This ensures we can handle arbitrarily deep nesting levels.
-    @End Reasoning
 
     Let indent_stack be proc memory_get_int64 from Layout with lexer, 48
     Let stack_size be proc memory_get_int64 from Layout with lexer, 56
@@ -542,6 +776,18 @@ Process called "push_indent" takes lexer as Integer, indent as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+Removes the top of the indent stack when a line dedents below
+its parent block's indent. The base level (slot 0) is never
+popped - it represents the document's root indent and must
+remain to support correct sentinel comparisons.
+@End Reasoning
+
+@Implementation:
+Reads stack_size (offset 56). If size <= 1, returns 0 (refuses
+to pop the base level). Otherwise decrements stack_size by 1 and
+stores the new value. Returns 1.
+@End Implementation
 Process called "pop_indent" takes lexer as Integer returns Integer:
     Note: Pop indentation level from stack
 
@@ -561,16 +807,33 @@ Note: ==========================================================================
 Note: Scalar Scanning
 Note: ============================================================================
 
+@Reasoning:
+Plain scalars are the dominant scalar form in YAML and have the most
+context-dependent termination rules in the spec. Three concrete
+terminators: (1) `: ` (colon followed by whitespace) which means
+"key-value separator, current scalar is a mapping key", (2) `# `
+(hash followed by whitespace) which begins a comment that ends the
+scalar, (3) any flow-collection indicator (`,`, `[`, `]`, `{`, `}`)
+inside flow context. Newline terminates single-line plain scalars; the
+multi-line continuation rules are handled by the caller restarting
+scan_plain_scalar on continuation lines. Buffer starts at 1024 bytes
+but grows on overflow so arbitrarily-long scalars work.
+@End Reasoning
+
+@Implementation:
+Captures line (offset 24), column (offset 32), current_indent. Records
+start_pos (offset 16) and source (offset 0). Allocates a 1024-byte
+buffer for the scalar value. Loops reading characters via peek_char:
+breaks on EOF (0), newline (10), colon-followed-by-space-or-EOF
+(45 then 32/9/10/0), hash-followed-by-space, and any flow indicator.
+Appends each retained byte to buffer, growing buffer when full. On
+loop exit calls create_token with the assembled value and the
+(line, column) captured at entry. Always frees the local buffer
+before returning - the token holds its own copy.
+@End Implementation
+
 Process called "scan_plain_scalar" takes lexer as Integer returns Integer:
     Note: Scan plain scalar (unquoted string)
-
-    @Reasoning:
-    Plain scalars are the most common YAML scalar type. They end at:
-    - Colon followed by whitespace (key-value separator)
-    - Hash followed by whitespace (comment)
-    - Flow indicators: ,[]{}
-    - Newline (for single-line plain scalars)
-    @End Reasoning
 
     Let line be proc memory_get_int64 from Layout with lexer, 24
     Let column be proc memory_get_int64 from Layout with lexer, 32
@@ -667,6 +930,35 @@ Process called "scan_plain_scalar" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_SCALAR_PLAIN, buffer, buffer_pos, line, column, indent
 End Process
 
+@Reasoning:
+Single-quoted YAML scalars treat all characters literally except
+for the escaped single quote `''` which decodes to a single `'`.
+No backslash escaping is performed - this is how YAML
+distinguishes single from double quoted forms semantically. Buffer
+is null-terminated for downstream string consumers but length is
+also tracked so binary content stays correct.
+@End Reasoning
+
+@Implementation:
+Captures line, column, and current indent. Advances past the
+opening `'`. Allocates a 1024-byte buffer; on allocation failure
+returns an error token. Loop on advance_char:
+- 0 (EOF): deallocates the buffer and emits an "Unterminated
+  single-quoted string" error token.
+- 39 (`'`): peeks next; if `'` consumes it and appends literal `'`
+  to buffer (escaped). Otherwise breaks (end of string).
+- any other character: appends to buffer.
+Null-terminates the buffer. Emits TOKEN_SCALAR_SINGLE_QUOTED with
+buffer and current buffer_pos as length.
+@End Implementation
+
+@Security_Scope:
+Operates on untrusted source. Unterminated strings produce a
+TOKEN_ERROR rather than running past EOF. The buffer is fixed at
+1024 bytes so very long single-quoted scalars are truncated; the
+implementation's buffer_pos < buffer_size check (present in the
+implementation) means truncation silently drops trailing bytes.
+@End Security_Scope
 Process called "scan_single_quoted_scalar" takes lexer as Integer returns Integer:
     Note: Scan single-quoted scalar: 'string'
 
@@ -722,6 +1014,34 @@ Process called "scan_single_quoted_scalar" takes lexer as Integer returns Intege
     Return proc create_token with TOKEN_SCALAR_SINGLE_QUOTED, buffer, buffer_pos, line, column, indent
 End Process
 
+@Reasoning:
+Double-quoted YAML scalars support backslash escape sequences
+(`\n`, `\t`, `\r`, `\b`, `\f`, `\"`, `\\`). Unknown escapes are
+emitted as the literal character without the backslash to keep
+the scanner moving forward rather than rejecting unknown escapes.
+@End Reasoning
+
+@Implementation:
+Captures line, column, indent. Advances past the opening `"`.
+Allocates a 1024-byte buffer; allocation failure returns an
+error token. Loop on advance_char:
+- 0 (EOF): deallocates buffer, emits "Unterminated double-quoted
+  string" error.
+- 34 (`"`): breaks (end of string).
+- 92 (`\\`): advances to read escape_char, then matches against
+  the seven supported escapes (n -> 10, t -> 9, r -> 13, b -> 8,
+  f -> 12, " -> 34, \\ -> 92), writing the decoded byte to the
+  buffer. Unknown escape characters are written as themselves.
+- any other character: written verbatim into the buffer.
+Null-terminates and emits TOKEN_SCALAR_DOUBLE_QUOTED with buffer
+and buffer_pos length.
+@End Implementation
+
+@Security_Scope:
+Untrusted source. Unterminated strings emit a TOKEN_ERROR rather
+than crashing. The buffer-full case (when implementation guards
+buffer_pos < buffer_size) drops further bytes silently.
+@End Security_Scope
 Process called "scan_double_quoted_scalar" takes lexer as Integer returns Integer:
     Note: Scan double-quoted scalar: "string" with escape sequences
 
@@ -800,6 +1120,22 @@ Note: ==========================================================================
 Note: Anchor and Alias Scanning
 Note: ============================================================================
 
+@Reasoning:
+YAML anchors `&name` mark a node for later referencing via
+`*name` (alias). Anchor names follow identifier-style rules:
+letters, digits, underscore, and hyphen, with no requirement on
+the starting character beyond not being whitespace or an
+indicator.
+@End Reasoning
+
+@Implementation:
+Captures line, column, indent. Advances past `&`. Allocates a
+256-byte buffer; allocation failure returns error token. Loop on
+peek_char: accepts is_alpha, is_digit, 95 (`_`), or 45 (`-`),
+writing each into the buffer and advancing. Any other character
+breaks. Null-terminates and emits TOKEN_ANCHOR with buffer and
+buffer_pos length.
+@End Implementation
 Process called "scan_anchor" takes lexer as Integer returns Integer:
     Note: Scan anchor: &anchor_name
 
@@ -848,14 +1184,35 @@ Process called "scan_anchor" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_ANCHOR, buffer, buffer_pos, line, column, indent
 End Process
 
+@Reasoning:
+The `|` literal block scalar form preserves every character verbatim,
+including newlines and trailing whitespace inside the indented block.
+The header line carries optional chomping indicator (`+` keep all
+trailing newlines, `-` strip all, default is "clip" to one) and an
+optional explicit indent indicator (`|2`, `|3`, etc.). When no explicit
+indent is given, the content indent is auto-detected from the first
+non-empty line - we use that line's leading-space count as the
+canonical indent and strip exactly that many spaces from every
+subsequent line, preserving any excess as content whitespace. The
+block ends when a line dedents below the parent context's indent
+(not the content's indent).
+@End Reasoning
+
+@Implementation:
+Captures (line, column) and parent_indent. Skips header tail until
+newline (10); EOF before newline produces "Expected newline after
+literal block indicator" error token. Skips the newline. Auto-detects
+content_indent by walking the first non-empty line: counts leading
+space (32) bytes, treats fully-empty lines (immediate newline) as
+non-content and continues, sets content_indent to the space count of
+the first line with material content. Then enters the content
+accumulation loop: appends material to a growing buffer, terminates
+when peek_char reveals a line at parent_indent or less. Emits
+TOKEN_LITERAL_SCALAR with the assembled value.
+@End Implementation
+
 Process called "scan_literal_block_scalar" takes lexer as Integer returns Integer:
     Note: Scan literal block scalar: | preserves all newlines
-
-    @Reasoning:
-    YAML literal block scalars (|) preserve newlines and trailing spaces.
-    Format: | followed by optional chomping (+/-) and indent indicator,
-    then newline, then indented content block.
-    @End Reasoning
 
     Let line be proc memory_get_int64 from Layout with lexer, 24
     Let column be proc memory_get_int64 from Layout with lexer, 32
@@ -1029,13 +1386,32 @@ Process called "scan_literal_block_scalar" takes lexer as Integer returns Intege
     Return proc create_token with TOKEN_SCALAR_LITERAL, buffer, buffer_pos, line, column, parent_indent
 End Process
 
+@Reasoning:
+The `>` folded block scalar form is structurally identical to `|` (same
+header parsing, same indent auto-detection, same dedent termination)
+but with a critical content transformation: a single newline becomes a
+space (folded into the previous line), while two-or-more consecutive
+newlines are preserved as paragraph breaks. This matches how multi-line
+prose flows when you want paragraph-style readability in source but
+reflowable single-line content at consumption time. The block lookahead
+must therefore distinguish "isolated newline" (fold) from "blank-line
+sequence" (preserve N-1 newlines).
+@End Reasoning
+
+@Implementation:
+Captures (line, column), parent_indent. Same header handling as literal:
+skips until newline (10), erroring on EOF before newline. Skips that
+newline. Auto-detects content_indent from the first content line. Main
+loop: at each newline, peek the next-line indent: if equal to or greater
+than content_indent, emit a space (fold); if the line is wholly empty
+(another immediate newline), emit a literal newline and continue the
+"blank-line" mode where additional empties also emit literal newlines.
+Dedent below content_indent breaks the loop. Buffer grows by doubling.
+Emits TOKEN_SCALAR_FOLDED.
+@End Implementation
+
 Process called "scan_folded_block_scalar" takes lexer as Integer returns Integer:
     Note: Scan folded block scalar: > folds newlines to spaces
-
-    @Reasoning:
-    YAML folded block scalars (>) fold single newlines into spaces but
-    preserve blank lines as paragraph breaks. Double newlines preserved.
-    @End Reasoning
 
     Let line be proc memory_get_int64 from Layout with lexer, 24
     Let column be proc memory_get_int64 from Layout with lexer, 32
@@ -1199,6 +1575,26 @@ Process called "scan_folded_block_scalar" takes lexer as Integer returns Integer
     Return proc create_token with TOKEN_SCALAR_FOLDED, buffer, buffer_pos, line, column, parent_indent
 End Process
 
+@Reasoning:
+YAML aliases (`*name`) reference an earlier-defined anchor (`&name`) and
+must follow the same character-set restrictions: alphanumerics plus `_`
+and `-`. Tokenising as a separate name buffer (rather than scanning the
+following position) lets the parser cross-reference into the anchor
+table without re-tokenising. An alias name cannot contain spaces or
+indicators - the first such character terminates the scan and is left
+for the next-token call.
+@End Reasoning
+
+@Implementation:
+Captures (line, column, indent). Advances past the leading `*` (caller
+already verified peek_char == 42). Allocates a 256-byte buffer; out-of-
+memory returns an error token. Loop on peek_char: accepts is_alpha,
+is_digit, byte 95 (`_`), or byte 45 (`-`); writes each into buffer at
+buffer_pos and advances. Any other character breaks. Null-terminates
+the buffer and returns create_token(TOKEN_ALIAS, buffer, buffer_pos,
+line, column, indent).
+@End Implementation
+
 Process called "scan_alias" takes lexer as Integer returns Integer:
     Note: Scan alias: *alias_name
 
@@ -1250,6 +1646,29 @@ End Process
 Note: ============================================================================
 Note: Tag Scanning
 Note: ============================================================================
+
+@Reasoning:
+YAML tags have three surface forms with progressively more permissive
+character sets: `!local-tag` (the most common form, alphanumeric +
+underscore + hyphen), `!!global-tag` (using the secondary tag handle for
+shorthand types like `!!str`, `!!int`), and `!<verbatim:uri:tag>`
+(angle-bracketed verbatim form allowing any URI characters including
+colons and slashes). All three start with `!` so the scanner branches
+after consuming the first `!`: a second `!` selects the shorthand
+form, a `<` selects the verbatim form, and anything else falls through
+to the local-tag character loop.
+@End Reasoning
+
+@Implementation:
+Captures (line, column, indent). Advances past the first `!` (caller
+already verified peek_char == 33). Allocates a 256-byte buffer. Branch
+1: if peek_char == 33 (`!`), advance and prepend "!!" to the buffer
+then loop the shorthand character set. Branch 2: if peek_char == 60
+(`<`), advance, loop reading until peek_char == 62 (`>`), then advance
+past `>`. Branch 3: default, loop the local-tag character set
+(alphanumeric, 95 `_`, 45 `-`). Null-terminates and emits TOKEN_TAG
+with the assembled value.
+@End Implementation
 
 Process called "scan_tag" takes lexer as Integer returns Integer:
     Note: Scan tag: !tag or !!tag or !<tag:uri>
@@ -1313,16 +1732,38 @@ Note: ==========================================================================
 Note: Main Tokenization
 Note: ============================================================================
 
+@Reasoning:
+Top-level tokenizer dispatcher producing one token per call. Ordering of
+the dispatch table matters: document markers (`---`, `...`) MUST be
+tested before single-char (`-`, `.`) versions because the three-char
+forms only appear at column 1 and we don't want a stray `-` in column
+1 to be misclassified as a sequence-entry dash when followed by two
+more dashes. Whitespace and comments are silently skipped at the top
+of the function because YAML has no meaningful whitespace tokens
+except newlines, which are explicitly emitted as TOKEN_NEWLINE so the
+parser can detect blank-line separation. The position-skipping loop
+needs both skip_whitespace and skip_comment because a comment can
+start mid-line and a whitespace stretch can follow a comment-
+terminating newline.
+@End Reasoning
+
+@Implementation:
+Outer loop: calls skip_whitespace, peeks; if peek == 35 (`#`) calls
+skip_comment and continues, else breaks. Captures position (line,
+column, indent). Then a long sequence of equality tests on peek_char:
+0 -> TOKEN_EOF; 10 (newline) -> TOKEN_NEWLINE; 45 (`-`) with two-char
+lookahead at source+position+1 and +2 -> if both are 45 emit
+TOKEN_DOCUMENT_START else TOKEN_DASH; 46 (`.`) with same lookahead ->
+TOKEN_DOCUMENT_END; 58 (`:`) -> TOKEN_COLON; 63 (`?`) -> TOKEN_QUESTION;
+91/93/123/125/44 -> flow bracket/brace/comma tokens; 38 (`&`) ->
+scan_anchor; 42 (`*`) -> scan_alias; 33 (`!`) -> scan_tag; 124 (`|`)
+-> scan_literal_block_scalar; 62 (`>`) -> scan_folded_block_scalar;
+34/39 (`"`, `'`) -> scan_double_quoted/scan_single_quoted; default ->
+scan_plain_scalar.
+@End Implementation
+
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next YAML token
-
-    @Reasoning:
-    Main tokenization entry point. Handles:
-    - Whitespace and comments
-    - Indentation tracking
-    - All YAML token types
-    - Error reporting
-    @End Reasoning
 
     Note: Skip whitespace and comments
     While 1 is equal to 1:

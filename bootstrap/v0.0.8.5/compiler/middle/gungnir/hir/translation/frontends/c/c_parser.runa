@@ -100,6 +100,26 @@ Note: ==========================================================================
 Note: AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+A uniform 8-field AST node is used for every C construct so the parser
+can build the tree without per-kind allocations and the downstream
+HIR-translation pass can walk a single shape. node_type discriminates
+between declarations, statements, expressions, and type nodes using the
+C_* constants defined above. The line/column fields preserve source
+positions for diagnostic reporting and lossless round-tripping back to
+C-equivalent Runa.
+@End Reasoning
+
+@Implementation:
+Eight pointer-sized fields, total 64 bytes:
+- node_type (offset 0): C_* discriminator constant
+- name (offset 8): identifier string for named declarations
+- value (offset 16): literal/operator value
+- type_info (offset 24): nested CASTNode pointer holding type
+- children (offset 32): List of child CASTNode pointers
+- attributes (offset 40): List of attribute/qualifier strings
+- line (offset 48), column (offset 56): source position integers
+@End Implementation
 Type called "CASTNode":
     node_type as Integer       Note: Node type constant
     name as Integer           Note: Name/identifier (if applicable)
@@ -115,6 +135,22 @@ Note: ==========================================================================
 Note: Parser State
 Note: ============================================================================
 
+@Reasoning:
+The recursive-descent parser needs to track the lexer it pulls tokens
+from, the lookahead token currently under consideration, and any
+in-flight error state. Keeping has_error as an explicit flag separate
+from error_message lets callers detect a parse failure even when no
+diagnostic string is available (e.g. allocation failure during error
+reporting).
+@End Reasoning
+
+@Implementation:
+Four pointer-sized fields packed into 32 bytes:
+- lexer (offset 0): backing C lexer
+- current_token (offset 8): integer token kind for one-token lookahead
+- error_message (offset 16): heap-allocated diagnostic string, owned
+- has_error (offset 24): 1 if a parse error has been recorded, 0 otherwise
+@End Implementation
 Type called "CParser":
     lexer as Integer          Note: C lexer
     current_token as Integer  Note: Current token type
@@ -126,6 +162,21 @@ Note: ==========================================================================
 Note: Parser Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Constructs a parser by allocating the CParser struct and creating a
+backing lexer over the input source. The parser is primed with a single
+lookahead via advance_token so the recursive-descent routines can
+inspect current_token without having to bootstrap on their first call.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes for CParser. On failure returns 0. Creates the C
+lexer via Lexer.create_c_lexer; if lexer creation fails the partially
+allocated parser is freed and 0 returned. Initializes lexer slot
+(offset 0), current_token (8), error_message (16), has_error (24) all
+to 0 except lexer. Calls advance_token to load the first token into
+current_token. Returns parser pointer.
+@End Implementation
 Process called "create_c_parser" takes source as Integer returns Integer:
     Note: Create C parser from source code
 
@@ -154,6 +205,19 @@ Process called "create_c_parser" takes source as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+Releases the parser-owned resources: the backing lexer and any heap-
+allocated error_message. The lexer is destroyed via its own destructor
+to ensure its internal buffers and token cache are released. Returns 1
+on null input (idempotent).
+@End Reasoning
+
+@Implementation:
+Returns 1 immediately if parser is 0. Reads lexer (offset 0) and
+destroys it via Lexer.destroy_c_lexer when non-null. Reads error_message
+(offset 16) and deallocates it via Layout.deallocate when non-null.
+Finally deallocates the parser struct.
+@End Implementation
 Process called "destroy_c_parser" takes parser as Integer returns Integer:
     Note: Destroy C parser and free resources
 
@@ -182,6 +246,20 @@ Note: ==========================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Single factory for every AST node kind. Pre-allocates the children list
+so parsers can `append` without first checking initialization, which
+simplifies every parse_* routine. Fields not relevant to a particular
+node kind stay null and are simply ignored by downstream consumers.
+@End Reasoning
+
+@Implementation:
+Allocates 64-byte CASTNode. On failure returns 0. Writes node_type at
+offset 0; zeroes all other slots. Creates an empty List via
+List.create and stores it in the children slot (offset 32) when
+allocation succeeds; otherwise leaves children null and callers must
+guard. Returns the node pointer.
+@End Implementation
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     Note: Create AST node of given type
 
@@ -210,6 +288,19 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+The node must own its name string independently of the token buffer
+the name came from, because the lexer reuses its lexeme buffer between
+tokens. Allocating a NUL-terminated copy makes the AST independent of
+the lexer's token lifecycle.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Measures source name via StringCore.string_length,
+allocates length+1 bytes, copies bytes via memory_copy, writes a trailing
+NUL via memory_set_byte. Stores the copy pointer in the node's name slot
+(offset 8). Returns 1.
+@End Implementation
 Process called "set_node_name" takes node as Integer, name as Integer returns Integer:
     Note: Set node name
 
@@ -229,6 +320,19 @@ Process called "set_node_name" takes node as Integer, name as Integer returns In
     Return 1
 End Process
 
+@Reasoning:
+Mirror of set_node_name for the value slot (offset 16). Used for
+literals (the literal text), operators (the operator token), and
+member-access discriminators (e.g. "." vs "->"). The owned copy is
+required for the same lifetime reason: lexer lexeme buffers are
+re-used.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Measures the source string, allocates length+1
+bytes, copies plus NUL terminator, stores the copy at offset 16.
+Returns 1.
+@End Implementation
 Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
     Note: Set node value
 
@@ -248,6 +352,19 @@ Process called "set_node_value" takes node as Integer, value as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Type info on a declaration node is a pointer to a C_TYPE_NODE (or
+pointer/array/function type variant). Setter exists so the parser does
+not have to inline memory_set_int64 calls at every site that attaches
+a type to a declarator.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null node. Writes the type_info pointer to offset 24.
+Returns 1. Note: ownership of type_info transfers to the node tree but
+this routine does not copy or retain - the parser must not share the
+same type_info pointer across multiple nodes.
+@End Implementation
 Process called "set_node_type_info" takes node as Integer, type_info as Integer returns Integer:
     Note: Set node type information
 
@@ -260,6 +377,19 @@ Process called "set_node_type_info" takes node as Integer, type_info as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Centralizes child appending so parse_* routines do not have to deref
+the children slot manually. Treats either pointer being null as a no-op
+which allows skipping optional children without explicit guards at
+every call site.
+@End Reasoning
+
+@Implementation:
+Returns 0 if either node or child is 0. Reads the children List at
+offset 32; if List is null also returns 0 (factory failed to allocate
+it). Calls List.append on the children list with the child pointer.
+Returns 1 on success.
+@End Implementation
 Process called "add_child_node" takes node as Integer, child as Integer returns Integer:
     Note: Add child node
 
@@ -286,6 +416,18 @@ Note: ==========================================================================
 Note: Token Access
 Note: ============================================================================
 
+@Reasoning:
+Single-token lookahead is maintained in the parser's current_token
+slot. advance_token pulls the next token from the lexer and overwrites
+current_token, returning the new token type so callers can chain calls
+without a follow-up peek.
+@End Reasoning
+
+@Implementation:
+Reads the lexer pointer (offset 0). Calls Lexer.next_token to pull the
+next token type. Writes the resulting integer to current_token
+(offset 8). Returns the new token type.
+@End Implementation
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -297,6 +439,15 @@ Process called "advance_token" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Non-consuming accessor returning the cached current_token without
+calling the lexer. Recursive-descent code uses this constantly to
+decide which production to dispatch on.
+@End Reasoning
+
+@Implementation:
+Reads and returns the integer at offset 8 of the parser struct.
+@End Implementation
 Process called "peek_token_type" takes parser as Integer returns Integer:
     Note: Peek at current token type
 
@@ -305,6 +456,16 @@ Process called "peek_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Boolean predicate version of peek_token_type used by parse_* routines
+to switch on token kind without consuming. Returns 1/0 to keep
+conditions clean at call sites.
+@End Reasoning
+
+@Implementation:
+Reads current_token (offset 8). Returns 1 if equal to expected_type,
+0 otherwise.
+@End Implementation
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches expected type
 
@@ -317,6 +478,18 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
     Return 0
 End Process
 
+@Reasoning:
+The "expect-or-error" idiom is the recursive-descent equivalent of an
+assertion: consume the expected token if present, otherwise record a
+parse error and signal failure. Centralizing this avoids duplicating
+the error-set-then-return pattern at every grammar rule.
+@End Reasoning
+
+@Implementation:
+Reads current_token. If it does not match expected_type, calls
+set_parse_error with the supplied message and returns 0. Otherwise
+calls advance_token to consume and returns 1.
+@End Implementation
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Note: Expect token of given type, set error if not found
 
@@ -332,6 +505,19 @@ Process called "expect_token" takes parser as Integer, expected_type as Integer,
     Return 1
 End Process
 
+@Reasoning:
+Returns the textual lexeme of the current token. Callers typically use
+this to capture identifier names and literal values for the AST node
+they are about to build, immediately copying via set_node_name /
+set_node_value so the lexeme's storage can be reused by later tokens.
+@End Reasoning
+
+@Implementation:
+Reads the lexer pointer (offset 0). Calls Lexer.get_token_lexeme to
+retrieve the current lexeme string. Returns the pointer. Callers must
+treat this as borrowed and either copy it or deallocate it before
+re-driving the lexer.
+@End Implementation
 Process called "peek_token_lexeme" takes parser as Integer returns Integer:
     Note: Get current token lexeme
 
@@ -345,6 +531,21 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Stores a parse error in the parser's error_message slot and sets the
+has_error flag. The previous message (if any) is freed first because
+the parser owns its diagnostic string. Copying the incoming message
+ensures the parser's error remains valid even when the caller's
+message buffer is short-lived.
+@End Reasoning
+
+@Implementation:
+Reads existing error_message (offset 16) and deallocates it if non-zero.
+Measures the incoming message via StringCore.string_length and
+allocates length+1 bytes for a copy. Copies bytes via memory_copy and
+writes the NUL terminator via memory_set_byte. Writes the new pointer
+to offset 16. Sets has_error (offset 24) to 1. Returns 1.
+@End Implementation
 Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
     Note: Set parse error message
 
@@ -368,6 +569,15 @@ Process called "set_parse_error" takes parser as Integer, message as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+Lets callers (typically the top-level translator entry point) detect
+whether parsing succeeded without inspecting struct internals. Returning
+1/0 keeps the test cheap and uniform.
+@End Reasoning
+
+@Implementation:
+Reads and returns the integer at offset 24 of the parser struct.
+@End Implementation
 Process called "has_parse_error" takes parser as Integer returns Integer:
     Note: Check if parser has error
 
@@ -376,6 +586,17 @@ Process called "has_parse_error" takes parser as Integer returns Integer:
     Return has_error
 End Process
 
+@Reasoning:
+Returns the borrowed error_message pointer so the caller can render or
+log it. The string is still owned by the parser and must not be freed
+by the caller; the parser will free it on destroy_c_parser or on the
+next set_parse_error.
+@End Reasoning
+
+@Implementation:
+Reads and returns the pointer at offset 16 of the parser struct. May
+return 0 when no error has been set.
+@End Implementation
 Process called "get_parse_error" takes parser as Integer returns Integer:
     Note: Get parse error message
 
@@ -388,13 +609,27 @@ Note: ==========================================================================
 Note: Type Parsing
 Note: ============================================================================
 
+@Reasoning:
+Type specifiers in C come in three orthogonal flavors that this
+function unifies into a single C_TYPE_NODE: built-in primitives
+(int/char/float/double/void plus the qualifiers short/long/
+signed/unsigned), tagged user types (struct/union/enum followed
+by a tag identifier), and typedef names. The peek-then-advance
+pattern is required because typedef detection needs an extra
+identifier-followup check beyond the bare token kind.
+@End Reasoning
+
+@Implementation:
+Reads the current token kind via peek_token_type. For each primitive
+kind we create a C_TYPE_NODE, set its name to the canonical spelling,
+consume the token, and return. For struct/union/enum we consume the
+keyword, read the following IDENTIFIER token as the tag name, then
+deallocate the lexeme buffer (the name was copied into the node by
+set_node_name). Falls through with no return if no recognized type
+specifier is found - caller must check for zero.
+@End Implementation
 Process called "parse_type_specifier" takes parser as Integer returns Integer:
     Note: Parse type specifier (int, char, struct foo, etc.)
-
-    @Reasoning:
-    Type specifiers can be primitive (int, char, float, double, void),
-    or user-defined (struct, union, enum, typedef name).
-    @End Reasoning
 
     Let token_type be proc peek_token_type from parser
 
@@ -509,6 +744,26 @@ Process called "parse_type_specifier" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+A C declarator combines pointer prefixes, an identifier, and array
+suffixes onto a base type. Building the type bottom-up - wrapping the
+base type with C_POINTER_TYPE nodes for each `*` and C_ARRAY_TYPE nodes
+for each `[size]` - produces a left-to-right type-name composition that
+matches C's pointer-to-array-of-T semantics correctly.
+@End Reasoning
+
+@Implementation:
+Initializes type_node to base_type and pointer_count to 0. Loops while
+the current token is TOKEN_STAR: advances, wraps type_node in a new
+C_POINTER_TYPE node (via set_node_type_info), increments pointer_count.
+Then expects TOKEN_IDENTIFIER and captures the variable name. Loops
+again while current token is TOKEN_LBRACKET: advances, parses the
+optional integer size (TOKEN_RBRACKET means flexible), expects the
+closing `]`, wraps type_node in a new C_ARRAY_TYPE node with size stored
+in the value field at offset 16. Finally creates a C_VARIABLE node with
+the captured name, attaches the final composed type, frees the borrowed
+var_name lexeme, returns the variable node.
+@End Implementation
 Process called "parse_declarator" takes parser as Integer, base_type as Integer returns Integer:
     Note: Parse declarator (name with optional pointers and arrays)
 
@@ -580,6 +835,24 @@ Note: ==========================================================================
 Note: Expression Parsing
 Note: ============================================================================
 
+@Reasoning:
+Primary expressions are the leaves of the expression grammar: integer,
+float, character, and string literals; bare identifiers; and
+parenthesized sub-expressions. Parenthesized expressions recurse to
+parse_expression so they preserve the full grammar precedence inside
+parens.
+@End Reasoning
+
+@Implementation:
+Reads current token type. For TOKEN_INTEGER, TOKEN_FLOAT_LITERAL,
+TOKEN_CHAR_LITERAL, TOKEN_STRING_LITERAL: peeks the lexeme, advances,
+builds a C_LITERAL_EXPR node, sets its value to a copy of the lexeme,
+frees the lexeme, returns the node. For TOKEN_IDENTIFIER: similar but
+builds a C_IDENTIFIER_EXPR with the name set. For TOKEN_LPAREN: advances,
+recursively parses the inner expression via parse_expression, expects the
+closing `)`, returns the inner expression unwrapped. Any other token
+triggers set_parse_error and returns 0.
+@End Implementation
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
     Note: Parse primary expression (literal, identifier, parenthesized)
 
@@ -647,6 +920,26 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Return 0
 End Process
 
+@Reasoning:
+Postfix operators in C bind tighter than every prefix/binary operator,
+and they chain: a single expression can carry function calls,
+subscripts, member access (`.` and `->`), and post-increment/decrement
+in any combination. The loop-and-replace pattern keeps the AST shape
+correct (each postfix wraps the previous expression).
+@End Reasoning
+
+@Implementation:
+Starts with parse_primary_expression; returns 0 on failure. Loops:
+inspects current token. For TOKEN_LPAREN builds a C_CALL_EXPR whose
+first child is the callee and subsequent children are arguments parsed
+via parse_expression with commas. For TOKEN_LBRACKET builds a
+C_SUBSCRIPT_EXPR with object and index children. For TOKEN_DOT /
+TOKEN_ARROW builds a C_MEMBER_EXPR with the operator in value and the
+member name in name. For TOKEN_PLUS_PLUS / TOKEN_MINUS_MINUS builds a
+C_UNARY_EXPR with value "++post" or "--post". Otherwise breaks. The
+running `expr` variable is replaced on each iteration so chained
+postfixes nest correctly.
+@End Implementation
 Process called "parse_postfix_expression" takes parser as Integer returns Integer:
     Note: Parse postfix expression (call, subscript, member access, ++/--)
 
@@ -755,6 +1048,23 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
     Return expr
 End Process
 
+@Reasoning:
+Prefix operators (++ -- - ! ~ * & sizeof) bind tighter than binary
+operators but looser than postfix. Each is parsed by consuming the
+operator then recursively parsing the operand as another unary
+expression to allow nested prefixes (e.g. `--*p`).
+@End Reasoning
+
+@Implementation:
+Inspects current token. For each prefix token (TOKEN_PLUS_PLUS,
+TOKEN_MINUS_MINUS, TOKEN_MINUS, TOKEN_EXCLAIM, TOKEN_TILDE, TOKEN_STAR,
+TOKEN_AMP): advances, recurses into parse_unary_expression for the
+operand, builds a C_UNARY_EXPR node with the appropriate value string
+(e.g. "++pre", "--pre", "-", "!", "~", "*", "&"), attaches operand as
+child, returns the node. For TOKEN_SIZEOF: same pattern but builds a
+C_SIZEOF_EXPR. Falls through to parse_postfix_expression when no prefix
+matches.
+@End Implementation
 Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Note: Parse unary expression (-, !, ~, ++, --, *, &, sizeof)
 
@@ -842,23 +1152,26 @@ Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Return proc parse_postfix_expression from parser
 End Process
 
+@Reasoning:
+Precedence climbing parser - linear time, no operator stack. The
+recursive call passes op_precedence+1 to enforce left-associativity:
+the right operand only consumes operators of strictly higher
+precedence, so equal-precedence sequences group left-to-right
+("a-b-c" parses as "(a-b)-c"). C's operator precedence levels in
+this parser are 1-10 from ||  down to * / %.
+@End Reasoning
+
+@Implementation:
+Starts by parsing a unary expression as the leftmost operand. Then
+loops: peek operator, get its precedence, exit loop if below the
+caller's threshold; otherwise recursively parse the right side at
+precedence+1, build a C_BINARY_EXPR node with the operator as its
+value and left/right as children, and use that as the new left for
+the next iteration. The deallocate call on the operator lexeme
+releases the buffer ownership; the node has its own copy.
+@End Implementation
 Process called "parse_binary_expression" takes parser as Integer, precedence as Integer returns Integer:
     Note: Parse binary expression with operator precedence
-
-    @Reasoning:
-    Use precedence climbing algorithm for binary operators.
-    Precedence levels (higher number = higher precedence):
-    1: ||
-    2: &&
-    3: |
-    4: ^
-    5: &
-    6: ==, !=
-    7: <, >, <=, >=
-    8: <<, >>
-    9: +, -
-    10: *, /, %
-    @End Reasoning
 
     Let left be proc parse_unary_expression from parser
 
@@ -895,6 +1208,18 @@ Process called "parse_binary_expression" takes parser as Integer, precedence as 
     Return left
 End Process
 
+@Reasoning:
+Centralizes the C operator precedence table so parse_binary_expression
+can do precedence climbing with a single comparison per iteration.
+Returning 0 for non-binary tokens is the implicit "stop climbing"
+signal because every real operator returns >= 1.
+@End Reasoning
+
+@Implementation:
+Linear If chain mapping token type to precedence integer:
+1=||, 2=&&, 3=|, 4=^, 5=&, 6={==,!=}, 7={<,>,<=,>=}, 8={<<,>>},
+9={+,-}, 10={*,/,%}. Returns 0 for any other token.
+@End Implementation
 Process called "get_operator_precedence" takes token_type as Integer returns Integer:
     Note: Get operator precedence (higher = tighter binding)
 
@@ -973,6 +1298,23 @@ Process called "get_operator_precedence" takes token_type as Integer returns Int
     Return 0  Note: Not a binary operator
 End Process
 
+@Reasoning:
+The conditional operator binds looser than every binary operator but
+tighter than assignment, so it sits between parse_binary_expression and
+parse_assignment_expression in the precedence chain. The false branch
+recurses into parse_ternary_expression to make `a ? b : c ? d : e`
+right-associative as the C standard requires.
+@End Reasoning
+
+@Implementation:
+Parses the condition via parse_binary_expression with starting
+precedence 1. If the next token is not TOKEN_QUESTION, returns the
+condition unchanged so non-ternary expressions are passed through. On
+TOKEN_QUESTION: advances, parses the true branch via parse_expression,
+expects TOKEN_COLON, recursively parses the false branch via
+parse_ternary_expression. Builds a C_TERNARY_EXPR with three children:
+condition, true_branch, false_branch.
+@End Implementation
 Process called "parse_ternary_expression" takes parser as Integer returns Integer:
     Note: Parse ternary conditional expression (cond ? true_expr : false_expr)
 
@@ -1012,6 +1354,24 @@ Process called "parse_ternary_expression" takes parser as Integer returns Intege
     Return ternary_expr
 End Process
 
+@Reasoning:
+Assignment is the loosest non-comma binding in C and is right-
+associative, so the right operand recurses into
+parse_assignment_expression rather than going through the binary
+expression machinery. Compound assignment operators all share the same
+node shape with the operator captured in the value field.
+@End Reasoning
+
+@Implementation:
+Parses the left-hand side via parse_ternary_expression. Inspects the
+current token; sets is_assign to 1 for any of the recognized
+assignment tokens (TOKEN_EQUALS plus the ten compound forms). When
+is_assign is 0 returns the LHS unchanged. Otherwise: captures the
+operator lexeme, advances, recurses to parse the right-hand side via
+parse_assignment_expression. Builds a C_ASSIGN_EXPR with the operator
+stored in value and LHS/RHS as children, frees the borrowed operator
+lexeme.
+@End Implementation
 Process called "parse_assignment_expression" takes parser as Integer returns Integer:
     Note: Parse assignment expression (=, +=, -=, etc.)
 
@@ -1092,6 +1452,17 @@ Process called "parse_assignment_expression" takes parser as Integer returns Int
     Return assign_expr
 End Process
 
+@Reasoning:
+Top-level entry point so callers in statement parsers can use a single
+name without knowing the precedence tower. Equivalent to
+parse_assignment_expression since that is the loosest non-comma form.
+The comma operator is intentionally not modeled here because it is
+handled at statement level (expression-statement parsing).
+@End Reasoning
+
+@Implementation:
+Tail-call to parse_assignment_expression with the same parser pointer.
+@End Implementation
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse expression (top-level entry point)
 
@@ -1102,6 +1473,24 @@ Note: ==========================================================================
 Note: Statement Parsing
 Note: ============================================================================
 
+@Reasoning:
+Statement dispatch reads the leading keyword token to pick which
+sub-parser to call. Falling through to parse_expression_statement when
+no keyword matches handles bare expression statements (function calls,
+assignments) without needing a separate marker.
+@End Reasoning
+
+@Implementation:
+Reads current token type. Dispatches by token: TOKEN_LBRACE ->
+parse_compound_statement, TOKEN_IF -> parse_if_statement, TOKEN_WHILE
+-> parse_while_statement, TOKEN_FOR -> parse_for_statement, TOKEN_DO
+-> parse_do_while_statement, TOKEN_SWITCH -> parse_switch_statement,
+TOKEN_CASE -> parse_case_statement, TOKEN_DEFAULT ->
+parse_default_statement, TOKEN_RETURN -> parse_return_statement,
+TOKEN_BREAK / TOKEN_CONTINUE -> builds a 0-child C_BREAK_STMT /
+C_CONTINUE_STMT and consumes the semicolon. Anything else falls
+through to parse_expression_statement.
+@End Implementation
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse statement
 
@@ -1184,6 +1573,19 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Return proc parse_expression_statement from parser
 End Process
 
+@Reasoning:
+A compound statement (`{ ... }`) is a sequence of declarations or
+statements terminated by `}`. Using parse_declaration_or_statement
+allows mixed C99 declarations within blocks.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_LBRACE (sets error and returns 0 on mismatch). Creates a
+C_COMPOUND_STMT node. Loops while current token is not TOKEN_RBRACE
+and the parser has no error: calls parse_declaration_or_statement,
+attaching each non-null child via add_child_node. Expects TOKEN_RBRACE
+to close the block. Returns the compound node.
+@End Implementation
 Process called "parse_compound_statement" takes parser as Integer returns Integer:
     Note: Parse compound statement (block)
 
@@ -1218,6 +1620,20 @@ Process called "parse_compound_statement" takes parser as Integer returns Intege
     Return block_node
 End Process
 
+@Reasoning:
+`if (cond) stmt [else stmt]` with the else clause optional. The else
+branch is appended as a third child when present so consumers can
+distinguish two-arm from three-arm if nodes by checking child count.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_IF then TOKEN_LPAREN. Parses the condition expression,
+expects TOKEN_RPAREN. Recursively parses the then-statement via
+parse_statement. Builds C_IF_STMT with condition and then-statement as
+the first two children. If the next token is TOKEN_ELSE, advances and
+parses the else-statement, attaching it as the third child. Returns
+the if node.
+@End Implementation
 Process called "parse_if_statement" takes parser as Integer returns Integer:
     Note: Parse if statement
 
@@ -1257,6 +1673,17 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
     Return if_node
 End Process
 
+@Reasoning:
+Straightforward `while (cond) stmt`. The condition lives in
+parentheses; the body is any statement (typically a compound but the
+grammar allows a single statement).
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_WHILE then TOKEN_LPAREN. Parses condition expression,
+expects TOKEN_RPAREN. Parses body via parse_statement. Builds
+C_WHILE_STMT with two children: condition, body. Returns the node.
+@End Implementation
 Process called "parse_while_statement" takes parser as Integer returns Integer:
     Note: Parse while statement
 
@@ -1284,6 +1711,22 @@ Process called "parse_while_statement" takes parser as Integer returns Integer:
     Return while_node
 End Process
 
+@Reasoning:
+C's `for (init; cond; update) stmt` has three optional expression
+slots. The AST always carries four children in fixed positions so
+consumers can index directly; missing slots are represented as 0
+children rather than null entries to keep the children list dense.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_FOR then TOKEN_LPAREN. Parses each of init, cond, update
+as an expression unless the next token is TOKEN_SEMICOLON / TOKEN_RPAREN
+(meaning the slot is empty). After init expects TOKEN_SEMICOLON; after
+cond expects TOKEN_SEMICOLON; after update expects TOKEN_RPAREN. Parses
+the body via parse_statement. Builds C_FOR_STMT and attaches all four
+children in order (init, cond, update, body), substituting 0 for
+empty slots when appropriate.
+@End Implementation
 Process called "parse_for_statement" takes parser as Integer returns Integer:
     Note: Parse for statement
 
@@ -1342,6 +1785,19 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
     Return for_node
 End Process
 
+@Reasoning:
+`do stmt while (cond);` is the inverse of while: body runs first, then
+the condition is tested. The terminating semicolon is part of the
+statement (unlike `while`) which makes it the only loop form that
+requires explicit semicolon consumption here.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_DO. Parses body via parse_statement. Expects TOKEN_WHILE,
+TOKEN_LPAREN. Parses condition expression. Expects TOKEN_RPAREN then
+TOKEN_SEMICOLON. Builds C_DO_WHILE_STMT with body and condition as
+children (body first to match source order).
+@End Implementation
 Process called "parse_do_while_statement" takes parser as Integer returns Integer:
     Note: Parse do-while statement
 
@@ -1372,6 +1828,18 @@ Process called "parse_do_while_statement" takes parser as Integer returns Intege
     Return do_while_node
 End Process
 
+@Reasoning:
+`switch (expr) stmt` is a single body statement (almost always a
+compound containing case / default labels). The cases themselves are
+recognized by parse_statement so the same dispatch handles them as
+labeled statements within the switch body.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_SWITCH then TOKEN_LPAREN. Parses the switch expression,
+expects TOKEN_RPAREN. Parses body via parse_statement. Builds
+C_SWITCH_STMT with expression and body as children. Returns the node.
+@End Implementation
 Process called "parse_switch_statement" takes parser as Integer returns Integer:
     Note: Parse switch statement
 
@@ -1399,6 +1867,18 @@ Process called "parse_switch_statement" takes parser as Integer returns Integer:
     Return switch_node
 End Process
 
+@Reasoning:
+A `case <const-expr>:` label inside a switch body. The constant
+expression is stored as a child so consumers can evaluate or pattern-
+match it. The trailing colon is consumed here; the labeled body
+statement is a separate sibling in the parent compound.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_CASE. Parses the case value via parse_expression
+(returns 0 on failure). Expects TOKEN_COLON. Builds C_CASE_STMT with
+the value expression as its single child.
+@End Implementation
 Process called "parse_case_statement" takes parser as Integer returns Integer:
     Note: Parse case label
 
@@ -1418,6 +1898,16 @@ Process called "parse_case_statement" takes parser as Integer returns Integer:
     Return case_node
 End Process
 
+@Reasoning:
+The `default:` label has no expression payload so the AST node carries
+no children. Modeling it as its own node kind (C_DEFAULT_STMT) keeps
+case/default discrimination explicit downstream.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_DEFAULT then TOKEN_COLON. Creates and returns a fresh
+C_DEFAULT_STMT node with no children.
+@End Implementation
 Process called "parse_default_statement" takes parser as Integer returns Integer:
     Note: Parse default label
 
@@ -1429,6 +1919,18 @@ Process called "parse_default_statement" takes parser as Integer returns Integer
     Return default_node
 End Process
 
+@Reasoning:
+`return [expr];` - the expression is optional in C for `void` functions.
+The optionality is signaled by whether a semicolon immediately follows
+the `return` keyword.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_RETURN. Creates a C_RETURN_STMT node. If the next token
+is not TOKEN_SEMICOLON, parses an expression and attaches it as a
+child (non-null guarded). Expects the terminating TOKEN_SEMICOLON
+afterward.
+@End Implementation
 Process called "parse_return_statement" takes parser as Integer returns Integer:
     Note: Parse return statement
 
@@ -1451,6 +1953,24 @@ Process called "parse_return_statement" takes parser as Integer returns Integer:
     Return return_node
 End Process
 
+@Reasoning:
+This routine handles two grammar productions that share a TOKEN_IDENTIFIER
+prefix: labeled statements (`name:`) and expression statements starting
+with an identifier (`name = ...`, `name();`). One-token lookahead past
+the identifier is enough to distinguish them because only labels are
+immediately followed by `:`.
+@End Reasoning
+
+@Implementation:
+If current token is TOKEN_IDENTIFIER: captures the label name and
+advances. If next token is TOKEN_COLON, advances and builds a
+C_LABEL_STMT with the name set, returns it. Otherwise treats the
+captured name as an identifier expression, builds a C_EXPR_STMT
+wrapping that single child, expects TOKEN_SEMICOLON, returns the
+statement (this is a conservative one-token-ahead "backtrack"). For
+non-identifier leads: parses an expression directly via parse_expression,
+expects TOKEN_SEMICOLON, wraps in a C_EXPR_STMT.
+@End Implementation
 Process called "parse_expression_statement" takes parser as Integer returns Integer:
     Note: Parse expression statement or labeled statement
 
@@ -1501,6 +2021,21 @@ Note: ==========================================================================
 Note: Declaration Parsing
 Note: ============================================================================
 
+@Reasoning:
+A variable declaration is `<type> <declarator> [= <initializer>];`. The
+type comes pre-parsed from the caller (e.g. parse_declaration_or_statement
+or parse_program) so this routine focuses on the declarator and the
+optional initializer, attaching the initializer as a child of the
+declarator node when present.
+@End Reasoning
+
+@Implementation:
+Calls parse_declarator with the supplied base_type. Returns 0 on
+failure. If the next token is TOKEN_EQUALS, advances and parses the
+initializer via parse_expression; attaches non-null initializers as a
+child of the declarator. Returns the (possibly-augmented) declarator.
+The trailing semicolon is consumed by the caller.
+@End Implementation
 Process called "parse_variable_declaration" takes parser as Integer, base_type as Integer returns Integer:
     Note: Parse variable declaration with optional initializer
 
@@ -1525,6 +2060,25 @@ Process called "parse_variable_declaration" takes parser as Integer, base_type a
     Return declarator
 End Process
 
+@Reasoning:
+Handles both forward declarations (`int f(int x);`) and definitions
+(`int f(int x) { ... }`). Both share the parameter-list grammar; the
+distinguishing token is `{` vs `;`. Parameters are emitted as
+C_PARAMETER nodes carrying name and type-info, not as declarator
+sub-nodes, so consumers can iterate parameters without re-deriving them
+from declarators.
+@End Reasoning
+
+@Implementation:
+Creates C_FUNCTION node with name and return_type. Expects TOKEN_LPAREN.
+Loops parameter parsing while not at TOKEN_RPAREN: parses each param's
+type via parse_type_specifier, the param's declarator via parse_declarator,
+then extracts the declarator's name (offset 8) and type_info (offset 24)
+into a fresh C_PARAMETER node attached to the function. Comma-separates
+parameters. Expects TOKEN_RPAREN. If next token is TOKEN_LBRACE, parses
+the body via parse_compound_statement and attaches. Otherwise consumes
+TOKEN_SEMICOLON for the declaration form. Returns the function node.
+@End Implementation
 Process called "parse_function_declaration" takes parser as Integer, return_type as Integer, func_name as Integer returns Integer:
     Note: Parse function declaration or definition
 
@@ -1586,6 +2140,20 @@ Process called "parse_function_declaration" takes parser as Integer, return_type
     Return func_node
 End Process
 
+@Reasoning:
+Inside a compound block both declarations and statements are valid
+(C99 onward). The disambiguation uses the leading token: any type
+keyword (int/char/float/double/void/struct/union/enum) starts a
+declaration; anything else is a statement.
+@End Reasoning
+
+@Implementation:
+Peeks the current token; sets is_type=1 when it matches any C type
+keyword listed above. If is_type, parses the base type, the variable
+declaration via parse_variable_declaration, and consumes the trailing
+TOKEN_SEMICOLON. Otherwise falls through to parse_statement and returns
+whatever it produces.
+@End Implementation
 Process called "parse_declaration_or_statement" takes parser as Integer returns Integer:
     Note: Parse declaration or statement
 
@@ -1637,13 +2205,27 @@ Process called "parse_declaration_or_statement" takes parser as Integer returns 
     Return proc parse_statement from parser
 End Process
 
+@Reasoning:
+Top-level driver - loops over the token stream creating one child of
+the C_PROGRAM node per declaration or preprocessor directive. The
+preprocessor branches (#hash, include, define) are recognized BEFORE
+attempting to parse a type specifier because they can appear anywhere
+between declarations. After the type specifier we use a single-token
+lookahead on TOKEN_LPAREN to distinguish function declarations from
+variable declarations - C's grammar requires this disambiguation.
+@End Reasoning
+
+@Implementation:
+Creates the root C_PROGRAM node, then enters an infinite loop that
+breaks on TOKEN_EOF. Preprocessor branches Continue to skip the
+declaration logic. The declaration path parses a base type, expects
+an identifier, then peeks for LPAREN: if present, calls
+parse_function_declaration; otherwise builds a C_VARIABLE node and
+optionally consumes an array suffix and/or initializer. After each
+declaration, checks has_parse_error and bails with 0 on failure.
+@End Implementation
 Process called "parse_program" takes parser as Integer returns Integer:
     Note: Parse entire C program (top-level entry point)
-
-    @Reasoning:
-    Parse all top-level declarations (functions, variables, structs, etc.)
-    until EOF is reached.
-    @End Reasoning
 
     Let program_node be proc create_ast_node from C_PROGRAM
 
@@ -1746,13 +2328,28 @@ Note: ==========================================================================
 Note: Preprocessor Directive Parsing (Production Implementation)
 Note: ============================================================================
 
+@Reasoning:
+Generic dispatcher for #-prefixed lines. Specific directives that
+take meaningful payloads (#include, #define) delegate to dedicated
+helpers; directives that just record their kind (#ifdef, #ifndef,
+#endif, #else, #elif, #undef, #pragma) build a C_PREPROCESSOR node
+inline with the directive's token tag stored in the node value.
+Unknown directives are silently skipped to TOKEN_NEWLINE rather than
+erroring, because real C codebases use compiler-specific directives
+(e.g. #warning, MSVC pragmas) that we must tolerate.
+@End Reasoning
+
+@Implementation:
+Consumes the leading TOKEN_HASH, peeks the directive keyword, and
+branches per known directive. For #ifdef/#ifndef/#undef it consumes
+the keyword then expects an IDENTIFIER (the macro name) which is
+written to the node's name field. For #elif it parses a preprocessor
+expression as a child node. For #pragma it captures the rest of the
+line as pragma_content via parse_pragma_content. The fallback loop
+swallows tokens until TOKEN_NEWLINE or TOKEN_EOF.
+@End Implementation
 Process called "parse_preprocessor_directive" takes parser as Integer returns Integer:
     Note: Parse any preprocessor directive starting with #
-
-    @Reasoning:
-    Handle all standard C preprocessor directives including #include, #define,
-    #ifdef, #ifndef, #if, #else, #elif, #endif, #undef, #pragma, #line, #error
-    @End Reasoning
 
     proc expect_token with parser, TOKEN_HASH from Lexer, "Expected '#'"
 
@@ -1839,6 +2436,24 @@ Process called "parse_preprocessor_directive" takes parser as Integer returns In
     Return directive_node
 End Process
 
+@Reasoning:
+`#include` supports two forms - quoted (local) and angle-bracketed
+(system) - with different search path semantics. Storing the include
+kind as a child attribute node lets downstream semantic analysis
+mirror the compiler's actual lookup behavior.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_INCLUDE. Creates a C_PREPROCESSOR node tagged with
+TOKEN_INCLUDE in its value field. Peeks next token: TOKEN_STRING -> a
+"header.h" form, captures the string as name and attaches an attribute
+C_TYPE_NODE with value 1 (local). TOKEN_LESS -> the <header.h> form,
+advances past `<`, captures the header identifier, optionally consumes
+a `.h` suffix via TOKEN_DOT handling, expects TOKEN_GREATER, attaches
+attribute with value 0 (system). Skips trailing tokens up to newline /
+EOF to handle directives with stray whitespace. Returns the include
+node.
+@End Implementation
 Process called "parse_include_directive" takes parser as Integer returns Integer:
     Note: Parse #include directive with complete header file handling
 
@@ -1904,6 +2519,25 @@ Process called "parse_include_directive" takes parser as Integer returns Integer
     Return include_node
 End Process
 
+@Reasoning:
+`#define` covers both object-like (`#define X 1`) and function-like
+(`#define ADD(a,b) ((a)+(b))`) macros. The macro name is stored on the
+node, parameters become C_PARAMETER children for function-like macros,
+and the replacement tokens are captured as a child expression for
+later expansion.
+@End Reasoning
+
+@Implementation:
+Expects TOKEN_DEFINE. Creates a C_PREPROCESSOR node tagged with
+TOKEN_DEFINE. Captures the macro name via peek_token_lexeme, expects
+TOKEN_IDENTIFIER, attaches name. If the next token is TOKEN_LPAREN
+(immediately, no space - distinguishing function-like from object-like
+forms), parses a comma-separated parameter list of identifiers, each
+attached as a C_PARAMETER child. Consumes TOKEN_RPAREN. Captures the
+remainder of the replacement list up to newline / EOF as an expression
+sub-tree via parse_expression or token capture, attaching it as a
+child. Returns the define node.
+@End Implementation
 Process called "parse_define_directive" takes parser as Integer returns Integer:
     Note: Parse #define directive with macro parameters and body
 
@@ -1992,24 +2626,42 @@ Process called "parse_define_directive" takes parser as Integer returns Integer:
     Return define_node
 End Process
 
+@Reasoning:
+Conditional preprocessor directives like `#if` and `#elif` accept a
+limited C constant-expression grammar (typically integer literals,
+defined() checks, and boolean combinators). Delegating to
+parse_expression reuses the full machinery while keeping unsupported
+sub-expressions (assignment, sizeof of types) out of scope.
+@End Reasoning
+
+@Implementation:
+Tail-calls parse_expression on the parser. The returned subtree is
+attached by the caller as a child of the controlling #if / #elif node.
+@End Implementation
 Process called "parse_preprocessor_expression" takes parser as Integer returns Integer:
     Note: Parse preprocessor conditional expression for #if/#elif
-
-    @Reasoning:
-    Handle preprocessor expressions including defined(), numeric constants,
-    string comparisons, and logical operators for conditional compilation.
-    @End Reasoning
-
     Return proc parse_logical_or_expression from parser
 End Process
 
+@Reasoning:
+#pragma is the extensibility hatch for compiler-specific commands
+(pack, once, GCC poison, etc.). We don't interpret any of them at
+parse time - we just snapshot the entire token stream up to the
+newline as a list and stash it as the pragma node's value. Semantic
+analysis or backend stages can later inspect the saved token list to
+honor pragmas they understand and ignore the rest.
+@End Reasoning
+
+@Implementation:
+Creates an empty List, then loops peeking each token. On TOKEN_NEWLINE
+it consumes the newline and exits; on TOKEN_EOF it exits without
+consuming. Otherwise it grabs the lexeme string, appends to the list,
+and advances. Wraps the list in a C_LITERAL_EXPR node with the list
+as its value field. The lexeme strings are owned by the list, so the
+caller must traverse them through the list to free.
+@End Implementation
 Process called "parse_pragma_content" takes parser as Integer returns Integer:
     Note: Parse pragma directive content until end of line
-
-    @Reasoning:
-    Pragma directives are implementation-specific. Store the entire
-    content as a string for later processing by semantic analyzer.
-    @End Reasoning
 
     Let pragma_tokens be proc create_list from List
 

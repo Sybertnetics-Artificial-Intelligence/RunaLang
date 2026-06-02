@@ -49,6 +49,17 @@ Note: ==========================================================================
 Note: Python Code Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Code-generation state bundle for the Python backend. Identical four-field
+shape to the JavaScript backend so the two backends share patterns, but kept
+as a distinct type so emitter changes don't accidentally affect both.
+@End Reasoning
+@Implementation:
+32-byte layout: emitter@0, indent_level@8, arena@16, errors@24. CONTEXT_SIZE
+constant below documents the size. Python's significant-whitespace rule
+makes indent_level load-bearing - getting this offset wrong breaks every
+emitted file.
+@End Implementation
 Type called "PythonGenContext":
     emitter as Integer         Note: Python emitter for output
     indent_level as Integer    Note: Current indentation level
@@ -58,6 +69,17 @@ End Type
 
 Constant CONTEXT_SIZE as Integer is 32
 
+@Reasoning:
+Atomic emitter + context creation: if the embedded emitter can't be allocated,
+the partially-built context is rolled back so callers see a clean 0 rather
+than a half-initialized handle. Indent starts at 0 because Python modules are
+top-level by default.
+@End Reasoning
+@Implementation:
+Allocate 32 bytes; create python emitter; on emitter failure, deallocate the
+context and return 0. Otherwise write emitter@0, zero indent@8, store arena@16,
+create errors list and store@24.
+@End Implementation
 Process called "create_python_gen_context" takes arena as Integer returns Integer:
     Note: Create Python code generation context
 
@@ -84,6 +106,16 @@ Process called "create_python_gen_context" takes arena as Integer returns Intege
     Return context
 End Process
 
+@Reasoning:
+Owns the embedded emitter and errors list (created in the constructor) and
+must release both before freeing the context block. Arena handle is borrowed
+from the caller and intentionally untouched.
+@End Reasoning
+@Implementation:
+Null context returns 1. Otherwise destroy emitter@0 if non-null, destroy
+errors@24 if non-null, deallocate the 32-byte context. Idempotent: a
+double-call would see null fields and no-op safely.
+@End Implementation
 Process called "destroy_python_gen_context" takes context as Integer returns Integer:
     Note: Destroy Python code generation context
 
@@ -106,6 +138,15 @@ Process called "destroy_python_gen_context" takes context as Integer returns Int
     Return 1
 End Process
 
+@Reasoning:
+Python's block structure is signaled entirely by indentation, so the indent
+counter is correctness-critical (not just cosmetic). Every block-opening
+construct (def/class/if/for/while/with/try) must pair an increase with the
+exit decrease.
+@End Reasoning
+@Implementation:
+Read offset 8, add 1, write back. No upper clamp.
+@End Implementation
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -115,6 +156,14 @@ Process called "increase_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Zero-clamp guards against indent stack underflow which would otherwise yield
+Python source with body content unindented relative to its enclosing block -
+a hard syntax error in Python rather than a cosmetic glitch.
+@End Reasoning
+@Implementation:
+Read offset 8; decrement only if greater than 0; write back.
+@End Implementation
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
 
@@ -131,6 +180,17 @@ Note: ==========================================================================
 Note: Main Generation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Driver entry point: own the context lifetime, recurse over the HIR root,
+extract the rendered String from the emitter, tear the context down. The
+returned String survives context destruction because get_output returns a
+handle owned by the emitter that allocates from the caller's arena.
+@End Reasoning
+@Implementation:
+Null HIR returns 0. Create context (returns 0 on alloc failure). Call
+generate_node on hir. Retrieve emitter@0 and call get_output on it. Destroy
+the context. Return the output handle.
+@End Implementation
 Process called "generate_python_from_hir" takes hir as Integer, arena as Integer returns Integer:
     Note: Generate Python code from HIR dictionary
 
@@ -164,6 +224,17 @@ Note: ==========================================================================
 Note: Node Generation Dispatcher
 Note: ============================================================================
 
+@Reasoning:
+Routes HIR nodes by their string "_type" tag to the appropriate generator.
+String-based dispatch (vs integer enum) matches the upstream Python frontend's
+HIR conventions, lets unknown tags be detected at runtime, and avoids
+recompiling consumers when new node types are added.
+@End Reasoning
+@Implementation:
+Null hir returns 1. Read "_type" string from the dict. Long if/Otherwise If
+chain comparing the type against each known py_* tag and dispatching to
+generate_<kind>. Unknown tags fall through with no emission.
+@End Implementation
 Process called "generate_node" takes context as Integer, hir as Integer returns Integer:
     Note: Dispatch node generation based on HIR type
 
@@ -410,6 +481,15 @@ Note: ==========================================================================
 Note: Module Generation
 Note: ============================================================================
 
+@Reasoning:
+A Python module is a flat sequence of top-level members (imports,
+functions, classes, statements). No outer scaffolding is emitted - the
+module IS the file.
+@End Reasoning
+@Implementation:
+Read members list; null returns 1 (empty module). Iterate by index,
+dispatching each non-null member to generate_node.
+@End Implementation
 Process called "generate_module" takes context as Integer, hir as Integer returns Integer:
     Note: Generate Python module from HIR
 
@@ -439,6 +519,17 @@ Note: ==========================================================================
 Note: Declaration Generation
 Note: ============================================================================
 
+@Reasoning:
+`def name(parameters):` then indented body. Empty body must emit `pass` to
+remain syntactically valid (an indented block can't be empty in Python).
+Trailing blank line after the function matches PEP 8 separation conventions
+for top-level definitions.
+@End Reasoning
+@Implementation:
+Emit indent + "def " + name + "(" + recurse parameters + "):" + newline.
+Increase_indent; if body present recurse it, otherwise emit indent + "pass"
++ newline. Decrease_indent; emit blank newline.
+@End Implementation
 Process called "generate_function" takes context as Integer, hir as Integer returns Integer:
     Note: Generate function definition
 
@@ -484,6 +575,17 @@ Process called "generate_function" takes context as Integer, hir as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+`class Name(Base1, Base2):` with optional base-class list. Empty base list
+omits the parentheses entirely (idiomatic Python style for classes without
+inheritance). Empty body must emit `pass` for the same reason functions do.
+@End Reasoning
+@Implementation:
+Emit indent + "class " + name. If base_classes list non-empty: emit "(" +
+iterate bases recursively with ", " separators + ")". Emit ":" + newline.
+Increase_indent; recurse body if present, otherwise emit indent + "pass" +
+newline. Decrease_indent; emit blank newline.
+@End Implementation
 Process called "generate_class" takes context as Integer, hir as Integer returns Integer:
     Note: Generate class definition
 
@@ -546,6 +648,15 @@ Process called "generate_class" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+`import mod1, mod2, mod3`. Multiple modules on one import statement is
+permitted; whether to emit one statement or many is decided upstream by the
+HIR producer.
+@End Reasoning
+@Implementation:
+Emit indent + "import "; iterate modules list, recursing each module HIR
+node with ", " separator between; emit newline.
+@End Implementation
 Process called "generate_import" takes context as Integer, hir as Integer returns Integer:
     Note: Generate import statement
 
@@ -578,6 +689,14 @@ Process called "generate_import" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+`from module import item1, item2`. Items are HIR nodes (because each may be
+a bare name or a name + alias), so they are recursed through generate_node.
+@End Reasoning
+@Implementation:
+Emit indent + "from " + module_name + " import "; iterate items list with
+recursion and ", " separators; emit newline.
+@End Implementation
 Process called "generate_from_import" takes context as Integer, hir as Integer returns Integer:
     Note: Generate from...import statement
 
@@ -621,6 +740,14 @@ Note: ==========================================================================
 Note: Statement Generation
 Note: ============================================================================
 
+@Reasoning:
+Wraps a bare expression in statement position. No trailing semicolon (Python
+uses newline as the statement terminator). The expression itself recurses
+through generate_node so it can be any expression form.
+@End Reasoning
+@Implementation:
+Emit indent; recurse the "expression" field if present; emit newline.
+@End Implementation
 Process called "generate_expression_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate expression statement
 
@@ -640,6 +767,14 @@ Process called "generate_expression_stmt" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Simple `target = value` assignment. Multi-target (`a = b = c`) and unpacking
+(`a, b = ...`) come through the same routine because both forms are
+expressed as a single "target" HIR that may itself be a tuple/list literal.
+@End Reasoning
+@Implementation:
+Emit indent; recurse target; emit " = "; recurse value; emit newline.
+@End Implementation
 Process called "generate_assignment" takes context as Integer, hir as Integer returns Integer:
     Note: Generate assignment
 
@@ -667,6 +802,16 @@ Process called "generate_assignment" takes context as Integer, hir as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Augmented forms (`x += y`, `x //= y`, etc.) are kept as a distinct HIR tag
+because Python's semantics for them differ from `x = x OP y` for mutable
+sequences (the in-place variant calls __iadd__). The emitter just routes
+the operator through verbatim.
+@End Reasoning
+@Implementation:
+Emit indent; recurse target; emit space + operator + space; recurse value;
+emit newline.
+@End Implementation
 Process called "generate_augmented_assignment" takes context as Integer, hir as Integer returns Integer:
     Note: Generate augmented assignment
 
@@ -701,6 +846,19 @@ Process called "generate_augmented_assignment" takes context as Integer, hir as 
     Return 1
 End Process
 
+@Reasoning:
+The branches list is flattened: even indices hold condition expressions and
+odd indices hold the corresponding body blocks; an extra final entry (if
+total count is odd) is the trailing `else` body. This compact encoding
+keeps elif chains as a flat list without nested HIR objects.
+@End Reasoning
+@Implementation:
+Walk pairs at indices (0,1), (2,3), ...: first pair emits `if cond:`, later
+pairs emit `elif cond:` (toggled by is_first). For each pair emit indent +
+keyword + recurse condition + ":" + newline, increase_indent, recurse body,
+decrease_indent. After the loop, if a leftover index remains, emit `else:`
++ body the same way.
+@End Implementation
 Process called "generate_if_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate if statement
 
@@ -761,6 +919,17 @@ Process called "generate_if_statement" takes context as Integer, hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+`for target in iterable: body [else: else_body]`. Python's optional for-else
+clause runs only if the loop completed without a break, which downstream
+producers may rely on for "search and report" patterns.
+@End Reasoning
+@Implementation:
+Emit indent + "for "; recurse target; " in "; recurse iterable; ":" +
+newline. Increase_indent; recurse body; decrease_indent. If else_body
+present, emit indent + "else:" + newline; increase_indent; recurse
+else_body; decrease_indent.
+@End Implementation
 Process called "generate_for_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate for statement
 
@@ -812,6 +981,14 @@ Process called "generate_for_statement" takes context as Integer, hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+`while condition: body [else: else_body]`. The same break-aware else clause
+that exists on for-loops also exists here.
+@End Reasoning
+@Implementation:
+Emit indent + "while "; recurse condition; ":" + newline. Increase_indent;
+recurse body; decrease_indent. If else_body present, emit "else:" block.
+@End Implementation
 Process called "generate_while_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate while statement
 
@@ -855,6 +1032,15 @@ Process called "generate_while_statement" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+`with cm1, cm2, ...: body`. Multiple context managers are comma-separated
+within a single `with` (Python 3.1+ syntax). Each context manager is its
+own HIR node so `expr as name` forms are emitted by the recursion.
+@End Reasoning
+@Implementation:
+Emit indent + "with "; iterate context_managers list with recursion and
+", " separator; ":" + newline. Increase_indent; recurse body; decrease_indent.
+@End Implementation
 Process called "generate_with_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate with statement
 
@@ -898,6 +1084,17 @@ Process called "generate_with_statement" takes context as Integer, hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+`try: body except <type> [as name]: handler ...`. Multiple except clauses
+in source order. Exception type and binding are pulled out of each clause
+node's string fields and emitted in the header before the body is recursed
+through generate_node (which handles the indented suite).
+@End Reasoning
+@Implementation:
+Emit "try:" + newline, recurse try_body inside increase/decrease_indent.
+For each except clause in the list: emit "except" + optional " Type [as
+name]" + ":" + newline, then recurse the clause's body indented.
+@End Implementation
 Process called "generate_try_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate try statement
 
@@ -957,6 +1154,17 @@ Process called "generate_try_statement" takes context as Integer, hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+PEP 634 `match subject: case pattern: body`. Patterns can be any expression-
+like HIR; wildcard `_` is emitted when no pattern is supplied for a case
+(rather than dropping the case silently).
+@End Reasoning
+@Implementation:
+Emit "match " + recurse subject + ":" + newline. Increase_indent; for each
+case node: emit indent + "case " + recurse pattern (or "_" fallback) + ":"
++ newline, then recurse the case body indented one further level.
+Decrease_indent at end.
+@End Implementation
 Process called "generate_match_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate match statement
 
@@ -1013,6 +1221,14 @@ Process called "generate_match_statement" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+`return [expr]`. Python tolerates bare `return` (yielding None) and `return
+expr`; we emit the space-before-expr form when one is present.
+@End Reasoning
+@Implementation:
+Emit indent + "return"; if expression present emit space + recurse it;
+emit newline.
+@End Implementation
 Process called "generate_return_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate return statement
 
@@ -1034,6 +1250,12 @@ Process called "generate_return_statement" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+`break`. No label form in Python (unlike JS), so there are no fields to read.
+@End Reasoning
+@Implementation:
+Emit indent + "break" + newline.
+@End Implementation
 Process called "generate_break_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate break statement
 
@@ -1047,6 +1269,12 @@ Process called "generate_break_statement" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+`continue`. Same shape as break - labeless in Python.
+@End Reasoning
+@Implementation:
+Emit indent + "continue" + newline.
+@End Implementation
 Process called "generate_continue_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate continue statement
 
@@ -1060,6 +1288,14 @@ Process called "generate_continue_statement" takes context as Integer, hir as In
     Return 1
 End Process
 
+@Reasoning:
+`pass` is a no-op statement required when a block would otherwise be empty
+(empty class/function/if bodies). The function and class emitters use this
+as a fallback when their body field is null.
+@End Reasoning
+@Implementation:
+Emit indent + "pass" + newline.
+@End Implementation
 Process called "generate_pass_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate pass statement
 
@@ -1073,6 +1309,15 @@ Process called "generate_pass_statement" takes context as Integer, hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+`raise [exception]`. Bare `raise` re-raises the current exception within an
+except block; with an argument it raises a new one. The from-cause form
+(`raise X from Y`) is not handled here.
+@End Reasoning
+@Implementation:
+Emit indent + "raise"; if exception present emit space + recurse it; emit
+newline.
+@End Implementation
 Process called "generate_raise_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate raise statement
 
@@ -1094,6 +1339,15 @@ Process called "generate_raise_statement" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+`assert test [, message]`. The optional message is comma-separated from the
+test expression. Note: Python's -O flag disables asserts entirely; producers
+should not use assert for production validation.
+@End Reasoning
+@Implementation:
+Emit indent + "assert "; recurse test. If message present emit ", " +
+recurse message. Emit newline.
+@End Implementation
 Process called "generate_assert_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate assert statement
 
@@ -1121,6 +1375,14 @@ Process called "generate_assert_statement" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+`del target`. Target can be a name, subscript, attribute, or tuple of
+these. We recurse the target HIR without special handling because the
+expression emitters already cover those shapes.
+@End Reasoning
+@Implementation:
+Emit indent + "del "; recurse target; newline.
+@End Implementation
 Process called "generate_delete_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate del statement
 
@@ -1141,6 +1403,15 @@ Process called "generate_delete_statement" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+`global name1, name2`. Declares module-level binding intent for subsequent
+assignments in the enclosing scope. Names are HIR nodes (typically
+identifiers) recursed through generate_node.
+@End Reasoning
+@Implementation:
+Emit indent + "global "; iterate names list with recursion and ", "
+separator; emit newline.
+@End Implementation
 Process called "generate_global_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate global statement
 
@@ -1173,6 +1444,14 @@ Process called "generate_global_statement" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+`nonlocal name1, name2`. Companion to global - declares enclosing-function
+binding intent. Same emission shape as generate_global_statement.
+@End Reasoning
+@Implementation:
+Emit indent + "nonlocal "; iterate names list with recursion and ", "
+separator; emit newline.
+@End Implementation
 Process called "generate_nonlocal_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate nonlocal statement
 
@@ -1209,6 +1488,14 @@ Note: ==========================================================================
 Note: Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+Infix form `left OP right`. No parenthesization is added; producer is
+responsible for grouping when precedence matters. Python's chained-
+comparison form (`a < b < c`) would arrive here as nested HIR nodes.
+@End Reasoning
+@Implementation:
+Recurse left; space + operator + space; recurse right.
+@End Implementation
 Process called "generate_binary_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate binary expression
 
@@ -1238,6 +1525,15 @@ Process called "generate_binary_expression" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Prefix unary `OP operand`. Python's `not` operator must include a trailing
+space - the producer is expected to set operator = "not " in that case
+(since `notx` is invalid). The other unary operators (`-`, `+`, `~`) glue
+to their argument with no space.
+@End Reasoning
+@Implementation:
+Emit operator; recurse operand if present.
+@End Implementation
 Process called "generate_unary_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate unary expression
 
@@ -1257,6 +1553,14 @@ Process called "generate_unary_expression" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+`lambda params: body`. Python lambda bodies are single expressions, not
+suites - so the body recurses to one expression node and no indent or
+newline scaffolding is involved.
+@End Reasoning
+@Implementation:
+Emit "lambda "; recurse parameters; ": "; recurse body.
+@End Implementation
 Process called "generate_lambda_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate lambda expression
 
@@ -1281,6 +1585,15 @@ Process called "generate_lambda_expression" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+`callee(arg1, arg2)`. Both positional and keyword arguments live in the
+same list - keyword args arrive as HIR nodes that render as `name=value`,
+not as a separate structure.
+@End Reasoning
+@Implementation:
+Recurse callee; emit "("; iterate arguments with recursion and ", "
+separator between; emit ")".
+@End Implementation
 Process called "generate_call_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate call expression
 
@@ -1317,6 +1630,13 @@ Process called "generate_call_expression" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+`object[index]`. Slices arrive as a single index HIR (typically a slice
+literal), so this routine doesn't need special slice syntax handling.
+@End Reasoning
+@Implementation:
+Recurse object; emit "["; recurse index; emit "]".
+@End Implementation
 Process called "generate_subscript_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate subscript expression
 
@@ -1341,6 +1661,15 @@ Process called "generate_subscript_expression" takes context as Integer, hir as 
     Return 1
 End Process
 
+@Reasoning:
+`object.attr`. Attribute is a STRING, not a HIR node, because Python's
+grammar disallows expressions in dotted-access position. The producer is
+expected to encode dynamic access as a subscript with getattr() call
+instead.
+@End Reasoning
+@Implementation:
+Recurse object; emit "."; emit attribute string.
+@End Implementation
 Process called "generate_attribute_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate attribute expression
 
@@ -1362,6 +1691,14 @@ Process called "generate_attribute_expression" takes context as Integer, hir as 
     Return 1
 End Process
 
+@Reasoning:
+`[e1, e2, ...]`. Distinct from tuple expression because Python tuples and
+lists have different semantics (mutability, hashability) - even though the
+emission shape is similar.
+@End Reasoning
+@Implementation:
+Emit "["; iterate elements list with recursion and ", " separator; emit "]".
+@End Implementation
 Process called "generate_list_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate list expression
 
@@ -1392,6 +1729,14 @@ Process called "generate_list_expression" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+`{key: value, ...}`. Each pair HIR has "key" and "value" sub-fields (both
+arbitrary expressions, since Python keys can be any hashable expression).
+@End Reasoning
+@Implementation:
+Emit "{"; iterate pairs list: emit recursed key + ": " + recursed value,
+with ", " separator between pairs; emit "}".
+@End Implementation
 Process called "generate_dict_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate dict expression
 
@@ -1433,6 +1778,14 @@ Process called "generate_dict_expression" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+`{e1, e2, ...}`. Same brace literal as dict but with no colons. Empty set
+literal `{}` would emit as empty dict instead - producers must use `set()`
+constructor for empty sets and never emit a zero-element set literal here.
+@End Reasoning
+@Implementation:
+Emit "{"; iterate elements list with recursion and ", " separator; emit "}".
+@End Implementation
 Process called "generate_set_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate set expression
 
@@ -1463,6 +1816,17 @@ Process called "generate_set_expression" takes context as Integer, hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+`(e1, e2, ...)`. Critical edge case: single-element tuple needs a trailing
+comma `(x,)` to distinguish from a parenthesized expression `(x)`. Empty
+tuple `()` is valid. We always emit the surrounding parens even though
+Python allows tuples without them in some positions, because the bare form
+collides with comma-operator-like contexts elsewhere.
+@End Reasoning
+@Implementation:
+Emit "("; iterate elements with recursion and ", " separator; if exactly
+one element, emit trailing ","; emit ")".
+@End Implementation
 Process called "generate_tuple_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate tuple expression
 
@@ -1498,6 +1862,13 @@ Process called "generate_tuple_expression" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+`await expr`. Only legal inside async functions; that constraint is the
+producer's responsibility. We emit the keyword + space unconditionally.
+@End Reasoning
+@Implementation:
+Emit "await "; recurse expression if present.
+@End Implementation
 Process called "generate_await_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate await expression
 
@@ -1514,6 +1885,14 @@ Process called "generate_await_expression" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+`yield [expr]`. Bare `yield` yields None; the optional expression is space-
+separated from `yield`. The yield-from form (`yield from iter`) is not
+handled here - the producer would shape it via a different HIR tag.
+@End Reasoning
+@Implementation:
+Emit "yield"; if expression present emit space then recurse it.
+@End Implementation
 Process called "generate_yield_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate yield expression
 
@@ -1531,6 +1910,16 @@ Process called "generate_yield_expression" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Python ternary `consequent if cond else alternate` puts the consequent
+FIRST (unlike C-family `cond ? a : b`). The HIR field names
+"true_expression" / "condition" / "false_expression" reflect the C-style
+ordering of operands; emission reorders them.
+@End Reasoning
+@Implementation:
+Recurse true_expr; emit " if "; recurse condition; emit " else "; recurse
+false_expr.
+@End Implementation
 Process called "generate_conditional_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate conditional expression (ternary)
 
@@ -1565,6 +1954,13 @@ Note: ==========================================================================
 Note: Literal Generation
 Note: ============================================================================
 
+@Reasoning:
+Pure name emission. Python's keyword collision (a HIR node named `class`)
+would emit invalid code - the producer must avoid reserved words.
+@End Reasoning
+@Implementation:
+Read "name"; emit verbatim if non-null.
+@End Implementation
 Process called "generate_identifier" takes context as Integer, hir as Integer returns Integer:
     Note: Generate identifier
 
@@ -1578,6 +1974,14 @@ Process called "generate_identifier" takes context as Integer, hir as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Integers stored pre-formatted as Strings (including any radix prefix like
+0x/0b/0o). We emit verbatim because Python's integer literal grammar allows
+any of those prefixes.
+@End Reasoning
+@Implementation:
+Read "value" string; emit verbatim if non-null.
+@End Implementation
 Process called "generate_integer" takes context as Integer, hir as Integer returns Integer:
     Note: Generate integer literal
 
@@ -1591,6 +1995,14 @@ Process called "generate_integer" takes context as Integer, hir as Integer retur
     Return 1
 End Process
 
+@Reasoning:
+Floats stored pre-formatted including any exponent notation. Distinguished
+from integer because Python's literal grammar separates them and producers
+may want to enforce the decimal point even when round (`2.0` vs `2`).
+@End Reasoning
+@Implementation:
+Read "value" string; emit verbatim if non-null.
+@End Implementation
 Process called "generate_float" takes context as Integer, hir as Integer returns Integer:
     Note: Generate float literal
 
@@ -1604,6 +2016,18 @@ Process called "generate_float" takes context as Integer, hir as Integer returns
     Return 1
 End Process
 
+@Reasoning:
+String literals stored pre-formatted INCLUDING surrounding quotes and any
+prefix (b'', r'', f''). The producer chooses single vs double quoting and
+escape handling.
+@End Reasoning
+@Implementation:
+Read "value" string; emit verbatim if non-null.
+@End Implementation
+@Security_Scope:
+Trusts the producer to properly escape embedded quotes and backslashes.
+Untrusted text becoming a string literal MUST be escaped upstream.
+@End Security_Scope
 Process called "generate_string" takes context as Integer, hir as Integer returns Integer:
     Note: Generate string literal
 
@@ -1617,6 +2041,14 @@ Process called "generate_string" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+Python's `None` is a keyword spelled with leading uppercase. Hard-coded
+string emission avoids any chance of casing mistakes from string
+interpolation paths.
+@End Reasoning
+@Implementation:
+Emit "None".
+@End Implementation
 Process called "generate_none" takes context as Integer, hir as Integer returns Integer:
     Note: Generate None literal
 
@@ -1627,6 +2059,13 @@ Process called "generate_none" takes context as Integer, hir as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Python's `True` is uppercase-T (unlike JS `true`). Hard-coded string for
+casing safety.
+@End Reasoning
+@Implementation:
+Emit "True".
+@End Implementation
 Process called "generate_true" takes context as Integer, hir as Integer returns Integer:
     Note: Generate True literal
 
@@ -1637,6 +2076,12 @@ Process called "generate_true" takes context as Integer, hir as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Python's `False` is uppercase-F. Companion to generate_true.
+@End Reasoning
+@Implementation:
+Emit "False".
+@End Implementation
 Process called "generate_false" takes context as Integer, hir as Integer returns Integer:
     Note: Generate False literal
 
@@ -1651,6 +2096,14 @@ Note: ==========================================================================
 Note: Parameter Generation
 Note: ============================================================================
 
+@Reasoning:
+`name[: type]`. Type annotations (PEP 484) are optional but emitted when
+present, formatted as a recursive HIR node so complex types (`List[int]`,
+`Optional[Foo]`) work via the expression emitters.
+@End Reasoning
+@Implementation:
+Emit name string; if "type" field present, emit ": " + recurse it.
+@End Implementation
 Process called "generate_parameter" takes context as Integer, hir as Integer returns Integer:
     Note: Generate parameter
 

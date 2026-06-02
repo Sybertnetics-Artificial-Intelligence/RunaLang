@@ -82,13 +82,25 @@ Note: ==========================================================================
 Note: Context Management
 Note: ============================================================================
 
+@Reasoning:
+Allocates and zero-initialises the CppTranslationContext, the cursor object
+that every recursive translation function threads through. Class/template/
+lambda pointers start null because a fresh translation begins outside any
+enclosing scope; the namespace stack is a real List so push/pop can use
+amortised O(1) operations without reallocating the context block.
+@End Reasoning
+
+@Implementation:
+Two-step allocation: 48-byte struct first, then the List for namespace_stack.
+If either allocation fails, ownership is unwound (context is freed before
+returning 0) so the function never leaks. All six fields are written via
+memory_set_int64 at the byte offsets matching the Type declaration: 0
+(class), 8 (template), 16 (namespace stack), 24 (lambda), 32 (error
+message), 40 (has_error). Returns the context pointer or 0 on OOM.
+@End Implementation
+
 Process called "create_cpp_translation_context" returns Integer:
     Note: Create translation context for C++ to HIR conversion
-
-    @Reasoning:
-    Initialize translation context with namespace stack, template tracking,
-    class hierarchy information, and error handling state.
-    @End Reasoning
 
     Let context_size be 48  Note: CppTranslationContext: 6 fields × 8 bytes
     Let context be proc allocate from Layout with context_size
@@ -113,6 +125,22 @@ Process called "create_cpp_translation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Frees the context and every owned resource it points at. Two heap-owned
+slots can outlive the translation walk: the namespace_stack List (always
+owned) and the error_message StringCore copy (only owned when an error
+fired). A null context is treated as already-destroyed and returns success
+so callers don't have to track a separate "context-built" flag.
+@End Reasoning
+
+@Implementation:
+Reads slots 16 (namespace stack) and 32 (error message), invokes the
+type-specific destructor when non-null, then deallocates the 48-byte
+context block itself. Returns 1 unconditionally on success; the only
+failure surface is hitting a null context, which is also reported as 1
+because the contract is "after this call nothing remains to free".
+@End Implementation
 
 Process called "destroy_cpp_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context and free resources
@@ -141,14 +169,26 @@ Note: ==========================================================================
 Note: Main Translation Entry Points
 Note: ============================================================================
 
+@Reasoning:
+Top-of-tree walk over the C++ translation unit. Output is a HIR dictionary
+literal tagged _type="program" with _source_language="cpp" so downstream
+HIR consumers can route language-specific lowering. Children of the
+program node are iterated in source order to preserve declaration order,
+which C++ semantics require (ODR, forward declarations).
+@End Reasoning
+
+@Implementation:
+Children list lives at offset 32 of the program AST node. After validating
+context and program_node (both must be non-null), creates the HIR program
+dict, attaches _type and _source_language string entries, then iterates
+the child list dispatching each through translate_cpp_declaration_to_hir.
+Sticky-error short-circuit: the has_error flag at context offset 40 is
+checked after every child translation and abandons the walk on first
+failure to avoid emitting partial HIR.
+@End Implementation
+
 Process called "translate_cpp_program_to_hir" takes context as Integer, program_node as Integer returns Integer:
     Note: Translate C++ program to HIR representation
-
-    @Reasoning:
-    Convert entire C++ program including all declarations, maintaining
-    namespace structure, template instantiations, and class hierarchies
-    in HIR format for further processing.
-    @End Reasoning
 
     If context is equal to 0:
         Return 0
@@ -200,14 +240,25 @@ Process called "translate_cpp_program_to_hir" takes context as Integer, program_
     Return hir_program
 End Process
 
+@Reasoning:
+Dispatcher over the seven top-level declaration kinds that can appear in a
+C++ translation unit: class, namespace, template, function, variable,
+typedef, and enum. Each translates through its dedicated lowering function
+so this node remains a thin switch — no shared logic — keeping per-kind
+HIR shape decisions local to their handlers.
+@End Reasoning
+
+@Implementation:
+The node-type tag lives at offset 0 of every C++ AST node. Compares against
+the CPP_CLASS, CPP_NAMESPACE, CPP_TEMPLATE, CPP_FUNCTION, CPP_VARIABLE,
+CPP_TYPEDEF, CPP_ENUM constants from the Parser module. Unknown tags
+record an error on the context and emit an UnknownDeclaration HIR error
+node so the walk can continue and report all failures rather than just
+the first. Null decl_node returns 0 silently (no-op).
+@End Implementation
+
 Process called "translate_cpp_declaration_to_hir" takes context as Integer, decl_node as Integer returns Integer:
     Note: Translate C++ declaration to HIR
-
-    @Reasoning:
-    Handle all C++ declaration types including classes, templates, functions,
-    variables, namespaces, and type aliases. Preserve C++ specific semantics
-    while converting to HIR representation.
-    @End Reasoning
 
     If decl_node is equal to 0:
         Return 0
@@ -259,14 +310,25 @@ Note: ==========================================================================
 Note: Class Translation
 Note: ============================================================================
 
+@Reasoning:
+Lowers a C++ class definition while temporarily installing it as the
+current class_context so nested members can resolve `this`, name lookup,
+and access-control questions through the context cursor. The previous
+class is saved and restored to support nested class declarations.
+@End Reasoning
+
+@Implementation:
+Reads class name from AST offset 8, inheritance from a dedicated helper,
+template params from offset 48 (set only on templated classes), and the
+member list from the children at offset 32. Each member is dispatched
+through translate_class_member_to_hir which itself may recurse into
+function/variable lowering. The class_context slot (offset 0 on the
+context) is swapped via load-modify-restore so exception escape paths
+won't corrupt the cursor.
+@End Implementation
+
 Process called "translate_cpp_class_to_hir" takes context as Integer, class_node as Integer returns Integer:
     Note: Translate C++ class to HIR preserving OOP semantics
-
-    @Reasoning:
-    Convert C++ class including inheritance hierarchy, access specifiers,
-    member functions, constructors, destructors, and virtual functions.
-    Maintain polymorphism information for HIR consumers.
-    @End Reasoning
 
     Let hir_class be proc create_hir_dictionary_literal from HIR
 
@@ -326,14 +388,27 @@ Process called "translate_cpp_class_to_hir" takes context as Integer, class_node
     Return hir_class
 End Process
 
+@Reasoning:
+Member-scoped dispatcher that fans out into the five member node kinds
+(constructor, destructor, operator overload, member function, member
+variable) and silently drops access-specifier nodes (public:, private:,
+protected:) because access info travels on the member itself, not as
+its own HIR node. Member functions/variables additionally receive an
+"access" string attribute lifted from offset 40 of the AST node.
+@End Reasoning
+
+@Implementation:
+Tag at offset 0 determines the routing. CPP_CONSTRUCTOR/CPP_DESTRUCTOR/
+CPP_OPERATOR_OVERLOAD each have dedicated lowerers. CPP_FUNCTION and
+CPP_VARIABLE share the top-level lowerers but then mutate the returned
+HIR dict to add an access entry derived from access_level_to_string.
+CPP_ACCESS_SPECIFIER returns 0 because the parser already attached the
+new visibility to subsequent members; emitting it again would duplicate.
+Unknown tags also return 0 silently — class parsing is permissive.
+@End Implementation
+
 Process called "translate_class_member_to_hir" takes context as Integer, member_node as Integer returns Integer:
     Note: Translate class member to HIR
-
-    @Reasoning:
-    Handle all class member types including member functions, data members,
-    constructors, destructors, operator overloads, and nested types.
-    Preserve access control information and virtual function semantics.
-    @End Reasoning
 
     If member_node is equal to 0:
         Return 0
@@ -395,14 +470,26 @@ Note: ==========================================================================
 Note: Template Translation
 Note: ============================================================================
 
+@Reasoning:
+Lowers a template-declaration prefix (template<...>) plus its single
+templated entity. The HIR shape is a dict tagged "template" carrying a
+"parameters" list and one "declaration" child, so consumers can pattern
+match on _type=="template" before descending into the wrapped class or
+function. Setting template_context on the way down enables nested
+typename substitution during sub-translations.
+@End Reasoning
+
+@Implementation:
+Reads template parameter list at offset 48 and the wrapped declaration as
+the first child (children list at offset 32). Pushes template_node into
+context offset 8 so any expression below it can detect "we're inside a
+template" via context inspection. The previous template context is saved
+on stack-local old_template_context and restored unconditionally so
+sibling templates can declare distinct parameter packs.
+@End Implementation
+
 Process called "translate_cpp_template_to_hir" takes context as Integer, template_node as Integer returns Integer:
     Note: Translate C++ template to HIR preserving generic programming semantics
-
-    @Reasoning:
-    Convert template declarations including type parameters, non-type parameters,
-    template template parameters, and specializations. Maintain template
-    instantiation information for HIR consumers.
-    @End Reasoning
 
     Let hir_template be proc create_hir_dictionary_literal from HIR
 
@@ -442,13 +529,22 @@ Process called "translate_cpp_template_to_hir" takes context as Integer, templat
     Return hir_template
 End Process
 
+@Reasoning:
+Lowers a parameter-list AST subtree into a HIR list of parameter dicts.
+The list shape matters: HIR consumers iterate in declaration order to
+preserve parameter-pack expansion semantics and to keep diagnostic
+"parameter N" messages stable across translation passes.
+@End Reasoning
+
+@Implementation:
+Children of the params_node live at offset 32. Iterates the entire list
+calling translate_template_param_to_hir on each child; null results
+(rare, only on malformed input) are skipped so a single bad parameter
+doesn't corrupt downstream ordinal indexing of the surviving entries.
+@End Implementation
+
 Process called "translate_template_params_to_hir" takes context as Integer, params_node as Integer returns Integer:
     Note: Translate template parameter list to HIR
-
-    @Reasoning:
-    Convert template parameters preserving their types (typename, class, non-type,
-    template template) and any default arguments or constraints.
-    @End Reasoning
 
     Let hir_params be proc create_hir_list_literal from HIR
 
@@ -473,13 +569,25 @@ Process called "translate_template_params_to_hir" takes context as Integer, para
     Return hir_params
 End Process
 
+@Reasoning:
+Each template parameter becomes a HIR dict with name, kind, and optional
+default. The kind string ("typename"/"class"/"non_type") is what lets
+downstream tooling reproduce the exact source spelling — C++ treats
+"class T" and "typename T" as synonyms but users see them differently.
+@End Reasoning
+
+@Implementation:
+Pulls name from offset 8, kind tag from offset 16 (translated through
+template_param_kind_to_string), and optional default expression from
+the first element of the children list at offset 32. The default
+expression is recursively lowered through translate_cpp_expression_to_hir,
+which is the only callsite that recurses back into expression lowering
+from the template path — important for `template<int N = compute()>`
+where the default is itself a constant expression.
+@End Implementation
+
 Process called "translate_template_param_to_hir" takes context as Integer, param_node as Integer returns Integer:
     Note: Translate individual template parameter to HIR
-
-    @Reasoning:
-    Handle type parameters (typename/class), non-type parameters, and
-    template template parameters with their constraints and defaults.
-    @End Reasoning
 
     Let hir_param be proc create_hir_dictionary_literal from HIR
 
@@ -518,14 +626,26 @@ Note: ==========================================================================
 Note: Expression Translation
 Note: ============================================================================
 
+@Reasoning:
+Expression dispatcher specialised for C++-only forms (lambda, new, delete,
+this, ::, ->) before delegating to the base-language expression lowerer.
+This split lets translate_base_expression_to_hir stay clean of C++isms
+and reused by both the C and C++ frontends, while the C++-specific forms
+each receive their own HIR shape.
+@End Reasoning
+
+@Implementation:
+Tag at offset 0 selects the path. Six C++-specific tags route to
+dedicated lowerers: CPP_LAMBDA, CPP_NEW_EXPR, CPP_DELETE_EXPR,
+CPP_THIS_EXPR, CPP_SCOPE_RESOLUTION, CPP_ARROW_EXPR. Anything else falls
+through to translate_base_expression_to_hir, which handles literals,
+binary/unary operators, function calls, and identifier references shared
+with C. Null expr_node short-circuits to 0 — callers must treat that as
+"absent expression" rather than error.
+@End Implementation
+
 Process called "translate_cpp_expression_to_hir" takes context as Integer, expr_node as Integer returns Integer:
     Note: Translate C++ expression to HIR
-
-    @Reasoning:
-    Convert C++ expressions preserving semantics including lambda expressions,
-    new/delete operations, template instantiations, operator overloads,
-    and reference/pointer operations.
-    @End Reasoning
 
     If expr_node is equal to 0:
         Return 0
@@ -567,14 +687,26 @@ Process called "translate_cpp_expression_to_hir" takes context as Integer, expr_
     Return proc translate_base_expression_to_hir with context, expr_node
 End Process
 
+@Reasoning:
+Lambdas in C++ are closures: the capture list materialises an anonymous
+struct with copy- or reference-bound members, parameters define the call
+operator's signature, and the body executes with those captures live.
+HIR represents this as a single dict with three child entries so a later
+closure-conversion pass can hoist the capture struct without re-parsing.
+@End Reasoning
+
+@Implementation:
+Reads captures, parameters, and body through the parser's getter helpers
+(get_lambda_captures/_parameters/_body) which already abstract the
+storage offsets. Pushes lambda_node into context offset 24 across the
+body translation so nested expressions can detect lambda scope (e.g.,
+implicit-this capture decisions). The previous lambda context is saved
+locally and restored after body translation completes — supports nested
+lambdas where the inner closure captures from the outer's frame.
+@End Implementation
+
 Process called "translate_lambda_to_hir" takes context as Integer, lambda_node as Integer returns Integer:
     Note: Translate C++ lambda expression to HIR
-
-    @Reasoning:
-    Convert lambda expressions including capture lists, parameter lists,
-    return types, and body. Generate closure representation suitable
-    for further compilation or interpretation.
-    @End Reasoning
 
     Let hir_lambda be proc create_hir_dictionary_literal from HIR
 
@@ -617,14 +749,24 @@ Note: ==========================================================================
 Note: Statement Translation
 Note: ============================================================================
 
+@Reasoning:
+Statement dispatcher for the C++-only statement forms (range-for from
+C++11, try/catch, throw) with everything else falling through to the
+base-language statement lowerer. Splitting C++-specific statements out
+keeps the C frontend's shared base lowerer free of exception-handling
+machinery it doesn't need.
+@End Reasoning
+
+@Implementation:
+Tag at offset 0 routes between CPP_RANGE_FOR_STMT, CPP_TRY_STMT, and
+CPP_THROW_STMT. Everything else delegates to translate_base_statement_to_hir
+which handles if/while/for/switch/return etc. Null stmt_node returns 0
+to signal "no statement", matching the convention used elsewhere in
+this translator.
+@End Implementation
+
 Process called "translate_cpp_statement_to_hir" takes context as Integer, stmt_node as Integer returns Integer:
     Note: Translate C++ statement to HIR
-
-    @Reasoning:
-    Convert C++ statements including C++ specific constructs like try-catch,
-    range-based for loops, and RAII patterns. Preserve exception handling
-    and resource management semantics.
-    @End Reasoning
 
     If stmt_node is equal to 0:
         Return 0
@@ -654,6 +796,23 @@ End Process
 Note: ============================================================================
 Note: Utility Functions
 Note: ============================================================================
+
+@Reasoning:
+Records the sticky-error state so deeply-recursive translation walks can
+detect failure on the next iteration and bail. The message string is
+copied (rather than aliased) so the caller's transient diagnostic buffer
+can be freed independently — important because most error sites pass a
+literal that may be in a Note region, not heap memory.
+@End Reasoning
+
+@Implementation:
+Sets has_error at context offset 40 to 1 and stores an owned copy of
+the message string at offset 32. The copy is allocated through
+copy_string from StringCore which owns the new buffer; the matching
+free happens in destroy_cpp_translation_context. No previous error
+message is freed here — first-error-wins semantics, intentional to
+preserve the original cause through repeated failure annotations.
+@End Implementation
 
 Process called "set_cpp_translation_error" takes context as Integer, message as Integer:
     Note: Set translation error state
@@ -730,14 +889,25 @@ Note: ==========================================================================
 Note: Public API
 Note: ============================================================================
 
+@Reasoning:
+Public-API wrapper that owns the lifetime of the translation context.
+Callers pass in an already-built C++ AST and receive a HIR tree or 0
+on failure — they never see the context object itself. This isolation
+keeps the C++ frontend's internal state invisible to the rest of the
+compiler driver.
+@End Reasoning
+
+@Implementation:
+Three steps: create context (returns 0 on OOM), run translation walk,
+destroy context. The has_error flag at context offset 40 is consulted
+after translation; if set, the partial HIR result is discarded by
+returning 0 instead of the dictionary. destroy_cpp_translation_context
+is called on both success and failure paths so no context is leaked
+regardless of outcome.
+@End Implementation
+
 Process called "cpp_ast_to_hir" takes cpp_ast as Integer returns Integer:
     Note: Main public API - convert C++ AST to HIR
-
-    @Reasoning:
-    Primary entry point for C++ to HIR translation. Creates context,
-    performs translation, and returns HIR representation suitable
-    for further compilation phases.
-    @End Reasoning
 
     Let context be proc create_cpp_translation_context
 

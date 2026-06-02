@@ -17,6 +17,23 @@ Import "compiler/middle/gungnir/hir/hir_builder.runa" as HirBuilder
 Note: Local Julia AST node schema (fields used by translation logic; distinct from
 Note: the real HIRNode in hir_nodes.runa which has node_type/value/children/etc).
 Note: This represents the parsed Julia source AST input, NOT the HIR output.
+@Reasoning:
+Julia's AST contains many syntactically distinct constructs (modules,
+function/method definitions, parametric type defs, comprehensions, macro
+calls, type-annotated lets). One union record with optional fields lets a
+single Match in translate_julia_node dispatch on .type without per-construct
+node hierarchies, mirroring how Julia itself uses Expr(:head, args...).
+@End Reasoning
+
+@Implementation:
+30+ optional fields. .type and .type_kind are dispatch discriminators;
+.name/.function_name carry identifiers; .body/.expression/.value carry
+nested ASTs; .parameters/.type_parameters/.arguments/.fields are List
+handles; .literal_type tags primitive literals; .supertype/.base_type
+are recursive JuliaIRNode handles for type-level expressions. Fields not
+relevant to a given node kind are simply ignored by the translator.
+@End Implementation
+
 Type called "JuliaIRNode":
     type as String
     name as String
@@ -52,14 +69,46 @@ Type called "JuliaIRNode":
     base_type as JuliaIRNode
 End Type
 
+@Reasoning:
+Minimal type-parameter record. Julia parametric types like Array{T,N} carry
+zero or more such parameters; current translation only needs the parameter
+name. Constraint info (where-clauses) is held on the parent function/struct
+record, not here.
+@End Reasoning
+
 Type called "JuliaTypeParam":
     name as String
 End Type
+
+@Reasoning:
+Function parameters in Julia carry an optional type annotation
+(`x::Int64`). The annotation is itself a JuliaIRNode because Julia
+type-expressions can be arbitrary (parametric, where-quantified, vararg).
+Untyped parameters carry a null type_annotation.
+@End Reasoning
 
 Type called "JuliaFuncParam":
     name as String
     type_annotation as JuliaIRNode
 End Type
+
+@Reasoning:
+The translation context bundles every piece of mutable state a Julia
+translation pass needs: the HIR builder it appends to, the lexical
+module/function stack, the type-parameter scope (for `where T` resolution),
+local variable bindings, an instance cache for method specialization, a
+macro-expansion cache, and the optimization knobs (`optimization_level`,
+`world_age`) Julia exposes. Bundling avoids threading 10 separate
+parameters through every translate_* call.
+@End Reasoning
+
+@Implementation:
+Reference-counted record built via "a value of type" constructor in
+create_julia_hir_context. Dictionaries are keyed by qualified Julia name;
+performance_hints is a list of pragma strings collected from @inbounds /
+@simd / @fastmath macros and consumed by the optimizer pass after
+translation.
+@End Implementation
 
 Type called "JuliaToHIRContext":
     hir_builder as HIRBuilder
@@ -74,14 +123,18 @@ Type called "JuliaToHIRContext":
     world_age as Integer
 End Type
 
+@Reasoning:
+The public entry point creates a fresh JuliaToHIRContext (which seeds the
+"Main" module, optimisation level 2, world age 1), recursively translates the
+Julia AST into HIR, and then runs optimize_julia_hir on the result. Running
+the optimiser inside the entry rather than asking the caller to do it
+guarantees that Julia-specific transforms (dispatch hint annotation, special
+function recognition, array hot-path hints) are always applied; clients that
+want unoptimised HIR for diagnostic purposes should call translate_julia_node
+directly with their own context.
+@End Reasoning
 Process called "translate_julia_to_hir" that takes julia_ast as JuliaIRNode returns HIRNode:
     Note: Main entry point for Julia to HIR translation
-
-    @Reasoning:
-    Julia's sophisticated type system and multiple dispatch require careful
-    translation to HIR. We need to preserve type information, method
-    specialization hints, and performance annotations for optimization.
-    @End Reasoning
 
     Let context be create_julia_hir_context
     Let hir_module be translate_julia_node with julia_ast and context
@@ -91,6 +144,21 @@ Process called "translate_julia_to_hir" that takes julia_ast as JuliaIRNode retu
 
     Return hir_module
 End Process
+
+@Reasoning:
+A fresh context establishes the "Main" module as the default lexical scope
+(matching Julia's REPL behaviour) and seeds an optimization_level of 2
+(-O2 equivalent) and world_age 1, which represents the empty
+method-dispatch world prior to any user method definitions. Both knobs are
+mutated as the translator visits `@optlevel` / method definitions.
+@End Reasoning
+
+@Implementation:
+Allocates a new HIRBuilder, then constructs JuliaToHIRContext via the
+struct-with-fields syntax. All five tracking maps (locals, methods, macros,
+hints, params) start empty so the translator can populate them
+incrementally.
+@End Implementation
 
 Process called "create_julia_hir_context" that takes nothing returns JuliaToHIRContext:
     Note: Create translation context for Julia to HIR
@@ -109,6 +177,21 @@ Process called "create_julia_hir_context" that takes nothing returns JuliaToHIRC
         optimization_level as 2,
         world_age as 1
 End Process
+
+@Reasoning:
+Central dispatcher: every other translate_julia_* helper handles a single
+construct, but the recursive structure of Julia ASTs means many helpers
+need to re-translate child nodes whose kind is not statically known. This
+function is the polymorphic entry point those helpers call back into.
+@End Reasoning
+
+@Implementation:
+One large Match on node.type. Each arm forwards to the dedicated helper
+(translate_julia_module, _function_def, _method_def, etc). Falls through
+to an Otherwise branch that builds a generic HIR placeholder node for any
+construct the translator does not yet specialise — keeps the pipeline
+total rather than crashing on unknown shapes.
+@End Implementation
 
 Process called "translate_julia_node" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate any Julia AST node to HIR
@@ -199,14 +282,17 @@ Process called "translate_julia_node" that takes node as JuliaIRNode, ctx as Jul
     End Match
 End Process
 
+@Reasoning:
+Modules are translated by saving and restoring ctx.current_module around the
+recursive body translation. This save-restore pattern is necessary because
+Julia allows nested module declarations and inner constructs (qualified
+references, exports) must be resolved against the innermost enclosing module
+at the point where they appear. Exports and imports are translated in source
+order BEFORE the body so subsequent body references can see the populated
+import map, matching Julia's actual resolution semantics.
+@End Reasoning
 Process called "translate_julia_module" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia module definition
-
-    @Reasoning:
-    Julia modules provide namespace isolation and control exports/imports.
-    They are essential for organizing large Julia programs and managing
-    dependencies.
-    @End Reasoning
 
     Let module_name be node.name
     Let module_body be node.body
@@ -244,14 +330,23 @@ Process called "translate_julia_module" that takes node as JuliaIRNode, ctx as J
     Return hir_module
 End Process
 
+@Reasoning:
+Julia functions translate into HIR functions that carry the type-parameter
+list, where-clause constraints, parameter list with per-parameter type
+annotations, and an optional return-type assertion. Type parameters are added
+to ctx.type_parameters BEFORE translating the parameter list, body, or where
+clause because each of those may reference the type parameters as bound names
+that must resolve to a parameter slot rather than a free identifier. After the
+body is translated we remove the type parameters from scope so they cannot
+leak into sibling function definitions in the same module body.
+@End Reasoning
+@Implementation:
+Dispatch hint generation runs after the body to allow add_julia_dispatch_hints
+to consult the fully-translated HIR body when synthesising specialisation
+hints; the hints depend on which method-call shapes appear inside the function.
+@End Implementation
 Process called "translate_julia_function_def" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia function definition
-
-    @Reasoning:
-    Julia functions are methods that participate in multiple dispatch.
-    They can have type parameters, constraints, and various performance
-    annotations that need to be preserved in HIR.
-    @End Reasoning
 
     Let func_name be node.name
     Let type_params be node.type_parameters
@@ -317,14 +412,18 @@ Process called "translate_julia_function_def" that takes node as JuliaIRNode, ct
     Return hir_function
 End Process
 
+@Reasoning:
+A 'method' in Julia is a single specialisation of a function for one argument
+signature; functions are name-bound collections of methods that the runtime
+dispatches between based on the runtime types of arguments. We translate by
+building an HIR method node and registering it in the dispatch table via
+add_method_to_dispatch_table, which lets downstream optimisation passes ask
+"what are all the methods of this function?" without re-walking the AST. The
+line_info is propagated to the HIR via set_hir_source_location so debugger
+backends can map between Julia source positions and HIR positions.
+@End Reasoning
 Process called "translate_julia_method_def" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia method definition (specific method for existing function)
-
-    @Reasoning:
-    Julia methods are specializations of functions with specific type
-    signatures. They are the core of Julia's multiple dispatch system
-    and require careful type signature preservation.
-    @End Reasoning
 
     Let func_name be node.function_name
     Let signature be node.signature
@@ -351,6 +450,21 @@ Process called "translate_julia_method_def" that takes node as JuliaIRNode, ctx 
     Return hir_method
 End Process
 
+@Reasoning:
+Julia type declarations come in three shapes that share the same outer AST
+form (`type ... end`) but have very different semantics: struct (composite
+with fields), abstract (no fields, used as supertype only), and primitive
+(fixed-bit-width bits-types). The type_kind sub-discriminator selects the
+right specialised translator.
+@End Reasoning
+
+@Implementation:
+Match on node.type_kind. The Otherwise arm defaults to struct because
+unrecognised kinds most often originate from a missing kind tag on a
+field-bearing AST, and struct is the least-lossy fallback. Each specialised
+translator owns its own HIR construction.
+@End Implementation
+
 Process called "translate_julia_type_def" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia type definition (struct, abstract type, or primitive type)
 
@@ -366,14 +480,18 @@ Process called "translate_julia_type_def" that takes node as JuliaIRNode, ctx as
     End Match
 End Process
 
+@Reasoning:
+Julia structs carry a mutability bit that affects whether field stores are
+permitted after construction; we translate this into an HIR property so the
+backend can reject illegal mutations and choose between stack and heap layout
+strategies. Default constructors are generated AFTER field translation
+because the constructor signature depends on the materialised field set; if
+the source defined custom constructors elsewhere, the upstream parser emits
+them as separate method definitions that the dispatcher in translate_julia_node
+processes independently.
+@End Reasoning
 Process called "translate_julia_struct_def" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia struct definition
-
-    @Reasoning:
-    Julia structs are composite types that can be mutable or immutable,
-    have type parameters, and define the layout of objects in memory.
-    This information is crucial for optimization.
-    @End Reasoning
 
     Let type_name be node.name
     Let type_params be node.type_parameters
@@ -413,14 +531,18 @@ Process called "translate_julia_struct_def" that takes node as JuliaIRNode, ctx 
     Return hir_struct
 End Process
 
+@Reasoning:
+Method calls are the dispatch sites that drive Julia's multiple-dispatch
+runtime: the actual method selected depends on the runtime types of every
+argument, not just the receiver. We translate by recording the call shape
+verbatim (function name + argument expressions) and then invoke
+optimize_special_function_calls to recognise hot patterns like +(::Int,::Int)
+or getindex(::Array,::Int) where the compiler can devirtualise the call at HIR
+level. Generic calls remain dispatch-flexible and only specialise during
+later monomorphisation.
+@End Reasoning
 Process called "translate_julia_method_call" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia method call with multiple dispatch
-
-    @Reasoning:
-    Julia method calls require type-based dispatch resolution. The HIR
-    needs to preserve enough information for the compiler to generate
-    efficient dispatch code and method specialization.
-    @End Reasoning
 
     Let function_name be node.function_name
     Let arguments be node.arguments
@@ -461,14 +583,19 @@ Process called "translate_julia_method_call" that takes node as JuliaIRNode, ctx
     Return hir_call
 End Process
 
+@Reasoning:
+Julia macros are syntactic transforms applied before HIR generation, so by the
+time the translator sees them they have either already been expanded by the
+upstream parser or they are a small set of compiler-recognised performance
+macros (@inbounds, @simd, @fastmath, @inline, @noinline, @generated, @time,
+@allocated, @assert, @show) that we treat specially because they MAP to HIR
+attributes rather than HIR code. Each recognised macro routes to a dedicated
+translator that attaches the appropriate hint to the argument expressions;
+unrecognised macros fall through to translate_generic_macro_call which keeps
+the macro shape verbatim for the user to inspect.
+@End Reasoning
 Process called "translate_julia_macro_call" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia macro call and expand
-
-    @Reasoning:
-    Julia macros perform code transformation at compile time. Some macros
-    like @inbounds, @simd provide performance hints, while others like
-    @generated create specialized code.
-    @End Reasoning
 
     Let macro_name be node.macro_name
     Let arguments be node.arguments
@@ -500,14 +627,18 @@ Process called "translate_julia_macro_call" that takes node as JuliaIRNode, ctx 
     End Match
 End Process
 
+@Reasoning:
+Array literals translate into an HIR array construction node that carries the
+element type (if explicitly written, e.g. Int[1,2,3]), the dimensions (for
+multi-dimensional constructors like [1 2 ; 3 4]), and each element subtree.
+The dimensions field is crucial because Julia's row-major bracketed syntax
+encodes 2-D arrays in a way that text reconstruction loses, so we capture
+dimensions up front from the AST. add_array_optimization_hints runs after
+element translation to recognise homogeneous-type literals where SIMD-friendly
+storage layouts can be selected.
+@End Reasoning
 Process called "translate_julia_array_construction" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia array construction
-
-    @Reasoning:
-    Julia arrays are fundamental data structures with specific performance
-    characteristics. Different construction methods (literals, comprehensions,
-    constructors) have different optimization opportunities.
-    @End Reasoning
 
     Let elements be node.elements
     Let element_type be node.element_type
@@ -539,14 +670,18 @@ Process called "translate_julia_array_construction" that takes node as JuliaIRNo
     Return hir_array
 End Process
 
+@Reasoning:
+Array comprehensions ([expr for var in iter if filter]) are kept in their
+high-level comprehension form rather than desugared to a manual loop at HIR
+level because loop optimisations (pre-allocation sizing, fusion, type
+specialisation) need to see the comprehension as a unit. The HIR record holds
+the body expression, the iterator list (multiple 'for' clauses chain into
+nested loops), and the filter list (one or more 'if' clauses applied to each
+combined iteration tuple). Filters are emitted as a list because Julia allows
+multiple 'if' clauses; they are ANDed together at codegen time.
+@End Reasoning
 Process called "translate_julia_comprehension" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia array comprehension
-
-    @Reasoning:
-    Julia comprehensions can be optimized into efficient loops with
-    pre-allocated arrays. The HIR should preserve the comprehension
-    structure for loop optimization.
-    @End Reasoning
 
     Let expression be node.expression
     Let iterators be node.iterators
@@ -579,14 +714,18 @@ Process called "translate_julia_comprehension" that takes node as JuliaIRNode, c
     Return hir_comprehension
 End Process
 
+@Reasoning:
+'expr::Type' assertions in Julia are runtime type checks that simultaneously
+inform the type inferencer of the expression's narrowed type. We preserve both
+the underlying expression and the asserted type as siblings on an HIR
+assertion node, with add_type_assertion_hints attaching a strong type narrowing
+hint that downstream passes use to specialise the surrounding code. The
+assertion is NOT lowered into an if-throw pair at HIR level so that the
+compiler can elide the runtime check when type inference proves it
+unnecessary; lowering happens during code generation.
+@End Reasoning
 Process called "translate_julia_type_assertion" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia type assertion (::Type)
-
-    @Reasoning:
-    Type assertions in Julia provide type information to the compiler
-    and can enable optimizations. They should be preserved in HIR for
-    type inference and specialization.
-    @End Reasoning
 
     Let expression be node.expression
     Let asserted_type be node.asserted_type
@@ -608,14 +747,18 @@ Process called "translate_julia_type_assertion" that takes node as JuliaIRNode, 
     Return hir_assertion
 End Process
 
+@Reasoning:
+For-loops in Julia bind a single variable to successive elements of any
+iterable; this translator captures the iteration variable, the iterable
+expression, and the loop body without rewriting them into a while-with-index
+form because the HIR keeps the for-loop shape so analyze_simd_opportunities
+can pattern-match against canonical ranges (1:N, eachindex(...)) for
+vectorisation. add_loop_optimization_hints inspects the iterable to attach
+loop-bound information when statically determinable, which feeds bound-check
+elimination later in the pipeline.
+@End Reasoning
 Process called "translate_julia_for_loop" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia for loop
-
-    @Reasoning:
-    Julia for loops can iterate over various collections and can be
-    optimized with SIMD operations. The HIR should preserve iteration
-    patterns for vectorization analysis.
-    @End Reasoning
 
     Let variable be node.variable
     Let iterable be node.iterable
@@ -644,6 +787,21 @@ Process called "translate_julia_for_loop" that takes node as JuliaIRNode, ctx as
 
     Return hir_for
 End Process
+
+@Reasoning:
+Julia literals carry semantic type information that matters for downstream
+optimization (e.g. Int64 vs Float64 selects different arithmetic
+instructions). The translator must preserve the literal_type tag rather
+than letting it be inferred, because integer overflow / float precision
+behaviour differ.
+@End Reasoning
+
+@Implementation:
+Creates a HIR literal with the raw value, then matches literal_type and
+sets a concrete HIR type name: Integer -> Int64, Float -> Float64, Char ->
+Char, Boolean -> Bool, Symbol -> Symbol, String -> String. Unrecognised
+literal kinds fall through to "Any" so the translator stays total.
+@End Implementation
 
 Process called "translate_julia_literal" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia literal values
@@ -679,14 +837,21 @@ Note: ==========================================================================
 Note: PERFORMANCE MACRO TRANSLATIONS
 Note: ============================================================================
 
+@Reasoning:
+@inbounds wraps an expression in an HIR block that promises every array
+indexing inside the expression is in-bounds, allowing the backend to remove
+bounds checks. We translate the inner expression first (so any nested macros
+or method calls translate normally), then attach the "no_bounds_check" hint
+on the wrapper block; backend passes consult the hint when emitting array
+access code. This contract is unsafe: violating it is undefined behaviour,
+matching Julia's @inbounds semantics exactly.
+@End Reasoning
+@Security_Scope:
+@inbounds disables safety checks; the trustworthiness of the wrapped code is
+the user's responsibility. Translator does not add any extra validation.
+@End Security_Scope
 Process called "translate_inbounds_macro" that takes arguments as List[JuliaIRNode], ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate @inbounds macro for bounds check elimination
-
-    @Reasoning:
-    @inbounds tells the compiler to skip array bounds checking for
-    performance. This is a critical optimization hint that should be
-    preserved in HIR.
-    @End Reasoning
 
     Note: Get the expression to execute without bounds checking
     Let expression be arguments at index 0
@@ -704,13 +869,17 @@ Process called "translate_inbounds_macro" that takes arguments as List[JuliaIRNo
     Return hir_inbounds
 End Process
 
+@Reasoning:
+@simd marks a loop as a candidate for SIMD vectorisation. The translator
+wraps the loop in an HIR SIMD block and attaches both "vectorize" and "simd"
+hints; the dual hinting is intentional - "vectorize" is the backend-agnostic
+request and "simd" is the architecture-specific permission to emit SIMD
+instructions specifically. The macro contract permits the compiler to assume
+loop iterations are independent enough to reorder, which the user has
+asserted by writing @simd.
+@End Reasoning
 Process called "translate_simd_macro" that takes arguments as List[JuliaIRNode], ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate @simd macro for vectorization
-
-    @Reasoning:
-    @simd hints that a loop can be vectorized using SIMD instructions.
-    This is important for high-performance numerical computing.
-    @End Reasoning
 
     Note: Get the loop to vectorize
     Let loop_expr be arguments at index 0
@@ -729,13 +898,17 @@ Process called "translate_simd_macro" that takes arguments as List[JuliaIRNode],
     Return hir_simd
 End Process
 
+@Reasoning:
+@fastmath enables IEEE-relaxed floating-point transformations: reassociation,
+no-NaN, no-Inf, no-signed-zero, contraction. The translator attaches four
+separate hints rather than a single "fastmath" hint so backend passes can
+opt into individual relaxations selectively - some targets support reassoc
+but not no_nans, for example. The user has accepted that exact IEEE semantics
+no longer hold inside the block; we do NOT silently propagate the hints into
+nested macros, only into the immediate expression.
+@End Reasoning
 Process called "translate_fastmath_macro" that takes arguments as List[JuliaIRNode], ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate @fastmath macro for aggressive math optimizations
-
-    @Reasoning:
-    @fastmath allows aggressive floating-point optimizations that may
-    not preserve exact IEEE semantics but improve performance.
-    @End Reasoning
 
     Note: Get the expression for fast math
     Let expression be arguments at index 0
@@ -760,14 +933,18 @@ Note: ==========================================================================
 Note: HELPER FUNCTIONS
 Note: ============================================================================
 
+@Reasoning:
+For each function parameter whose declaration carries an explicit type
+annotation, we emit a "specialized_for_<TypeName>" hint on the HIR function.
+These hints let downstream monomorphisation choose a single concrete method
+instance over the generic one when call-site type analysis matches the
+annotation. A final "multiple_dispatch" hint is added unconditionally so even
+fully-untyped functions are tagged for the dispatch optimiser to consider.
+The hint vocabulary is open-ended; backends ignore hints they do not
+recognise.
+@End Reasoning
 Process called "add_julia_dispatch_hints" that takes hir_function as HIRNode, params as List[JuliaIRNode], ctx as JuliaToHIRContext returns Nothing:
     Note: Add method dispatch hints for optimization
-
-    @Reasoning:
-    Julia's multiple dispatch system can benefit from hints about which
-    methods are likely to be called, enabling better specialization
-    and inlining decisions.
-    @End Reasoning
 
     Note: Analyze parameter types for dispatch hints
     For Each param as JuliaFuncParam in params:
@@ -781,14 +958,17 @@ Process called "add_julia_dispatch_hints" that takes hir_function as HIRNode, pa
     Call add_hir_optimization_hint with hir_function and "multiple_dispatch"
 End Process
 
+@Reasoning:
+A small fixed set of Julia function names map to well-known semantic
+categories that backend passes optimise specifically: the four arithmetic
+operators get an "arithmetic_op" tag (enabling fold-on-constant and target
+ISA selection), getindex/setindex! get array access tags (enabling bounds
+elision when paired with @inbounds), and length/size get an "array_property"
+tag (enabling load hoisting in loops). Any name not in this list passes
+through untagged because adding noise hints would just dilute the signal.
+@End Reasoning
 Process called "optimize_special_function_calls" that takes hir_call as HIRNode, function_name as String, ctx as JuliaToHIRContext returns Nothing:
     Note: Add optimization hints for special Julia functions
-
-    @Reasoning:
-    Some Julia functions like mathematical operations, array operations,
-    and built-in functions have special optimization opportunities that
-    should be marked in HIR.
-    @End Reasoning
 
     Match function_name:
         When "+":
@@ -812,14 +992,18 @@ Process called "optimize_special_function_calls" that takes hir_call as HIRNode,
     End Match
 End Process
 
+@Reasoning:
+We attach three hint kinds: "literal_array" + "const_fold" when every element
+is a literal (the entire construction can be folded to a static constant at
+compile time), "small_array" when the literal length is at most 32 (the
+threshold below which stack allocation is generally a win), and
+"array_construction" unconditionally so backend passes can locate every
+construction site uniformly. The threshold of 32 is chosen to match typical
+cache-line/spill thresholds; revisiting it requires profiling, not
+guesswork.
+@End Reasoning
 Process called "add_array_optimization_hints" that takes hir_array as HIRNode, elements as List[JuliaIRNode], ctx as JuliaToHIRContext returns Nothing:
     Note: Add optimization hints for array construction
-
-    @Reasoning:
-    Array construction patterns can benefit from different optimizations
-    such as pre-allocation, memory layout optimization, and element
-    type specialization.
-    @End Reasoning
 
     Note: Check if all elements are literals
     Let all_literals be true
@@ -844,14 +1028,18 @@ Process called "add_array_optimization_hints" that takes hir_array as HIRNode, e
     Call add_hir_optimization_hint with hir_array and "array_construction"
 End Process
 
+@Reasoning:
+After the full HIR module has been built, this pass runs Julia-specific
+analyses that need the complete module in hand: method specialisation
+opportunity analysis (cross-method call patterns), type stability analysis
+(which fields/locals have type-invariant assignments), and inlining
+candidate identification (small/leaf methods). Each sub-analysis attaches
+hints to existing nodes rather than mutating structure, so the optimiser can
+be re-run incrementally as more HIR is added (e.g. by additional source
+files in the same module).
+@End Reasoning
 Process called "optimize_julia_hir" that takes hir_module as HIRNode, ctx as JuliaToHIRContext returns Nothing:
     Note: Perform post-translation HIR optimizations
-
-    @Reasoning:
-    After translating Julia to HIR, we can perform optimizations that
-    are specific to Julia's semantics, such as method specialization
-    hints and type stability analysis.
-    @End Reasoning
 
     Note: Add method specialization hints
     Call analyze_method_specialization_opportunities with hir_module and ctx
@@ -870,14 +1058,18 @@ Note: ==========================================================================
 Note: TYPE EXPRESSION TRANSLATION
 Note: ============================================================================
 
+@Reasoning:
+Julia type expressions are themselves an AST sublanguage with bare names,
+parametric instantiations (Array{T,N}), unions (Union{T1,T2}), where-clause
+quantifiers (T where T<:Number), variadic types (Vararg{T,N}), and type
+parameter references. Each variety routes to a dedicated translator because
+the HIR representation diverges substantially: a bare name becomes a type
+reference, a union becomes a sum type, a where-clause becomes a constrained
+type expression. The Otherwise fallback returns the HIR Any type rather than
+nil so that downstream type-checking always has SOMETHING to compare against.
+@End Reasoning
 Process called "translate_julia_type_expression" that takes type_expr as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate Julia type expressions
-
-    @Reasoning:
-    Julia's type system is sophisticated with parametric types, type unions,
-    constraints, and abstract types. These need to be accurately translated
-    to HIR for type inference and optimization.
-    @End Reasoning
 
     Match type_expr.type:
         When "TypeName":
@@ -897,12 +1089,39 @@ Process called "translate_julia_type_expression" that takes type_expr as JuliaIR
     End Match
 End Process
 
+@Reasoning:
+Simplest case of type-expression translation: a bare name like `Int64` or
+`String`. Wrapped in a dedicated helper so the type-expression dispatcher
+can call it uniformly alongside parametric/where/vararg cases.
+@End Reasoning
+
+@Implementation:
+Pulls the name field and builds a single HIR type-reference node via
+create_hir_type_reference. No further resolution happens here — the HIR
+builder owns name->declaration binding.
+@End Implementation
+
 Process called "translate_julia_type_name" that takes type_expr as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate simple type name
 
     Let type_name be type_expr.name
     Return create_hir_type_reference with ctx.hir_builder and type_name
 End Process
+
+@Reasoning:
+Parametric type translation must preserve both the base type name and the
+ordered list of type arguments because Julia's monomorphization and
+multiple dispatch both key on the full applied form. Array{Int64,2} and
+Array{Float64,2} produce distinct specialisations.
+@End Reasoning
+
+@Implementation:
+Reads .base_type (itself a JuliaIRNode with .name) and .type_parameters
+(list of type expressions). Builds a HIR parametric type with the base
+name and appends each translated parameter via add_hir_type_parameter,
+recursively translating parameters through translate_julia_type_expression
+so nested parametrics work correctly.
+@End Implementation
 
 Process called "translate_julia_parametric_type" that takes type_expr as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
     Note: Translate parametric type like Array{Int64, 2}
@@ -921,6 +1140,18 @@ Process called "translate_julia_parametric_type" that takes type_expr as JuliaIR
 End Process
 
 Note: Entry point for Julia to HIR translation
+@Reasoning:
+Public, stable name for use by the translation driver. Hides the internal
+context-creating translate_julia_to_hir so callers do not need to know
+about JuliaToHIRContext.
+@End Reasoning
+
+@Implementation:
+Single forwarding call into translate_julia_to_hir. Context creation,
+optimization passes, and dispatch-table population are all handled
+downstream.
+@End Implementation
+
 Process called "julia_to_hir" that takes julia_ast as JuliaIRNode returns HIRNode:
     Return translate_julia_to_hir with julia_ast
 End Process
