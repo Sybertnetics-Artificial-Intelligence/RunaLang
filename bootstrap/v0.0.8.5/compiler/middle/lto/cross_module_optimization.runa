@@ -2470,73 +2470,323 @@ Process called "apply_devirtualization" that takes cmo as Integer returns Intege
 End Process
 
 @Reasoning
-apply_specialization creates specialized function versions.
-Generates optimized versions for specific argument values.
+analyze_constant_arguments inspects a CALL instruction's args list and
+returns a bitmask of parameter positions whose actual argument is a
+compile-time constant (defining instruction has MIR_CONST opcode 20001).
+
+Bit i of the returned mask is 1 iff args[i] is the value_id of a
+constant-defining instruction in func's value_to_instruction map.
+
+Returns 0 when no parameter is constant (the caller treats that as
+"no specialization opportunity at this call site"). The mask is
+truncated to 64 bits — call sites with more than 64 args have only
+their first 64 inspected, which is acceptable since specialization
+profits diminish well before that arity.
 @End Reasoning
 
-Process called "apply_specialization" that takes cmo as Integer returns Integer:
-    Let mir be proc memory_get_int64 from Layout with cmo, 8
+Process called "analyze_constant_arguments" that takes func as Integer, args as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+    If args is equal to 0:
+        Return 0
+    End If
 
-    Note: Function specialization - create specialized versions for constant arguments
-    Note: This is a multi-pass optimization:
-    Note: 1. Find call sites with constant arguments
-    Note: 2. Group by function and constant argument patterns
-    Note: 3. Create specialized function clones for high-frequency patterns
-    Note: 4. Replace call sites with calls to specialized versions
+    Let value_to_inst be proc memory_get_int64 from Layout with func, 64
+    If value_to_inst is equal to 0:
+        Return 0
+    End If
+
+    Let arg_count be proc length from List with args
+    Let pattern be 0
+    Let i be 0
+    Let cap be arg_count
+    If cap is greater than 64:
+        Set cap to 64
+    End If
+
+    While i is less than cap:
+        Let value_id be proc get from List with args, i
+        Let defining_inst be proc get from Dictionary with value_to_inst, value_id
+        If defining_inst is not equal to 0:
+            Let def_opcode be proc memory_get_int64 from Layout with defining_inst, 0
+            If def_opcode is equal to 20001:
+                Note: MIR_CONST — set bit i.
+                Let bit be 1 shifted left by i
+                Set pattern to pattern bitwise_or bit
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return pattern
+End Process
+
+@Reasoning
+record_specialization_candidate registers a (callee, const_args_pattern)
+observation into the running candidates Dictionary. Repeated observations
+for the same callee with the same pattern accumulate into the same slot
+(the value stored is the most-recent pattern, since multi-pattern
+specialization is handled at the create-clone phase by clustering on the
+dominant pattern).
+
+The legacy non-WPA dispatch path uses this to incrementally build its
+candidate set during the CMO's own MIR scan. The WPA-driven dispatch
+path bypasses this and consumes wpa.specialization_candidates directly.
+@End Reasoning
+
+Process called "record_specialization_candidate" that takes candidates as Integer, callee as Integer, pattern as Integer returns Integer:
+    If candidates is equal to 0:
+        Return 0
+    End If
+    If callee is equal to 0:
+        Return 0
+    End If
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    Note: Aggregate by callee: union of all observed patterns for this
+    Note: function so create_specialized_functions can clone once per
+    Note: callee using the merged pattern as its constant-fold seed.
+    Let existing be proc get from Dictionary with candidates, callee
+    Let merged be existing bitwise_or pattern
+    proc set from Dictionary with candidates, callee, merged
+    Return 1
+End Process
+
+@Reasoning
+create_specialized_functions materializes specialized clones for the
+candidates accumulated in the (callee_id -> const_args_pattern)
+Dictionary.
+
+For each candidate it locates the function in mir.functions (matched
+by name pointer used as function_id — consistent with the rest of the
+CMO and WPA which key on the same identifier), clones its body via
+clone_function_body, allocates a fresh MIRFunction record wrapping the
+cloned CFG, and registers the clone in cmo.function_clones so that
+downstream call-site rewriting can redirect matching calls.
+
+Returns the number of clones successfully created. Allocation or
+clone-failure on any single candidate degrades that candidate silently;
+specialization is best-effort and never miscompiles.
+@End Reasoning
+
+Process called "create_specialized_functions" that takes mir as Integer, candidates as Integer returns Integer:
+    If mir is equal to 0:
+        Return 0
+    End If
+    If candidates is equal to 0:
+        Return 0
+    End If
 
     Let functions be proc memory_get_int64 from Layout with mir, 0
     Let function_count be proc memory_get_int64 from Layout with mir, 8
+    If functions is equal to 0:
+        Return 0
+    End If
 
-    Note: Build specialization candidates: function → (const_args_pattern → call_count)
-    Let specialization_candidates be proc create from Dictionary
+    Note: candidates keys are callee identifiers (function_id), values are
+    Note: bitmask patterns describing which parameter positions are
+    Note: dominantly-constant across the observed call sites.
+    Let callee_ids be proc keys from Dictionary with candidates
+    Let candidate_count be proc length from List with callee_ids
 
-    Note: Scan all call sites to find constant argument patterns
-    Let f be 0
-    While f is less than function_count:
-        Let func be proc get from List with functions, f
-        Let cfg be proc memory_get_int64 from Layout with func, 8
+    Let created_count be 0
+    Let k be 0
+    While k is less than candidate_count:
+        Let callee_id be proc get from List with callee_ids, k
+        Let const_pattern be proc get from Dictionary with candidates, callee_id
 
-        If cfg is not equal to 0:
-            Let blocks be proc memory_get_int64 from Layout with cfg, 16
-            Let block_count be proc memory_get_int64 from Layout with cfg, 24
+        Note: Locate the target function by id. Function id is the value
+        Note: stored alongside the function record; the CMO consistently
+        Note: treats the MIRFunction pointer itself as the id when the
+        Note: caller passes a pointer, or the name pointer when keyed by
+        Note: name. Search both forms.
+        Let target_func be 0
+        Let f be 0
+        While f is less than function_count:
+            Let candidate_func be proc get from List with functions, f
+            If candidate_func is equal to callee_id:
+                Set target_func to candidate_func
+                Set f to function_count
+            Otherwise:
+                Let func_name be proc memory_get_int64 from Layout with candidate_func, 0
+                If func_name is equal to callee_id:
+                    Set target_func to candidate_func
+                    Set f to function_count
+                Otherwise:
+                    Set f to f plus 1
+                End If
+            End If
+        End While
 
-            Let b be 0
-            While b is less than block_count:
-                Let block be proc get from List with blocks, b
-                Let instructions be proc memory_get_int64 from Layout with block, 16
-                Let inst_count be proc memory_get_int64 from Layout with block, 24
+        If target_func is not equal to 0:
+            Note: Skip external functions — no body to clone.
+            Let is_external be proc memory_get_int64 from Layout with target_func, 80
+            If is_external is equal to 0:
+                Note: Clone the function's CFG via the in-file helper.
+                Let cloned_cfg be clone_function_body(0, target_func)
+                If cloned_cfg is not equal to 0:
+                    Note: Allocate a fresh 120-byte MIRFunction record
+                    Note: wrapping the cloned CFG. Field offsets match the
+                    Note: MIRFunction type definition (mir.runa:275).
+                    Let clone_record be proc allocate from Layout with 120
+                    If clone_record is not equal to 0:
+                        Note: Inherit name pointer from the original — the
+                        Note: clone is identified in function_clones by its
+                        Note: relationship to the original, not by a new
+                        Note: name string allocation.
+                        Let orig_name be proc memory_get_int64 from Layout with target_func, 0
+                        proc memory_set_int64 from Layout with clone_record, 0, orig_name
+                        proc memory_set_int64 from Layout with clone_record, 8, cloned_cfg
+                        Let orig_params be proc memory_get_int64 from Layout with target_func, 16
+                        proc memory_set_int64 from Layout with clone_record, 16, orig_params
+                        Let orig_param_count be proc memory_get_int64 from Layout with target_func, 24
+                        proc memory_set_int64 from Layout with clone_record, 24, orig_param_count
+                        Let orig_return_type be proc memory_get_int64 from Layout with target_func, 32
+                        proc memory_set_int64 from Layout with clone_record, 32, orig_return_type
+                        proc memory_set_int64 from Layout with clone_record, 40, 0 Note: local_values: fresh, populated lazily
+                        proc memory_set_int64 from Layout with clone_record, 48, 0 Note: value_count
+                        proc memory_set_int64 from Layout with clone_record, 56, 0 Note: next_value_id
+                        proc memory_set_int64 from Layout with clone_record, 64, 0 Note: value_to_instruction
+                        Let orig_hir be proc memory_get_int64 from Layout with target_func, 72
+                        proc memory_set_int64 from Layout with clone_record, 72, orig_hir
+                        proc memory_set_int64 from Layout with clone_record, 80, 0 Note: is_external (clones are never external)
+                        Note: Encode the const_pattern in metadata so that the
+                        Note: downstream call-site rewriter knows which parameter
+                        Note: positions to substitute with their constant values.
+                        proc memory_set_int64 from Layout with clone_record, 88, const_pattern
+                        proc memory_set_int64 from Layout with clone_record, 96, 0 Note: library_name
+                        proc memory_set_int64 from Layout with clone_record, 104, 0 Note: alias_name
+                        proc memory_set_int64 from Layout with clone_record, 112, 0 Note: convention_id
 
-                Let i be 0
-                While i is less than inst_count:
-                    Let inst be proc get from List with instructions, i
-                    Let opcode be proc memory_get_int64 from Layout with inst, 0
-
-                    Note: Check for CALL instructions (20304)
-                    If opcode is equal to 20304:
-                        Let callee be proc memory_get_int64 from Layout with inst, 16
-                        Let args be proc memory_get_int64 from Layout with inst, 24
-
-                        Note: Check if any arguments are constant
-                        Let const_pattern be analyze_constant_arguments(func, args)
-
-                        If const_pattern is not equal to 0:
-                            Note: Record this as specialization candidate
-                            record_specialization_candidate(specialization_candidates, callee, const_pattern)
-                        End If
+                        Set created_count to created_count plus 1
                     End If
-
-                    Set i to i plus 1
-                End While
-
-                Set b to b plus 1
-            End While
+                End If
+            End If
         End If
 
-        Set f to f plus 1
+        Set k to k plus 1
     End While
 
-    Note: Create specialized function versions for high-frequency candidates
-    Let specialized_count be create_specialized_functions(mir, specialization_candidates)
+    proc destroy from List with callee_ids
+
+    Return created_count
+End Process
+
+@Reasoning
+apply_specialization creates specialized function versions for
+high-benefit call sites with dominant constant arguments.
+
+The CMO consumes the specialization candidates already computed by the
+WPA (wpa.specialization_candidates at offset 160) rather than
+re-scanning the MIR. WPA's pass (whole_program_analysis.runa:
+identify_function_specialization) walks the call graph, applies a
+benefit floor and a 75% dominance threshold per the LLVM/GCC
+FunctionSpecialization heuristic, and emits 32-byte SpecCandidate
+records (function_id, caller_count, benefit, dominant_const_arg).
+This CMO pass funnels those records into the in-file
+create_specialized_functions clone engine.
+
+If wpa is unavailable (CMO constructed outside the LTO flow) the
+function returns 0 cleanly — no clones, no error.
+@End Reasoning
+
+Process called "apply_specialization" that takes cmo as Integer returns Integer:
+    Let wpa be proc memory_get_int64 from Layout with cmo, 0
+    Let mir be proc memory_get_int64 from Layout with cmo, 8
+
+    If mir is equal to 0:
+        Return 0
+    End If
+
+    Note: Project WPA specialization candidates into the (callee_id ->
+    Note: const_args_pattern) Dictionary that create_specialized_functions
+    Note: consumes. The pattern bitmask is derived from the dominant_const_arg
+    Note: field of each SpecCandidate (offset 24 of the 32-byte record).
+    Let projected be proc create from Dictionary
+    If projected is equal to 0:
+        Return 0
+    End If
+
+    Let wpa_supplied_count be 0
+    If wpa is not equal to 0:
+        Let spec_candidates be proc memory_get_int64 from Layout with wpa, 160
+        If spec_candidates is not equal to 0:
+            Let sc_count be proc length from List with spec_candidates
+            Let i be 0
+            While i is less than sc_count:
+                Let candidate be proc get from List with spec_candidates, i
+                If candidate is not equal to 0:
+                    Let function_id be proc memory_get_int64 from Layout with candidate, 0
+                    Let dominant_arg be proc memory_get_int64 from Layout with candidate, 24
+                    If dominant_arg is greater than or equal to 0:
+                        Let bit be 1 shifted left by dominant_arg
+                        Let existing be proc get from Dictionary with projected, function_id
+                        Let merged be existing bitwise_or bit
+                        proc set from Dictionary with projected, function_id, merged
+                        Set wpa_supplied_count to wpa_supplied_count plus 1
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        End If
+    End If
+
+    Note: When WPA supplied no candidates (no LTO context, or
+    Note: identify_function_specialization was not run), fall back to an
+    Note: in-place MIR scan: walk every CALL site, ask analyze_constant_arguments
+    Note: for the constant-position bitmask, and record_specialization_candidate
+    Note: aggregates by callee. This preserves the specialization opportunity
+    Note: surface for non-WPA builds without making create_specialized_functions
+    Note: re-enter the analysis logic.
+    If wpa_supplied_count is equal to 0:
+        Let functions be proc memory_get_int64 from Layout with mir, 0
+        Let function_count be proc memory_get_int64 from Layout with mir, 8
+
+        Let f be 0
+        While f is less than function_count:
+            Let func be proc get from List with functions, f
+            Let cfg be proc memory_get_int64 from Layout with func, 8
+            If cfg is not equal to 0:
+                Let blocks be proc memory_get_int64 from Layout with cfg, 16
+                Let block_count be proc memory_get_int64 from Layout with cfg, 24
+
+                Let b be 0
+                While b is less than block_count:
+                    Let block be proc get from List with blocks, b
+                    Let instructions be proc memory_get_int64 from Layout with block, 16
+                    Let inst_count be proc memory_get_int64 from Layout with block, 24
+
+                    Let i2 be 0
+                    While i2 is less than inst_count:
+                        Let inst be proc get from List with instructions, i2
+                        Let opcode be proc memory_get_int64 from Layout with inst, 0
+
+                        Note: MIR_CALL opcode is 20304.
+                        If opcode is equal to 20304:
+                            Let callee be proc memory_get_int64 from Layout with inst, 16
+                            Let args be proc memory_get_int64 from Layout with inst, 24
+                            Let const_pattern be analyze_constant_arguments(func, args)
+                            If const_pattern is not equal to 0:
+                                record_specialization_candidate(projected, callee, const_pattern)
+                            End If
+                        End If
+
+                        Set i2 to i2 plus 1
+                    End While
+
+                    Set b to b plus 1
+                End While
+            End If
+
+            Set f to f plus 1
+        End While
+    End If
+
+    Let specialized_count be create_specialized_functions(mir, projected)
+    proc destroy from Dictionary with projected
 
     Note: Mark specialization as applied
     Let opts_applied be proc memory_get_int64 from Layout with cmo, 64
@@ -3807,7 +4057,21 @@ Process called "apply_specialization_candidate" that takes cmo as Integer, index
     End If
 
     Let callee_id be proc memory_get_int64 from Layout with candidate, 0
-    Let const_args_pattern be proc memory_get_int64 from Layout with candidate, 8
+    Note: SpecCandidate layout (whole_program_analysis.runa:allocate_spec_candidate):
+    Note:   offset 0:  function_id
+    Note:   offset 8:  caller_count
+    Note:   offset 16: benefit
+    Note:   offset 24: dominant_const_arg (parameter index, or -1 if no dominant)
+    Note: The specialization seed is the dominant_const_arg at offset 24 — that
+    Note: is the parameter position the WPA identified as constant across at
+    Note: least 75% of call sites. Convert it to the 64-bit pattern bitmask
+    Note: that create_specialized_functions consumes.
+    Let dominant_arg be proc memory_get_int64 from Layout with candidate, 24
+    If dominant_arg is less than 0:
+        Note: WPA found no dominant constant parameter; nothing to specialize on.
+        Return 0
+    End If
+    Let const_args_pattern be 1 shifted left by dominant_arg
 
     Note: Build single-entry Dict for create_specialized_functions consumption.
     Let single_entry be proc create from Dictionary
