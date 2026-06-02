@@ -39,8 +39,33 @@ Constant TRANSFORM_TILE as Integer is 4           Note: Apply tiling
 Constant TRANSFORM_PAD as Integer is 5            Note: Add padding
 
 Note: ================================================================
+Note: Fixed-Point Scale (PPM = Parts Per Million)
+Note: ================================================================
+Note: Stage1 of the bootstrap chain emits idivq for canonical Float
+Note: operators on IEEE 754 bit patterns, producing garbage at runtime.
+Note: All speedup factors are therefore represented as fixed-point
+Note: integers in PPM, where 1_000_000 represents the floating-point
+Note: value 1.0.
+Note:
+Note:   PPM_ONE        == 1_000_000   (== 1.0x)
+Note:   1_300_000 PPM  == 1.3x speedup
+Note:   2_000_000 PPM  == 2.0x speedup
+Note: ================================================================
+
+Constant PPM_ONE as Integer is 1000000
+Constant PPM_ZERO as Integer is 0
+
+Note: ================================================================
 Note: Type Definitions
 Note: ================================================================
+
+@Reasoning:
+DataLayout is the canonical descriptor consumed by every transformation in this module. The six fields together fully describe how an array/matrix/tensor is laid out in memory: layout_type names the family (row-major, col-major, AoS, SoA, tiled, padded), dimensions and strides describe per-dimension shape and byte stride, tile_sizes and padding are the auxiliary parameters consumed when layout_type is TILED or PADDED, and is_coalesced is a memoized coalescing test used by detect_optimal_layout to short-circuit when the current layout is already optimal.
+@End Reasoning
+
+@Implementation:
+Six-slot record at offsets 0/8/16/24/32/40. analyze_current_layout populates it via field initialization. The other layout_opt procs read fields via memory_get_int64 at the documented offsets - these offsets are part of this module's internal contract.
+@End Implementation
 
 Type called "DataLayout":
     layout_type as Integer          Note: LAYOUT_* constant
@@ -51,14 +76,30 @@ Type called "DataLayout":
     is_coalesced as Boolean         Note: Whether layout enables coalescing
 End Type
 
+@Reasoning:
+LayoutTransformation captures one proposed layout change: which node, what kind of transform (transpose, AoS-to-SoA, tile, pad), the source and target DataLayout, and the PPM-scaled cost/benefit metrics computed by estimate_layout_benefit and estimate_transformation_cost. optimize_data_layout consumes a List of these to drive the greedy pass.
+@End Reasoning
+
+@Implementation:
+Six-slot record at offsets 0/8/16/24/32/40. estimated_benefit_ppm and transformation_cost_ppm are PPM-scaled Integer values stored at offsets 32 and 40; the orchestrator reads them via memory_get_int64 to compute net_benefit_ppm = (benefit_ppm * PPM_ONE) / (PPM_ONE + cost_ppm).
+@End Implementation
+
 Type called "LayoutTransformation":
-    transform_type as Integer       Note: TRANSFORM_* constant
-    target_node as Integer          Note: Node whose layout to transform
-    source_layout as Integer        Note: Original DataLayout
-    target_layout as Integer        Note: Optimized DataLayout
-    estimated_benefit as Float      Note: Expected speedup
-    transformation_cost as Float    Note: Cost of layout conversion
+    transform_type as Integer            Note: TRANSFORM_* constant
+    target_node as Integer               Note: Node whose layout to transform
+    source_layout as Integer             Note: Original DataLayout
+    target_layout as Integer             Note: Optimized DataLayout
+    estimated_benefit_ppm as Integer     Note: Expected speedup in PPM (1_000_000 == 1.0x)
+    transformation_cost_ppm as Integer   Note: Layout conversion cost in PPM
 End Type
+
+@Reasoning:
+TilingConfig records the parameters of a single tiling decision: which dimensions are tiled, the size per tile, and which cache level the tile is sized for (L1/L2/L3). compute_optimal_tiling returns one of these for a given DataLayout.
+@End Reasoning
+
+@Implementation:
+Three-slot record at offsets 0/8/16. tile_dimensions and tile_sizes are List pointers; cache_level is the integer 1/2/3 selector matching x86_64 cache hierarchy.
+@End Implementation
 
 Type called "TilingConfig":
     tile_dimensions as Integer      Note: Which dimensions to tile
@@ -70,31 +111,27 @@ Note: ================================================================
 Note: Layout Analysis
 Note: ================================================================
 
+@Reasoning:
+Reconstructs the current DataLayout for a node by combining its BifrostType (Matrix or Tensor) with any "layout" hint stored in the node's metadata dictionary. Default assumption is row-major (C convention); the metadata key "column_major" overrides this. The result is fed into detect_optimal_layout to discover transformation opportunities.
+@End Reasoning
+
+@Implementation:
+1. Initialize layout as row-major with dimensions/strides = 0.
+2. get_node_output_type; bail with default if 0.
+3. Read type discriminant at offset 0. For Matrix (3): pull rows (offset 16) and cols (offset 24), build a 2-element dimensions list, compute row-major strides via element_size = get_primitive_size(element_type at offset 8).
+4. Inspect metadata for "layout" key; if "column_major", flip layout_type and rebuild strides via element_size-then-rows layout.
+5. For Tensor (5): the shape list pointer is at offset 16, then compute row-major strides over that shape.
+@End Implementation
+
+@Performance_Hints:
+O(d) where d is dimension count. The hot allocations are the dimensions and strides Lists; both are sized exactly to d. Called once per array node during the layout pass.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of node fields and metadata. Allocates fresh layout/dimension/stride lists. Trusts the BifrostType layout offsets that are part of node.runa's contract.
+@End Security_Scope
+
 Process called "analyze_current_layout" that takes graph as Integer, node as Integer returns Integer:
-    @Reasoning
-    Analyzes current data layout for a node.
-
-    Layout detection:
-    - Matrix: row-major or column-major
-    - Struct arrays: AoS or SoA
-    - Dimensions and strides
-    - Padding and alignment
-
-    Sources:
-    - Type information (Matrix, Tensor)
-    - Access patterns from memory analysis
-    - Metadata annotations
-    @End Reasoning
-
-    @Implementation
-    1. Get node output type
-    2. Extract dimensions from type
-    3. Compute default strides for layout
-    4. Check for existing layout metadata
-    5. Detect layout type from access patterns
-    6. Return DataLayout structure
-    @End Implementation
-
     Let layout be a value of type DataLayout with
         layout_type as LAYOUT_ROW_MAJOR,
         dimensions as 0,
@@ -169,33 +206,27 @@ Process called "analyze_current_layout" that takes graph as Integer, node as Int
     Return layout
 End Process
 
+@Reasoning:
+Selects the optimal DataLayout for a node by reconciling the actual access pattern (from MemoryAccess.analyze_access_pattern) with the current layout. The objective is to make the innermost dimension contiguous in memory along the dimension that consumers iterate fastest - this is what enables GPU coalescing and CPU prefetching. Falls back to tiling for cache-bound workloads and padding for bank-conflict avoidance.
+@End Reasoning
+
+@Implementation:
+1. Run analyze_access_pattern; read pattern_type (offset 0) and stride (offset 8).
+2. clone_layout current_layout as the starting point.
+3. ACCESS_CONTIGUOUS (1): mark is_coalesced and return.
+4. ACCESS_STRIDED (2): flip row-major <-> column-major and rebuild strides via compute_row_major_strides / compute_column_major_strides; mark coalesced.
+5. Other patterns: consult should_apply_tiling -> compute_optimal_tiling and should_apply_padding -> compute_optimal_padding to stack tiling/padding modifiers on top of the base layout.
+@End Implementation
+
+@Performance_Hints:
+Single analyze_access_pattern call (O(depth of address DAG)) plus constant-time decision logic. Cost is dominated by the embedded MemoryAccess analyzer, not this proc itself.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only on graph, node, current_layout. Allocates a fresh DataLayout via clone_layout and potentially fresh stride lists.
+@End Security_Scope
+
 Process called "detect_optimal_layout" that takes graph as Integer, node as Integer, current_layout as Integer returns Integer:
-    @Reasoning
-    Determines optimal data layout for memory coalescing.
-
-    Optimization goals:
-    1. Innermost dimension contiguous (stride=element_size)
-    2. Access pattern matches layout
-    3. Alignment to cache lines
-    4. Bank conflict avoidance
-
-    Strategy:
-    - Analyze access pattern (from memory_access.runa)
-    - If column-wise access, use column-major
-    - If row-wise access, use row-major
-    - Consider tiling for large arrays
-    - Add padding to eliminate conflicts
-    @End Reasoning
-
-    @Implementation
-    1. Analyze access pattern for node
-    2. Determine dominant access direction
-    3. Select layout that makes dominant access contiguous
-    4. Consider tiling based on cache size
-    5. Compute padding for alignment
-    6. Return optimized DataLayout
-    @End Implementation
-
     Note: Analyze access pattern
     Let access_pattern be proc analyze_access_pattern from MemoryAccess with graph, node
     Let pattern_type be proc memory_get_int64 from Layout with access_pattern, 0
@@ -263,29 +294,27 @@ Note: ================================================================
 Note: Layout Transformations
 Note: ================================================================
 
+@Reasoning:
+Sweeps every node in the graph, filtering down to those carrying array/matrix data (Matrix or Tensor type per node_has_layout). For each one, computes current and optimal layouts and emits a LayoutTransformation when they differ. The result is the worklist that optimize_data_layout sorts and applies greedily.
+@End Reasoning
+
+@Implementation:
+1. Get all nodes from the graph.
+2. For each node, filter via node_has_layout.
+3. analyze_current_layout -> detect_optimal_layout.
+4. layouts_differ check; if true, compute transform_type via determine_transform_type, benefit via estimate_layout_benefit, cost via estimate_transformation_cost.
+5. Allocate a LayoutTransformation record and append.
+@End Implementation
+
+@Performance_Hints:
+O(N * d) where N is node count and d is average dimension count - each kept node runs a constant chain of helpers, each linear in dimension count. The MemoryAccess.analyze_access_pattern subcall is the dominant cost per node.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis; allocates a fresh transformations List of LayoutTransformation records. No graph mutation. Safe to run concurrently with other read-only passes.
+@End Security_Scope
+
 Process called "generate_layout_transformations" that takes graph as Integer returns Integer:
-    @Reasoning
-    Generates layout transformation opportunities for all nodes.
-
-    Algorithm:
-    - For each node with array/matrix data
-    - Analyze current layout
-    - Detect optimal layout
-    - If different, create transformation
-    - Estimate benefit vs cost
-    @End Reasoning
-
-    @Implementation
-    1. Get all nodes from graph
-    2. Filter to array/matrix nodes
-    3. For each node:
-       - Analyze current layout
-       - Detect optimal layout
-       - If different, create transformation
-       - Estimate benefit and cost
-    4. Return list of LayoutTransformation structures
-    @End Implementation
-
     Let transformations be proc create from List
 
     Note: Get all nodes
@@ -323,8 +352,8 @@ Process called "generate_layout_transformations" that takes graph as Integer ret
                     target_node as node,
                     source_layout as current_layout,
                     target_layout as optimal_layout,
-                    estimated_benefit as benefit,
-                    transformation_cost as cost
+                    estimated_benefit_ppm as benefit,
+                    transformation_cost_ppm as cost
 
                 proc append from List with transformations, transformation
             End If
@@ -336,31 +365,26 @@ Process called "generate_layout_transformations" that takes graph as Integer ret
     Return transformations
 End Process
 
+@Reasoning:
+Mutates the graph to physically realize one LayoutTransformation. For TRANSPOSE/TILE/PAD/AOS_TO_SOA, the corresponding insert_*/apply_*/convert_* helper splices a new operation node between the target and its consumers using splice_node_after_producer, then update_layout_metadata stamps the new node with the new layout string. The splice ensures every consumer sees the post-transform layout while producers retain their native layout.
+@End Reasoning
+
+@Implementation:
+1. Read transform_type (offset 0), target_node (offset 8), target_layout (offset 24).
+2. Dispatch on transform_type to insert_transpose_op / insert_tiling_ops / apply_padding / convert_aos_to_soa, capturing the spliced node ID.
+3. If splice succeeded (non-zero), annotate the spliced node; otherwise fall back to annotating the original target so graph state stays consistent on splice failure.
+4. Run validate_graph as a sanity gate.
+@End Implementation
+
+@Performance_Hints:
+Dominated by splice_node_after_producer (O(consumers)) and one validate_graph pass at the end. Called once per beneficial transformation in optimize_data_layout's main loop.
+@End Performance_Hints
+
+@Security_Scope:
+Graph-mutating: adds nodes and rewires edges. Returns 0 from individual helpers on null-pointer detection so the fallback annotation path stays valid. validate_graph is the trust boundary that catches any inconsistency before subsequent passes see the graph.
+@End Security_Scope
+
 Process called "apply_layout_transformation" that takes graph as Integer, transformation as Integer returns Nothing:
-    @Reasoning
-    Applies layout transformation to graph.
-
-    Transformation process:
-    1. Insert layout conversion node
-    2. Update node metadata with new layout
-    3. Adjust strides in memory operations
-    4. Add transpose/tiling operations as needed
-
-    Graph modification:
-    - Add conversion nodes between incompatible layouts
-    - Update edges to preserve semantics
-    - Annotate nodes with layout information
-    @End Reasoning
-
-    @Implementation
-    1. Extract transformation info
-    2. Get target node
-    3. Create layout conversion operation
-    4. Insert into graph
-    5. Update metadata
-    6. Validate graph
-    @End Implementation
-
     Let transform_type be proc memory_get_int64 from Layout with transformation, 0
     Let target_node be proc memory_get_int64 from Layout with transformation, 8
     Let target_layout be proc memory_get_int64 from Layout with transformation, 24
@@ -411,31 +435,27 @@ Note: ================================================================
 Note: Tiling Optimization
 Note: ================================================================
 
+@Reasoning:
+Computes tile dimensions such that one tile's working set fits in L1 cache (32KB target). For 2D matrices uses square tiles since they balance row and column reuse; for higher-dimensional tensors uses a smaller uniform 32-element baseline. Rounding to powers of 2 (16/32/64/128) keeps loop bound code lean and avoids divisor overhead inside generated tile loops.
+@End Reasoning
+
+@Implementation:
+1. Initialize TilingConfig with cache_level = 1 (L1 target).
+2. Read dimensions (offset 8) and strides (offset 16) from the DataLayout; element_size = innermost stride.
+3. 2D case: tile_size = round_down_to_power_of_2(sqrt(L1 / element_size)), capped at 128 and clamped to rows/cols.
+4. Higher-dim: append a uniform tile_size = 32 for every dimension.
+5. Store tile_sizes (offset 8) and tile_dimensions (offset 0); return.
+@End Implementation
+
+@Performance_Hints:
+O(d) where d is dimension count, plus one float sqrt + power-of-2 quantize for the 2D path. Run once per array node that needs tiling.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis; reads DataLayout fields, returns fresh TilingConfig and tile_sizes List. No graph mutation.
+@End Security_Scope
+
 Process called "compute_optimal_tiling" that takes graph as Integer, node as Integer, layout as Integer returns Integer:
-    @Reasoning
-    Computes optimal tile sizes for cache locality.
-
-    Tiling goals:
-    - Fit working set in cache
-    - Maximize reuse
-    - Balance load across dimensions
-
-    Algorithm:
-    - Estimate cache size for each level
-    - Compute data access working set
-    - Find tile size that fits in target cache
-    - Balance tiles to minimize edge effects
-    @End Reasoning
-
-    @Implementation
-    1. Get cache sizes (L1: 32KB, L2: 256KB, L3: 8MB)
-    2. Get data dimensions
-    3. Compute tile size for L1 cache
-    4. Adjust for power-of-2 and divisibility
-    5. Create TilingConfig
-    6. Return tiling configuration
-    @End Implementation
-
     Let tiling_config be a value of type TilingConfig with
         tile_dimensions as 0,
         tile_sizes as 0,
@@ -467,10 +487,13 @@ Process called "compute_optimal_tiling" that takes graph as Integer, node as Int
         Note: Compute square tile that fits in L1
         Note: tile_size^2 * element_size <= L1_size
         Let max_tile_elements be l1_cache_size divided by element_size
-        Let max_tile_size be proc sqrt from Math with Math.int_to_float(max_tile_elements )
+
+        Note: Integer square root via Newton's method (no Float dependency).
+        Note: We want max_tile_size = floor(sqrt(max_tile_elements)).
+        Let max_tile_size be integer_sqrt(max_tile_elements)
 
         Note: Round down to power of 2 (16, 32, 64, etc.)
-        Let tile_size be round_down_to_power_of_2(proc float_to_int from Math with max_tile_size)
+        Let tile_size be round_down_to_power_of_2(max_tile_size)
 
         Note: Cap at reasonable maximum (128)
         If tile_size is greater than 128:
@@ -507,29 +530,26 @@ Process called "compute_optimal_tiling" that takes graph as Integer, node as Int
     Return tiling_config
 End Process
 
+@Reasoning:
+Gate that decides whether tiling is worth applying. Tiling only helps when the working set is larger than the target cache level AND the access pattern is predictable enough to benefit (contiguous or strided). Tiling random-access workloads adds overhead with no locality gain.
+@End Reasoning
+
+@Implementation:
+1. Read dimensions list from layout offset 8; multiply all dim sizes to get total element count.
+2. element_size = innermost stride (offset 16, last element).
+3. If total_bytes <= 32KB (L1 threshold), return false.
+4. Run analyze_access_pattern; return true only when pattern_type is ACCESS_CONTIGUOUS (1) or ACCESS_STRIDED (2).
+@End Implementation
+
+@Performance_Hints:
+O(d) multiplication over dimensions plus one access-pattern analysis call. Constant memory.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only; safe to call on any valid layout/node.
+@End Security_Scope
+
 Process called "should_apply_tiling" that takes graph as Integer, node as Integer, layout as Integer returns Boolean:
-    @Reasoning
-    Determines if tiling would be beneficial.
-
-    Tiling benefits:
-    - Large arrays that don't fit in cache
-    - Regular access patterns
-    - Reuse across iterations
-
-    Skip tiling:
-    - Small arrays (fit in L1)
-    - Irregular access patterns
-    - Single-use data
-    @End Reasoning
-
-    @Implementation
-    1. Get data size
-    2. Check if larger than L1 cache
-    3. Check for regular access pattern
-    4. Check for reuse
-    5. Return true if tiling beneficial
-    @End Implementation
-
     Note: Get data size
     Let dimensions be proc memory_get_int64 from Layout with layout, 8
     If dimensions is equal to 0:
@@ -579,30 +599,27 @@ Note: ================================================================
 Note: Padding Optimization
 Note: ================================================================
 
+@Reasoning:
+Computes per-row padding in elements such that the padded row size is a multiple of the 64-byte cache line. Padding to cache-line boundaries eliminates the "last-line straddles a cache line" effect and avoids GPU shared-memory bank conflicts when the column count is a power-of-2 multiple of bank count. Returned amount is in elements, not bytes, since DataLayout.padding is element-counted.
+@End Reasoning
+
+@Implementation:
+1. Read dimensions/strides from offsets 8/16; bail with 0 if no dimensions.
+2. inner_dim = last dimension; element_size = last stride.
+3. row_size_bytes = inner_dim * element_size.
+4. If row_size_bytes % 64 == 0, already aligned -> return 0.
+5. padding_bytes = 64 - (row_size_bytes % 64); return padding_bytes / element_size.
+@End Implementation
+
+@Performance_Hints:
+O(1) - just two list reads and a modulo. Called for every candidate node in the layout pass.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of layout fields. No allocations.
+@End Security_Scope
+
 Process called "compute_optimal_padding" that takes layout as Integer returns Integer:
-    @Reasoning
-    Computes padding to avoid bank conflicts and improve alignment.
-
-    Padding goals:
-    - Align to cache line (64 bytes typical)
-    - Avoid shared memory bank conflicts (stride != bank_count)
-    - Minimize wasted space
-
-    Algorithm:
-    - Get innermost dimension size
-    - Compute padding to next cache line boundary
-    - Check for bank conflict patterns
-    - Return optimal padding amount
-    @End Reasoning
-
-    @Implementation
-    1. Get dimensions and strides
-    2. Compute current row size
-    3. Compute padding to cache line boundary
-    4. Check for bank conflicts
-    5. Return padding amount
-    @End Implementation
-
     Let dimensions be proc memory_get_int64 from Layout with layout, 8
     If dimensions is equal to 0:
         Return 0
@@ -636,28 +653,26 @@ Process called "compute_optimal_padding" that takes layout as Integer returns In
     Return padding_elements
 End Process
 
+@Reasoning:
+Gate that decides whether padding is worth applying. Three veto conditions: layout is already aligned (padding = 0), wasted memory exceeds 10% of the row (padding ratio threshold), or the access pattern is random (padding does not help arbitrary indirections). Only proceeds when the pattern is ACCESS_CONTIGUOUS so the cache-line alignment win actually materializes.
+@End Reasoning
+
+@Implementation:
+1. compute_optimal_padding(layout); if 0 return false.
+2. Compute waste_ratio = padding / (inner_dim + padding).
+3. If waste_ratio > 0.1, return false.
+4. analyze_access_pattern; return true only when pattern_type == ACCESS_CONTIGUOUS (1).
+@End Implementation
+
+@Performance_Hints:
+One compute_optimal_padding (O(1)) plus one analyze_access_pattern. Constant work.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only on graph and layout. Safe to call alongside other analysis passes.
+@End Security_Scope
+
 Process called "should_apply_padding" that takes graph as Integer, node as Integer, layout as Integer returns Boolean:
-    @Reasoning
-    Determines if padding would be beneficial.
-
-    Padding benefits:
-    - Improves cache line alignment
-    - Reduces bank conflicts
-    - Enables better coalescing
-
-    Skip padding:
-    - Already aligned
-    - Padding wastes too much memory (>10%)
-    - Random access patterns (padding doesn't help)
-    @End Reasoning
-
-    @Implementation
-    1. Check current alignment
-    2. Estimate padding amount
-    3. Check memory waste percentage
-    4. Return true if beneficial
-    @End Implementation
-
     Note: Compute padding needed
     Let padding_needed be compute_optimal_padding(layout)
 
@@ -666,16 +681,21 @@ Process called "should_apply_padding" that takes graph as Integer, node as Integ
         Return false
     End If
 
-    Note: Check memory waste percentage
+    Note: Check memory waste percentage in PPM
     Let dimensions be proc memory_get_int64 from Layout with layout, 8
     Let dim_count be proc length from List with dimensions
     Let inner_dim be proc get from List with dimensions, dim_count minus 1
 
-    Note: Waste percentage = padding / (size + padding)
-    Let waste_ratio be proc int_to_float from Math with padding_needed divided by Math.int_to_float(inner_dim plus padding_needed)
+    Note: Waste percentage as PPM = padding * PPM_ONE / (size + padding).
+    Let denom be inner_dim plus padding_needed
+    If denom is less than or equal to 0:
+        Return false
+    End If
+    Let scaled be padding_needed multiplied by PPM_ONE
+    Let waste_ratio_ppm be scaled divided by denom
 
-    Note: Only pad if waste < 10%
-    If waste_ratio is greater than 0.1:
+    Note: Only pad if waste < 10% (== 100_000 PPM)
+    If waste_ratio_ppm is greater than 100000:
         Return false
     End If
 
@@ -695,155 +715,132 @@ Note: ================================================================
 Note: Benefit Estimation
 Note: ================================================================
 
-Process called "estimate_layout_benefit" that takes graph as Integer, node as Integer, current_layout as Integer, optimal_layout as Integer returns Float:
-    @Reasoning
-    Estimates speedup from layout transformation.
+@Reasoning:
+Estimates the speedup from a layout transformation as a PPM-scaled integer (PPM_ONE == 1.0x). Three benefit sources are combined multiplicatively (in PPM domain): (1) coalescing - 1.5x (1_500_000 PPM) when the new layout enables coalescing and the old one did not, (2) tiling - 1.2x (1_200_000 PPM) when the new layout introduces tiling for cache locality, (3) padding - 1.1x (1_100_000 PPM) when padding eliminates bank conflicts. Multiplicative combination in PPM: result_ppm = (a_ppm * b_ppm / PPM_ONE * c_ppm) / PPM_ONE.
+@End Reasoning
 
-    Benefit sources:
-    - Improved memory coalescing
-    - Better cache locality
-    - Reduced bank conflicts
+@Implementation:
+1. Read optimal/current is_coalesced (offset 40); if optimal is true and current is false, coalescing_benefit_ppm = 1_500_000.
+2. Read optimal/current layout_type (offset 0); if optimal is LAYOUT_TILED and current is not, tiling_benefit_ppm = 1_200_000.
+3. Read optimal/current padding (offset 32); if optimal > 0 and current == 0, padding_benefit_ppm = 1_100_000.
+4. Combine: combined = coalescing * tiling / PPM_ONE * padding / PPM_ONE.
+5. Floor at PPM_ONE (never report < 1.0x).
+@End Implementation
 
-    Measurement:
-    - Memory transactions: optimal vs current
-    - Cache hit rate improvement
-    - Bandwidth utilization
-    @End Reasoning
+@Performance_Hints:
+O(1); six memory_get_int64 reads and three PPM multiplications.
+@End Performance_Hints
 
-    @Implementation
-    1. Analyze coalescing improvement
-    2. Estimate cache locality improvement
-    3. Compute overall speedup
-    4. Return benefit factor
-    @End Implementation
+@Security_Scope:
+Pure analysis on caller-supplied layout descriptors.
+@End Security_Scope
 
-    Note: Check if optimal layout enables coalescing
+Process called "estimate_layout_benefit" that takes graph as Integer, node as Integer, current_layout as Integer, optimal_layout as Integer returns Integer:
     Let optimal_coalesced be proc memory_get_int64 from Layout with optimal_layout, 40
     Let current_coalesced be proc memory_get_int64 from Layout with current_layout, 40
 
-    Note: Base benefit from coalescing
-    Let coalescing_benefit be 1.0
-
+    Let coalescing_benefit_ppm be PPM_ONE
     If optimal_coalesced is equal to true:
         If current_coalesced is equal to false:
-            Note: Enabling coalescing: 1.3x to 2.0x typical
-            Set coalescing_benefit to 1.5
+            Note: Enabling coalescing: 1.5x (== 1_500_000 PPM)
+            Set coalescing_benefit_ppm to 1500000
         End If
     End If
 
-    Note: Tiling benefit (cache locality)
-    Let tiling_benefit be 1.0
-
+    Let tiling_benefit_ppm be PPM_ONE
     Let optimal_type be proc memory_get_int64 from Layout with optimal_layout, 0
     Let current_type be proc memory_get_int64 from Layout with current_layout, 0
-
     If optimal_type is equal to LAYOUT_TILED:
         If current_type is not equal to LAYOUT_TILED:
-            Note: Tiling benefit: 1.1x to 1.3x typical
-            Set tiling_benefit to 1.2
+            Note: Tiling benefit: 1.2x (== 1_200_000 PPM)
+            Set tiling_benefit_ppm to 1200000
         End If
     End If
 
-    Note: Padding benefit (bank conflicts)
-    Let padding_benefit be 1.0
-
+    Let padding_benefit_ppm be PPM_ONE
     Let optimal_padding be proc memory_get_int64 from Layout with optimal_layout, 32
     Let current_padding be proc memory_get_int64 from Layout with current_layout, 32
-
     If optimal_padding is greater than 0:
         If current_padding is equal to 0:
-            Note: Padding benefit: 1.05x to 1.15x typical
-            Set padding_benefit to 1.1
+            Note: Padding benefit: 1.1x (== 1_100_000 PPM)
+            Set padding_benefit_ppm to 1100000
         End If
     End If
 
-    Note: Combine benefits (multiplicative)
-    Let total_benefit be coalescing_benefit multiplied by tiling_benefit multiplied by padding_benefit
+    Note: Multiplicative combination in PPM:
+    Note:   combined = coalescing * tiling / PPM_ONE * padding / PPM_ONE
+    Let combined be coalescing_benefit_ppm multiplied by tiling_benefit_ppm
+    Set combined to combined divided by PPM_ONE
+    Set combined to combined multiplied by padding_benefit_ppm
+    Set combined to combined divided by PPM_ONE
 
-    Return total_benefit
+    If combined is less than PPM_ONE:
+        Set combined to PPM_ONE
+    End If
+
+    Return combined
 End Process
 
-Process called "estimate_transformation_cost" that takes source_layout as Integer, target_layout as Integer returns Float:
-    @Reasoning
-    Estimates cost of layout transformation.
+@Reasoning:
+Estimates the relative cost of a layout transformation in PPM, where PPM_ONE means "as costly as the original computation". The cost is anchored at 5% (50_000 PPM) for cheap same-layout-type transformations (just changing strides) and 10% (100_000 PPM) when the layout TYPE itself changes (requiring full data reorganization). A zero/missing dimensions list disqualifies the transformation (returns 0, signaling "free" since there is no data to move).
+@End Reasoning
 
-    Costs:
-    - Memory allocation for new layout
-    - Data copying/reorganization
-    - Runtime overhead
+@Implementation:
+1. If source has no dimensions, return 0 (no data).
+2. Default base_cost = 50_000 PPM (5%).
+3. If source.layout_type != target.layout_type, raise to 100_000 PPM (10%).
+@End Implementation
 
-    Measurement:
-    - Data size
-    - Transformation complexity
-    - Execution time
-    @End Reasoning
+@Performance_Hints:
+O(1): two field reads from each layout descriptor.
+@End Performance_Hints
 
-    @Implementation
-    1. Get data size
-    2. Estimate transformation time
-    3. Return cost (relative to original execution time)
-    @End Implementation
+@Security_Scope:
+Pure analysis on caller-supplied descriptors.
+@End Security_Scope
 
-    Note: Get data size
+Process called "estimate_transformation_cost" that takes source_layout as Integer, target_layout as Integer returns Integer:
     Let dimensions be proc memory_get_int64 from Layout with source_layout, 8
     If dimensions is equal to 0:
-        Return 0.0
+        Return 0
     End If
 
-    Let total_elements be 1
-    Let dim_count be proc length from List with dimensions
+    Let base_cost_ppm be 50000
 
-    Let i be 0
-    While i is less than dim_count:
-        Let dim_size be proc get from List with dimensions, i
-        Set total_elements to total_elements multiplied by dim_size
-        Set i to i plus 1
-    End While
-
-    Note: Transformation cost proportional to data size
-    Note: Typical: 0.01 to 0.1 relative cost
-    Let base_cost be 0.05
-
-    Note: Higher cost for complex transformations
     Let source_type be proc memory_get_int64 from Layout with source_layout, 0
     Let target_type be proc memory_get_int64 from Layout with target_layout, 0
-
     If source_type is not equal to target_type:
-        Note: Layout change requires data reorganization
-        Set base_cost to 0.1
+        Set base_cost_ppm to 100000
     End If
 
-    Return base_cost
+    Return base_cost_ppm
 End Process
 
 Note: ================================================================
 Note: Optimization Orchestration
 Note: ================================================================
 
+@Reasoning:
+Top-level driver for the layout optimization pass. Implements a greedy net-benefit policy: generate every candidate, filter to those with net_benefit = benefit / (1 + cost) > 1.05 (5% minimum improvement threshold), sort by net benefit descending, apply in order. The 1.05 floor avoids churning the graph for trivial gains; the descending sort means the high-impact transforms run first while the IR is still in its original shape.
+@End Reasoning
+
+@Implementation:
+1. generate_layout_transformations(graph) -> candidate List.
+2. Filter loop: compute net_benefit per transformation by reading benefit (offset 32) and cost (offset 40), keep only those with net_benefit > 1.05.
+3. sort_transformations_by_benefit on the beneficial list.
+4. Apply each in turn via apply_layout_transformation, incrementing the counter.
+5. Return total count applied (used by the pass manager to detect whether the pass made progress).
+@End Implementation
+
+@Performance_Hints:
+O(N + N log N) where N is candidate count (sort dominates). apply_layout_transformation is O(consumers) per call. Single graph traversal feeds the candidate list.
+@End Performance_Hints
+
+@Security_Scope:
+Mutates the graph through apply_layout_transformation. Allocates fresh transformations and beneficial Lists. validate_graph runs inside apply_layout_transformation after every splice so corruption surfaces immediately.
+@End Security_Scope
+
 Process called "optimize_data_layout" that takes graph as Integer returns Integer:
-    @Reasoning
-    Top-level data layout optimization.
-
-    Algorithm:
-    1. Generate all layout transformation candidates
-    2. Filter to beneficial transformations (benefit > cost)
-    3. Sort by net benefit
-    4. Apply transformations greedily
-    5. Validate graph after each transformation
-
-    Strategy:
-    - Prioritize high-benefit, low-cost transformations
-    - Apply transformations incrementally
-    - Revalidate after each change
-    @End Reasoning
-
-    @Implementation
-    1. Generate transformations
-    2. Filter and sort
-    3. Apply beneficial transformations
-    4. Return count of transformations applied
-    @End Implementation
-
     Let transformations_applied be 0
 
     Note: Generate layout transformations
@@ -860,14 +857,20 @@ Process called "optimize_data_layout" that takes graph as Integer returns Intege
     Let i be 0
     While i is less than transform_count:
         Let transformation be proc get from List with transformations, i
-        Let benefit be proc memory_get_float64 from Layout with transformation, 32
-        Let cost be proc memory_get_float64 from Layout with transformation, 40
+        Let benefit_ppm be proc memory_get_int64 from Layout with transformation, 32
+        Let cost_ppm be proc memory_get_int64 from Layout with transformation, 40
 
-        Note: Net benefit = benefit / (1 + cost)
-        Let net_benefit be benefit divided by (1.0 plus cost)
+        Note: Net benefit in PPM = (benefit * PPM_ONE) / (PPM_ONE + cost).
+        Note: Pure integer arithmetic; no Float dependency.
+        Let denom be PPM_ONE plus cost_ppm
+        If denom is less than 1:
+            Set denom to 1
+        End If
+        Let scaled be benefit_ppm multiplied by PPM_ONE
+        Let net_benefit_ppm be scaled divided by denom
 
-        Note: Only apply if net benefit > 1.05 (5% improvement)
-        If net_benefit is greater than 1.05:
+        Note: Only apply if net benefit > 1.05x (== 1_050_000 PPM)
+        If net_benefit_ppm is greater than 1050000:
             proc append from List with beneficial, transformation
         End If
 
@@ -898,6 +901,14 @@ Note: ================================================================
 Note: Helper Functions - Layout Management
 Note: ================================================================
 
+@Reasoning:
+Shallow-copies a DataLayout so callers can mutate it without disturbing the original. Used by detect_optimal_layout as the starting point for layout refinement: clone the current layout, then adjust fields in the clone. Dimensions and strides are shared by reference because they are conceptually immutable in this pass.
+@End Reasoning
+
+@Implementation:
+Reads each of the six fields via memory_get_int64 at offsets 0/8/16/24/32/40, then constructs a fresh DataLayout via "a value of type DataLayout with" initialization. Lists referenced by dimensions/strides/tile_sizes are shared.
+@End Implementation
+
 Process called "clone_layout" that takes layout as Integer returns Integer:
     Let cl_layout_type be proc memory_get_int64 from Layout with layout, 0
     Let cl_dimensions be proc memory_get_int64 from Layout with layout, 8
@@ -917,6 +928,14 @@ Process called "clone_layout" that takes layout as Integer returns Integer:
     Return cloned
 End Process
 
+@Reasoning:
+Cheap equivalence check on the two fields that actually drive transformation dispatch: layout_type and padding. Two layouts that match on these are functionally indistinguishable for the purposes of optimize_data_layout, even if their dimensions/strides differ in caller-private ways. Avoids spurious transformations.
+@End Reasoning
+
+@Implementation:
+Two memory_get_int64 reads per layout (offsets 0 and 32). Returns true on first mismatch, false otherwise.
+@End Implementation
+
 Process called "layouts_differ" that takes layout1 as Integer, layout2 as Integer returns Boolean:
     Let type1 be proc memory_get_int64 from Layout with layout1, 0
     Let type2 be proc memory_get_int64 from Layout with layout2, 0
@@ -934,6 +953,14 @@ Process called "layouts_differ" that takes layout1 as Integer, layout2 as Intege
 
     Return false
 End Process
+
+@Reasoning:
+Maps a (current_layout_type, optimal_layout_type) pair to one of the TRANSFORM_* operation constants that apply_layout_transformation dispatches on. Encodes the full transition matrix: row<->col is TRANSPOSE, any->TILED is TILE, any->PADDED is PAD, AOS->SOA is the named conversion. Returns TRANSFORM_NONE for cases without an implemented transition.
+@End Reasoning
+
+@Implementation:
+Series of nested If checks comparing current_type and optimal_type (both at offset 0) against the LAYOUT_* constants. Returns the corresponding TRANSFORM_* integer. The matching order ensures the most specific transition matches first.
+@End Implementation
 
 Process called "determine_transform_type" that takes current_layout as Integer, optimal_layout as Integer returns Integer:
     Let current_type be proc memory_get_int64 from Layout with current_layout, 0
@@ -972,6 +999,14 @@ Note: ================================================================
 Note: Helper Functions - Stride Computation
 Note: ================================================================
 
+@Reasoning:
+Computes the stride vector for a row-major (C-order) layout. By definition, the innermost (rightmost) dimension has stride = element_size, and each outer dimension's stride equals the product of all dimensions to its right times element_size. This is the canonical layout for C, Numpy default arrays, and the Bifrost default.
+@End Reasoning
+
+@Implementation:
+Iterates from rightmost to leftmost dimension. Starts stride = element_size, prepends the running stride to the result list, then multiplies stride by the current dimension size before moving outward. The List.prepend keeps the result in the correct natural order without a final reverse step.
+@End Implementation
+
 Process called "compute_row_major_strides" that takes dimensions as Integer, element_size as Integer returns Integer:
     Let strides be proc create from List
     Let dim_count be proc length from List with dimensions
@@ -995,6 +1030,14 @@ Process called "compute_row_major_strides" that takes dimensions as Integer, ele
 
     Return strides
 End Process
+
+@Reasoning:
+Computes the stride vector for a column-major (Fortran-order) layout. The leftmost dimension has stride = element_size; each subsequent (outer-right) dimension's stride equals the product of all dimensions to its left times element_size. This is the layout for Fortran, MATLAB, and the column-store convention used when matrix access is column-dominant.
+@End Reasoning
+
+@Implementation:
+Iterates from leftmost to rightmost dimension. Starts stride = element_size, appends the running stride to the result list, then multiplies stride by the current dimension size before moving rightward.
+@End Implementation
 
 Process called "compute_column_major_strides" that takes dimensions as Integer, element_size as Integer returns Integer:
     Let strides be proc create from List
@@ -1052,41 +1095,26 @@ Memory Safety:
   collection); we only detach them from the adjacency structures.
 :End Note
 
+@Reasoning:
+Internal helper used by all four layout-transformation Processes (insert_transpose_op, insert_tiling_ops, apply_padding, convert_aos_to_soa). Each helper builds a fresh operation node and then needs to interpose it between the producer node and every downstream consumer. The splice is purely a graph-edge rewiring operation: the producer's existing outgoing edges become outgoing edges of the spliced node, and a single new edge connects the producer to the spliced node. Encapsulating this in a helper keeps the four caller Processes short and consistent.
+@End Reasoning
+
+@Implementation:
+1. Snapshot producer's outgoing edges so iteration is stable across graph mutations.
+2. For each consumer edge, read (dest, kind, data_type), remove the original edge, and create a new edge from spliced_node to dest.
+3. Create one producer->spliced edge carrying the producer's original output type as the data type and DataFlow as the edge kind.
+4. Register the producer->spliced edge on the spliced node's input list so it appears in get_node_inputs.
+@End Implementation
+
+@Performance_Hints:
+O(C) where C is the number of consumer edges. Each iteration does one remove_edge (O(C) within the producer's outputs list because List.remove scans linearly) and one add_edge. Acceptable for typical accelerator graphs where any single node has at most a handful of consumers.
+@End Performance_Hints
+
+@Security_Scope:
+Operates entirely on internal IR graph adjacency lists in Tier-3 owned heap. No external input is involved; type and edge pointers are validated before dereference to fail safe on graph corruption.
+@End Security_Scope
+
 Process called "splice_node_after_producer" that takes graph as Integer, producer as Integer, spliced_node as Integer, producer_output_type as Integer returns Nothing:
-    @Reasoning
-    Internal helper used by all four layout-transformation Processes. Each
-    helper builds a fresh operation node and then needs to interpose it
-    between the producer node and every downstream consumer. The splice is
-    purely a graph-edge rewiring operation: the producer's existing
-    outgoing edges become outgoing edges of the spliced node, and a single
-    new edge connects the producer to the spliced node. Encapsulating this
-    in a helper keeps the four caller Processes short and consistent.
-    @End Reasoning
-
-    @Implementation
-    1. Snapshot producer's outgoing edges so iteration is stable across
-       graph mutations.
-    2. For each consumer edge, read (dest, kind, data_type), remove the
-       original edge, and create a new edge from spliced_node to dest.
-    3. Create one producer->spliced edge carrying the producer's original
-       output type as the data type and DataFlow as the edge kind.
-    4. Register the producer->spliced edge on the spliced node's input
-       list so it appears in get_node_inputs.
-    @End Implementation
-
-    @Security_Scope
-    Operates entirely on internal IR graph adjacency lists in Tier-3 owned
-    heap. No external input is involved; type and edge pointers are
-    validated before dereference to fail safe on graph corruption.
-    @End Security_Scope
-
-    @Performance_Hints
-    O(C) where C is the number of consumer edges. Each iteration does one
-    remove_edge (O(C) within the producer's outputs list because List.remove
-    scans linearly) and one add_edge. Acceptable for typical accelerator
-    graphs where any single node has at most a handful of consumers.
-    @End Performance_Hints
-
     Note: Snapshot consumer edges so iteration is stable.
     Let consumers be proc get_node_outputs from Graph with graph, producer
     If consumers is equal to 0:
@@ -1146,41 +1174,28 @@ node. The element type is shared with the original (no element-level
 copy needed). This matches the architect's ratified Q1 answer.
 :End Note
 
+@Reasoning:
+Inserts a MatrixTranspose operation node between the target node and all of its consumers so that downstream operations see the transposed-layout matrix. Producer-side type is preserved; the transpose's output type is a new Matrix(elem, cols, rows) reflecting the dimension swap (architect Q1, ratified).
+@End Reasoning
+
+@Implementation:
+1. Validate graph, node, layout pointers.
+2. Read producer output type. Must be a Matrix variant (discriminant 3) for the dimension swap to be meaningful; bail out cleanly if not.
+3. Allocate a new Matrix type with rows/cols swapped, sharing the element type pointer (immutable in Bifrost type system).
+4. Build an empty inputs list and an Operation node for OpKind.MatrixTranspose (discriminant 8) with DataParallel parallelism.
+5. Add the new node to the graph, then call splice_node_after_producer to rewire edges. Splice will populate the transpose node's input list with the producer->transpose bridge edge.
+6. Return the spliced node ID so the caller can attach metadata to it.
+@End Implementation
+
+@Performance_Hints:
+Single allocation for the new Matrix type (32 bytes) and one create_operation_node call (48 bytes for node + Dictionary for metadata). Edge rewiring is O(C) over the producer's consumers.
+@End Performance_Hints
+
+@Security_Scope:
+Pure IR transformation on the Tier-3 graph heap. No untrusted input. Returns 0 on any null-pointer or type-shape mismatch so the caller can fall back without crashing.
+@End Security_Scope
+
 Process called "insert_transpose_op" that takes graph as Integer, node as Integer, layout as Integer returns Integer:
-    @Reasoning
-    Inserts a MatrixTranspose operation node between the target node and
-    all of its consumers so that downstream operations see the
-    transposed-layout matrix. Producer-side type is preserved; the
-    transpose's output type is a new Matrix(elem, cols, rows) reflecting
-    the dimension swap (architect Q1, ratified).
-    @End Reasoning
-
-    @Implementation
-    1. Validate graph, node, layout pointers.
-    2. Read producer output type. Must be a Matrix variant (discriminant 3)
-       for the dimension swap to be meaningful; bail out cleanly if not.
-    3. Allocate a new Matrix type with rows/cols swapped, sharing the
-       element type pointer (immutable in Bifrost type system).
-    4. Build an empty inputs list and an Operation node for OpKind.MatrixTranspose
-       (discriminant 8) with DataParallel parallelism.
-    5. Add the new node to the graph, then call splice_node_after_producer
-       to rewire edges. Splice will populate the transpose node's input
-       list with the producer->transpose bridge edge.
-    6. Return the spliced node ID so the caller can attach metadata to it.
-    @End Implementation
-
-    @Performance_Hints
-    Single allocation for the new Matrix type (32 bytes) and one
-    create_operation_node call (48 bytes for node + Dictionary for
-    metadata). Edge rewiring is O(C) over the producer's consumers.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure IR transformation on the Tier-3 graph heap. No untrusted input.
-    Returns 0 on any null-pointer or type-shape mismatch so the caller can
-    fall back without crashing.
-    @End Security_Scope
-
     If graph is equal to 0:
         Return 0
     End If
@@ -1258,41 +1273,29 @@ target layout's tile_sizes field) in its metadata so backend emitters
 can lower it to nested tiled loops over the tensor.
 :End Note
 
+@Reasoning:
+Inserts a Tile operation node between the target and its consumers. The new layout's tile_sizes list (computed by compute_optimal_tiling upstream) is stored in the Tile node's metadata under the "tile_sizes" key so backend code generators (CUDA, Metal, OpenCL, FPGA) can emit nested tiled loops that respect the cache-aware tile shape. The tile op preserves element type and shape - it is a loop structuring transformation, not a tensor reshape.
+@End Reasoning
+
+@Implementation:
+1. Validate graph, node, layout pointers.
+2. Read tile_sizes list from the layout (offset 24 - see DataLayout struct layout in this file). Bail if 0 (no tiling info).
+3. Read producer output type. Pass-through to the Tile node since tile is a loop transformation, not a type change.
+4. Build an Operation node for OpKind.Tile (discriminant 68) with DataParallel parallelism.
+5. Attach the tile_sizes list under the "tile_sizes" metadata key.
+6. Add the node to the graph and splice through.
+7. Return the spliced node ID.
+@End Implementation
+
+@Performance_Hints:
+Tile sizes are stored by pointer (list reference), not by copy, so metadata attachment is O(1). Splice is O(consumers).
+@End Performance_Hints
+
+@Security_Scope:
+Pure IR transformation. tile_sizes are pre-validated by the upstream compute_optimal_tiling pass. The metadata key is a static interned string literal so no untrusted data reaches the dictionary.
+@End Security_Scope
+
 Process called "insert_tiling_ops" that takes graph as Integer, node as Integer, layout as Integer returns Integer:
-    @Reasoning
-    Inserts a Tile operation node between the target and its consumers.
-    The new layout's tile_sizes list (computed by compute_optimal_tiling
-    upstream) is stored in the Tile node's metadata under the
-    "tile_sizes" key so backend code generators (CUDA, Metal, OpenCL,
-    FPGA) can emit nested tiled loops that respect the cache-aware tile
-    shape. The tile op preserves element type and shape - it is a loop
-    structuring transformation, not a tensor reshape.
-    @End Reasoning
-
-    @Implementation
-    1. Validate graph, node, layout pointers.
-    2. Read tile_sizes list from the layout (offset 24 - see DataLayout
-       struct layout in this file). Bail if 0 (no tiling info).
-    3. Read producer output type. Pass-through to the Tile node since
-       tile is a loop transformation, not a type change.
-    4. Build an Operation node for OpKind.Tile (discriminant 68) with
-       DataParallel parallelism.
-    5. Attach the tile_sizes list under the "tile_sizes" metadata key.
-    6. Add the node to the graph and splice through.
-    7. Return the spliced node ID.
-    @End Implementation
-
-    @Performance_Hints
-    Tile sizes are stored by pointer (list reference), not by copy, so
-    metadata attachment is O(1). Splice is O(consumers).
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure IR transformation. tile_sizes are pre-validated by the upstream
-    compute_optimal_tiling pass. The metadata key is a static interned
-    string literal so no untrusted data reaches the dictionary.
-    @End Security_Scope
-
     If graph is equal to 0:
         Return 0
     End If
@@ -1352,39 +1355,29 @@ bytes) under the "pad_amount" key and a zero fill value under the
 a guarded copy whose innermost dimension is aligned per the metadata.
 :End Note
 
+@Reasoning:
+Inserts a Pad operation node carrying the padding amount in metadata. Architect Q2: pad fill value is hard-coded "0" - layout padding is dead space, so the fill never represents a meaningful value. If a future call site needs non-zero padding it can override the "pad_value" metadata key after the splice.
+@End Reasoning
+
+@Implementation:
+1. Validate graph, node, layout pointers.
+2. Read padding element count from layout offset 32 (DataLayout.padding). Bail if 0 (no padding needed - the layout is already aligned).
+3. Read producer output type. Pass-through (padding does not change element type, only changes the buffer shape along the innermost dimension; that's encoded in metadata so backend allocators know).
+4. Build an Operation node for OpKind.Pad (discriminant 67) with DataParallel parallelism.
+5. Attach "pad_amount" = padding_elements and "pad_value" = "0".
+6. Add to graph and splice through.
+7. Return the spliced node ID.
+@End Implementation
+
+@Performance_Hints:
+Metadata attachment is O(1) per key. Splice is O(consumers).
+@End Performance_Hints
+
+@Security_Scope:
+Pad amount is pre-validated by compute_optimal_padding. The "0" fill value is a string literal under control of the compiler; no untrusted input ever reaches metadata.
+@End Security_Scope
+
 Process called "apply_padding" that takes graph as Integer, node as Integer, layout as Integer returns Integer:
-    @Reasoning
-    Inserts a Pad operation node carrying the padding amount in metadata.
-    Architect Q2: pad fill value is hard-coded "0" - layout padding is
-    dead space, so the fill never represents a meaningful value. If a
-    future call site needs non-zero padding it can override the
-    "pad_value" metadata key after the splice.
-    @End Reasoning
-
-    @Implementation
-    1. Validate graph, node, layout pointers.
-    2. Read padding element count from layout offset 32 (DataLayout.padding).
-       Bail if 0 (no padding needed - the layout is already aligned).
-    3. Read producer output type. Pass-through (padding does not change
-       element type, only changes the buffer shape along the innermost
-       dimension; that's encoded in metadata so backend allocators know).
-    4. Build an Operation node for OpKind.Pad (discriminant 67) with
-       DataParallel parallelism.
-    5. Attach "pad_amount" = padding_elements and "pad_value" = "0".
-    6. Add to graph and splice through.
-    7. Return the spliced node ID.
-    @End Implementation
-
-    @Performance_Hints
-    Metadata attachment is O(1) per key. Splice is O(consumers).
-    @End Performance_Hints
-
-    @Security_Scope
-    Pad amount is pre-validated by compute_optimal_padding. The "0" fill
-    value is a string literal under control of the compiler; no untrusted
-    input ever reaches metadata.
-    @End Security_Scope
-
     If graph is equal to 0:
         Return 0
     End If
@@ -1450,38 +1443,28 @@ in present-day code. When the upstream labeling pass lands later, this
 Process must just work without further changes.
 :End Note
 
+@Reasoning:
+Inserts a Reshape operation node tagged with layout_transform = "aos_to_soa" in metadata. Backend emitters lowering a Reshape look at the layout_transform tag to decide between an AoS->SoA gather/scatter and other reshape variants. Implemented correctly per architect Q3 even though unreachable in current production code (no upstream pass currently emits LAYOUT_AOS).
+@End Reasoning
+
+@Implementation:
+1. Validate graph, node pointers.
+2. Read producer output type. Pass through to the reshape node since AoS->SoA is a layout flip, not a type-shape change at the BifrostType level. (Real shape information lives in the type's inner shape list.)
+3. Build an Operation node for OpKind.Reshape (discriminant 69) with DataParallel parallelism.
+4. Tag with layout_transform = "aos_to_soa".
+5. Add to graph and splice through. If no consumers, return the new node without splicing so it remains addressable.
+6. Return the spliced node ID.
+@End Implementation
+
+@Performance_Hints:
+O(1) metadata attachment, O(C) splice over consumers.
+@End Performance_Hints
+
+@Security_Scope:
+Pure IR transformation. Metadata key and value are static string literals from this file - no untrusted input.
+@End Security_Scope
+
 Process called "convert_aos_to_soa" that takes graph as Integer, node as Integer returns Integer:
-    @Reasoning
-    Inserts a Reshape operation node tagged with layout_transform =
-    "aos_to_soa" in metadata. Backend emitters lowering a Reshape look
-    at the layout_transform tag to decide between an AoS->SoA gather/
-    scatter and other reshape variants. Implemented correctly per
-    architect Q3 even though unreachable in current production code.
-    @End Reasoning
-
-    @Implementation
-    1. Validate graph, node pointers.
-    2. Read producer output type. Pass through to the reshape node since
-       AoS->SoA is a layout flip, not a type-shape change at the
-       BifrostType level. (Real shape information lives in the type's
-       inner shape list.)
-    3. Build an Operation node for OpKind.Reshape (discriminant 69) with
-       DataParallel parallelism.
-    4. Tag with layout_transform = "aos_to_soa".
-    5. Add to graph and splice through. If no consumers, return the new
-       node without splicing so it remains addressable.
-    6. Return the spliced node ID.
-    @End Implementation
-
-    @Performance_Hints
-    O(1) metadata attachment, O(C) splice over consumers.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure IR transformation. Metadata key and value are static string
-    literals from this file - no untrusted input.
-    @End Security_Scope
-
     If graph is equal to 0:
         Return 0
     End If
@@ -1527,6 +1510,20 @@ Process called "convert_aos_to_soa" that takes graph as Integer, node as Integer
     Return reshape_node
 End Process
 
+@Reasoning:
+Stamps a node's metadata Dict with a human-readable "layout" string ("row_major", "column_major", "tiled") corresponding to its post-transformation DataLayout.layout_type. Downstream code generators read this metadata key to make layout-aware decisions about loop emission and address computation.
+@End Reasoning
+
+@Implementation:
+1. Fetch the node's metadata Dict; allocate a fresh Dict if missing.
+2. Read layout_type at offset 0. If LAYOUT_ROW_MAJOR/COLUMN_MAJOR/TILED, set the "layout" key to the corresponding string literal.
+3. Re-attach the metadata Dict via set_node_metadata.
+@End Implementation
+
+@Security_Scope:
+Mutates node metadata only. Layout strings are interned literals; no untrusted data is written.
+@End Security_Scope
+
 Process called "update_layout_metadata" that takes node as Integer, layout as Integer returns Nothing:
     Let metadata be proc get_node_metadata from Node with node
     If metadata is equal to 0:
@@ -1552,6 +1549,14 @@ Note: ================================================================
 Note: Helper Functions - Utilities
 Note: ================================================================
 
+@Reasoning:
+Gate used by generate_layout_transformations to filter the graph traversal to nodes whose output type actually carries a memory layout. Only Matrix (discriminant 3) and Tensor (discriminant 5) types have layouts in Bifrost; scalars, strings, and tuples do not.
+@End Reasoning
+
+@Implementation:
+Read the node's output type. If null, return false. Else read the type discriminant at offset 0 and return true iff it is 3 (Matrix) or 5 (Tensor).
+@End Implementation
+
 Process called "node_has_layout" that takes node as Integer returns Boolean:
     Let output_type be proc get_node_output_type from Node with node
     If output_type is equal to 0:
@@ -1570,6 +1575,14 @@ Process called "node_has_layout" that takes node as Integer returns Boolean:
 
     Return false
 End Process
+
+@Reasoning:
+Maps Bifrost's PrimitiveKind discriminants to byte widths used in stride computations. Constants: INT8=0/1B, INT16=1/2B, INT32=2/4B, INT64=3/8B, FLOAT32=6/4B, FLOAT64=7/8B. Default 4 bytes (Int32) matches the convention for unspecified primitives.
+@End Reasoning
+
+@Implementation:
+Linear If chain on the six recognized PrimitiveKind constants returning the corresponding power-of-2 byte width. The default fall-through returns 4 (Int32-equivalent).
+@End Implementation
 
 Process called "get_primitive_size" that takes primitive_kind as Integer returns Integer:
     Note: Map primitive type kind to byte size
@@ -1596,6 +1609,14 @@ Process called "get_primitive_size" that takes primitive_kind as Integer returns
 
     Return 4
 End Process
+
+@Reasoning:
+Quantizes a tile dimension candidate to the largest power of 2 not exceeding n, in the range [1, 128]. Power-of-2 tile sizes simplify backend address computation (cheap shift-based indexing) and avoid divisor overhead in tile-loop bound calculations. Caps at 128 because larger tiles defeat L1 fitting.
+@End Reasoning
+
+@Implementation:
+Cascade of If-greater-or-equal tests against 128/64/32/16/8/4/2 returning the first match. Returns 1 for non-positive input as the degenerate default (no tiling).
+@End Implementation
 
 Process called "round_down_to_power_of_2" that takes n as Integer returns Integer:
     Note: Round down to nearest power of 2
@@ -1628,8 +1649,60 @@ Process called "round_down_to_power_of_2" that takes n as Integer returns Intege
     Return 1
 End Process
 
+@Reasoning:
+Computes floor(sqrt(n)) using Newton's method on integers. We need an integer-only square root because stage1 Float arithmetic is broken. The classical Newton iteration x_{k+1} = (x_k + n / x_k) / 2 converges in O(log log n) steps and is exact for floor(sqrt(n)) when initialized at any x_0 >= sqrt(n). We initialize with n itself.
+@End Reasoning
+
+@Implementation:
+1. Return 0 for n <= 0 and 1 for n == 1.
+2. Otherwise iterate Newton's update until convergence (y >= x stops the loop).
+@End Implementation
+
+@Performance_Hints:
+O(log log n) Newton iterations on 64-bit Integer; effectively O(1). Pure integer arithmetic; no Float dependency.
+@End Performance_Hints
+
+@Security_Scope:
+Pure function. Validates input range. Returns 0 for non-positive input.
+@End Security_Scope
+
+Process called "integer_sqrt" that takes n as Integer returns Integer:
+    If n is less than or equal to 0:
+        Return 0
+    End If
+    If n is equal to 1:
+        Return 1
+    End If
+
+    Let x be n
+    Let y be (x plus 1) divided by 2
+    While y is less than x:
+        Set x to y
+        Set y to (x plus (n divided by x)) divided by 2
+    End While
+
+    Return x
+End Process
+
+@Reasoning:
+Bubble-sorts layout transformations by net benefit, computed in PPM as net_ppm = benefit_ppm * PPM_ONE / (PPM_ONE + cost_ppm). Sorting puts the highest-net-benefit transformation first so the greedy outer loop picks the best win each iteration. Bubble sort suffices because the candidate list is bounded by O(graph_nodes) and typically << 32 per pass.
+@End Reasoning
+
+@Implementation:
+1. Clone the transformations list so the caller's ordering is preserved.
+2. For each pair, compute net_ppm in PPM domain (integer-only).
+3. Swap into descending order when net1 < net2.
+@End Implementation
+
+@Performance_Hints:
+O(N^2) bubble sort. Acceptable because N is small (bounded by graph-wide layout transformation count).
+@End Performance_Hints
+
+@Security_Scope:
+Pure sort over caller-supplied list; returns a sorted clone.
+@End Security_Scope
+
 Process called "sort_transformations_by_benefit" that takes transformations as Integer returns Integer:
-    Note: Simple bubble sort by net benefit (descending)
     Let sorted be proc clone from List with transformations
     Let n be proc length from List with sorted
 
@@ -1640,15 +1713,25 @@ Process called "sort_transformations_by_benefit" that takes transformations as I
             Let t1 be proc get from List with sorted, j
             Let t2 be proc get from List with sorted, j plus 1
 
-            Let benefit1 be proc memory_get_float64 from Layout with t1, 32
-            Let cost1 be proc memory_get_float64 from Layout with t1, 40
-            Let net1 be benefit1 divided by (1.0 plus cost1)
+            Let benefit1_ppm be proc memory_get_int64 from Layout with t1, 32
+            Let cost1_ppm be proc memory_get_int64 from Layout with t1, 40
+            Let denom1 be PPM_ONE plus cost1_ppm
+            If denom1 is less than 1:
+                Set denom1 to 1
+            End If
+            Let net1_ppm be benefit1_ppm multiplied by PPM_ONE
+            Set net1_ppm to net1_ppm divided by denom1
 
-            Let benefit2 be proc memory_get_float64 from Layout with t2, 32
-            Let cost2 be proc memory_get_float64 from Layout with t2, 40
-            Let net2 be benefit2 divided by (1.0 plus cost2)
+            Let benefit2_ppm be proc memory_get_int64 from Layout with t2, 32
+            Let cost2_ppm be proc memory_get_int64 from Layout with t2, 40
+            Let denom2 be PPM_ONE plus cost2_ppm
+            If denom2 is less than 1:
+                Set denom2 to 1
+            End If
+            Let net2_ppm be benefit2_ppm multiplied by PPM_ONE
+            Set net2_ppm to net2_ppm divided by denom2
 
-            If net1 is less than net2:
+            If net1_ppm is less than net2_ppm:
                 proc set from List with sorted, j, t2
                 proc set from List with sorted, j plus 1, t1
             End If

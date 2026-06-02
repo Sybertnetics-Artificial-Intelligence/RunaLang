@@ -27,6 +27,14 @@ Note: ================================================================
 Note: Type Definitions
 Note: ================================================================
 
+@Reasoning:
+ScheduleEntry is the unit produced by list_schedule and consumed by validate_schedule and apply_schedule_to_graph. The five fields capture the full scheduling decision for one operation: which node, when it runs, why it was picked, and the legal window [earliest_cycle, latest_cycle] derived from data-dependence chains. Decoupling priority from earliest/latest lets the scheduler reason about slack independently of the chosen cycle.
+@End Reasoning
+
+@Implementation:
+Plain record with five Integer slots laid out at offsets 0, 8, 16, 24, 32. validate_schedule and apply_schedule_to_graph read offsets 0 (node) and 8 (cycle) directly via memory_get_int64 because the layout is part of the scheduler's contract.
+@End Implementation
+
 Type called "ScheduleEntry":
     node as Integer                 Note: Operation to schedule
     cycle as Integer                Note: Cycle when operation executes
@@ -35,12 +43,28 @@ Type called "ScheduleEntry":
     latest_cycle as Integer         Note: Latest cycle without extending schedule
 End Type
 
+@Reasoning:
+ResourceConstraints models the hardware issue width for the three op classes Bifrost cares about (memory, arithmetic, control) plus an OpKind->latency dictionary. This is the model compute_resource_mii uses to bound II from below, and that get_operation_latency consults for per-op latency. Three classes (not one global limit) prevents the scheduler from packing too many memory ops on a cycle when arithmetic units are free.
+@End Reasoning
+
+@Implementation:
+Four-slot struct at offsets 0/8/16/24. Offset 24 holds the latencies Dict; the scheduler reads it via memory_get_int64 from Layout in get_operation_latency. create_default_constraints populates a sensible default (2 mem, 4 alu, 1 ctrl) and installs the standard latency table.
+@End Implementation
+
 Type called "ResourceConstraints":
     max_memory_ops as Integer       Note: Max memory ops per cycle
     max_arithmetic_ops as Integer   Note: Max arithmetic ops per cycle
     max_control_ops as Integer      Note: Max control ops per cycle
     instruction_latencies as Integer Note: Dict of OpKind → latency cycles
 End Type
+
+@Reasoning:
+PipelineStage represents one stage of a modulo-scheduled loop. After software_pipeline runs, the loop body is split into stage_count groups; stage k holds operations whose modulo-collapsed cycle falls in [k*II, (k+1)*II). The iteration_offset records which logical iteration (relative to the prologue) the stage belongs to, which the backend uses to emit prologue/steady/epilogue code.
+@End Reasoning
+
+@Implementation:
+Three-slot record at offsets 0/8/16. stage_number is the integer stage index, operations is the List of node IDs in this stage as returned by extract_stage_operations, and iteration_offset is the iteration distance from the prologue.
+@End Implementation
 
 Type called "PipelineStage":
     stage_number as Integer         Note: Pipeline stage index
@@ -52,38 +76,26 @@ Note: ================================================================
 Note: List Scheduling
 Note: ================================================================
 
+@Reasoning:
+Classic forward list scheduling: maintain a priority queue of ready operations (no unscheduled predecessors), pop the highest-priority one, place it at the earliest cycle that satisfies data-dependence latencies from the constraints model, then update successor earliest_start. This is the canonical local instruction scheduler; correctness depends on the priority order being any topological extension of the dependence DAG, which compute_scheduling_priorities guarantees.
+@End Reasoning
+
+@Implementation:
+1. Build priority map via compute_scheduling_priorities(graph, PRIORITY_CRITICAL_PATH).
+2. Topological-sort the graph and seed ready_list with predecessor-free nodes.
+3. Loop: select_highest_priority -> place at max(current_cycle, earliest_start[node]) -> emit ScheduleEntry -> mark scheduled -> for each successor, update earliest_start using get_operation_latency and add to ready_list when all predecessors are scheduled.
+4. Advance current_cycle = legal_cycle + 1 after each placement.
+@End Implementation
+
+@Performance_Hints:
+O(N * (N + E)) worst case where N is node count and E is edges, because each placement linear-scans the ready list in select_highest_priority and iterates successors. This is the hot pass of the reordering optimization; for graphs with a few hundred nodes it dominates compile time of the Bifrost middle end.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis: reads graph topology and constraints, returns a fresh List. No file I/O, no shared mutable state. Trusts upstream graph builders for DAG-ness (cycles would prevent the loop from terminating).
+@End Security_Scope
+
 Process called "list_schedule" that takes graph as Integer, constraints as Integer returns Integer:
-    @Reasoning
-    Classic list scheduling algorithm.
-
-    Algorithm:
-    1. Compute priorities (critical path, register pressure, etc.)
-    2. Initialize ready list (operations with no pending dependencies)
-    3. While ready list non-empty:
-       - Select highest-priority ready operation
-       - Schedule operation to earliest available cycle
-       - Update ready list (add newly-ready operations)
-    4. Return schedule
-
-    Priority function:
-    - Critical path length (operations on longest path first)
-    - Register pressure (minimize live values)
-    - Latency hiding (schedule long-latency ops early)
-    @End Reasoning
-
-    @Implementation
-    1. Compute operation priorities
-    2. Initialize ready list
-    3. Initialize current cycle = 0
-    4. While unscheduled operations exist:
-       - Select ready operation with highest priority
-       - Determine earliest legal cycle (dependencies + resources)
-       - Schedule operation
-       - Update dependencies
-       - Update ready list
-    5. Return schedule
-    @End Implementation
-
     Let schedule be proc create from List
 
     Note: Compute priorities for all nodes
@@ -201,31 +213,27 @@ Note: ================================================================
 Note: Software Pipelining
 Note: ================================================================
 
+@Reasoning:
+Software pipelining (Rau modulo scheduling) overlaps successive loop iterations so that long-latency operations from iteration i hide behind work from iterations i+1..i+k. The Initiation Interval II is the cycle gap between consecutive iteration starts; the lower bound MII = max(RecMII, ResMII) comes from recurrence latencies and resource issue width respectively, and is provably tight for affine loops.
+@End Reasoning
+
+@Implementation:
+1. compute_recurrence_mii(graph, loop_nodes, constraints) - latency-around-cycle bound.
+2. compute_resource_mii(graph, loop_nodes, constraints) - issue-width bound.
+3. ii = max(rec_mii, res_mii).
+4. modulo_schedule_operations(graph, loop_nodes, ii, constraints) collapses cycles modulo ii.
+5. compute_stage_count + extract_stage_operations build PipelineStage records 0..stage_count-1.
+@End Implementation
+
+@Performance_Hints:
+Dominated by modulo_schedule_operations which itself calls list_schedule, so O(N*(N+E)) on the loop subgraph plus O(N) for stage extraction. Called once per loop nest selected for pipelining.
+@End Performance_Hints
+
+@Security_Scope:
+Pure transformation. Reads graph and loop_nodes; allocates a fresh List of PipelineStage records. Trusts that loop_nodes is a true loop body identified upstream by Bifrost's loop analyzer.
+@End Security_Scope
+
 Process called "software_pipeline" that takes graph as Integer, loop_nodes as Integer, constraints as Integer returns Integer:
-    @Reasoning
-    Software pipelining overlaps loop iterations for latency hiding.
-
-    Algorithm (Modulo Scheduling):
-    1. Compute Initiation Interval (II) - cycles between iteration starts
-    2. Compute stage count - iterations in flight simultaneously
-    3. Schedule operations % II
-    4. Build prologue, steady state, epilogue
-
-    Key metrics:
-    - MII (Minimum II) = max(RecMII, ResMII)
-    - RecMII = Recurrence-constrained II (loop-carried dependencies)
-    - ResMII = Resource-constrained II (hardware limits)
-    @End Reasoning
-
-    @Implementation
-    1. Compute RecMII from loop-carried dependencies
-    2. Compute ResMII from resource constraints
-    3. Set II = max(RecMII, ResMII)
-    4. Schedule operations % II
-    5. Build pipeline stages
-    6. Return pipelined schedule
-    @End Implementation
-
     Let pipeline_stages be proc create from List
 
     Note: Compute Recurrence-constrained II
@@ -261,29 +269,27 @@ Process called "software_pipeline" that takes graph as Integer, loop_nodes as In
     Return pipeline_stages
 End Process
 
+@Reasoning:
+RecMII = ceil(sum_of_latencies_around_cycle / recurrence_distance). A loop-carried dependence with total latency L spread over d iterations forces the II to be at least L/d, otherwise the cycle would re-enter itself before the previous iteration finished. Without a recurrence (acyclic loop body) RecMII = 1.
+@End Reasoning
+
+@Implementation:
+1. get_subgraph extracts the loop's nodes into a fresh graph.
+2. has_cycle/find_cycle detect the recurrence; for the single-loop case Bifrost emits, exactly one cycle path is returned.
+3. Walk the cycle list, summing per-node latencies via get_operation_latency.
+4. recurrence_distance is taken as |cycle| - the count of nodes along the back-edge path - exact for single-loop recurrences.
+5. Return integer ceiling (cycle_latency + distance - 1) / distance.
+@End Implementation
+
+@Performance_Hints:
+O(N + E) for subgraph + cycle detection, plus O(|cycle|) for latency summation. Run once per loop during scheduling preparation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of graph topology. No shared state. Trusts upstream loop analyzer for loop_nodes membership.
+@End Security_Scope
+
 Process called "compute_recurrence_mii" that takes graph as Integer, loop_nodes as Integer, constraints as Integer returns Integer:
-    @Reasoning
-    Computes recurrence-constrained Minimum Initiation Interval.
-
-    RecMII = max over all recurrences (cycle_latency / recurrence_distance)
-
-    Algorithm:
-    - Find all recurrences (cycles) in loop body
-    - For each recurrence, sum operation latencies
-    - Divide by recurrence distance (iterations between uses)
-    - Return maximum
-    @End Reasoning
-
-    @Implementation
-    1. Create subgraph from loop nodes
-    2. Find all cycles (recurrences)
-    3. For each cycle:
-       - Sum operation latencies
-       - Determine recurrence distance
-       - Compute MII = latency / distance
-    4. Return maximum MII
-    @End Implementation
-
     Note: Create subgraph
     Let subgraph be proc get_subgraph from Graph with graph, loop_nodes
 
@@ -334,25 +340,26 @@ Process called "compute_recurrence_mii" that takes graph as Integer, loop_nodes 
     Return rec_mii
 End Process
 
+@Reasoning:
+ResMII = ceil(ops_of_class / issue_width_of_class), maximized across classes. If the loop body contains M memory ops and the machine issues at most max_memory_ops per cycle, then II must be at least ceil(M / max_memory_ops); same for arithmetic and control. The tightest class wins.
+@End Reasoning
+
+@Implementation:
+1. Walk loop_nodes; classify each via is_memory_op/is_arithmetic_op/is_control_op.
+2. Read max_memory/max_arithmetic/max_control via memory_get_int64 at constraints offsets 0/8/16.
+3. For each class, compute integer ceiling of count / capacity; defend against zero capacity by clamping MII to 1.
+4. Return max(memory_mii, arithmetic_mii, control_mii) via Math.max.
+@End Implementation
+
+@Performance_Hints:
+O(|loop_nodes|) single pass for classification plus constant work per resource class. Cheap relative to the recurrence-MII computation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. No allocations of structured data, no shared state.
+@End Security_Scope
+
 Process called "compute_resource_mii" that takes graph as Integer, loop_nodes as Integer, constraints as Integer returns Integer:
-    @Reasoning
-    Computes resource-constrained Minimum Initiation Interval.
-
-    ResMII = max over all resources (resource_usage / resource_capacity)
-
-    Algorithm:
-    - Count operations of each type
-    - Divide by hardware capacity
-    - Return maximum
-    @End Reasoning
-
-    @Implementation
-    1. Count memory, arithmetic, control operations
-    2. Get resource limits from constraints
-    3. Compute MII for each resource type
-    4. Return maximum MII
-    @End Implementation
-
     Let memory_ops be 0
     Let arithmetic_ops be 0
     Let control_ops be 0
@@ -422,25 +429,23 @@ Note: ================================================================
 Note: Critical Path Optimization
 Note: ================================================================
 
+@Reasoning:
+Critical-path scheduling assigns each operation a priority equal to its height in the DAG (longest weighted path to a sink). Scheduling longer-height ops first minimizes makespan because they have the least scheduling slack; deviating from this risks extending the schedule by exactly the slack deficit.
+@End Reasoning
+
+@Implementation:
+Delegates to Graph.compute_heights which performs reverse-topological DP: height(leaf) = 0, height(n) = 1 + max(height(s) for s in successors(n)). The resulting Dict node->height is itself the priority map this proc returns.
+@End Implementation
+
+@Performance_Hints:
+O(N + E) via compute_heights' linear DAG traversal. Called once at the start of list_schedule.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returns a fresh Dict owned by the caller.
+@End Security_Scope
+
 Process called "prioritize_critical_path" that takes graph as Integer returns Integer:
-    @Reasoning
-    Computes scheduling priorities based on critical path.
-
-    Critical path = longest path from node to leaf in DAG.
-    Operations on critical path have highest priority.
-
-    Algorithm:
-    - Use find_critical_path from graph.runa
-    - Assign priority = path length to leaf
-    - Operations with longer paths have higher priority
-    @End Reasoning
-
-    @Implementation
-    1. Compute heights (distance to leaves) for all nodes
-    2. Use height as priority
-    3. Return priority map
-    @End Implementation
-
     Note: Compute heights (longest path to leaves)
     Let heights be proc compute_heights from Graph with graph
 
@@ -448,22 +453,19 @@ Process called "prioritize_critical_path" that takes graph as Integer returns In
     Return heights
 End Process
 
+@Reasoning:
+Single dispatch entry point so callers (list_schedule, optimize_operation_ordering) can pick a priority policy by integer constant rather than picking a function pointer. Falls back to critical-path priority on unknown enum values, which is the safest default because it never extends makespan beyond a topologically valid schedule.
+@End Reasoning
+
+@Implementation:
+If/else chain on the four PRIORITY_* constants dispatching to prioritize_critical_path, prioritize_register_pressure, or prioritize_latency_hiding. RESOURCE_USAGE is not yet a separate prioritizer; it currently falls through to critical-path as the documented fallback.
+@End Implementation
+
+@Security_Scope:
+Pure dispatcher with no mutable state.
+@End Security_Scope
+
 Process called "compute_scheduling_priorities" that takes graph as Integer, priority_type as Integer returns Integer:
-    @Reasoning
-    Computes scheduling priorities based on specified strategy.
-
-    Priority types:
-    - CRITICAL_PATH: Longest path to leaf
-    - REGISTER_PRESSURE: Minimize live values
-    - LATENCY_HIDING: Schedule long-latency ops early
-    - RESOURCE_USAGE: Balance resource utilization
-    @End Reasoning
-
-    @Implementation
-    1. Based on priority_type, compute appropriate priorities
-    2. Return priority map (node → priority value)
-    @End Implementation
-
     If priority_type is equal to PRIORITY_CRITICAL_PATH:
         Return prioritize_critical_path(graph)
     End If
@@ -480,24 +482,23 @@ Process called "compute_scheduling_priorities" that takes graph as Integer, prio
     Return prioritize_critical_path(graph)
 End Process
 
+@Reasoning:
+Register-pressure-aware priority. Negating successor count means a node with many consumers (a value about to "die" once all consumers run) scores higher and is therefore scheduled sooner; this shortens its live range and reduces overlapping live values at any cycle. The accumulating live-set is what register pressure measures.
+@End Reasoning
+
+@Implementation:
+Walk every node via get_all_nodes; for each, set priorities[node] = -length(successors(node)). Returned Dict is consumed verbatim by select_highest_priority which uses Math.greater_than over the integer values.
+@End Implementation
+
+@Performance_Hints:
+O(N + E): one pass over nodes, one query per node for successors. Single allocation of the result Dict.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; returns fresh Dict. No shared state.
+@End Security_Scope
+
 Process called "prioritize_register_pressure" that takes graph as Integer returns Integer:
-    @Reasoning
-    Prioritizes operations to minimize register pressure.
-
-    Strategy:
-    - Schedule operations with many successors first (free up values)
-    - Delay operations that produce long-lived values
-    - Balance live value count
-
-    Priority = -(number of successors)
-    @End Reasoning
-
-    @Implementation
-    1. For each node, count successors
-    2. Priority = -successor_count (more successors = higher priority)
-    3. Return priority map
-    @End Implementation
-
     Let priorities be proc create from Dict
 
     Let all_nodes be proc get_all_nodes from Graph with graph
@@ -521,24 +522,23 @@ Process called "prioritize_register_pressure" that takes graph as Integer return
     Return priorities
 End Process
 
+@Reasoning:
+Latency-hiding priority assigns each op its own latency as priority. The principle: an op that takes K cycles to retire blocks its consumers for K cycles, so issuing it early gives the scheduler K-1 cycles of freed-up issue slots to fill with independent shorter ops. Memory loads (100 cycles default) are the canonical winners under this policy.
+@End Reasoning
+
+@Implementation:
+For each node from get_all_nodes, call get_operation_latency(node, create_default_constraints()). Store the integer latency directly into the priorities Dict. The default constraints provide the canonical latency table so this proc is callable without a caller-supplied constraints object.
+@End Implementation
+
+@Performance_Hints:
+O(N) plus a constant per-node Dict lookup via get_operation_latency. create_default_constraints is invoked once outside the loop to keep this linear.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; allocates a fresh constraints record and a fresh priority Dict. No shared state.
+@End Security_Scope
+
 Process called "prioritize_latency_hiding" that takes graph as Integer returns Integer:
-    @Reasoning
-    Prioritizes long-latency operations to schedule them early.
-
-    Strategy:
-    - Estimate operation latency
-    - Schedule high-latency ops first
-    - Allows other ops to execute during long-latency wait
-
-    Priority = operation_latency
-    @End Reasoning
-
-    @Implementation
-    1. For each node, estimate latency
-    2. Priority = latency (higher latency = higher priority)
-    3. Return priority map
-    @End Implementation
-
     Let priorities be proc create from Dict
 
     Let all_nodes be proc get_all_nodes from Graph with graph
@@ -565,24 +565,23 @@ Note: ================================================================
 Note: Schedule Validation and Application
 Note: ================================================================
 
+@Reasoning:
+Defense-in-depth check that the schedule actually respects data dependencies before apply_schedule_to_graph mutates the IR. The fundamental invariant a list scheduler must preserve: every predecessor must be scheduled at a strictly earlier cycle than its successor. Violation returns false, blocking the application phase in optimize_operation_ordering.
+@End Reasoning
+
+@Implementation:
+Walk schedule entries in order. For each entry, read node and cycle via memory_get_int64 at offsets 0 and 8. For every predecessor returned by get_node_predecessors, look up its assigned cycle in scheduled_cycles; if predecessor cycle >= current cycle, the schedule is invalid and we return false. Otherwise record the current node's cycle and continue.
+@End Implementation
+
+@Performance_Hints:
+O(N + E) over the schedule plus O(P) per node for predecessor checks where P is fan-in. Validation runs only once per optimization invocation so amortized cost is negligible.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only verifier. No mutation of graph or schedule. Trusts memory_get_int64 offsets are correct for the ScheduleEntry layout, which is part of this module's contract.
+@End Security_Scope
+
 Process called "validate_schedule" that takes graph as Integer, schedule as Integer returns Boolean:
-    @Reasoning
-    Validates schedule respects dependencies and resource constraints.
-
-    Validation checks:
-    1. All dependencies satisfied (predecessors before successors)
-    2. No resource oversubscription
-    3. Latencies respected
-    @End Reasoning
-
-    @Implementation
-    1. For each schedule entry:
-       - Check all predecessors scheduled earlier
-       - Verify latency constraints
-    2. Check resource usage per cycle
-    3. Return true if valid
-    @End Implementation
-
     Let entry_count be proc length from List with schedule
 
     Note: Track scheduled nodes and cycles
@@ -619,23 +618,23 @@ Process called "validate_schedule" that takes graph as Integer, schedule as Inte
     Return true
 End Process
 
+@Reasoning:
+Persists the scheduling decision into the Bifrost graph by tagging each node's metadata dictionary with its assigned cycle. The cycle annotation is what downstream stages (instruction selection, register allocator) read to determine emission order; the graph itself is not topologically re-sorted in place because Bifrost's traversal already respects metadata-driven ordering.
+@End Reasoning
+
+@Implementation:
+For each ScheduleEntry, read node (offset 0) and cycle (offset 8), fetch get_node_metadata; if absent allocate a new Dict. Store cycle under key "scheduled_cycle" and write back via set_node_metadata. After all entries, call validate_graph to assert the IR is still well-formed.
+@End Implementation
+
+@Performance_Hints:
+O(N) with one metadata Dict update per scheduled node. Allocates a Dict only for nodes that had no prior metadata.
+@End Performance_Hints
+
+@Security_Scope:
+Mutates per-node metadata; does not change graph edges or node identity, so dependence invariants are preserved. validate_graph is the final guard against any subtle corruption.
+@End Security_Scope
+
 Process called "apply_schedule_to_graph" that takes graph as Integer, schedule as Integer returns Nothing:
-    @Reasoning
-    Applies computed schedule to graph by reordering operations.
-
-    Application:
-    - Update graph traversal order
-    - Add metadata with cycle information
-    - Preserve dependencies
-    @End Reasoning
-
-    @Implementation
-    1. For each schedule entry:
-       - Update node metadata with cycle
-    2. Reorder graph nodes by cycle
-    3. Validate graph remains DAG
-    @End Implementation
-
     Let entry_count be proc length from List with schedule
 
     Let i be 0
@@ -664,26 +663,27 @@ Note: ================================================================
 Note: Optimization Orchestration
 Note: ================================================================
 
+@Reasoning:
+Top-level driver invoked by the Bifrost optimization pipeline. Combines the scheduling primitives - constraints, list_schedule, validate, apply - into a single transaction. Returns makespan (worst cycle in the schedule) so the optimization manager can decide whether reordering paid off.
+@End Reasoning
+
+@Implementation:
+1. constraints = create_default_constraints() yields the canonical issue-width + latency model.
+2. schedule = list_schedule(graph, constraints).
+3. If validate_schedule fails, return 0 (signals no change applied).
+4. Otherwise apply_schedule_to_graph(graph, schedule) writes cycle metadata.
+5. Loop over schedule entries reading offset 8 to compute max cycle; return that as makespan.
+@End Implementation
+
+@Performance_Hints:
+Dominated by list_schedule's O(N*(N+E)). Validation and application are linear post-passes. One full optimization pass per Bifrost graph.
+@End Performance_Hints
+
+@Security_Scope:
+Pipeline driver: invokes its sub-procs with their own scope; only side effect is the cycle metadata writes inside apply_schedule_to_graph. Returns 0 sentinel on validation failure rather than partially applying.
+@End Security_Scope
+
 Process called "optimize_operation_ordering" that takes graph as Integer returns Integer:
-    @Reasoning
-    Top-level operation reordering optimization.
-
-    Algorithm:
-    1. Create resource constraints model
-    2. Perform list scheduling
-    3. Validate schedule
-    4. Apply schedule to graph
-    5. Return schedule length (makespan)
-    @End Reasoning
-
-    @Implementation
-    1. Create default resource constraints
-    2. Perform list scheduling
-    3. Validate schedule
-    4. Apply to graph
-    5. Return makespan
-    @End Implementation
-
     Note: Create resource constraints
     Let constraints be create_default_constraints()
 
@@ -724,6 +724,14 @@ Note: ================================================================
 Note: Helper Functions - Operation Classification
 Note: ================================================================
 
+@Reasoning:
+Classifies an OpKind as a memory operation. Bifrost reserves OpKind 40 for Load and 41 for Store; this proc is the canonical check used by compute_resource_mii and the default latency fallback in get_operation_latency.
+@End Reasoning
+
+@Implementation:
+Two equality checks against the reserved OpKind constants 40 (Load) and 41 (Store); returns true on match, false otherwise.
+@End Implementation
+
 Process called "is_memory_op" that takes op_kind as Integer returns Boolean:
     Note: Load=40, Store=41
     If op_kind is equal to 40:
@@ -735,6 +743,14 @@ Process called "is_memory_op" that takes op_kind as Integer returns Boolean:
 
     Return false
 End Process
+
+@Reasoning:
+Classifies an OpKind as an arithmetic/linear-algebra operation. Bifrost reserves 0..3 for scalar Add/Sub/Mul/Div and reuses 6 for MatrixMultiply and 12 for VectorDot since those occupy arithmetic issue slots.
+@End Reasoning
+
+@Implementation:
+Equality checks against the six recognized arithmetic OpKinds. Order matters only for early-out short-circuiting; correctness is unaffected.
+@End Implementation
 
 Process called "is_arithmetic_op" that takes op_kind as Integer returns Boolean:
     Note: Add=0, Subtract=1, Multiply=2, Divide=3
@@ -762,21 +778,15 @@ Process called "is_arithmetic_op" that takes op_kind as Integer returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+Classifies an OpKind as a control-flow operation. Bifrost reserves the contiguous range 35..39 for control ops: 35=Jump (unconditional), 36=Branch (conditional), 37=Return, 38=Call, 39=reserved-for-future. Used by compute_resource_mii to bound II by control-op issue width.
+@End Reasoning
+
+@Implementation:
+Single bounded range check: returns true iff 35 <= op_kind <= 39, false otherwise. Cheaper than five equality tests and matches Bifrost's explicit OpKind contiguity contract.
+@End Implementation
+
 Process called "is_control_op" that takes op_kind as Integer returns Boolean:
-    @Reasoning
-    True iff op_kind is a control-flow operation. Bifrost reserves
-    OpKind range 35..39 for control operations:
-      35 = Jump            (unconditional jump)
-      36 = Branch          (conditional branch)
-      37 = Return          (function return)
-      38 = Call            (function call)
-      39 = Reserved
-    @End Reasoning
-
-    @Implementation
-    Return true iff op_kind is in [35, 39].
-    @End Implementation
-
     If op_kind is greater than or equal to 35:
         If op_kind is less than or equal to 39:
             Return true
@@ -785,23 +795,26 @@ Process called "is_control_op" that takes op_kind as Integer returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+Returns the cycle latency for the operation at a given node. Consults the per-graph latency table installed in ResourceConstraints first (so callers can override defaults for specific architectures), then falls back to canonical defaults: memory loads/stores 100, multiply 4, divide 8, add/sub 1. These defaults match modern out-of-order x86_64 cost models within an order of magnitude.
+@End Reasoning
+
+@Implementation:
+1. get_node_opkind retrieves the OpKind integer.
+2. Read constraints.instruction_latencies (offset 24) via memory_get_int64. If non-zero, look up op_kind in the Dict; if found and non-zero, return that value.
+3. Otherwise classify with is_memory_op (returns 100), is_arithmetic_op (returns 4 for op_kind 2 Multiply, 8 for op_kind 3 Divide, 1 for Add/Subtract).
+4. Default return 1 for any op not covered above.
+@End Implementation
+
+@Performance_Hints:
+O(1) dictionary lookup per call. Called at hot frequency by list_schedule once per scheduled node and by prioritize_latency_hiding once per graph node.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; trusts ResourceConstraints layout (offset 24 for latencies). No allocations.
+@End Security_Scope
+
 Process called "get_operation_latency" that takes node as Integer, constraints as Integer returns Integer:
-    @Reasoning
-    Estimates operation latency in cycles.
-
-    Latencies (typical):
-    - Arithmetic: 1-4 cycles
-    - Memory load: 100-400 cycles (cache miss)
-    - Memory store: 1 cycle (write-through)
-    - Matrix multiply: 10-100 cycles (size-dependent)
-    @End Reasoning
-
-    @Implementation
-    1. Get operation kind
-    2. Look up latency in constraints
-    3. Return latency
-    @End Implementation
-
     Let op_kind be proc get_node_opkind from Node with node
 
     Note: Get latency map from constraints
@@ -838,6 +851,18 @@ Note: ================================================================
 Note: Helper Functions - Scheduling Utilities
 Note: ================================================================
 
+@Reasoning:
+Linear scan over the ready list returning the node with maximum priority value. Linear scan rather than a heap because Bifrost ready lists are small (bounded by the graph width, typically under 32 nodes) and the constant factor of a heap dominates for that size.
+@End Reasoning
+
+@Implementation:
+Seed best_node with index 0; iterate i = 1..length-1, lookup each priority via Dict.get, and swap best when a strictly greater priority is seen. Ties keep the earlier-indexed (lower-ID) node which preserves a deterministic schedule.
+@End Implementation
+
+@Performance_Hints:
+O(|ready_list|) per invocation. Called once per scheduled node from list_schedule, so total scheduling cost is O(N * average_ready_size).
+@End Performance_Hints
+
 Process called "select_highest_priority" that takes ready_list as Integer, priorities as Integer returns Integer:
     Note: Select node with highest priority from ready list
     Let best_node be proc get from List with ready_list, 0
@@ -859,31 +884,26 @@ Process called "select_highest_priority" that takes ready_list as Integer, prior
     Return best_node
 End Process
 
+@Reasoning:
+Modulo scheduling per Rau 1994: each operation is placed at cycle = list_schedule_cycle modulo II, collapsing the loop body's schedule into exactly II distinct cycle slots. This is the canonical software-pipelining transform used by every HLS/FPGA backend. Post-collapse, downstream consumers see at most II cycle values per iteration, enabling prologue/steady/epilogue code emission.
+@End Reasoning
+
+@Implementation:
+1. get_subgraph extracts loop_nodes into a fresh acyclic-after-recurrence-break view.
+2. list_schedule produces full cycle assignments.
+3. Defensive: if ii <= 0 return the unrewritten schedule (caller failed to compute MII).
+4. Iterate entries; replace each entry's cycle field (offset 8) with cycle modulo ii via memory_set_int64. Earliest_cycle at offset 24 is preserved for downstream callers that need the original cycle.
+@End Implementation
+
+@Performance_Hints:
+Dominated by the embedded list_schedule call; the modulo rewrite is O(|schedule|) linear post-pass.
+@End Performance_Hints
+
+@Security_Scope:
+Mutates entries within the schedule List in place at offset 8. Caller-owned schedule List is consumed and returned; no other state touched.
+@End Security_Scope
+
 Process called "modulo_schedule_operations" that takes graph as Integer, loop_nodes as Integer, ii as Integer, constraints as Integer returns Integer:
-    @Reasoning
-    Implements modulo-scheduling on the loop body: each operation is placed
-    at cycle = list_schedule_cycle modulo II. This collapses the schedule
-    into II stages, which is the canonical software-pipelining formulation
-    by Rau (1994) used in nearly every HLS/FPGA backend.
-
-    We delegate to list_schedule to obtain the initial cycle assignment,
-    then post-process each schedule entry to record its stage = cycle / II
-    and its modulo cycle = cycle modulo II. The result remains a List of
-    schedule entries with the same layout as list_schedule's output, so
-    downstream compute_stage_count and extract_stage_operations can reuse
-    their existing offset 8 (cycle) reading; the modulo collapse is
-    materialized via cycle = (cycle modulo II) so consumers see at most
-    II distinct cycle values.
-    @End Reasoning
-
-    @Implementation
-    1. Extract the loop's subgraph and run list_schedule.
-    2. Iterate schedule entries; for each, replace its cycle field with
-       cycle modulo II (preserving the original cycle as schedule entry
-       offset 24 "earliest_cycle" stays a tracking record for callers).
-    3. Return the modulo-rewritten schedule list.
-    @End Implementation
-
     Let subgraph be proc get_subgraph from Graph with graph, loop_nodes
     Let schedule be list_schedule(subgraph, constraints)
 
@@ -903,6 +923,14 @@ Process called "modulo_schedule_operations" that takes graph as Integer, loop_no
 
     Return schedule
 End Process
+
+@Reasoning:
+Computes the number of pipeline stages needed by the software pipeline given the schedule and II. Stage count equals ceil(max_cycle / II); this is the number of in-flight iterations during the steady-state body, and equivalently the depth of the prologue and epilogue.
+@End Reasoning
+
+@Implementation:
+Walk schedule entries to find max cycle (offset 8). Integer-divide max_cycle by ii; bump by 1 if there is any non-zero remainder. Effectively returns the integer ceiling.
+@End Implementation
 
 Process called "compute_stage_count" that takes schedule as Integer, ii as Integer returns Integer:
     Note: Stage count = max_cycle / II
@@ -931,6 +959,14 @@ Process called "compute_stage_count" that takes schedule as Integer, ii as Integ
     Return stage_count
 End Process
 
+@Reasoning:
+Collects the node IDs that belong to a single pipeline stage. After modulo collapse, a node's stage is determined by its original (pre-modulo) cycle divided by II - which is preserved in the entry's offset 8 by callers who supply unmodulo'd schedules, or computable directly when offset 8 still holds the original. Used by software_pipeline to assemble PipelineStage records.
+@End Reasoning
+
+@Implementation:
+Iterate every schedule entry, divide its cycle (offset 8) by ii to determine its stage, and append the node ID (offset 0) to the result List when it matches stage_number. Returns a fresh List of node IDs.
+@End Implementation
+
 Process called "extract_stage_operations" that takes schedule as Integer, stage_number as Integer, ii as Integer returns Integer:
     Note: Extract operations in specified stage
     Let stage_ops be proc create from List
@@ -955,6 +991,17 @@ Process called "extract_stage_operations" that takes schedule as Integer, stage_
 
     Return stage_ops
 End Process
+
+@Reasoning:
+Factory for the canonical ResourceConstraints used when no architecture-specific override is supplied. Encodes the wide-issue baseline (2 mem ports, 4 ALU ports, 1 control port) that matches modern x86_64 cores. Installs the standard latency table: Load 100, Store 1, Add/Sub 1, Multiply 4, Divide 8, MatrixMultiply 50, VectorDot 10.
+@End Reasoning
+
+@Implementation:
+1. Construct ResourceConstraints with the four issue-width fields.
+2. Create the latency Dict.
+3. Populate via repeated proc set from Dict using OpKind integer literals (40=Load, 41=Store, 0=Add, 1=Sub, 2=Mul, 3=Div, 6=MatrixMultiply, 12=VectorDot) as keys.
+4. Wire the Dict into constraints.instruction_latencies and return.
+@End Implementation
 
 Process called "create_default_constraints" that takes nothing returns Integer:
     Note: Create default resource constraints

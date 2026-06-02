@@ -39,12 +39,28 @@ Note: ================================================================
 Note: Type Definitions
 Note: ================================================================
 
+@Reasoning:
+VerificationResult is the uniform return type for every verifier entry point. It carries the verdict (status: PASS/FAIL/UNKNOWN), the specific safety category that was violated (violation_type), the node where the violation was detected (violation_location), and a human-readable error string. All five top-level verifier procs return this type so verify_graph can chain checks and surface the first failure.
+@End Reasoning
+
+@Implementation:
+Four-slot record at offsets 0/8/16/24. Status and violation_type are read by orchestrator code via memory_get_int64. violation_location is a node pointer (0 when status == PASS). error_message is a String that downstream diagnostics formatters consume.
+@End Implementation
+
 Type called "VerificationResult":
     status as Integer               Note: VERIFY_PASS, VERIFY_FAIL, VERIFY_UNKNOWN
     violation_type as Integer       Note: VIOLATION_* constant
     violation_location as Integer   Note: Pointer to node where violation occurs
     error_message as String         Note: Human-readable error description
 End Type
+
+@Reasoning:
+MemorySafetyProof decomposes the memory safety verdict into its three sub-properties: bounds-checked, null-deref-free, alignment-verified. Carrying these flags separately lets the verifier produce diagnostics that pinpoint which aspect of memory safety failed instead of returning a single opaque boolean.
+@End Reasoning
+
+@Implementation:
+Four-slot record at offsets 0/8/16/24. Each field is Boolean (Integer at runtime). The overall is_safe is the AND of the three sub-flags; the verifier sets the relevant flag to false and is_safe to false on first failure.
+@End Implementation
 
 Type called "MemorySafetyProof":
     is_safe as Boolean              Note: Whether memory safety is proven
@@ -53,12 +69,28 @@ Type called "MemorySafetyProof":
     alignment_verified as Boolean   Note: All accesses properly aligned
 End Type
 
+@Reasoning:
+RaceFreedomProof captures the result of data-race-freedom verification. is_race_free is the verdict; happens_before_graph is the pointer to the transitive-closure graph used to decide concurrency; conflicting_accesses is the list of access pairs that needed synchronization checking; synchronization_verified indicates whether all conflicts were resolved by valid happens-before edges.
+@End Reasoning
+
+@Implementation:
+Four-slot record at offsets 0/8/16/24. happens_before_graph and conflicting_accesses are pointers (Integer offsets to allocated Lists/graph structures). is_race_free and synchronization_verified are Booleans.
+@End Implementation
+
 Type called "RaceFreedomProof":
     is_race_free as Boolean         Note: Whether data-race freedom is proven
     happens_before_graph as Integer Note: Pointer to happens-before relation
     conflicting_accesses as Integer Note: List of potential race pairs
     synchronization_verified as Boolean Note: Proper synchronization present
 End Type
+
+@Reasoning:
+ResourceBounds carries both the hardware limits and the actual measured usage for the three resource axes Bifrost tracks (memory bytes, registers per thread, threads per block) plus a final within_limits verdict. verify_resource_bounds populates this struct and within_limits is true iff every actual_* is within the corresponding *_limit.
+@End Reasoning
+
+@Implementation:
+Seven-slot record at offsets 0/8/16/24/32/40/48. Reading limits at offsets 0/8/16 and actuals at 24/32/40 matches the comparison loop in verify_resource_bounds. within_limits at offset 48 is the AND of the three per-axis comparisons.
+@End Implementation
 
 Type called "ResourceBounds":
     memory_limit as Integer         Note: Maximum memory usage in bytes
@@ -70,6 +102,14 @@ Type called "ResourceBounds":
     within_limits as Boolean        Note: Whether all limits satisfied
 End Type
 
+@Reasoning:
+HappensBeforeRelation records the temporal ordering between two nodes: 0 = concurrent (no ordering), 1 = node1 before node2, 2 = node2 before node1. Used by query_happens_before as the return-value encoding so callers can branch on the three possible relations.
+@End Reasoning
+
+@Implementation:
+Three-slot record at offsets 0/8/16. relation_type uses the integer encoding {0,1,2}; query_happens_before reads it via memory_get_int64 from offset 16.
+@End Implementation
+
 Type called "HappensBeforeRelation":
     node1 as Integer                Note: First node
     node2 as Integer                Note: Second node
@@ -80,32 +120,26 @@ Note: ================================================================
 Note: Memory Safety Verification
 Note: ================================================================
 
+@Reasoning:
+Top-level memory safety verifier. Three properties guarantee memory safety for Bifrost graphs: buffer accesses within bounds (no buffer overflow), pointer non-nullness (no null dereferences), and address alignment (matches element size). Returns the first violation encountered rather than the full list because callers (typically verify_graph) want the earliest actionable diagnostic, not an exhaustive enumeration.
+@End Reasoning
+
+@Implementation:
+1. extract_memory_operations(all_nodes) filters to Load (OpKind 40) and Store (OpKind 41).
+2. For each memory op, run verify_buffer_bounds, verify_non_null_pointer, verify_alignment in that order.
+3. On first failure, populate result.status = VERIFY_FAIL, set the corresponding VIOLATION_* code, record the violating node, write a descriptive error_message, and return immediately.
+4. If all checks pass, set "Memory safety verified" and return PASS.
+@End Implementation
+
+@Performance_Hints:
+O(M * (B + N + A)) where M is memory op count and B/N/A are per-op bounds/null/alignment costs. Bounds and alignment dominate due to recursive range/alignment analysis on the address subgraph.
+@End Performance_Hints
+
+@Security_Scope:
+Top-level safety check. Read-only on graph. The early-exit-on-first-violation policy means subsequent unsafe ops are not reported in a single pass; orchestrators that need exhaustive reporting can call this in a loop after fixing each.
+@End Security_Scope
+
 Process called "verify_memory_safety" that takes graph as Integer returns Integer:
-    @Reasoning
-    Memory safety verification ensures:
-    1. All array accesses are within bounds
-    2. No null pointer dereferences
-    3. No use-after-free
-    4. Proper alignment
-
-    Approach:
-    - Extract all memory operations (Load, Store)
-    - For each operation, verify bounds constraints
-    - Check pointer validity (non-null)
-    - Verify alignment requirements
-    - Build proof if all checks pass
-    @End Reasoning
-
-    @Implementation
-    1. Get all memory operations from graph
-    2. For each operation:
-       - Verify buffer bounds
-       - Check pointer non-null
-       - Verify alignment
-    3. If any check fails, return VERIFY_FAIL with violation
-    4. Otherwise return VERIFY_PASS with proof
-    @End Implementation
-
     Let result be a value of type VerificationResult with
         status as VERIFY_PASS,
         violation_type as VIOLATION_NONE,
@@ -162,30 +196,28 @@ Process called "verify_memory_safety" that takes graph as Integer returns Intege
     Return result
 End Process
 
+@Reasoning:
+Buffer-bounds verifier for a single memory op. Proves 0 <= min_index AND max_index < buffer_size using range analysis on the index expression and buffer-size extraction from the allocation/declaration. Returns false (cannot prove safe) when either bound is violated or the analysis lacks information; this conservative answer preserves soundness at the cost of false positives.
+@End Reasoning
+
+@Implementation:
+1. inputs = get_node_inputs(mem_op); bail false if empty (malformed op).
+2. address_node = first input.
+3. extract_base_index decomposes the address into (base_ptr, index_node).
+4. get_buffer_size(graph, base_ptr) returns the upper bound (in bytes or elements depending on the allocation - currently bytes).
+5. compute_value_range(index_node) returns [min, max].
+6. Return false if min < 0 OR max >= buffer_size; true otherwise.
+@End Implementation
+
+@Performance_Hints:
+Dominated by recursive compute_value_range over the index expression DAG and the buffer-size trace back to allocation. Typically O(depth_of_index_DAG + depth_of_allocation_chain).
+@End Performance_Hints
+
+@Security_Scope:
+Read-only on graph. No mutation. Returns false on inconclusive analysis to preserve soundness.
+@End Security_Scope
+
 Process called "verify_buffer_bounds" that takes graph as Integer, mem_op as Integer returns Boolean:
-    @Reasoning
-    Verifies that array access is within bounds.
-
-    Approach:
-    - Extract buffer size from allocation
-    - Extract access index from address computation
-    - Prove: 0 < or equal to index < buffer_size
-
-    Techniques:
-    - Range analysis on index expression
-    - Constant propagation
-    - Symbolic execution for bounds
-    @End Reasoning
-
-    @Implementation
-    1. Get address computation for memory operation
-    2. Extract base pointer and index
-    3. Get buffer size from allocation
-    4. Perform range analysis on index
-    5. Check if index range is within [0, buffer_size)
-    6. Return true if proven safe
-    @End Implementation
-
     Note: Get address computation (first input)
     Let inputs be proc get_node_inputs from Node with mem_op
     If proc length from List with inputs is equal to 0:
@@ -219,29 +251,26 @@ Process called "verify_buffer_bounds" that takes graph as Integer, mem_op as Int
     Return true
 End Process
 
+@Reasoning:
+Null-dereference verifier for a single memory op. Bifrost has two ABI-guaranteed non-null sources: Input nodes (kernel parameters - non-null by calling convention) and direct Alloc nodes (OpKind 42 - returns a fresh non-null pointer or fails before reaching the load/store). Other pointer origins are conservatively assumed nullable and return false.
+@End Reasoning
+
+@Implementation:
+1. Get address_node from mem_op's first input.
+2. Check is_input via get_node_type comparison with NodeType.Input (1); return true if input.
+3. Walk address_node's predecessors looking for an Alloc op (OpKind 42); return true on match.
+4. No match -> return false (conservative).
+@End Implementation
+
+@Performance_Hints:
+O(predecessors of address_node). Could be improved with caching across multiple mem_ops sharing the same address.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only graph analysis. Conservative false on inconclusive cases preserves soundness.
+@End Security_Scope
+
 Process called "verify_non_null_pointer" that takes graph as Integer, mem_op as Integer returns Boolean:
-    @Reasoning
-    Verifies that pointer is non-null.
-
-    Approach:
-    - Track pointer flow from allocation
-    - Check if pointer can be null
-    - Verify null checks before dereference
-
-    Techniques:
-    - Data flow analysis
-    - Null pointer tracking
-    - Path sensitivity
-    @End Reasoning
-
-    @Implementation
-    1. Get pointer operand
-    2. Trace pointer flow backward
-    3. Check if pointer originates from allocation (non-null)
-    4. Check for null checks on all paths
-    5. Return true if proven non-null
-    @End Implementation
-
     Note: Get address computation
     Let inputs be proc get_node_inputs from Node with mem_op
     If proc length from List with inputs is equal to 0:
@@ -278,30 +307,23 @@ Process called "verify_non_null_pointer" that takes graph as Integer, mem_op as 
     Return false
 End Process
 
+@Reasoning:
+Alignment verifier for a memory op. Proves the address is aligned to a multiple of the element size. Most modern ISAs trap on misaligned vectorized loads/stores, so misalignment is a correctness bug not just a performance issue. Requires element_size to be a power of 2 (otherwise alignment cannot be expressed as a bit mask).
+@End Reasoning
+
+@Implementation:
+1. element_size = byte size of mem_op's output type via get_type_size_bytes.
+2. is_power_of_two(element_size); return false on non-power-of-2.
+3. address_node = first input.
+4. computed_alignment = compute_alignment(graph, address_node) which propagates alignment through arithmetic ops.
+5. Return true if computed_alignment >= element_size, or if element_size is a multiple of computed_alignment (compatible alignment).
+@End Implementation
+
+@Security_Scope:
+Read-only. Returns false on inconclusive cases (e.g. non-power-of-2 element size).
+@End Security_Scope
+
 Process called "verify_alignment" that takes graph as Integer, mem_op as Integer returns Boolean:
-    @Reasoning
-    Verifies memory access alignment.
-
-    Requirements:
-    - Address must be aligned to element size
-    - Element size must be power-of-2
-    - Address % element_size == 0
-
-    Techniques:
-    - Alignment tracking through address arithmetic
-    - GCD analysis for strides
-    - Modular arithmetic
-    @End Reasoning
-
-    @Implementation
-    1. Get element size
-    2. Check element size is power-of-2
-    3. Get address computation
-    4. Track alignment through arithmetic operations
-    5. Verify final address is aligned
-    6. Return true if proven aligned
-    @End Implementation
-
     Note: Get element size
     Let output_type be proc get_node_output_type from Node with mem_op
     Let element_size be proc get_type_size_bytes from Node with output_type
@@ -340,32 +362,28 @@ Note: ================================================================
 Note: Data Race Freedom Verification
 Note: ================================================================
 
+@Reasoning:
+Top-level data-race-freedom verifier. A data race exists when two memory accesses to the same location with at least one write are not ordered by a happens-before relation. The algorithm builds the happens-before graph from synchronization edges, then checks every pair of memory ops for the (conflict, write, no-HB) signature.
+@End Reasoning
+
+@Implementation:
+1. build_happens_before_graph computes the HB closure of the IR.
+2. extract_memory_operations gives the Load/Store node list.
+3. Double loop over pairs (i, j) where j > i to avoid double-checking.
+4. check_memory_conflict(op1, op2) tests aliasing.
+5. has_write_operation(op1, op2) tests that at least one is a Store.
+6. query_happens_before returns 0 (concurrent) on no-HB; concurrent + conflict + write -> race; set VIOLATION_DATA_RACE and return.
+@End Implementation
+
+@Performance_Hints:
+O(M^2) for the pair loop plus O(N + E) for happens-before graph construction. Could be O(M log M) with an alias-class bucketing optimization on check_memory_conflict.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only. Conservative reporting on first race. The happens-before graph is allocated and held for the duration of the check.
+@End Security_Scope
+
 Process called "verify_data_race_freedom" that takes graph as Integer returns Integer:
-    @Reasoning
-    Data race verification ensures no two threads access same memory
-    location concurrently with at least one write and no synchronization.
-
-    Approach:
-    - Build happens-before graph (synchronization ordering)
-    - Find all pairs of memory accesses
-    - For each pair:
-      - Check if they access same location
-      - Check if at least one is write
-      - Check if happens-before relation exists
-    - Race exists if no happens-before and accesses conflict
-    @End Reasoning
-
-    @Implementation
-    1. Build happens-before graph from synchronization edges
-    2. Extract all memory operations
-    3. For each pair of memory operations:
-       - Check for memory conflict (same address)
-       - Check for write operation
-       - Check happens-before relation
-    4. If race found, return VERIFY_FAIL
-    5. Otherwise return VERIFY_PASS
-    @End Implementation
-
     Let result be a value of type VerificationResult with
         status as VERIFY_PASS,
         violation_type as VIOLATION_NONE,
@@ -421,29 +439,26 @@ Process called "verify_data_race_freedom" that takes graph as Integer returns In
     Return result
 End Process
 
+@Reasoning:
+Constructs the happens-before relation as a directed graph. An edge A->B in the HB graph means "A must complete before B starts." HB is induced by program-order within a thread, synchronization operations (barriers, fences, atomics), and transitivity. Bifrost encodes synchronization as Control edges (EdgeKind 1) in the data flow graph, so HB construction extracts those edges and takes their transitive closure.
+@End Reasoning
+
+@Implementation:
+1. create_graph allocates a fresh graph for HB.
+2. Copy every node from the original via add_node (HB graph has the same vertex set).
+3. Iterate every edge; if its kind == 1 (Control / EdgeKind.Control), add the same directed edge to the HB graph.
+4. compute_transitive_closure on the HB graph; the closure is what query_happens_before consults.
+@End Implementation
+
+@Performance_Hints:
+O(N + E) for the initial graph + Floyd-Warshall-style O(N^3) for the transitive closure inside compute_transitive_closure. For Bifrost graphs (typically dozens to low hundreds of nodes) this is acceptable.
+@End Performance_Hints
+
+@Security_Scope:
+Allocates a new graph owned by the caller. Reads original graph topology.
+@End Security_Scope
+
 Process called "build_happens_before_graph" that takes graph as Integer returns Integer:
-    @Reasoning
-    Builds happens-before relation from synchronization edges.
-
-    Happens-before rules:
-    1. Program order within a thread
-    2. Synchronization operations (barriers, atomics)
-    3. Transitivity
-
-    Representation:
-    - Directed graph where edge A→B means A happens-before B
-    - Use control edges from original graph
-    - Add transitive closure
-    @End Reasoning
-
-    @Implementation
-    1. Create new graph for happens-before relation
-    2. Add all nodes from original graph
-    3. For each control edge, add to happens-before graph
-    4. Compute transitive closure
-    5. Return happens-before graph
-    @End Implementation
-
     Note: Create happens-before graph
     Let hb_graph be proc create_graph from Graph
 
@@ -483,22 +498,17 @@ Process called "build_happens_before_graph" that takes graph as Integer returns 
     Return hb_closure
 End Process
 
+@Reasoning:
+Queries the precomputed happens-before graph for the relation between two ops. Returns one of three encodings: 0 (concurrent - no HB edge in either direction, meaning the ops can race), 1 (op1 -> op2 - op1 happens before op2), 2 (op2 -> op1 - op2 happens before op1). The encoding matches the HappensBeforeRelation type's relation_type field.
+@End Reasoning
+
+@Implementation:
+1. has_edge(hb_graph, op1, op2): if true, return 1.
+2. has_edge(hb_graph, op2, op1): if true, return 2.
+3. Otherwise return 0 (concurrent).
+@End Implementation
+
 Process called "query_happens_before" that takes hb_graph as Integer, op1 as Integer, op2 as Integer returns Integer:
-    @Reasoning
-    Queries happens-before relation between two operations.
-
-    Returns:
-    - 0: Concurrent (no happens-before in either direction)
-    - 1: op1 happens-before op2
-    - 2: op2 happens-before op1
-    @End Reasoning
-
-    @Implementation
-    1. Check if edge exists from op1 to op2 in hb_graph
-    2. Check if edge exists from op2 to op1 in hb_graph
-    3. Return appropriate relation type
-    @End Implementation
-
     Note: Check if op1 happens-before op2
     Let has_edge_1_to_2 be proc has_edge from Graph with hb_graph, op1, op2
     If has_edge_1_to_2 is equal to true:
@@ -519,32 +529,26 @@ Note: ================================================================
 Note: Resource Bounds Verification
 Note: ================================================================
 
+@Reasoning:
+Verifies the kernel stays within hardware resource budgets for memory, registers, and threads. The three axes are independent: a kernel can fit in registers and threads but exceed memory, or vice versa. Returns VERIFY_FAIL with VIOLATION_RESOURCE_EXCEEDED and an axis-specific error message on the first violation, allowing the user to know which budget needs trimming.
+@End Reasoning
+
+@Implementation:
+1. Read three limits from the limits struct at offsets 0/8/16 (memory, register, thread).
+2. compute_memory_usage, compute_register_usage, compute_thread_count on the graph.
+3. Sequential gates: memory then registers then threads. First violation populates VIOLATION_RESOURCE_EXCEEDED with the specific message ("Memory limit exceeded", "Register limit exceeded", "Thread limit exceeded") and returns.
+4. All-pass: set "Resource bounds verified" and return PASS.
+@End Implementation
+
+@Performance_Hints:
+Dominated by compute_memory_usage (O(N)), compute_register_usage (O(N) liveness pass), and compute_thread_count (O(N)). Single graph traversal each.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only. Allocates a fresh VerificationResult.
+@End Security_Scope
+
 Process called "verify_resource_bounds" that takes graph as Integer, limits as Integer returns Integer:
-    @Reasoning
-    Verifies that computation stays within hardware resource limits.
-
-    Resources:
-    - Memory: Global, shared, local (registers)
-    - Threads: Max threads per block
-    - Registers: Max registers per thread
-    - Shared memory: Max shared memory per block
-
-    Verification:
-    - Compute actual resource usage
-    - Compare against limits
-    - Fail if any limit exceeded
-    @End Reasoning
-
-    @Implementation
-    1. Extract resource limits from input
-    2. Compute actual memory usage
-    3. Compute register usage
-    4. Compute thread count
-    5. Compare each resource against limit
-    6. Return VERIFY_FAIL if any limit exceeded
-    7. Return VERIFY_PASS if all limits satisfied
-    @End Implementation
-
     Let result be a value of type VerificationResult with
         status as VERIFY_PASS,
         violation_type as VIOLATION_NONE,
@@ -590,23 +594,17 @@ Process called "verify_resource_bounds" that takes graph as Integer, limits as I
     Return result
 End Process
 
+@Reasoning:
+Sums the bytes-resident-in-memory across every node in the graph. Each node contributes its output type's byte size; this is the conservative upper bound assuming no liveness-based memory reuse (every value lives forever). The number feeds verify_resource_bounds's memory-limit comparison.
+@End Reasoning
+
+@Implementation:
+1. Initialize total_memory = 0.
+2. For each node, get_node_output_type and read its byte size via get_type_size_bytes.
+3. Accumulate.
+@End Implementation
+
 Process called "compute_memory_usage" that takes graph as Integer, nodes as Integer returns Integer:
-    @Reasoning
-    Computes total memory usage for graph.
-
-    Includes:
-    - Global memory allocations
-    - Shared memory usage
-    - Local memory (register spills)
-    @End Reasoning
-
-    @Implementation
-    1. For each node, get output type size
-    2. Classify memory space (global, shared, local)
-    3. Sum sizes per memory space
-    4. Return total memory usage
-    @End Implementation
-
     Let total_memory be 0
 
     Let node_count be proc length from List with nodes
@@ -628,23 +626,17 @@ Process called "compute_memory_usage" that takes graph as Integer, nodes as Inte
     Return total_memory
 End Process
 
+@Reasoning:
+Computes peak register pressure as max_simultaneous_live_values plus a 20% overhead margin for compiler temporaries. compute_liveness returns the SSA-liveness peak directly; the overhead accounts for spill temporaries, address calculation temporaries, and inlined intrinsics that the register allocator needs but liveness misses.
+@End Reasoning
+
+@Implementation:
+1. compute_liveness(graph, nodes) returns a list whose first element is max_live.
+2. overhead = max_live / 5 (20% margin).
+3. Return max_live + overhead.
+@End Implementation
+
 Process called "compute_register_usage" that takes graph as Integer, nodes as Integer returns Integer:
-    @Reasoning
-    Computes register usage per thread.
-
-    Estimation:
-    - Each live value requires a register
-    - Perform liveness analysis
-    - Compute max simultaneous live values
-    @End Reasoning
-
-    @Implementation
-    1. Perform liveness analysis on graph
-    2. Compute max simultaneous live values
-    3. Add extra registers for compiler temporaries
-    4. Return total register count
-    @End Implementation
-
     Note: Perform liveness analysis
     Let liveness be compute_liveness(graph, nodes)
     Let max_live be proc get from List with liveness, 0
@@ -656,24 +648,18 @@ Process called "compute_register_usage" that takes graph as Integer, nodes as In
     Return total_registers
 End Process
 
+@Reasoning:
+Estimates the maximum thread count the kernel needs. For data-parallel ops (parallelism kind 1 = DataParallel), the thread count is the cardinality of the output's iteration space (vector size, matrix elements, or tensor shape product). Returns the max across all data-parallel ops because that determines the block dimension the launcher must request.
+@End Reasoning
+
+@Implementation:
+1. Initialize max_threads = 1 (minimum sensible thread count).
+2. For each node, get_node_parallelism; only process nodes with parallelism == 1 (DataParallel).
+3. compute_data_parallel_threads on the node's output type returns the element count.
+4. Update max_threads on any node that exceeds it.
+@End Implementation
+
 Process called "compute_thread_count" that takes graph as Integer returns Integer:
-    @Reasoning
-    Computes number of threads required.
-
-    For data-parallel operations:
-    - Thread count = data size
-    - Limited by block size
-
-    For task-parallel:
-    - Thread count = number of independent tasks
-    @End Reasoning
-
-    @Implementation
-    1. Find data-parallel operations
-    2. Extract parallelism degree
-    3. Return maximum parallelism degree
-    @End Implementation
-
     Note: Find all nodes
     Let all_nodes be proc get_all_nodes from Graph with graph
     Let node_count be proc length from List with all_nodes
@@ -708,28 +694,22 @@ Note: ================================================================
 Note: Termination Verification
 Note: ================================================================
 
+@Reasoning:
+Termination verifier. Pure DAGs trivially terminate (no loops -> finite execution). If the graph has cycles (allowed in Bifrost for software-pipelined loops with explicit back-edges), verify_loop_bounds checks each cycle for an external bound. An unbounded loop returns VERIFY_FAIL.
+@End Reasoning
+
+@Implementation:
+1. is_dag(graph): if true, return PASS with "Termination verified (DAG)".
+2. find_cycle returns one cycle path. If non-zero, run verify_loop_bounds on it.
+3. verify_loop_bounds returning false sets VERIFY_FAIL with "Unbounded loop detected".
+4. Bounded cycle returns PASS with "Termination verified (bounded loops)".
+@End Implementation
+
+@Security_Scope:
+Read-only. Conservative: any inconclusive case returns FAIL.
+@End Security_Scope
+
 Process called "verify_termination" that takes graph as Integer returns Integer:
-    @Reasoning
-    Verifies that computation terminates (no infinite loops).
-
-    Approach:
-    - Check for cycles in graph (should be DAG)
-    - For loops, verify termination conditions
-    - Check for bounded iteration counts
-
-    Techniques:
-    - DAG verification
-    - Loop bound analysis
-    - Ranking functions
-    @End Reasoning
-
-    @Implementation
-    1. Check if graph is DAG (acyclic)
-    2. If DAG, termination is guaranteed
-    3. If cycles exist, analyze loop bounds
-    4. Return VERIFY_PASS if termination proven
-    @End Implementation
-
     Let result be a value of type VerificationResult with
         status as VERIFY_PASS,
         violation_type as VIOLATION_NONE,
@@ -762,25 +742,27 @@ Process called "verify_termination" that takes graph as Integer returns Integer:
     Return result
 End Process
 
+@Reasoning:
+Structural test: every node in a cycle must have at least one predecessor that originates outside the cycle and is either Constant (NodeType 0) or Input (NodeType 1). The principle is that loop iteration counts are determined by external bounds; any cycle whose only predecessors are also in the cycle has no upper bound and may iterate forever.
+@End Reasoning
+
+@Implementation:
+1. Build loop_member Dict from the loop_nodes list.
+2. For each node n in the loop, get its predecessors.
+3. For each predecessor not in loop_member, check NodeType: if 0 (Constant) or 1 (Input), set has_external_bound = true.
+4. If any loop node has no external-bound predecessor, return false.
+5. All loop nodes have external bounds -> return true.
+@End Implementation
+
+@Performance_Hints:
+O(L * P) where L is loop_nodes count and P is average predecessor count. Linear in loop size.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only graph analysis. Conservative false on any inconclusive case preserves soundness.
+@End Security_Scope
+
 Process called "verify_loop_bounds" that takes graph as Integer, loop_nodes as Integer returns Boolean:
-    @Reasoning
-    Verifies loop has bounded iteration count.
-
-    Approach:
-    - Extract loop induction variable
-    - Extract loop bound
-    - Verify bound is constant or bounded by input
-    - Check that induction variable progresses toward bound
-    @End Reasoning
-
-    @Implementation
-    1. Extract loop header and induction variable
-    2. Find loop bound expression
-    3. Check if bound is finite
-    4. Verify progress (induction variable changes each iteration)
-    5. Return true if bounded
-    @End Implementation
-
     Note: A loop is bounded iff every node participating in the cycle has
     Note: at least one Constant operand (the upper bound) and at least one
     Note: induction-variable-style chain that monotonically converges. We
@@ -834,24 +816,22 @@ Note: ================================================================
 Note: Synchronization Validation
 Note: ================================================================
 
+@Reasoning:
+Two-gate synchronization validator. Gate 1 (barrier alignment): every thread in a warp/block must reach each barrier under identical control conditions; a Branch op before a barrier that gates some threads out is a hazard. Gate 2 (deadlock): the happens-before graph must be acyclic; a cycle means thread A waits for thread B which waits for A.
+@End Reasoning
+
+@Implementation:
+1. extract_sync_operations filters to OpKinds 60..69 (barriers, atomics, fences).
+2. verify_barrier_alignment scans for divergent control predecessors before each barrier.
+3. check_deadlock builds the HB graph and tests for cycles.
+4. First failure populates VIOLATION_DEADLOCK or barrier-misalignment message; PASS otherwise.
+@End Implementation
+
+@Security_Scope:
+Read-only. Allocates the HB graph internally inside check_deadlock.
+@End Security_Scope
+
 Process called "validate_synchronization" that takes graph as Integer returns Integer:
-    @Reasoning
-    Validates synchronization primitives are used correctly.
-
-    Checks:
-    - Barriers are properly aligned (all threads reach barrier)
-    - No deadlocks (circular wait on synchronization)
-    - Atomics are used correctly (appropriate memory ordering)
-    @End Reasoning
-
-    @Implementation
-    1. Find all synchronization operations (barriers, atomics)
-    2. Verify barrier alignment (control flow converges)
-    3. Check for deadlocks (circular dependencies)
-    4. Validate atomic memory orderings
-    5. Return VERIFY_PASS if all checks pass
-    @End Implementation
-
     Let result be a value of type VerificationResult with
         status as VERIFY_PASS,
         violation_type as VIOLATION_NONE,
@@ -885,23 +865,22 @@ Process called "validate_synchronization" that takes graph as Integer returns In
     Return result
 End Process
 
+@Reasoning:
+Verifies every barrier is reached by all threads under the same control conditions. The hazard is a conditional Branch (OpKind 36) immediately before a barrier where the false-branch escapes elsewhere; threads taking the escape path skip the barrier, leaving the remaining threads waiting forever (deadlock).
+@End Reasoning
+
+@Implementation:
+1. For each barrier in the list, get its predecessors.
+2. For each predecessor whose OpKind == 36 (Branch), examine the Branch's successors.
+3. If the Branch has more than one successor AND any successor != this barrier, set other_target = true and return false (divergent control before barrier).
+4. All barriers pass alignment check -> return true.
+@End Implementation
+
+@Security_Scope:
+Read-only graph analysis.
+@End Security_Scope
+
 Process called "verify_barrier_alignment" that takes graph as Integer, barriers as Integer returns Boolean:
-    @Reasoning
-    Verifies all threads reach barrier (no divergence before barrier).
-
-    Approach:
-    - For each barrier, check control flow
-    - Verify all paths from entry reach barrier
-    - Check no conditional branches before barrier
-    @End Reasoning
-
-    @Implementation
-    1. For each barrier operation
-    2. Find all paths from entry to barrier
-    3. Check if all threads follow same path
-    4. Return true if aligned
-    @End Implementation
-
     Note: A barrier is "aligned" iff every thread in the warp/block reaches
     Note: it under the same control conditions. Structurally, a barrier
     Note: node B is aligned iff every predecessor path from the kernel
@@ -949,21 +928,17 @@ Process called "verify_barrier_alignment" that takes graph as Integer, barriers 
     Return true
 End Process
 
+@Reasoning:
+Deadlock detector via cycle-finding on the happens-before graph. A circular wait (A waits for B which waits for A) manifests as a cycle in HB. Pure DAG synchronization is provably deadlock-free; any cycle is at minimum a deadlock hazard.
+@End Reasoning
+
+@Implementation:
+1. build_happens_before_graph produces the HB closure.
+2. has_cycle(hb_graph) returns the boolean verdict.
+3. Returns true if a cycle is found (potential deadlock).
+@End Implementation
+
 Process called "check_deadlock" that takes graph as Integer, sync_ops as Integer returns Boolean:
-    @Reasoning
-    Checks for potential deadlocks in synchronization.
-
-    Deadlock occurs when:
-    - Circular wait (A waits for B, B waits for A)
-    - Detected via cycle in synchronization dependency graph
-    @End Reasoning
-
-    @Implementation
-    1. Build synchronization dependency graph
-    2. Check for cycles
-    3. Return true if cycle found (deadlock possible)
-    @End Implementation
-
     Note: Check if synchronization creates cycles
     Note: Use happens-before graph
     Let hb_graph be build_happens_before_graph(graph)
@@ -978,29 +953,28 @@ Note: ================================================================
 Note: Verification Orchestration
 Note: ================================================================
 
+@Reasoning:
+Top-level verification driver. Chains the five orthogonal verifier passes in dependency order: memory safety first (cheapest, most common failure mode), then race freedom (needs HB graph), then resource bounds (needs liveness analysis), then termination (needs cycle detection), then synchronization (needs HB graph again). Returns the first failure verbatim so callers get the most actionable diagnostic.
+@End Reasoning
+
+@Implementation:
+1. verify_memory_safety; read status at offset 0; bail out on != PASS.
+2. verify_data_race_freedom; same pattern.
+3. verify_resource_bounds(graph, resource_limits).
+4. verify_termination.
+5. validate_synchronization.
+6. All pass: allocate a fresh VerificationResult with PASS, "All verification checks passed".
+@End Implementation
+
+@Performance_Hints:
+Worst-case sum of all five sub-passes: roughly O(N^2 + M^2 + E*log(N)) where N is node count, M is memory op count, E is edge count. The pair-loop in race detection is dominant.
+@End Performance_Hints
+
+@Security_Scope:
+Top-level read-only orchestrator. Allocates verification results internally; no graph mutation.
+@End Security_Scope
+
 Process called "verify_graph" that takes graph as Integer, resource_limits as Integer returns Integer:
-    @Reasoning
-    Top-level verification function that runs all verification checks.
-
-    Checks performed:
-    1. Memory safety
-    2. Data race freedom
-    3. Resource bounds
-    4. Termination
-    5. Synchronization correctness
-
-    Returns first failure, or VERIFY_PASS if all checks pass.
-    @End Reasoning
-
-    @Implementation
-    1. Run memory safety verification
-    2. Run data race freedom verification
-    3. Run resource bounds verification
-    4. Run termination verification
-    5. Run synchronization validation
-    6. Return first failure or VERIFY_PASS
-    @End Implementation
-
     Note: Memory safety
     Let safety_result be verify_memory_safety(graph)
     Let safety_status be proc memory_get_int64 from Layout with safety_result, 0
@@ -1049,22 +1023,29 @@ Note: ================================================================
 Note: Helper Functions - Range Analysis
 Note: ================================================================
 
+@Reasoning:
+Computes the static value range [min, max] for a node. Constants have a singleton range; arithmetic ops (Add, Sub, Mul) propagate their operand ranges via interval arithmetic. The range narrows the possible index values for buffer-bounds checking. For nodes whose value cannot be bounded statically, returns the conservative [0, 1000000] interval.
+@End Reasoning
+
+@Implementation:
+1. is_node_constant: if true, read constant payload at offset 8 and return [v, v].
+2. Otherwise read op_kind and inputs.
+3. For binary arithmetic (2 inputs): recursively analyze_value_range on each.
+4. Add (op 0): [l_min+r_min, l_max+r_max].
+5. Subtract (op 1): [l_min-r_max, l_max-r_min].
+6. Multiply (op 2, both non-negative): [l_min*r_min, l_max*r_max].
+7. Fallback: return [0, 1000000] as conservative range.
+@End Implementation
+
+@Performance_Hints:
+Worst case O(N) for the recursive descent over the expression DAG. Memoization would reduce repeated subtree work but is not currently applied.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only graph analysis. Conservative range on unmodeled ops preserves soundness for bounds checking.
+@End Security_Scope
+
 Process called "compute_value_range" that takes graph as Integer, node as Integer returns Integer:
-    @Reasoning
-    Computes possible value range for a node.
-
-    Approach:
-    - For constants: [value, value]
-    - For inputs: [-∞, +∞] or user-provided bounds
-    - For arithmetic: propagate ranges through operations
-    @End Reasoning
-
-    @Implementation
-    1. Check if node is constant
-    2. If arithmetic operation, compute from inputs
-    3. Return [min, max] range
-    @End Implementation
-
     Note: Check if constant. For constants, we know the value precisely.
     Let is_constant be proc is_node_constant from Node with node
 
@@ -1143,19 +1124,18 @@ Note: ================================================================
 Note: Helper Functions - Pointer Analysis
 Note: ================================================================
 
+@Reasoning:
+Decomposes a Bifrost address computation into (base_pointer, index_expression). The canonical IR shape is Add(base, index) where the IR builder lowers every array access to this form. The proc handles three cases: Add (canonical), Multiply (index*stride with no explicit base - returns base=0), and non-arithmetic (address IS the base; index is none).
+@End Reasoning
+
+@Implementation:
+1. Read op_kind and inputs.
+2. Add (op 0): first input is base, second is index; return [base_src, index_src].
+3. Multiply (op 2): return [0, address_node] (base=0, full address treated as index).
+4. Other: return [address_node, 0] (the node itself is the base, no index).
+@End Implementation
+
 Process called "extract_base_index" that takes graph as Integer, address_node as Integer returns Integer:
-    @Reasoning
-    Extracts base pointer and index from address computation.
-
-    Pattern: address = base + index * element_size
-    @End Reasoning
-
-    @Implementation
-    1. Parse address arithmetic
-    2. Extract base and index components
-    3. Return [base_ptr, index_node]
-    @End Implementation
-
     Note: Bifrost addresses are Add(base, index) by construction (the IR
     Note: builder always lowers array accesses to this canonical form).
     Note: Recover both halves by structural inspection.
@@ -1192,17 +1172,27 @@ Process called "extract_base_index" that takes graph as Integer, address_node as
     Return result
 End Process
 
+@Reasoning:
+Recovers the buffer size for a base pointer by tracing it to its origin. Three trustworthy origins: Input nodes (parameter type byte size known at kernel signature), Constant nodes (value treated as base size), and Allocate ops (OpKind 42 - read the size operand). Falls back to a conservative 1 MB upper bound when the origin is opaque; this preserves soundness because verify_buffer_bounds will conservatively under-approximate proven safety.
+@End Reasoning
+
+@Implementation:
+1. base_ptr == 0: return 1MB fallback.
+2. NodeType.Input (1): get_node_output_type then get_type_size_bytes.
+3. NodeType.Constant (0): read payload at offset 8.
+4. OpKind 42 (Allocate): walk the alloc node's first input; if it's a Constant, return its value. Otherwise fall back to the alloc's declared output type size.
+5. Conservative 1MB fallback otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(1) for the typical case (single hop to allocation/input/constant). Only the allocate-with-dynamic-size case follows additional hops.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only. Conservative fallback preserves soundness.
+@End Security_Scope
+
 Process called "get_buffer_size" that takes graph as Integer, base_ptr as Integer returns Integer:
-    @Reasoning
-    Gets buffer size from allocation or input annotation.
-    @End Reasoning
-
-    @Implementation
-    1. Trace base_ptr to allocation
-    2. Extract size from allocation
-    3. Return buffer size
-    @End Implementation
-
     Note: Trace the base pointer back to its allocator/Input. If we find:
     Note:   - An Allocate operation: read its size operand (first input).
     Note:   - An Input node: read its declared type size in bytes.
@@ -1258,20 +1248,28 @@ Process called "get_buffer_size" that takes graph as Integer, base_ptr as Intege
     Return 1000000
 End Process
 
+@Reasoning:
+Recursively computes the alignment guarantee at an address-computation node. Bifrost's calling convention guarantees 16-byte alignment for kernel parameter pointers; constant values yield gcd(value, 16); Add takes min(alignment(a), alignment(b)) because either operand's misalignment forces the result misaligned; Multiply takes product when both >= 1 because every factor of 2 in either side contributes a factor of 2 in alignment.
+@End Reasoning
+
+@Implementation:
+1. Null pointer: ABI default 16.
+2. NodeType.Input: 16 (ABI alignment).
+3. NodeType.Constant: gcd-with-16 via cascade of (mod 16), (mod 8), (mod 4), (mod 2); zero treated as 16.
+4. Binary op (Add at op 0): min(l_align, r_align).
+5. Binary op (Multiply at op 2): l_align * r_align, capped at 16.
+6. Fallback: 16 (ABI default).
+@End Implementation
+
+@Performance_Hints:
+Recursive descent over the address-computation DAG. O(depth_of_address_expression).
+@End Performance_Hints
+
+@Security_Scope:
+Read-only. Cap at 16 prevents unbounded alignment promotion through multiplicative chains.
+@End Security_Scope
+
 Process called "compute_alignment" that takes graph as Integer, address_node as Integer returns Integer:
-    @Reasoning
-    Computes alignment guarantee for address.
-
-    Alignment tracking:
-    - Allocation alignment (typically 16 bytes)
-    - Preserved through arithmetic (add preserves, multiply by power-of-2 preserves)
-    @End Reasoning
-
-    @Implementation
-    1. Track alignment through address computation
-    2. Return guaranteed alignment in bytes
-    @End Implementation
-
     Note: Recursively compute the alignment guarantee through arithmetic:
     Note:   * Constant pointer: alignment is gcd(value, 16) if value > 0,
     Note:     else 16 (treating 0 as fully-aligned per ABI).
@@ -1348,22 +1346,27 @@ Note: ================================================================
 Note: Helper Functions - Liveness Analysis
 Note: ================================================================
 
+@Reasoning:
+Computes peak liveness over a topologically ordered node list. A value is born at its definition node and dies after its last consumer is visited. Tracking peak_live during a single forward pass gives the max simultaneous live values, which is exactly the register pressure bound. The remaining_uses Dict counts how many uses each value still has pending; when it hits zero the value is dead.
+@End Reasoning
+
+@Implementation:
+1. Bail with [0] on empty node list.
+2. Seed remaining_uses Dict: for each node n, remaining_uses[n] = |successors(n)|.
+3. Forward sweep: for each node in order, increment current_live (the node's value is now alive), update max_live.
+4. For each input edge, get source, decrement remaining_uses[source]; when it reaches 0, decrement current_live (source value died).
+5. Return [max_live].
+@End Implementation
+
+@Performance_Hints:
+O(N + E): single forward pass, constant work per node and edge. Dict operations are O(1) amortized.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only graph analysis. Allocates remaining_uses Dict and result List.
+@End Security_Scope
+
 Process called "compute_liveness" that takes graph as Integer, nodes as Integer returns Integer:
-    @Reasoning
-    Computes liveness intervals for values.
-
-    Liveness:
-    - Value is live from definition to last use
-    - Used to compute register pressure
-    @End Reasoning
-
-    @Implementation
-    1. For each node, find last use
-    2. Compute liveness interval
-    3. Find max simultaneous live values
-    4. Return [max_live, liveness_map]
-    @End Implementation
-
     Note: Standard SSA liveness sweep: walk nodes in given (topological)
     Note: order and track active value count. Each node's value becomes
     Note: live at definition and dies after its last consumer. The peak
@@ -1427,6 +1430,14 @@ Note: ================================================================
 Note: Helper Functions - Memory Operations
 Note: ================================================================
 
+@Reasoning:
+Filters a node list down to memory operations (Load=40, Store=41). Used by verify_memory_safety and verify_data_race_freedom as the precondition for any per-mem-op analysis.
+@End Reasoning
+
+@Implementation:
+Iterate the node list, get_node_opkind on each, append to result if op_kind is 40 or 41.
+@End Implementation
+
 Process called "extract_memory_operations" that takes nodes as Integer returns Integer:
     Let memory_ops be proc create from List
 
@@ -1451,22 +1462,17 @@ Process called "extract_memory_operations" that takes nodes as Integer returns I
     Return memory_ops
 End Process
 
+@Reasoning:
+Determines whether two memory operations can conflict. Identical to the parallelism-analysis predicate of the same name: Load/Load never conflicts (read-read is always safe); otherwise we look at the address-producer (first input) of each op. Same producer => potential conflict; distinct producers => statically non-aliasing.
+@End Reasoning
+
+@Implementation:
+1. Two Loads (OpKind 40 both): return 0 (no conflict).
+2. Read first input from each op; bail with conflict (1) if either has no input.
+3. get_edge_source on each address edge; compare. Identical sources -> 1 (potential conflict). Different -> 0 (statically non-aliasing).
+@End Implementation
+
 Process called "check_memory_conflict" that takes op1 as Integer, op2 as Integer returns Integer:
-    @Reasoning
-    Determines whether two memory operations can conflict. Identical to the
-    parallelism-analysis predicate of the same name: Load/Load never
-    conflicts; otherwise we look at the address-producer (first input)
-    of each op. Same producer => potential conflict; distinct producers
-    => statically non-aliasing.
-
-    Returns 0 (no conflict) or 1 (potential conflict).
-    @End Reasoning
-
-    @Implementation
-    1. Two Loads (OpKind 40 both) => 0.
-    2. Compare first input source nodes; identical => 1, else 0.
-    @End Implementation
-
     Let op1_kind be proc get_node_opkind from Node with op1
     Let op2_kind be proc get_node_opkind from Node with op2
 
@@ -1498,6 +1504,14 @@ Process called "check_memory_conflict" that takes op1 as Integer, op2 as Integer
     Return 0
 End Process
 
+@Reasoning:
+Tests whether at least one of two memory ops is a Store. Used by verify_data_race_freedom: read-read conflicts are never races; a race requires at least one writer. Stores are OpKind 41.
+@End Reasoning
+
+@Implementation:
+Read op_kind for each op; return true on first match against 41 (Store), false otherwise.
+@End Implementation
+
 Process called "has_write_operation" that takes op1 as Integer, op2 as Integer returns Boolean:
     Let op1_kind be proc get_node_opkind from Node with op1
     Let op2_kind be proc get_node_opkind from Node with op2
@@ -1513,27 +1527,15 @@ Process called "has_write_operation" that takes op1 as Integer, op2 as Integer r
     Return false
 End Process
 
+@Reasoning:
+Collects synchronization-class operations from the node list. The Bifrost OpKind range 60..69 is reserved for synchronization primitives: 60=Barrier (work-group barrier), 61=AtomicAdd, 62=AtomicSub, 63=AtomicMin, 64=AtomicMax, 65=AtomicCAS (compare-and-swap), 66=MemoryFence (full fence), 67=AcquireFence, 68=ReleaseFence, 69=reserved.
+@End Reasoning
+
+@Implementation:
+Iterate the node list; for each, read op_kind and append to result when 60 <= op_kind <= 69.
+@End Implementation
+
 Process called "extract_sync_operations" that takes nodes as Integer returns Integer:
-    @Reasoning
-    Collects synchronization-class operations from the node list. The
-    Bifrost OpKind range 60..69 is reserved for synchronization primitives:
-      60 = Barrier         (work-group barrier)
-      61 = AtomicAdd       (atomic read-modify-write)
-      62 = AtomicSub
-      63 = AtomicMin
-      64 = AtomicMax
-      65 = AtomicCAS       (compare-and-swap)
-      66 = MemoryFence     (memory fence with ordering)
-      67 = AcquireFence
-      68 = ReleaseFence
-      69 = Reserved
-    @End Reasoning
-
-    @Implementation
-    1. Iterate the node list.
-    2. Collect nodes whose OpKind is in [60, 69].
-    @End Implementation
-
     Let sync_ops be proc create from List
     Let node_count be proc length from List with nodes
 
@@ -1551,6 +1553,19 @@ Process called "extract_sync_operations" that takes nodes as Integer returns Int
 
     Return sync_ops
 End Process
+
+@Reasoning:
+Returns the number of threads required to execute a data-parallel op of the given output type. Vector size, Matrix area (rows*cols), and Tensor shape product determine the iteration count. Used by compute_thread_count to find the maximum block size needed across the kernel.
+@End Reasoning
+
+@Implementation:
+1. Null type: return 1.
+2. Read discriminant at offset 0.
+3. Vector (2): size at offset 16.
+4. Matrix (3): rows * cols at offsets 16 and 24.
+5. Tensor (5): walk shape list at offset 16 and multiply all dimensions.
+6. Other: return 1 (no parallelism).
+@End Implementation
 
 Process called "compute_data_parallel_threads" that takes output_type as Integer returns Integer:
     If output_type is equal to 0:
@@ -1592,6 +1607,14 @@ Process called "compute_data_parallel_threads" that takes output_type as Integer
 
     Return 1
 End Process
+
+@Reasoning:
+Tests whether n is a power of 2 in the range that Bifrost type byte-sizes can occupy (1, 2, 4, 8, 16, 32, 64, 128, 256). Used by verify_alignment to gate the alignment check; non-power-of-2 sizes cannot have their alignment expressed as a bit mask.
+@End Reasoning
+
+@Implementation:
+Cascade of equality checks against the nine powers of 2 from 1 to 256. Returns false for non-positive values and any value outside the cascade.
+@End Implementation
 
 Process called "is_power_of_two" that takes n as Integer returns Boolean:
     If n is less than or equal to 0:

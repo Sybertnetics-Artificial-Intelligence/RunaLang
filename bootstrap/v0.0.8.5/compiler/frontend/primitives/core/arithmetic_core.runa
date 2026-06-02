@@ -2021,3 +2021,85 @@ Note: - Float80: High-precision intermediate calculations
 Note: - Float16: Neural networks, memory-critical ML applications
 Note: - Float128: Specialized high-precision scientific applications (rare)
 Note: ============================================================================
+
+Note: ============================================================================
+Note: Value-based Float64 primitives (Math.* call surface)
+Note: ============================================================================
+
+Note:
+The three procs below (sqrt, int_to_float, float_to_int) are the value-based
+Float64 primitives exposed as the Math.* call surface to compiler subsystems
+that operate on Float values directly (rather than memory pointers). The
+pointer-based variants (float_sqrt, etc.) above are kept for code that
+manipulates float buffers in-place.
+
+ABI: parameters and return values are 64-bit. Float values are carried in
+general-purpose registers/stack slots as their IEEE 754 binary64
+bit-pattern, which matches the Integer ABI exactly at the calling-convention
+level. This lets Float-typed values pass through %rdi, %rsi, %rdx, %rcx, %r8,
+%r9 (System V AMD64) and return through %rax, identical to Integer.
+
+Implementation uses x86_64 SSE2 instructions directly via inline assembly,
+giving single-instruction, fully IEEE 754 compliant results:
+  sqrt           -> sqrtsd        (hardware square root, correctly rounded)
+  int_to_float   -> cvtsi2sdq     (signed 64-bit int -> double, correctly rounded)
+  float_to_int   -> cvttsd2siq    (double -> signed 64-bit int, round toward zero)
+
+This is the same inline-asm pattern established in runtime_api.runa's
+integer_to_float / float_to_integer helpers; the procs here are the
+Math-aliased entry points used by Bifrost analysis and optimization passes
+(memory_access.runa, parallelism.runa, kernel_fusion.runa, layout_opt.runa).
+
+NaN / infinity behavior follows IEEE 754:
+  sqrt(NaN) = NaN
+  sqrt(+Inf) = +Inf
+  sqrt(negative) = NaN (cvttsd2siq returns INT64_MIN as the indefinite integer)
+  cvttsd2siq on overflow returns INT64_MIN (the x86 indefinite integer value)
+:End Note
+
+Process called "sqrt" takes x as Float returns Float:
+    Note: Compute IEEE 754 binary64 square root of x.
+    Note: Uses x86_64 SSE2 sqrtsd: single hardware instruction, correctly
+    Note: rounded to nearest-even, fully IEEE 754 compliant.
+    Note: x param at [rbp-8], result local at [rbp-16]. Intel syntax inside
+    Note: the Inline Assembly block (stage1 wraps with .intel_syntax noprefix).
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        sqrtsd xmm0, xmm0
+        movq qword ptr [rbp-16], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "int_to_float" takes n as Integer returns Float:
+    Note: Convert signed 64-bit integer to IEEE 754 binary64.
+    Note: Uses x86_64 SSE2 cvtsi2sd: single hardware instruction, correctly
+    Note: rounded per the current SSE rounding mode (default: round-to-nearest-even).
+    Note: Integers with magnitude > 2^53 may lose precision (standard binary64 behavior).
+    Note: n param at [rbp-8], result_bits local at [rbp-16]. Intel syntax.
+    Let result_bits be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        cvtsi2sd xmm0, rax
+        movq qword ptr [rbp-16], xmm0
+    End Assembly
+    Return result_bits
+End Process
+
+Process called "float_to_int" takes x as Float returns Integer:
+    Note: Convert IEEE 754 binary64 to signed 64-bit integer with truncation.
+    Note: Uses x86_64 SSE2 cvttsd2si: single hardware instruction, rounds
+    Note: toward zero (truncation, matching C/C++ (int) cast semantics).
+    Note: On overflow, NaN, or infinity, returns 0x8000000000000000 (INT64_MIN,
+    Note: the x86 "indefinite integer" sentinel) - callers requiring saturation
+    Note: must check the input range beforehand.
+    Note: x param at [rbp-8], result local at [rbp-16]. Intel syntax.
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        cvttsd2si rax, xmm0
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process

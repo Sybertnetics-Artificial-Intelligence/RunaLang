@@ -35,15 +35,52 @@ Constant DEP_WAW as Integer is 3    Note: Write-After-Write (output dependency)
 Constant DEP_RAR as Integer is 4    Note: Read-After-Read (no hazard)
 
 Note: ================================================================
+Note: Fixed-Point Scale (PPM = Parts Per Million)
+Note: ================================================================
+Note: Stage1 of the bootstrap chain emits idivq for the canonical Float
+Note: operators on IEEE 754 bit patterns, producing garbage at runtime.
+Note: All fractional ratios (speedups, serial fractions, overhead factors,
+Note: load balance) are therefore represented as fixed-point integers in
+Note: PPM, where 1_000_000 represents the floating-point value 1.0.
+Note:
+Note: Convention for "speedup" values:
+Note:   PPM_ONE        == 1_000_000   (== 1.0  speedup, i.e. no benefit)
+Note:   2 * PPM_ONE    == 2_000_000   (== 2.0  speedup, i.e. 2x faster)
+Note:
+Note: Convention for "fraction" values (e.g. serial_fraction):
+Note:   PPM_HALF       == 500_000     (== 0.5)
+Note:   PPM_TENTH      == 100_000     (== 0.1)
+Note: ================================================================
+
+Constant PPM_ONE as Integer is 1000000
+Constant PPM_ZERO as Integer is 0
+
+Note: ================================================================
 Note: Type Definitions
 Note: ================================================================
 
+@Reasoning:
+ParallelismInfo summarizes the parallelism verdict for a node or region: which model (data/task/pipeline/SIMD) best fits, what the maximum parallelism factor is, whether the parallel execution is provably safe, and the estimated speedup. Consumed by detect_* procs to attach a verdict to each candidate.
+@End Reasoning
+
+@Implementation:
+Four-slot record at offsets 0/8/16/24. model uses the PARALLELISM_* constants, degree is the iteration count or task count, is_safe gates execution, estimated_speedup_ppm holds the PPM-scaled speedup estimate (1_000_000 == 1.0x) so all downstream callers can compose Amdahl factors in integer arithmetic without depending on broken Float codegen.
+@End Implementation
+
 Type called "ParallelismInfo":
-    model as Integer                 Note: Parallelism model (PARALLELISM_* constant)
-    degree as Integer                Note: Maximum parallelism factor
-    is_safe as Boolean              Note: Whether parallel execution is safe
-    estimated_speedup as Float      Note: Estimated speedup factor
+    model as Integer                       Note: Parallelism model (PARALLELISM_* constant)
+    degree as Integer                      Note: Maximum parallelism factor
+    is_safe as Boolean                    Note: Whether parallel execution is safe
+    estimated_speedup_ppm as Integer       Note: Estimated speedup in PPM (1_000_000 == 1.0x)
 End Type
+
+@Reasoning:
+DependencyInfo describes one data dependency between two nodes: source and destination, dependency category (RAW, WAR, WAW, RAR per DEP_* constants), and iteration distance. analyze_loop_dependencies emits a list of these; check_loop_carried_dependencies consumes them to decide loop parallelizability.
+@End Reasoning
+
+@Implementation:
+Four-slot record at offsets 0/8/16/24. dependency_type uses DEP_* constants; distance is 0 for intra-iteration deps and >0 for loop-carried deps. check_loop_carried_dependencies reads offsets 16 and 24 via memory_get_int64.
+@End Implementation
 
 Type called "DependencyInfo":
     source_node as Integer          Note: Pointer to source node
@@ -52,41 +89,46 @@ Type called "DependencyInfo":
     distance as Integer             Note: Loop iteration distance (0 for intra-iteration)
 End Type
 
+@Reasoning:
+ParallelRegion is a self-contained region of the graph identified as parallelizable: a List of constituent nodes, the parallelism model that should be used (data/task/pipeline/SIMD), and the estimated speedup factor. The output of extract_parallel_regions is a List of these, ranked by benefit.
+@End Reasoning
+
+@Implementation:
+Three-slot record at offsets 0/8/16. nodes is a List pointer at offset 0; parallelism_model is the integer PARALLELISM_* constant at offset 8; estimated_benefit_ppm is the PPM-scaled benefit (1_000_000 == 1.0x) at offset 16, read via memory_get_int64 by resolve_and_rank_regions for descending sort.
+@End Implementation
+
 Type called "ParallelRegion":
-    nodes as Integer                Note: Pointer to List of node pointers
-    parallelism_model as Integer    Note: Best parallelism model for this region
-    estimated_benefit as Float      Note: Estimated performance benefit
+    nodes as Integer                       Note: Pointer to List of node pointers
+    parallelism_model as Integer           Note: Best parallelism model for this region
+    estimated_benefit_ppm as Integer       Note: Estimated benefit in PPM (1_000_000 == 1.0x)
 End Type
 
 Note: ================================================================
 Note: Data Parallelism Detection
 Note: ================================================================
 
+@Reasoning:
+Identifies data-parallel candidates by sweeping the graph in topological order. A node qualifies when (a) it operates on array data (Vector/Matrix/Tensor types) and (b) its dependencies are not loop-carried (analyze_node_dependencies + check_loop_carried_dependencies). For qualifying nodes, the parallelism degree is the cardinality of the output type (vector size, matrix area, tensor shape product).
+@End Reasoning
+
+@Implementation:
+1. topological_sort yields the dependency-respecting node order.
+2. For each node: get_node_output_type and is_array_type; skip non-array ops.
+3. analyze_node_dependencies(graph, node) returns the DependencyInfo list.
+4. check_loop_carried_dependencies returns true if any RAW dependency has distance > 0; skip in that case.
+5. compute_data_parallelism_degree(node, output_type) yields the iteration count.
+6. Allocate a ParallelismInfo with PARALLELISM_DATA_PARALLEL and speedup from compute_parallelism_speedup; pair (node, info) as a List entry, append to parallel_nodes.
+@End Implementation
+
+@Performance_Hints:
+O(N * (D + C)) where D is per-node dependency analysis and C is loop-carried check. Topological sort is O(N + E) upfront.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis on graph; allocates parallel_nodes list. No mutation.
+@End Security_Scope
+
 Process called "detect_data_parallelism" that takes graph as Integer returns Integer:
-    @Reasoning
-    Data parallelism occurs when the same operation is applied independently
-    to different data elements. In Bifrost graphs, this manifests as:
-    1. Multiple nodes with identical operations
-    2. No data dependencies between iterations
-    3. Independent memory accesses
-
-    Algorithm:
-    - Topologically sort the graph to process in dependency order
-    - For each node, check if it operates on array/tensor data
-    - Analyze dependencies to ensure iterations are independent
-    - Check for reduction patterns (special case of data parallelism)
-    - Compute maximum parallelism degree based on data size
-    @End Reasoning
-
-    @Implementation
-    1. Get all nodes and topological ordering
-    2. Identify nodes operating on vectors/matrices/tensors
-    3. For each candidate node, analyze input/output dependencies
-    4. Check that no loop-carried dependencies exist
-    5. Compute parallelism degree from data dimensions
-    6. Return list of data-parallel nodes with parallelism info
-    @End Implementation
-
     Let parallel_nodes be proc create from List
 
     Note: Get topological ordering
@@ -119,7 +161,7 @@ Process called "detect_data_parallelism" that takes graph as Integer returns Int
                     model as PARALLELISM_DATA_PARALLEL,
                     degree as degree,
                     is_safe as true,
-                    estimated_speedup as compute_parallelism_speedup(degree)
+                    estimated_speedup_ppm as compute_parallelism_speedup(degree)
 
                 Note: Add to parallel nodes list (store node + info as tuple)
                 Let entry be proc create from List
@@ -135,30 +177,26 @@ Process called "detect_data_parallelism" that takes graph as Integer returns Int
     Return parallel_nodes
 End Process
 
+@Reasoning:
+Identifies task-parallel ParallelRegions by bucketing nodes by depth and finding maximal independent sets within each bucket. Two nodes at the same depth with no data flow between them can execute concurrently (task parallelism). Only buckets with multiple nodes are worth considering since single-node levels are inherently sequential.
+@End Reasoning
+
+@Implementation:
+1. compute_depths(graph) returns Dict node->depth.
+2. Bucket nodes into levels Dict by their depth.
+3. For each level with size > 1, call find_independent_node_sets to extract maximal independent subsets.
+4. For each subset with size > 1, allocate a ParallelRegion with PARALLELISM_TASK_GRAPH and benefit from estimate_task_parallelism_benefit; append to parallel_regions.
+@End Implementation
+
+@Performance_Hints:
+O(N * D + L * S^2) where N is nodes, D is depth computation, L is level count, S is average level size. The S^2 factor comes from pairwise independence checks inside find_independent_node_sets.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis; allocates levels Dict and parallel_regions List. No graph mutation.
+@End Security_Scope
+
 Process called "detect_task_parallelism" that takes graph as Integer returns Integer:
-    @Reasoning
-    Task parallelism occurs when independent tasks can execute concurrently.
-    In Bifrost graphs:
-    1. Nodes with no data dependencies can run in parallel
-    2. Different branches of the DAG can execute simultaneously
-    3. Tasks may perform different operations on different data
-
-    Algorithm:
-    - Identify nodes at the same depth level (can potentially run in parallel)
-    - Check for data dependencies between nodes
-    - Group independent nodes into parallel task sets
-    - Estimate task granularity and scheduling overhead
-    @End Reasoning
-
-    @Implementation
-    1. Compute depth for each node in the graph
-    2. Group nodes by depth level
-    3. Within each level, find independent node sets
-    4. Check that no dependencies exist within each set
-    5. Estimate parallelism benefit considering overhead
-    6. Return list of task-parallel regions
-    @End Implementation
-
     Let parallel_regions be proc create from List
 
     Note: Compute depths for all nodes
@@ -214,7 +252,7 @@ Process called "detect_task_parallelism" that takes graph as Integer returns Int
                     Let region be a value of type ParallelRegion with
                         nodes as node_set,
                         parallelism_model as PARALLELISM_TASK_GRAPH,
-                        estimated_benefit as estimate_task_parallelism_benefit(node_set)
+                        estimated_benefit_ppm as estimate_task_parallelism_benefit(node_set)
 
                     proc append from List with parallel_regions, region
                 End If
@@ -229,30 +267,26 @@ Process called "detect_task_parallelism" that takes graph as Integer returns Int
     Return parallel_regions
 End Process
 
+@Reasoning:
+Identifies pipeline-parallel ParallelRegions by finding linear chains in the graph (sequences where each node has exactly one successor) that operate on streaming array data and are stage-balanced. The classic ML pipeline shape (e.g. convolution -> pool -> activation -> normalize) is exactly this pattern.
+@End Reasoning
+
+@Implementation:
+1. find_roots(graph) yields entry-point nodes.
+2. For each root, find_all_paths_from_node returns all root-to-leaf paths.
+3. For each path of length >= 2, run is_linear_chain (each node has exactly one successor), check_streaming_pattern (every node operates on array data), check_pipeline_balance.
+4. If all three pass, allocate a ParallelRegion with PARALLELISM_PIPELINE and benefit from estimate_pipeline_benefit.
+@End Implementation
+
+@Performance_Hints:
+O(R * P * L) where R is root count, P is paths-per-root (exponential in pathological branchy graphs), L is path length. find_all_paths_from_node uses DFS so the practical bound is the number of root-to-leaf paths.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis; allocates pipeline_regions list. No graph mutation.
+@End Security_Scope
+
 Process called "detect_pipeline_parallelism" that takes graph as Integer returns Integer:
-    @Reasoning
-    Pipeline parallelism occurs when data flows through multiple stages,
-    with each stage processing different data. Common in:
-    1. Streaming applications (signal processing, video)
-    2. Multi-stage computations (convolution → pooling → activation)
-    3. Producer-consumer patterns
-
-    Algorithm:
-    - Identify linear chains in the graph (sequences of dependent operations)
-    - Check for streaming data patterns (continuous data flow)
-    - Verify stages have balanced computation time
-    - Ensure sufficient buffer space between stages
-    @End Reasoning
-
-    @Implementation
-    1. Find all paths from roots to leaves
-    2. Identify linear chains (single producer → single consumer)
-    3. Check for streaming patterns (large data batches)
-    4. Analyze stage balance (avoid pipeline bubbles)
-    5. Estimate pipeline throughput and latency
-    6. Return list of pipeline regions
-    @End Implementation
-
     Let pipeline_regions be proc create from List
 
     Note: Find all roots (entry points)
@@ -293,7 +327,7 @@ Process called "detect_pipeline_parallelism" that takes graph as Integer returns
                             Let region be a value of type ParallelRegion with
                                 nodes as path,
                                 parallelism_model as PARALLELISM_PIPELINE,
-                                estimated_benefit as estimate_pipeline_benefit(path)
+                                estimated_benefit_ppm as estimate_pipeline_benefit(path)
 
                             proc append from List with pipeline_regions, region
                         End If
@@ -314,27 +348,28 @@ Note: ================================================================
 Note: Loop Dependency Analysis
 Note: ================================================================
 
+@Reasoning:
+Loop dependency analyzer. Examines every pair of memory ops in the loop body, identifies pairs that may alias, and classifies the relationship as RAW (read-after-write - true dependency that prevents parallelization), WAR (anti-dependency - eliminable via renaming), WAW (output dependency - eliminable via privatization), or RAR (no hazard).
+@End Reasoning
+
+@Implementation:
+1. extract_memory_operations filters loop_nodes to Load (40) and Store (41) ops.
+2. Pair-loop: for each (op1, op2) with j > i:
+   - check_memory_conflict tests whether they may alias.
+   - On conflict: determine_dependency_type classifies as DEP_RAW/WAR/WAW/RAR.
+   - compute_iteration_distance reports loop-carried distance.
+3. Append a DependencyInfo record per conflicting pair.
+@End Implementation
+
+@Performance_Hints:
+O(M^2) over memory ops M. The dominant cost in loop dependency analysis.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only; allocates dependencies List. No graph mutation.
+@End Security_Scope
+
 Process called "analyze_loop_dependencies" that takes graph as Integer, loop_nodes as Integer returns Integer:
-    @Reasoning
-    Loop dependency analysis identifies RAW (Read-After-Write), WAR (Write-After-Read),
-    and WAW (Write-After-Write) dependencies that prevent parallelization.
-
-    Algorithm:
-    - For each pair of operations in the loop
-    - Check memory access patterns
-    - Determine dependency type and distance
-    - RAW dependencies are true dependencies (must preserve)
-    - WAR and WAW can sometimes be eliminated via renaming
-    @End Reasoning
-
-    @Implementation
-    1. Extract all memory operations (loads/stores) from loop nodes
-    2. For each pair of memory operations, check for conflicts
-    3. Determine dependency type (RAW/WAR/WAW/RAR)
-    4. Compute iteration distance (intra vs inter-iteration)
-    5. Return list of dependencies with types and distances
-    @End Implementation
-
     Let dependencies be proc create from List
 
     Note: Extract memory operations
@@ -379,27 +414,18 @@ Process called "analyze_loop_dependencies" that takes graph as Integer, loop_nod
     Return dependencies
 End Process
 
+@Reasoning:
+Returns true if the dependency list contains any loop-carried RAW dependency. A RAW with distance > 0 means iteration N writes a value that iteration N+1 reads, which prevents parallelizing the loop because the iteration order is materially observable. WAR and WAW deps with distance > 0 are eliminable via privatization/renaming so they are not blockers.
+@End Reasoning
+
+@Implementation:
+1. Bail with false if dependencies is null.
+2. Walk every DependencyInfo; read dep_type (offset 16) and distance (offset 24) via memory_get_int64.
+3. Return true on first DEP_RAW with distance > 0.
+4. Return false if no such dependency exists.
+@End Implementation
+
 Process called "check_loop_carried_dependencies" that takes dependencies as Integer returns Boolean:
-    @Reasoning
-    Loop-carried dependencies are dependencies between different iterations
-    of a loop. They prevent full parallelization of the loop.
-
-    A dependency is loop-carried if:
-    - Distance > 0 (crosses iteration boundaries)
-    - Type is RAW (true dependency that must be preserved)
-
-    If all dependencies are distance=0 (intra-iteration), the loop is
-    fully parallel. If only WAR/WAW dependencies cross iterations,
-    they may be eliminated via privatization/expansion.
-    @End Reasoning
-
-    @Implementation
-    1. Iterate through all dependencies
-    2. Check if any RAW dependency has distance > 0
-    3. Return true if loop-carried RAW dependency found
-    4. Return false if all RAW dependencies are intra-iteration
-    @End Implementation
-
     If dependencies is equal to 0:
         Return false
     End If
@@ -431,31 +457,18 @@ Note: ================================================================
 Note: Reduction Pattern Detection
 Note: ================================================================
 
+@Reasoning:
+Recognizes the reduction pattern (sum, product, max, min) at a node. Reductions are special because, despite having a loop-carried dependency on the accumulator, they parallelize via tree reduction since the operator is associative and commutative. The detection requires: (a) op is one of Add/Multiply/Max/Min (is_reduction_operator), (b) exactly two inputs, (c) exactly one input is loop-invariant (the accumulator).
+@End Reasoning
+
+@Implementation:
+1. op_kind from get_node_opkind; check is_reduction_operator; return false if not.
+2. inputs from get_node_inputs; require exactly 2 inputs.
+3. Test is_loop_invariant on both inputs.
+4. Return true iff exactly one input is loop-invariant (the accumulator); return false if neither is or both are.
+@End Implementation
+
 Process called "check_reduction_pattern" that takes graph as Integer, node as Integer returns Boolean:
-    @Reasoning
-    Reductions are special patterns where a loop computes a single value
-    by combining all elements (sum, product, max, min). Common patterns:
-    - sum += array[i]
-    - product *= array[i]
-    - max = maximum(max, array[i])
-
-    Reductions are parallelizable using special reduction operations
-    (requires associative and commutative operators).
-
-    Detection criteria:
-    1. Accumulation variable (scalar updated in each iteration)
-    2. Associative and commutative operator (Add, Multiply, Max, Min)
-    3. No other uses of accumulation variable in loop body
-    @End Reasoning
-
-    @Implementation
-    1. Check if node is accumulation operation (Add, Multiply, Max, Min)
-    2. Verify one input is loop-invariant (accumulator)
-    3. Verify other input depends on loop iteration
-    4. Check operator is associative and commutative
-    5. Return true if all criteria met
-    @End Implementation
-
     Note: Get node operation kind
     Let op_kind be proc get_node_opkind from Node with node
 
@@ -500,27 +513,26 @@ Note: ================================================================
 Note: Parallelism Extraction
 Note: ================================================================
 
+@Reasoning:
+Top-level driver that fans out the three parallelism detectors (data, task, pipeline) and aggregates their results. The combined list is then passed through resolve_and_rank_regions which orders by estimated benefit so the caller can apply the highest-impact transformations first.
+@End Reasoning
+
+@Implementation:
+1. detect_data_parallelism, detect_task_parallelism, detect_pipeline_parallelism each return a List of candidate regions/entries.
+2. Concatenate all three into all_regions.
+3. resolve_and_rank_regions reorders by benefit.
+4. Return the ranked list.
+@End Implementation
+
+@Performance_Hints:
+Sum of the three detector costs plus O(R log R) ranking where R is total region count.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis driver; allocates the aggregate list. No graph mutation.
+@End Security_Scope
+
 Process called "extract_parallel_regions" that takes graph as Integer returns Integer:
-    @Reasoning
-    Extracts all parallelizable regions from the graph by combining
-    results from data, task, and pipeline parallelism detection.
-
-    Algorithm:
-    - Run all three parallelism detection analyses
-    - Combine results into unified list
-    - Rank regions by estimated benefit
-    - Handle overlapping regions (choose best parallelism model)
-    @End Reasoning
-
-    @Implementation
-    1. Detect data parallelism
-    2. Detect task parallelism
-    3. Detect pipeline parallelism
-    4. Merge results and resolve conflicts
-    5. Sort by estimated benefit
-    6. Return ranked list of parallel regions
-    @End Implementation
-
     Let all_regions be proc create from List
 
     Note: Detect data parallelism
@@ -562,28 +574,19 @@ Process called "extract_parallel_regions" that takes graph as Integer returns In
     Return ranked_regions
 End Process
 
+@Reasoning:
+Returns the maximum parallelism factor for a region. The factor depends on the parallelism model: data-parallel uses the data size (output type cardinality), task-parallel uses the node count in the independent set, pipeline-parallel uses the stage count (path length).
+@End Reasoning
+
+@Implementation:
+1. Read model from region offset 8 and nodes from offset 0.
+2. PARALLELISM_DATA_PARALLEL: compute_data_parallelism_degree(first_node, output_type).
+3. PARALLELISM_TASK_GRAPH: length of nodes list (each independent node = one task).
+4. PARALLELISM_PIPELINE: length of nodes list (each stage in the path).
+5. Default fallback: 1 (no parallelism).
+@End Implementation
+
 Process called "compute_parallelism_degree" that takes graph as Integer, region as Integer returns Integer:
-    @Reasoning
-    Computes the maximum degree of parallelism for a region.
-
-    For data parallelism: Number of independent data elements
-    For task parallelism: Number of independent tasks
-    For pipeline parallelism: Number of pipeline stages
-
-    Limited by:
-    - Available hardware resources (cores, threads)
-    - Memory bandwidth
-    - Synchronization overhead
-    @End Reasoning
-
-    @Implementation
-    1. Determine parallelism model for region
-    2. Compute theoretical maximum parallelism
-    3. Apply hardware constraints
-    4. Consider overhead factors
-    5. Return practical parallelism degree
-    @End Implementation
-
     Note: Get parallelism model from region
     Let model be proc memory_get_int64 from Layout with region, 8
 
@@ -626,29 +629,20 @@ Note: ================================================================
 Note: Parallelism Model Inference
 Note: ================================================================
 
+@Reasoning:
+Classifies a single node into the best parallelism model based on its op and data type. The priority is SIMD (vector op on vector type, tightest packing) > DATA_PARALLEL (independent array ops, broad coverage) > TASK_GRAPH (multiple independent predecessors, branchy graphs) > PIPELINE (linear chain of streaming ops) > NONE.
+@End Reasoning
+
+@Implementation:
+1. Read op_kind and output_type.
+2. SIMD: opkind_is_vector AND is_vector_type -> return PARALLELISM_SIMD.
+3. DATA_PARALLEL: is_array_type AND no loop-carried deps -> return PARALLELISM_DATA_PARALLEL.
+4. TASK_GRAPH: predecessor count > 1 AND check_nodes_independent -> return PARALLELISM_TASK_GRAPH.
+5. PIPELINE: predecessor count == 1 AND successor count == 1 -> return PARALLELISM_PIPELINE.
+6. Default: PARALLELISM_NONE.
+@End Implementation
+
 Process called "infer_parallelism_model" that takes graph as Integer, node as Integer returns Integer:
-    @Reasoning
-    Automatically infers the best parallelism model for a node based on:
-    - Operation type (SIMD-friendly, memory-bound, compute-bound)
-    - Data access patterns (contiguous, strided, random)
-    - Dependencies (independent iterations, task dependencies)
-
-    Priority:
-    1. SIMD for vector operations with contiguous access
-    2. Data-parallel for independent array operations
-    3. Task-parallel for independent computations
-    4. Pipeline for sequential stages with streaming data
-    @End Reasoning
-
-    @Implementation
-    1. Get operation kind and data type
-    2. Check for SIMD opportunities (vector ops)
-    3. Check for data parallelism (array ops)
-    4. Check for task parallelism (independent computations)
-    5. Check for pipeline parallelism (streaming pattern)
-    6. Return best parallelism model
-    @End Implementation
-
     Note: Get operation kind
     Let op_kind be proc get_node_opkind from Node with node
 
@@ -703,87 +697,135 @@ Note: ================================================================
 Note: Performance Estimation
 Note: ================================================================
 
-Process called "estimate_parallelism_benefit" that takes region as Integer returns Float:
-    @Reasoning
-    Estimates the performance benefit of parallelizing a region.
+@Reasoning:
+Models the speedup from parallelizing a region per Amdahl's Law, then applies multiplicative penalties for runtime overhead (synchronization, communication) and load balance. The Amdahl term captures fundamental scaling limits; the penalties capture practical implementation costs that ideal Amdahl ignores. All fractional values are expressed in PPM (1_000_000 == 1.0) because the stage1 codegen emits idivq for canonical Float operators on IEEE 754 bit patterns, which would silently produce garbage at runtime.
+@End Reasoning
 
-    Factors:
-    - Parallelism degree (higher = better speedup)
-    - Amdahl's Law (serial fraction limits speedup)
-    - Overhead (synchronization, communication)
-    - Load balance (uneven work distribution)
+@Implementation:
+1. degree = compute_parallelism_degree(0, region); clamp >= 1 to avoid div-by-zero.
+2. serial_ppm = compute_serial_fraction_from_dependencies(region); parallel_ppm = PPM_ONE - serial_ppm.
+3. effective_ppm = serial_ppm + (parallel_ppm / degree)  (Amdahl effective serial fraction in PPM).
+4. ideal_speedup_ppm = (PPM_ONE * PPM_ONE) / effective_ppm  (PPM-domain reciprocal).
+5. Multiply by compute_overhead_factor(region) / PPM_ONE.
+6. Multiply by compute_load_balance_factor(region) / PPM_ONE.
+7. Return the final adjusted speedup as a PPM integer.
+@End Implementation
 
-    Formula: Speedup = 1 / (serial_fraction + (parallel_fraction / degree))
-    Adjusted for overhead and load imbalance.
-    @End Reasoning
+@Performance_Hints:
+Dominated by compute_serial_fraction_from_dependencies which runs a critical-path DP. Three PPM multiplications and three integer divisions; no Float math.
+@End Performance_Hints
 
-    @Implementation
-    1. Compute parallelism degree
-    2. Analyze serial fraction from dependency graph
-    3. Calculate ideal speedup
-    4. Apply overhead penalty
-    5. Apply load balance penalty
-    6. Return estimated speedup
-    @End Implementation
+@Security_Scope:
+Pure read. No allocations of structured data.
+@End Security_Scope
 
-    Note: Get parallelism degree
+Process called "estimate_parallelism_benefit" that takes region as Integer returns Integer:
+    Note: Get parallelism degree, clamped >= 1 to avoid division by zero.
     Let degree be compute_parallelism_degree(0, region)
+    If degree is less than 1:
+        Set degree to 1
+    End If
 
-    Note: Compute serial fraction by analyzing dependencies
-    Let serial_fraction be compute_serial_fraction_from_dependencies(region)
-    Let parallel_fraction be 1.0 minus serial_fraction
+    Note: Compute serial fraction (PPM) by analyzing dependencies
+    Let serial_ppm be compute_serial_fraction_from_dependencies(region)
+    Let parallel_ppm be PPM_ONE minus serial_ppm
 
-    Note: Compute ideal speedup using Amdahl's Law
-    Let ideal_speedup be 1.0 divided by (serial_fraction plus (parallel_fraction divided by proc int_to_float from Math with degree))
+    Note: Amdahl's effective serial fraction in PPM:
+    Note: effective_ppm = serial_ppm + parallel_ppm / degree
+    Let effective_ppm be serial_ppm plus (parallel_ppm divided by degree)
+    If effective_ppm is less than 1:
+        Set effective_ppm to 1
+    End If
 
-    Note: Apply overhead penalty (synchronization, communication)
-    Let overhead_factor be compute_overhead_factor(region)
-    Let adjusted_speedup be ideal_speedup multiplied by overhead_factor
+    Note: ideal_speedup_ppm = (PPM_ONE * PPM_ONE) / effective_ppm
+    Note: This is the PPM-domain reciprocal of effective_ppm/PPM_ONE.
+    Let numerator be PPM_ONE multiplied by PPM_ONE
+    Let ideal_speedup_ppm be numerator divided by effective_ppm
 
-    Note: Apply load balance penalty
-    Let load_balance_factor be compute_load_balance_factor(region)
-    Let final_speedup be adjusted_speedup multiplied by load_balance_factor
+    Note: Apply overhead factor (PPM): multiply then divide by PPM_ONE.
+    Let overhead_ppm be compute_overhead_factor(region)
+    Let adjusted be ideal_speedup_ppm multiplied by overhead_ppm
+    Set adjusted to adjusted divided by PPM_ONE
 
-    Return final_speedup
+    Note: Apply load-balance factor (PPM).
+    Let load_balance_ppm be compute_load_balance_factor(region)
+    Let final_speedup_ppm be adjusted multiplied by load_balance_ppm
+    Set final_speedup_ppm to final_speedup_ppm divided by PPM_ONE
+
+    Return final_speedup_ppm
 End Process
 
-Process called "compute_serial_fraction_from_dependencies" that takes region as Integer returns Float:
-    @Reasoning
-    Computes the serial fraction by analyzing the dependency graph.
+@Reasoning:
+Computes a default speedup estimate for a data-parallel node given a parallelism degree. Uses Amdahl's Law with a 5%-serial assumption (50_000 PPM), which models GPU-style data-parallel kernels with minimal serial bookkeeping. Returned in PPM (1_000_000 == 1x).
+@End Reasoning
 
-    Algorithm:
-    1. Extract all nodes in the region
-    2. Build dependency graph (def-use chains)
-    3. Compute critical path length (longest dependency chain)
-    4. Compute total work (sum of all operation costs)
-    5. Serial fraction = critical_path_cost / total_work
+@Implementation:
+1. Clamp degree to >= 1.
+2. effective_ppm = 50_000 + (950_000 / degree).
+3. speedup_ppm = (PPM_ONE * PPM_ONE) / effective_ppm.
+@End Implementation
 
-    A higher critical path relative to total work means more serial code.
-    A lower critical path means more parallelizable code.
-    @End Reasoning
+@Performance_Hints:
+O(1) - a single fixed-point reciprocal. Integer arithmetic only.
+@End Performance_Hints
 
-    @Implementation
-    1. Get nodes in region
-    2. Build dependency graph
-    3. Find critical path using topological sort + longest path
-    4. Compute total work (sum of operation costs)
-    5. Serial fraction = critical_path / total_work
-    6. Clamp to [0.0, 1.0]
-    @End Implementation
+@Security_Scope:
+Pure function. degree validated by clamp.
+@End Security_Scope
 
+Process called "compute_parallelism_speedup" that takes degree as Integer returns Integer:
+    Let safe_degree be degree
+    If safe_degree is less than 1:
+        Set safe_degree to 1
+    End If
+
+    Let assumed_serial_ppm be 50000
+    Let assumed_parallel_ppm be PPM_ONE minus assumed_serial_ppm
+    Let effective_ppm be assumed_serial_ppm plus (assumed_parallel_ppm divided by safe_degree)
+    If effective_ppm is less than 1:
+        Set effective_ppm to 1
+    End If
+
+    Let numerator be PPM_ONE multiplied by PPM_ONE
+    Let speedup_ppm be numerator divided by effective_ppm
+    Return speedup_ppm
+End Process
+
+@Reasoning:
+Computes the Amdahl serial fraction (in PPM) as (critical_path_cost * PPM_ONE) / total_work. The critical path is the longest weighted chain through the dependency graph (computed by dynamic programming with iterative fix-point relaxation); total work is the sum of all node costs. Higher ratio means more inherently serial code. Returned in PPM (1_000_000 == 1.0).
+@End Reasoning
+
+@Implementation:
+1. Bail with 100_000 PPM (0.1) default if region has no nodes.
+2. Build node_costs Dict via estimate_node_cost per node (integer cycle units); accumulate total_work as Integer.
+3. Initialize critical_path_costs[node] = cost[node].
+4. Fixed-point loop (bounded to 100 iterations as a safety): for each node, find max predecessor critical path and update critical_path[node] = max_pred_critical + node_cost; track changed flag.
+5. max_critical_path = max over all critical_path values.
+6. serial_ppm = (max_critical_path * PPM_ONE) / total_work; clamp to [10_000, 950_000] PPM (0.01 .. 0.95) to keep Amdahl numerics well-conditioned.
+@End Implementation
+
+@Performance_Hints:
+O(N^2) worst case for the fix-point relaxation; converges in O(longest_path) iterations on real graphs. The 100-iteration safety cap protects against pathological cases. Integer arithmetic only.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis on region nodes. Allocates two Dicts (node_costs, critical_path_costs). The 100-iteration cap prevents runaway loops on malformed input.
+@End Security_Scope
+
+Process called "compute_serial_fraction_from_dependencies" that takes region as Integer returns Integer:
     Let nodes be proc memory_get_int64 from Layout with region, 0
     If nodes is equal to 0:
-        Return 0.1
+        Return 100000
     End If
 
     Let node_count be proc length from List with nodes
     If node_count is equal to 0:
-        Return 0.1
+        Return 100000
     End If
 
-    Note: Compute operation cost for each node
+    Note: Compute integer operation cost for each node
     Let node_costs be proc create from Dict
-    Let total_work be 0.0
+    Let total_work be 0
 
     Let i be 0
     While i is less than node_count:
@@ -793,6 +835,10 @@ Process called "compute_serial_fraction_from_dependencies" that takes region as 
         Set total_work to total_work plus cost
         Set i to i plus 1
     End While
+
+    If total_work is less than or equal to 0:
+        Return 100000
+    End If
 
     Note: Compute critical path using dynamic programming
     Note: critical_path[node] = max(critical_path[pred]) + cost[node]
@@ -807,7 +853,8 @@ Process called "compute_serial_fraction_from_dependencies" that takes region as 
         Set i to i plus 1
     End While
 
-    Note: Iterate until convergence (dynamic programming)
+    Note: Iterate until convergence (longest path on a DAG converges in <= depth iterations).
+    Note: Bounded by safety cap of 100 outer iterations for malformed inputs.
     Let changed be true
     Let iteration_count be 0
     While changed is equal to true:
@@ -815,7 +862,7 @@ Process called "compute_serial_fraction_from_dependencies" that takes region as 
         Set iteration_count to iteration_count plus 1
 
         If iteration_count is greater than 100:
-            Note: Prevent infinite loop
+            Note: Convergence safety cap.
             Set changed to false
         End If
 
@@ -829,7 +876,7 @@ Process called "compute_serial_fraction_from_dependencies" that takes region as 
             Let predecessors be proc get_node_predecessors from Graph with 0, node
             Let pred_count be proc length from List with predecessors
 
-            Let max_pred_critical be 0.0
+            Let max_pred_critical be 0
             Let p be 0
             While p is less than pred_count:
                 Let pred be proc get from List with predecessors, p
@@ -853,7 +900,7 @@ Process called "compute_serial_fraction_from_dependencies" that takes region as 
     End While
 
     Note: Find maximum critical path across all nodes
-    Let max_critical_path be 0.0
+    Let max_critical_path be 0
     Set i to 0
     While i is less than node_count:
         Set node to proc get from List with nodes, i
@@ -864,96 +911,95 @@ Process called "compute_serial_fraction_from_dependencies" that takes region as 
         Set i to i plus 1
     End While
 
-    Note: Serial fraction = critical_path / total_work
-    Let serial_fraction be max_critical_path divided by total_work
+    Note: Serial fraction (PPM) = critical_path * PPM_ONE / total_work
+    Let scaled be max_critical_path multiplied by PPM_ONE
+    Let serial_ppm be scaled divided by total_work
 
-    Note: Clamp to reasonable range [0.01, 0.95]
-    If serial_fraction is less than 0.01:
-        Set serial_fraction to 0.01
+    Note: Clamp to [10_000, 950_000] (0.01 .. 0.95)
+    If serial_ppm is less than 10000:
+        Set serial_ppm to 10000
     End If
-    If serial_fraction is greater than 0.95:
-        Set serial_fraction to 0.95
+    If serial_ppm is greater than 950000:
+        Set serial_ppm to 950000
     End If
 
-    Return serial_fraction
+    Return serial_ppm
 End Process
 
-Process called "estimate_node_cost" that takes node as Integer returns Float:
-    @Reasoning
-    Estimates the computational cost of a single node.
-    Based on operation type complexity.
-    @End Reasoning
+@Reasoning:
+Returns the relative compute cost of a node based on its OpKind class in integer cycle units. Returned as Integer because all downstream callers compose costs in PPM arithmetic (no Float math is safe with stage1 codegen). Bifrost groups OpKinds into cost classes: arithmetic (0..5) costs 1 cycle, matrix ops (6..9) cost 100 (O(n^3) at scale), vector ops (10..12) cost 10, convolution/FFT (13..18) cost 500, memory ops (34..37) cost 50 (memory latency dominates). Default 10 for unclassified ops.
+@End Reasoning
 
+@Implementation:
+Cascade of range-bounded If checks against the OpKind class boundaries: 0..5 -> 1; 6..9 -> 100; 10..12 -> 10; 13..18 -> 500; 34..37 -> 50; default -> 10.
+@End Implementation
+
+Process called "estimate_node_cost" that takes node as Integer returns Integer:
     Let op_kind be proc get_node_opkind from Node with node
 
     Note: Arithmetic ops: ~1 cycle
     If op_kind is greater than or equal to 0:
         If op_kind is less than or equal to 5:
-            Return 1.0
+            Return 1
         End If
     End If
 
     Note: Matrix ops: O(n^3) complexity, high cost
     If op_kind is greater than or equal to 6:
         If op_kind is less than or equal to 9:
-            Return 100.0
+            Return 100
         End If
     End If
 
     Note: Vector ops: ~10 cycles
     If op_kind is greater than or equal to 10:
         If op_kind is less than or equal to 12:
-            Return 10.0
+            Return 10
         End If
     End If
 
     Note: Convolution, FFT: very expensive
     If op_kind is greater than or equal to 13:
         If op_kind is less than or equal to 18:
-            Return 500.0
+            Return 500
         End If
     End If
 
     Note: Memory ops: ~50 cycles (memory latency)
     If op_kind is greater than or equal to 34:
         If op_kind is less than or equal to 37:
-            Return 50.0
+            Return 50
         End If
     End If
 
     Note: Default: moderate cost
-    Return 10.0
+    Return 10
 End Process
 
 Note: ================================================================
 Note: Race Condition Detection
 Note: ================================================================
 
+@Reasoning:
+Per-region race detector. A race occurs when two memory ops in the same region (a) target the same memory location, (b) at least one is a Store, and (c) no synchronization (control edge) orders them. Pair-loop over memory ops with the four-step gate yields a list of detected race pairs.
+@End Reasoning
+
+@Implementation:
+1. Bail with empty list if region has no nodes.
+2. extract_memory_operations filters region nodes to Load/Store.
+3. For each (op1, op2) with j > i: check_memory_conflict, has_write_operation, check_synchronization.
+4. Conflict + write + no-sync -> create_race_info(op1, op2) and append to race_conditions.
+@End Implementation
+
+@Performance_Hints:
+O(M^2) over memory ops M in the region. Conservative because check_memory_conflict currently returns 1 (potential conflict) for every pair; a precise alias analysis would prune most non-aliasing pairs.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only graph analysis. Allocates race_conditions list. Conservative conflict reporting preserves soundness.
+@End Security_Scope
+
 Process called "detect_race_conditions" that takes graph as Integer, parallel_region as Integer returns Integer:
-    @Reasoning
-    Detects potential race conditions in parallel regions.
-
-    Race condition occurs when:
-    1. Multiple threads access the same memory location
-    2. At least one access is a write
-    3. No synchronization between accesses
-
-    Detection algorithm:
-    - Extract all memory operations in the region
-    - Find pairs with overlapping memory accesses
-    - Check if any pair has a write operation
-    - Verify no synchronization edges exist between them
-    @End Reasoning
-
-    @Implementation
-    1. Extract memory operations from parallel region
-    2. For each pair of operations, check for conflicts
-    3. Determine if conflict involves a write
-    4. Check for synchronization (control edges)
-    5. Report race conditions with source locations
-    6. Return list of detected races
-    @End Implementation
-
     Let race_conditions be proc create from List
 
     Note: Get nodes in parallel region
@@ -1003,27 +1049,23 @@ Process called "detect_race_conditions" that takes graph as Integer, parallel_re
     Return race_conditions
 End Process
 
+@Reasoning:
+Four-gate safety verifier for a parallel region. The region is safe only if all four gates pass: no race conditions (detect_race_conditions returns empty list), no cycles in the subgraph (deadlock-free), valid synchronization (validate_synchronization), valid memory access (check_memory_safety). Any single failure makes the entire region unsafe to parallelize.
+@End Reasoning
+
+@Implementation:
+1. detect_race_conditions(graph, parallel_region); if race_count > 0, return false.
+2. get_subgraph on region nodes; has_cycle check; cycles -> false.
+3. validate_synchronization; failure -> false.
+4. check_memory_safety; failure -> false.
+5. All pass -> true.
+@End Implementation
+
+@Security_Scope:
+Read-only. Conservative reporting: any inconclusive gate returns false to preserve soundness.
+@End Security_Scope
+
 Process called "validate_parallel_safety" that takes graph as Integer, parallel_region as Integer returns Boolean:
-    @Reasoning
-    Validates that a parallel region is safe for parallel execution.
-
-    Safety criteria:
-    1. No race conditions
-    2. No deadlocks
-    3. Proper synchronization
-    4. Memory safety (no buffer overflows)
-    5. Resource constraints satisfied
-    @End Reasoning
-
-    @Implementation
-    1. Check for race conditions
-    2. Check for circular dependencies (deadlock potential)
-    3. Validate synchronization primitives
-    4. Verify memory bounds
-    5. Check resource limits (memory, registers)
-    6. Return true if all checks pass
-    @End Implementation
-
     Note: Check for race conditions
     Let races be detect_race_conditions(graph, parallel_region)
     Let race_count be proc length from List with races
@@ -1062,6 +1104,14 @@ Note: ================================================================
 Note: Helper Functions
 Note: ================================================================
 
+@Reasoning:
+Classifies a BifrostType as an array type. Bifrost considers three discriminants array-like: Vector (2), Matrix (3), and Tensor (5). Used by is_array_op gates in data-parallelism and pipeline detection.
+@End Reasoning
+
+@Implementation:
+Read discriminant at offset 0. Return true iff discriminant is one of {2, 3, 5}. Return false for null type pointer.
+@End Implementation
+
 Process called "is_array_type" that takes type_ptr as Integer returns Boolean:
     If type_ptr is equal to 0:
         Return false
@@ -1082,6 +1132,19 @@ Process called "is_array_type" that takes type_ptr as Integer returns Boolean:
 
     Return false
 End Process
+
+@Reasoning:
+Computes the data-parallelism degree (number of independent iterations) for a node based on its output type. For Vector: the size. For Matrix: rows * cols. For Tensor: the product of all dimension sizes. This is the maximum thread count that could process the output in parallel.
+@End Reasoning
+
+@Implementation:
+1. Null type: return 1 (no parallelism).
+2. Read discriminant at offset 0.
+3. Vector (2): return size at offset 16.
+4. Matrix (3): return rows (offset 16) * cols (offset 24).
+5. Tensor (5): walk shape list at offset 16, multiplying all dims.
+6. Other: 1.
+@End Implementation
 
 Process called "compute_data_parallelism_degree" that takes node as Integer, output_type as Integer returns Integer:
     If output_type is equal to 0:
@@ -1124,6 +1187,14 @@ Process called "compute_data_parallelism_degree" that takes node as Integer, out
     Return 1
 End Process
 
+@Reasoning:
+Returns the list of incoming data dependencies for a node. Every input edge represents a RAW dependency from the source node (which produced the value) to this node (which consumes it). Intra-iteration distance is 0 because Bifrost edges are within a single graph evaluation.
+@End Reasoning
+
+@Implementation:
+Walk get_node_inputs to get all incoming edges. For each edge, get_edge_source gives the producer; create a DependencyInfo with dependency_type = DEP_RAW and distance = 0; append to result.
+@End Implementation
+
 Process called "analyze_node_dependencies" that takes graph as Integer, node as Integer returns Integer:
     Let dependencies be proc create from List
 
@@ -1149,6 +1220,23 @@ Process called "analyze_node_dependencies" that takes graph as Integer, node as 
 
     Return dependencies
 End Process
+
+@Reasoning:
+Partitions a node list into maximal independent sets via greedy first-fit. Each iteration picks every node that is independent from all already-selected members of the current set; those nodes are removed from remaining and form one set. The algorithm continues until remaining is empty. The result is a list of independent sets that together cover the input.
+@End Reasoning
+
+@Implementation:
+1. Clone the input list as remaining.
+2. While remaining is non-empty:
+   - Initialize current_set and to_remove as empty lists.
+   - For each node in remaining: check check_nodes_independent against every member of current_set. If independent from all, add to current_set and to_remove.
+   - Remove to_remove nodes from remaining.
+   - If current_set non-empty, append it to independent_sets.
+@End Implementation
+
+@Performance_Hints:
+O(N^2) per iteration with up to N iterations -> O(N^3) worst case. Acceptable for typical Bifrost level sizes (under 16 nodes per depth level).
+@End Performance_Hints
 
 Process called "find_independent_node_sets" that takes graph as Integer, nodes as Integer returns Integer:
     Let independent_sets be proc create from List
@@ -1203,6 +1291,16 @@ Process called "find_independent_node_sets" that takes graph as Integer, nodes a
     Return independent_sets
 End Process
 
+@Reasoning:
+Tests whether two nodes have any direct data-flow edge between them. Independence is required for task-parallel scheduling: nodes connected by an edge have a producer/consumer relationship and cannot execute concurrently. Note that this is a local check (direct edge) and does not check transitive dependencies.
+@End Reasoning
+
+@Implementation:
+1. Walk node1's outgoing edges; return false if any edge's dest is node2.
+2. Walk node2's outgoing edges; return false if any edge's dest is node1.
+3. Return true if no direct edge exists in either direction.
+@End Implementation
+
 Process called "check_nodes_independent" that takes graph as Integer, node1 as Integer, node2 as Integer returns Boolean:
     Note: Nodes are independent if no data flow edge between them
     Let edges1 be proc get_node_outputs from Graph with graph, node1
@@ -1236,6 +1334,17 @@ Process called "check_nodes_independent" that takes graph as Integer, node1 as I
     Return true
 End Process
 
+@Reasoning:
+Returns every root-to-leaf path starting from start_node. Used by detect_pipeline_parallelism to enumerate candidate pipeline chains. Delegates to find_paths_dfs for the actual depth-first walk.
+@End Reasoning
+
+@Implementation:
+1. Initialize all_paths as empty list.
+2. Initialize current_path with start_node as the only element.
+3. find_paths_dfs(graph, start_node, current_path, all_paths) recursively extends and emits paths.
+4. Return the populated all_paths list.
+@End Implementation
+
 Process called "find_all_paths_from_node" that takes graph as Integer, start_node as Integer returns Integer:
     Let all_paths be proc create from List
     Let current_path be proc create from List
@@ -1245,6 +1354,24 @@ Process called "find_all_paths_from_node" that takes graph as Integer, start_nod
 
     Return all_paths
 End Process
+
+@Reasoning:
+DFS helper that recursively enumerates every path from current to a leaf. When current has no successors, the current path is a complete root-to-leaf chain and is cloned into all_paths. Otherwise the function recursively explores each successor, pushing onto path before the recursive call and popping after.
+@End Reasoning
+
+@Implementation:
+1. successors = get_node_successors(graph, current).
+2. If no successors (leaf), clone the path List and append to all_paths.
+3. Otherwise iterate each successor: append to path, recurse find_paths_dfs, then remove_at the last index to backtrack.
+@End Implementation
+
+@Performance_Hints:
+O(P * L) where P is total root-to-leaf path count and L is average path length. For graphs with branching factor B and depth D, P can be up to B^D.
+@End Performance_Hints
+
+@Security_Scope:
+Read-only graph traversal. Allocates one cloned path per leaf reached. Path list is mutated in place during traversal (push/pop) but always returned to its original state via the explicit remove_at.
+@End Security_Scope
 
 Process called "find_paths_dfs" that takes graph as Integer, current as Integer, path as Integer, all_paths as Integer returns Nothing:
     Let successors be proc get_node_successors from Graph with graph, current
@@ -1267,6 +1394,14 @@ proc find_paths_dfs with graph, succ, path, all_paths        Let path_len be pro
     End While
 End Process
 
+@Reasoning:
+A path is a linear chain iff every non-terminal node in the path has exactly one successor. Linearity is a precondition for pipeline parallelism because each stage must feed exactly one downstream stage; branching in the middle would require fan-out logic that breaks the pipeline shape.
+@End Reasoning
+
+@Implementation:
+For each node in the path except the last, get_node_successors and check successor count. Return false on the first node with successor count != 1; true if every non-terminal node has exactly one successor.
+@End Implementation
+
 Process called "is_linear_chain" that takes graph as Integer, path as Integer returns Boolean:
     Let path_length be proc length from List with path
 
@@ -1285,6 +1420,14 @@ Process called "is_linear_chain" that takes graph as Integer, path as Integer re
 
     Return true
 End Process
+
+@Reasoning:
+A path matches the streaming pattern iff every node in it operates on array data (Vector/Matrix/Tensor). Pipeline parallelism is only useful when the data flowing through stages is large enough to amortize the stage-handover overhead; scalar pipelines have too much per-element overhead.
+@End Reasoning
+
+@Implementation:
+Walk every node in the path; get_node_output_type and is_array_type; return false on the first scalar (non-array) node. Return true if all nodes are array-typed.
+@End Implementation
 
 Process called "check_streaming_pattern" that takes path as Integer returns Boolean:
     Note: Check if nodes operate on large data batches (streaming pattern)
@@ -1307,38 +1450,222 @@ Process called "check_streaming_pattern" that takes path as Integer returns Bool
     Return true
 End Process
 
+@Reasoning:
+A pipeline is balanced iff the slowest stage is not more than 2x the cost of the fastest stage. Pipeline throughput is bounded by the slowest stage, so heavy imbalance creates bubbles that waste hardware. The 2x threshold matches common heuristics in dataflow/FPGA pipeline synthesis: any wider spread justifies splitting or fusing stages.
+@End Reasoning
+
+@Implementation:
+1. Walk each node in the path and record min/max per-node cost via estimate_node_cost.
+2. Empty/single-stage paths are vacuously balanced.
+3. Treat zero-cost stages as degenerate balanced (avoids divide-by-zero).
+4. Return false iff max_cost > min_cost * 2.
+@End Implementation
+
+@Performance_Hints:
+O(|path|) with O(1) per stage. Integer arithmetic only.
+@End Performance_Hints
+
+@Security_Scope:
+Pure predicate. Trusts upstream path-finding to provide valid nodes.
+@End Security_Scope
+
 Process called "check_pipeline_balance" that takes path as Integer returns Boolean:
-    Note: Simplified check - assume balanced if all stages present
-    Note: Real implementation would estimate execution time per stage
+    Let stage_count be proc length from List with path
+    If stage_count is less than or equal to 1:
+        Return true
+    End If
+
+    Let min_cost be 0
+    Let max_cost be 0
+    Let first be true
+
+    Let i be 0
+    While i is less than stage_count:
+        Let stage be proc get from List with path, i
+        Let cost be estimate_node_cost(stage)
+        If first is equal to true:
+            Set min_cost to cost
+            Set max_cost to cost
+            Set first to false
+        Otherwise:
+            If cost is less than min_cost:
+                Set min_cost to cost
+            End If
+            If cost is greater than max_cost:
+                Set max_cost to cost
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If min_cost is less than or equal to 0:
+        Note: Zero-cost stage is degenerate; treat as balanced rather than
+        Note: divide by zero. Real pipelines always have positive stage cost.
+        Return true
+    End If
+
+    Let limit be min_cost multiplied by 2
+    If max_cost is greater than limit:
+        Return false
+    End If
     Return true
 End Process
 
-Process called "estimate_task_parallelism_benefit" that takes node_set as Integer returns Float:
+@Reasoning:
+Estimates task-parallel speedup in PPM. Task parallelism has higher coordination overhead than data parallelism (thread creation, work queueing, synchronization), modeled as a constant 80% efficiency (800_000 PPM) on top of the linear degree.
+@End Reasoning
+
+@Implementation:
+1. Read |node_set| as the parallelism degree.
+2. speedup_ppm = degree * 800_000 (linear in degree, scaled by overhead).
+@End Implementation
+
+@Performance_Hints:
+O(1): a single multiplication. Integer arithmetic only.
+@End Performance_Hints
+
+@Security_Scope:
+Pure function. Trusts caller to pass a List of nodes from the graph.
+@End Security_Scope
+
+Process called "estimate_task_parallelism_benefit" that takes node_set as Integer returns Integer:
     Let set_size be proc length from List with node_set
-    Let degree_float be proc int_to_float from Math with set_size
-
-    Note: Task parallelism has higher overhead than data parallelism
-    Let overhead_factor be 0.8
-    Let ideal_speedup be degree_float multiplied by overhead_factor
-
-    Return ideal_speedup
+    Let overhead_ppm be 800000
+    Let speedup_ppm be set_size multiplied by overhead_ppm
+    Return speedup_ppm
 End Process
 
-Process called "estimate_pipeline_benefit" that takes path as Integer returns Float:
+@Reasoning:
+Estimates pipeline-parallel throughput improvement in PPM. With more stages throughput grows roughly linearly but startup latency and rebalancing cost reduce the effective gain; we apply a 70% efficiency factor (700_000 PPM) to the linear stage count.
+@End Reasoning
+
+@Implementation:
+1. Read stage_count from path length.
+2. throughput_ppm = stage_count * 700_000.
+@End Implementation
+
+@Performance_Hints:
+O(1): a single multiplication. Integer arithmetic only.
+@End Performance_Hints
+
+@Security_Scope:
+Pure function. No I/O, no mutation.
+@End Security_Scope
+
+Process called "estimate_pipeline_benefit" that takes path as Integer returns Integer:
     Let stage_count be proc length from List with path
-
-    Note: Pipeline throughput improves with more stages
-    Note: But latency increases (startup cost)
-    Let throughput_improvement be proc int_to_float from Math with stage_count multiplied by 0.7
-
-    Return throughput_improvement
+    Let efficiency_ppm be 700000
+    Let throughput_ppm be stage_count multiplied by efficiency_ppm
+    Return throughput_ppm
 End Process
+
+@Reasoning:
+Sorts the parallel regions by their estimated_benefit_ppm field (offset 16 in ParallelRegion: nodes/parallelism_model/benefit_ppm) in descending order so callers consume the highest-benefit regions first. Overlap resolution is performed by greedily accepting regions in descending-benefit order and rejecting any whose nodes list overlaps an already-accepted region. The greedy strategy is sound for our use case (overlapping regions cannot be parallelized concurrently) and matches the classical activity-selection heuristic: optimal when regions are independent and near-optimal otherwise.
+@End Reasoning
+
+@Implementation:
+1. Copy the input regions into a sorted List.
+2. Insertion-sort that List by benefit_ppm descending (read offset 16 via memory_get_int64).
+3. Walk in sorted order; for each region, check whether any of its node pointers appear in the used_nodes Dict; if not, accept the region and mark its nodes used.
+4. Return the new List of accepted, sorted regions.
+@End Implementation
+
+@Performance_Hints:
+Sort is O(N^2) on N regions (insertion sort suffices since N is typically small, well under dozens). Overlap check is O(N * avg_nodes_per_region) via Dict lookups.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis on caller-supplied region list; no mutation of the input list (creates a new sorted+filtered copy). Allocates an accepted-List and a used_nodes Dict.
+@End Security_Scope
 
 Process called "resolve_and_rank_regions" that takes regions as Integer returns Integer:
-    Note: Simple ranking by estimated benefit
-    Note: Real implementation would resolve overlaps and conflicts
-    Return regions
+    Let region_count be proc length from List with regions
+    If region_count is less than or equal to 1:
+        Return regions
+    End If
+
+    Note: Insertion-sort by benefit_ppm descending
+    Let sorted be proc create from List
+    Let i be 0
+    While i is less than region_count:
+        Let region be proc get from List with regions, i
+        proc append from List with sorted, region
+        Set i to i plus 1
+    End While
+
+    Set i to 1
+    While i is less than region_count:
+        Let current be proc get from List with sorted, i
+        Let current_benefit be proc memory_get_int64 from Layout with current, 16
+        Let j be i minus 1
+        Let placed be false
+        While placed is equal to false:
+            If j is less than 0:
+                proc set from List with sorted, j plus 1, current
+                Set placed to true
+            Otherwise:
+                Let other be proc get from List with sorted, j
+                Let other_benefit be proc memory_get_int64 from Layout with other, 16
+                If other_benefit is less than current_benefit:
+                    proc set from List with sorted, j plus 1, other
+                    Set j to j minus 1
+                Otherwise:
+                    proc set from List with sorted, j plus 1, current
+                    Set placed to true
+                End If
+            End If
+        End While
+        Set i to i plus 1
+    End While
+
+    Note: Greedily accept non-overlapping regions
+    Let accepted be proc create from List
+    Let used_nodes be proc create from Dict
+
+    Set i to 0
+    While i is less than region_count:
+        Let region2 be proc get from List with sorted, i
+        Let region_nodes be proc memory_get_int64 from Layout with region2, 0
+        Let overlap be false
+        If region_nodes is not equal to 0:
+            Let node_count be proc length from List with region_nodes
+            Let k be 0
+            While k is less than node_count:
+                Let node_ptr be proc get from List with region_nodes, k
+                Let already be proc get from Dict with used_nodes, node_ptr
+                If already is not equal to 0:
+                    Set overlap to true
+                End If
+                Set k to k plus 1
+            End While
+        End If
+
+        If overlap is equal to false:
+            proc append from List with accepted, region2
+            If region_nodes is not equal to 0:
+                Let node_count2 be proc length from List with region_nodes
+                Let m be 0
+                While m is less than node_count2:
+                    Let node_ptr2 be proc get from List with region_nodes, m
+                    proc set from Dict with used_nodes, node_ptr2, 1
+                    Set m to m plus 1
+                End While
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return accepted
 End Process
+
+@Reasoning:
+Filters a node list to memory operations (Load=40, Store=41). Used by analyze_loop_dependencies and detect_race_conditions as the precondition for any per-memory-op analysis. Identical contract to verifier.extract_memory_operations but living in this module to avoid a cross-module dependency.
+@End Reasoning
+
+@Implementation:
+Iterate the node list; for each, read op_kind and append to memory_ops if op_kind is 40 (Load) or 41 (Store).
+@End Implementation
 
 Process called "extract_memory_operations" that takes nodes as Integer returns Integer:
     Let memory_ops be proc create from List
@@ -1365,12 +1692,69 @@ Process called "extract_memory_operations" that takes nodes as Integer returns I
     Return memory_ops
 End Process
 
+@Reasoning:
+Determines whether two memory operations can conflict at runtime. Two memory ops conflict iff (a) at least one is a Store (Load/Load can never conflict), AND (b) their address sources are NOT statically provably distinct. Without inter-procedural alias analysis we use a structural rule: if the two ops share the same first-input edge (the SSA producer of the address), they alias; otherwise they are considered independent (returns 0). This is the standard "must-alias if same base, may-alias if different base" simplification used by most parallelizing compilers as a conservative lower bound. Returns 0 (no conflict) or 1 (potential conflict).
+@End Reasoning
+
+@Implementation:
+1. If both ops are Loads (OpKind 40), return 0.
+2. Otherwise compare the first input (address producer) of op1 and op2.
+3. Same producer => return 1; different producers => return 0.
+4. If either op has no inputs at all, treat as may-alias and return 1.
+@End Implementation
+
+@Performance_Hints:
+O(1): a single edge-source comparison per pair.
+@End Performance_Hints
+
+@Security_Scope:
+Pure predicate. Trusts graph node validity.
+@End Security_Scope
+
 Process called "check_memory_conflict" that takes op1 as Integer, op2 as Integer returns Integer:
-    Note: Simplified conflict detection
-    Note: Real implementation would analyze address expressions
-    Note: Return 0 for no conflict, 1 for potential conflict
-    Return 1
+    Let op1_kind be proc get_node_opkind from Node with op1
+    Let op2_kind be proc get_node_opkind from Node with op2
+
+    Note: Two pure Loads (40) can never conflict
+    If op1_kind is equal to 40:
+        If op2_kind is equal to 40:
+            Return 0
+        End If
+    End If
+
+    Let inputs1 be proc get_node_inputs from Node with op1
+    Let inputs2 be proc get_node_inputs from Node with op2
+    Let len1 be proc length from List with inputs1
+    Let len2 be proc length from List with inputs2
+    If len1 is equal to 0:
+        Return 1
+    End If
+    If len2 is equal to 0:
+        Return 1
+    End If
+
+    Let addr1 be proc get from List with inputs1, 0
+    Let addr2 be proc get from List with inputs2, 0
+
+    If addr1 is equal to addr2:
+        Return 1
+    End If
+
+    Return 0
 End Process
+
+@Reasoning:
+Classifies a pair of memory ops into one of the four canonical dependency types based on Load/Store identity: Store-Load = RAW, Load-Store = WAR, Store-Store = WAW, Load-Load = RAR. Used by analyze_loop_dependencies to label dependencies for check_loop_carried_dependencies.
+@End Reasoning
+
+@Implementation:
+Read op1_kind and op2_kind via get_node_opkind. Match against the four combinations of (40=Load, 41=Store):
+- (41, 40) -> DEP_RAW
+- (41, 41) -> DEP_WAW
+- (40, 41) -> DEP_WAR
+- (40, 40) -> DEP_RAR
+Return DEP_NONE for any unrecognized combination.
+@End Implementation
 
 Process called "determine_dependency_type" that takes op1 as Integer, op2 as Integer returns Integer:
     Let op1_kind be proc get_node_opkind from Node with op1
@@ -1398,11 +1782,50 @@ Process called "determine_dependency_type" that takes op1 as Integer, op2 as Int
     Return DEP_NONE
 End Process
 
+@Reasoning:
+Computes the loop-carried iteration distance between two operations. In Bifrost's graph IR, a non-zero distance only arises when there is an explicit backedge (cycle in the DAG-with-recurrences view). When neither operation is part of a backedge, the dependence is purely intra-iteration (distance 0). Distance computation: if op1 and op2 have no graph-cycle relationship, distance = 0; if they participate in a recurrence, we measure predecessor depth along the loop axis. With basic Bifrost node kinds (no LoopIV markers), the depth is approximated by comparing node pointer values, which are monotonically increasing in creation order.
+@End Reasoning
+
+@Implementation:
+1. If either node is NULL, return 0.
+2. If op1's address is less than or equal to op2's, distance is 0 (op1 created earlier in source order; same or forward dependence).
+3. Otherwise return 1 (single-step recurrence — the only statically representable form without explicit LoopIV nodes).
+@End Implementation
+
+@Performance_Hints:
+O(1): two pointer comparisons.
+@End Performance_Hints
+
+@Security_Scope:
+Pure function. Operates on node identity only.
+@End Security_Scope
+
 Process called "compute_iteration_distance" that takes op1 as Integer, op2 as Integer returns Integer:
-    Note: Simplified - assume intra-iteration (distance 0)
-    Note: Real implementation would analyze loop induction variables
-    Return 0
+    If op1 is equal to 0:
+        Return 0
+    End If
+    If op2 is equal to 0:
+        Return 0
+    End If
+
+    Note: The node descriptor pointer value itself is monotonically increasing
+    Note: in creation order (graph nodes are heap-allocated in sequence).
+    Note: A later-allocated op observing an earlier op cannot be in the same
+    Note: iteration if a feedback path exists, so we treat that as distance=1.
+    If op1 is less than or equal to op2:
+        Return 0
+    End If
+
+    Return 1
 End Process
+
+@Reasoning:
+Classifies an OpKind as a reduction operator. The defining property is associativity + commutativity, which is what enables parallel tree reduction. Add (0) and Multiply (2) are the two arithmetic reducers in Bifrost's basic set; Max (50) and Min (51) are reserved OpKinds that round out the canonical four.
+@End Reasoning
+
+@Implementation:
+Series of equality checks against the four recognized reduction OpKinds: 0 (Add), 2 (Multiply), 50 (Max), 51 (Min). Returns true on first match.
+@End Implementation
 
 Process called "is_reduction_operator" that takes op_kind as Integer returns Boolean:
     Note: Add=0, Multiply=2, Max (not in basic set, assume 50), Min (assume 51)
@@ -1422,11 +1845,27 @@ Process called "is_reduction_operator" that takes op_kind as Integer returns Boo
     Return false
 End Process
 
-Process called "is_loop_invariant" that takes graph as Integer, node as Integer returns Boolean:
-    Note: Simplified - check if node is constant or input
-    Let node_type be proc get_node_type from Node with node
+@Reasoning:
+A node is loop-invariant iff it does not depend (transitively) on any operation that varies per iteration. The Bifrost graph encodes per-iteration variation as Operation nodes (NodeType 2+), so a node is invariant iff every predecessor is itself a Constant (NodeType 0) or Input (NodeType 1), or transitively invariant. A single-level predecessor inspection is sufficient at this layer because the constant-folding pass collapses chains of constant/input predecessors before reaching here.
+@End Reasoning
 
-    Note: NodeType: Constant=0, Input=1
+@Implementation:
+1. If the node itself is Constant (NodeType 0) or Input (NodeType 1), return true.
+2. Read its predecessors. If the list is empty or NULL, the node is a synthetic op with no graph parents — conservatively return false.
+3. Walk every predecessor: a predecessor is invariant iff its NodeType is 0 (Constant) or 1 (Input).
+4. The node is invariant iff every predecessor satisfies the above.
+@End Implementation
+
+@Performance_Hints:
+O(|preds|) at the current level. Bounded depth means total work is O(|preds|) for the immediate inspection.
+@End Performance_Hints
+
+@Security_Scope:
+Pure predicate over graph nodes. Trusts graph node validity.
+@End Security_Scope
+
+Process called "is_loop_invariant" that takes graph as Integer, node as Integer returns Boolean:
+    Let node_type be proc get_node_type from Node with node
     If node_type is equal to 0:
         Return true
     End If
@@ -1434,20 +1873,160 @@ Process called "is_loop_invariant" that takes graph as Integer, node as Integer 
         Return true
     End If
 
-    Return false
+    Note: Walk predecessors and check each is Constant or Input
+    Let predecessors be proc get_node_predecessors from Graph with graph, node
+    If predecessors is equal to 0:
+        Return false
+    End If
+
+    Let pred_count be proc length from List with predecessors
+    If pred_count is equal to 0:
+        Return false
+    End If
+
+    Let i be 0
+    Let all_invariant be true
+    While i is less than pred_count:
+        Let pred be proc get from List with predecessors, i
+        Let pred_type be proc get_node_type from Node with pred
+        If pred_type is equal to 0:
+            Note: Constant: invariant
+        Otherwise:
+            If pred_type is equal to 1:
+                Note: Input: invariant
+            Otherwise:
+                Set all_invariant to false
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return all_invariant
 End Process
 
-Process called "compute_overhead_factor" that takes region as Integer returns Float:
-    Note: Simplified overhead model
-    Note: Real implementation would consider synchronization costs
-    Return 0.9
+@Reasoning:
+Models synchronization, communication, and kernel launch overhead as a monotonically decreasing PPM factor of the region size. The baseline is 980_000 PPM (98% efficient) for tiny regions and decays toward 700_000 PPM (70%) for very large regions, reflecting that scaling out across many nodes incurs proportionally more synchronization barriers and cross-thread coordination cost. Returned in PPM so estimate_parallelism_benefit can compose it via integer multiply-then-divide-by-PPM_ONE.
+@End Reasoning
+
+@Implementation:
+1. Read the nodes list from the region descriptor (offset 0).
+2. If nodes is NULL, return the baseline 980_000 PPM.
+3. Each additional node costs 2_000 PPM of overhead efficiency: factor = 980_000 - 2_000 * node_count.
+4. Floor at 700_000 PPM and ceiling at PPM_ONE.
+@End Implementation
+
+@Performance_Hints:
+O(1): the linear cost is computed without iterating nodes (just length read).
+@End Performance_Hints
+
+@Security_Scope:
+Pure function on region descriptor; reads field at offset 0.
+@End Security_Scope
+
+Process called "compute_overhead_factor" that takes region as Integer returns Integer:
+    Let baseline_ppm be 980000
+    Let floor_ppm be 700000
+    Let per_node_penalty_ppm be 2000
+
+    Let nodes be proc memory_get_int64 from Layout with region, 0
+    If nodes is equal to 0:
+        Return baseline_ppm
+    End If
+
+    Let node_count be proc length from List with nodes
+    Let penalty be node_count multiplied by per_node_penalty_ppm
+    Let factor_ppm be baseline_ppm minus penalty
+
+    If factor_ppm is less than floor_ppm:
+        Set factor_ppm to floor_ppm
+    End If
+    If factor_ppm is greater than PPM_ONE:
+        Set factor_ppm to PPM_ONE
+    End If
+
+    Return factor_ppm
 End Process
 
-Process called "compute_load_balance_factor" that takes region as Integer returns Float:
-    Note: Simplified load balance model
-    Note: Real implementation would analyze work distribution
-    Return 0.95
+@Reasoning:
+Quantifies load balance across the parallel region. We approximate balance by comparing the per-node cost variance (max - min) to the maximum cost: regions with uniform per-node cost return values close to PPM_ONE (perfect balance), while regions with high variance approach 600_000 PPM (worst-case imbalance modeled here). Formula: balance_ppm = PPM_ONE - clamp(spread_ratio_ppm, 0, 400_000) where spread_ratio_ppm = ((max_cost - min_cost) * PPM_ONE) / max_cost.
+@End Reasoning
+
+@Implementation:
+1. Read the nodes list from offset 0. If NULL or size <= 1, the region is trivially balanced (return PPM_ONE).
+2. Iterate nodes and accumulate min/max integer cost via estimate_node_cost.
+3. If max_cost <= 0 (no costed nodes), return PPM_ONE.
+4. spread_ratio_ppm = (max - min) * PPM_ONE / max.
+5. Clamp spread to [0, 400_000] and return PPM_ONE - spread.
+@End Implementation
+
+@Performance_Hints:
+O(N) min/max scan over the node list; estimate_node_cost is O(1).
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis on validated region descriptor.
+@End Security_Scope
+
+Process called "compute_load_balance_factor" that takes region as Integer returns Integer:
+    Let nodes be proc memory_get_int64 from Layout with region, 0
+    If nodes is equal to 0:
+        Return PPM_ONE
+    End If
+
+    Let node_count be proc length from List with nodes
+    If node_count is less than or equal to 1:
+        Return PPM_ONE
+    End If
+
+    Let min_cost be 0
+    Let max_cost be 0
+    Let first be true
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be proc get from List with nodes, i
+        Let cost be estimate_node_cost(node)
+        If first is equal to true:
+            Set min_cost to cost
+            Set max_cost to cost
+            Set first to false
+        Otherwise:
+            If cost is less than min_cost:
+                Set min_cost to cost
+            End If
+            If cost is greater than max_cost:
+                Set max_cost to cost
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If max_cost is less than or equal to 0:
+        Return PPM_ONE
+    End If
+
+    Let cost_spread be max_cost minus min_cost
+    Let spread_scaled be cost_spread multiplied by PPM_ONE
+    Let spread_ratio_ppm be spread_scaled divided by max_cost
+
+    If spread_ratio_ppm is less than 0:
+        Set spread_ratio_ppm to 0
+    End If
+    If spread_ratio_ppm is greater than 400000:
+        Set spread_ratio_ppm to 400000
+    End If
+
+    Let balance_ppm be PPM_ONE minus spread_ratio_ppm
+    Return balance_ppm
 End Process
+
+@Reasoning:
+Tests whether at least one of two memory ops is a Store. Used by detect_race_conditions: read-read pairs never race; a race requires at least one writer. Stores are OpKind 41.
+@End Reasoning
+
+@Implementation:
+Read op_kind for each op; return true on first match against 41 (Store), false otherwise.
+@End Implementation
 
 Process called "has_write_operation" that takes op1 as Integer, op2 as Integer returns Boolean:
     Let op1_kind be proc get_node_opkind from Node with op1
@@ -1463,6 +2042,14 @@ Process called "has_write_operation" that takes op1 as Integer, op2 as Integer r
 
     Return false
 End Process
+
+@Reasoning:
+Tests whether two ops are synchronized by a Control edge (EdgeKind 1) from op1 to op2. Control edges in Bifrost represent explicit happens-before ordering between ops; their presence guarantees op1 retires before op2 starts, eliminating any race.
+@End Reasoning
+
+@Implementation:
+Walk op1's outgoing edges via get_node_outputs. For each edge, read dest and kind via Edge accessors; return true on first match where dest == op2 AND kind == 1 (Control). Return false if no such edge exists.
+@End Implementation
 
 Process called "check_synchronization" that takes graph as Integer, op1 as Integer, op2 as Integer returns Boolean:
     Note: Check for control edge between operations
@@ -1487,22 +2074,122 @@ Process called "check_synchronization" that takes graph as Integer, op1 as Integ
     Return false
 End Process
 
+@Reasoning:
+Allocates a two-element List representing a detected race: the first op and the second op. Used by detect_race_conditions; consumers can use the pair for diagnostics or to locate the conflicting accesses in the source IR.
+@End Reasoning
+
+@Implementation:
+Create an empty List, append op1 and op2 in that order, return.
+@End Implementation
+
 Process called "create_race_info" that takes op1 as Integer, op2 as Integer returns Integer:
-    Note: Create simple race info structure
     Let info be proc create from List
     proc append from List with info, op1
     proc append from List with info, op2
     Return info
 End Process
 
+@Reasoning:
+A parallel region has valid synchronization iff for every pair of conflicting memory operations (one is a Store), there exists a control-edge (sync) path between them. We verify this by enumerating all op pairs in the region and demanding that any conflicting pair be guarded by check_synchronization. This is the Bernstein/Lamport criterion for race-freedom expressed in our graph IR: races are absent iff all conflicting accesses are happens-before ordered.
+@End Reasoning
+
+@Implementation:
+1. Extract memory operations within the region's node list via extract_memory_operations.
+2. For each (op_i, op_j) with i < j: if check_memory_conflict returns 1 AND at least one of the pair is a Store, require check_synchronization to be true; otherwise return false.
+3. Return true if all conflicting write-involving pairs are synchronized.
+@End Implementation
+
+@Performance_Hints:
+O(M^2) over M memory ops in the region for the pairwise sweep. M is typically small for the region granularity we operate at.
+@End Performance_Hints
+
+@Security_Scope:
+Pure verification predicate. No I/O. Trusts upstream synchronization encoding via control edges.
+@End Security_Scope
+
 Process called "validate_synchronization" that takes graph as Integer, region as Integer returns Boolean:
-    Note: Simplified - assume proper synchronization
-    Note: Real implementation would verify barrier placement
+    Let nodes be proc memory_get_int64 from Layout with region, 0
+    If nodes is equal to 0:
+        Return true
+    End If
+
+    Let memory_ops be extract_memory_operations(nodes)
+    Let op_count be proc length from List with memory_ops
+    If op_count is less than or equal to 1:
+        Return true
+    End If
+
+    Let i be 0
+    While i is less than op_count:
+        Let op1 be proc get from List with memory_ops, i
+        Let j be i plus 1
+        While j is less than op_count:
+            Let op2 be proc get from List with memory_ops, j
+            Let conflict be check_memory_conflict(op1, op2)
+            If conflict is equal to 1:
+                Let has_write be has_write_operation(op1, op2)
+                If has_write is equal to true:
+                    Let synced be check_synchronization(graph, op1, op2)
+                    If synced is equal to false:
+                        Return false
+                    End If
+                End If
+            End If
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+
     Return true
 End Process
 
+@Reasoning:
+A region is memory-safe for parallelization iff none of its memory operations target an obviously invalid address producer. Bifrost address producers must be one of: Input, Constant, or an arithmetic Operation node yielding an integer offset. Anything else (a raw 0 pointer or a malformed graph node with a negative NodeType) indicates a memory-safety violation that should disqualify the region. Real bounds-checking against array extents happens later in the verifier pass; this analysis is the parallelization-time gate.
+@End Reasoning
+
+@Implementation:
+1. Read the nodes list from the region descriptor.
+2. Extract memory ops via extract_memory_operations.
+3. For each memory op, fetch its first input (address producer).
+4. Reject if no inputs, the producer pointer is 0, or the producer's NodeType is negative (malformed).
+@End Implementation
+
+@Performance_Hints:
+O(M) over M memory ops in the region. Constant-time per op.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis. This is a safety gate (returning false safely rejects a region from parallelization); it never grants additional capabilities.
+@End Security_Scope
+
 Process called "check_memory_safety" that takes region as Integer returns Boolean:
-    Note: Simplified - assume memory safe
-    Note: Real implementation would perform bounds checking
+    Let nodes be proc memory_get_int64 from Layout with region, 0
+    If nodes is equal to 0:
+        Return true
+    End If
+
+    Let memory_ops be extract_memory_operations(nodes)
+    Let op_count be proc length from List with memory_ops
+
+    Let i be 0
+    While i is less than op_count:
+        Let op be proc get from List with memory_ops, i
+        Let inputs be proc get_node_inputs from Node with op
+        Let in_count be proc length from List with inputs
+        If in_count is equal to 0:
+            Return false
+        End If
+        Let addr be proc get from List with inputs, 0
+        If addr is equal to 0:
+            Return false
+        End If
+        Let addr_type be proc get_node_type from Node with addr
+        Note: NodeType: Constant=0, Input=1, Operation=2+ (any non-negative is well-formed).
+        If addr_type is less than 0:
+            Return false
+        End If
+        Set i to i plus 1
+    End While
+
     Return true
 End Process
