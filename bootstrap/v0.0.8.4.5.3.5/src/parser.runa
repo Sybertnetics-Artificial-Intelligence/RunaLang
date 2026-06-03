@@ -3696,12 +3696,33 @@ End Process
 
 Note: Create function
 Process called "function_create" takes name as Integer, return_type as Integer returns Integer:
-    Note: Function layout (56 bytes): name(0), parameters(8), parameter_count(16),
-    Note: return_type(24), statements(32), statement_count(40), is_exported(44),
-    Note: source_file(48). source_file is set later by import_system or main when
-    Note: the function's origin path is known; used by codegen for same-file
-    Note: struct-type disambiguation when multiple imported types share field sets.
-    Let func_size be 56
+    Note: Function layout (96 bytes):
+    Note:   offset  0: name           (pointer, 8 bytes)
+    Note:   offset  8: parameters     (pointer, 8 bytes)
+    Note:   offset 16: parameter_count (int32, bytes 16-19)
+    Note:   offset 20: (pad, bytes 20-23)
+    Note:   offset 24: return_type    (pointer, 8 bytes)
+    Note:   offset 32: statements     (pointer, 8 bytes)
+    Note:   offset 40: statement_count (int32, bytes 40-43)
+    Note:   offset 44: is_exported    (int32, bytes 44-47)
+    Note:   offset 48: source_file    (pointer, 8 bytes; bytes 48-55)
+    Note:   offset 56: is_external    (int32, bytes 56-59)  -- P3A extension
+    Note:   offset 60: is_unsafe      (int32, bytes 60-63)  -- P3A extension
+    Note:   offset 64: library_name   (pointer, 8 bytes; bytes 64-71) -- P3A
+    Note:   offset 72: link_kind      (int32, bytes 72-75)  -- 0=library, 1=framework
+    Note:   offset 76: convention     (int32, bytes 76-79)  -- 0=c, 1=objc
+    Note:   offset 80: alias_name     (pointer, 8 bytes; bytes 80-87) -- P3A
+    Note:   offset 88: (reserved, bytes 88-95)
+    Note: source_file is set later by import_system or main when the function's
+    Note: origin path is known; used by codegen for same-file struct-type
+    Note: disambiguation when multiple imported types share field sets.
+    Note: The is_external / is_unsafe / library_name / link_kind / convention /
+    Note: alias_name fields are populated only by parser_parse_external_declaration
+    Note: for top-level `[unsafe] External Process called "X" ...` declarations.
+    Note: All other call sites inherit zero-initialized defaults, so legacy
+    Note: Function records behave identically to the 56-byte layout — codegen's
+    Note: is_external check at offset 56 reads 0 and emits a normal function body.
+    Let func_size be 96
     Let func be memory_allocate(func_size)
     Let dup_name be string_duplicate_parser(name)
     memory_set_pointer(func, 0, dup_name)
@@ -3713,6 +3734,12 @@ Process called "function_create" takes name as Integer, return_type as Integer r
     memory_set_int32(func, 40, 0)  Note: statement_count = 0
     memory_set_int32(func, 44, 0)  Note: is_exported = 0 (default: not exported)
     memory_set_pointer(func, 48, 0)  Note: source_file = NULL (filled in later)
+    memory_set_int32(func, 56, 0)   Note: is_external = 0 (default: native function)
+    memory_set_int32(func, 60, 0)   Note: is_unsafe = 0 (default: safe)
+    memory_set_pointer(func, 64, 0) Note: library_name = NULL
+    memory_set_int32(func, 72, 0)   Note: link_kind = 0 (library)
+    memory_set_int32(func, 76, 0)   Note: convention = 0 (c)
+    memory_set_pointer(func, 80, 0) Note: alias_name = NULL
     Return func
 End Process
 
@@ -8191,6 +8218,484 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
     Return type
 End Process
 
+Note:
+parser_parse_external_declaration — top-level FFI binding parser (P3A bug A).
+
+Grammar (EBNF):
+  ExternalProcessDecl ::= [ "unsafe" ] "External" "Process" "called" StringLit
+                          [ TakesClause ]
+                          [ "returns" TypeName ]
+                          FromClause
+                          ConventionClause
+                          [ "aliased" "as" StringLit ]
+  TakesClause         ::= [ "that" ] "takes" Param { ParamSep Param }
+  ParamSep            ::= "," | "and"
+  Param               ::= MultiWordIdent "as" TypeName [ "[" TypeArgList "]" ]
+  FromClause          ::= "from" ("library" | "framework") StringLit
+  ConventionClause    ::= "convention" ("c" | "objc")
+
+Disjointness from the legacy expression form:
+  - Expression form (parser_parse_primary, line ~4400): `External "X" from a, b`
+    appears inside a Process body; `External` is followed by TOKEN_STRING_LITERAL.
+  - Declaration form (this function): appears at top level; `External` is
+    followed by TOKEN_PROCESS (1). The top-level dispatcher detects this and
+    invokes us before falling through to the unknown-token error.
+
+The declaration produces a Function struct with is_external=1 and the FFI
+metadata fields populated. Codegen skips emission for is_external functions;
+the linker resolves call sites against the host's runtime libraries.
+
+Caller contract:
+  - On entry the parser's current_token is the `External` identifier token
+    OR (if unsafe was consumed by dispatch) it's the `unsafe` identifier.
+  - The function eats `[unsafe] External Process called "name" ...` and
+    returns a populated Function pointer (96-byte struct from function_create).
+  - All allocations follow parser_parse_function's pattern using
+    string_duplicate_parser for owned strings.
+:End Note
+Process called "parser_parse_external_declaration" takes parser as Integer returns Integer:
+    Note: Eat optional `unsafe` identifier. The dispatcher already verified
+    Note: this is followed by `External Process`, but we eat it here for symmetry
+    Note: and so the parser state is identical to the no-unsafe case afterwards.
+    Let extd_saw_unsafe be 0
+    Let extd_cur be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Let extd_cur_type be memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    Let extd_cur_val be memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+    If extd_cur_type is equal to 53:
+        If extd_cur_val is not equal to 0:
+            If string_equals(extd_cur_val, "unsafe") is equal to 1:
+                parser_eat(parser, 53)
+                Set extd_saw_unsafe to 1
+            End If
+        End If
+    End If
+
+    Note: Eat `External` identifier (must be TOKEN_IDENTIFIER with value "External").
+    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    Set extd_cur_val to memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+    If extd_cur_type is not equal to 53:
+        print_string("[PARSER ERROR] External declaration: expected 'External' identifier, got token type ")
+        print_integer(extd_cur_type)
+        print_string(" at line ")
+        Let extd_err_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+        print_integer(extd_err_line)
+        print_newline()
+        exit_with_code(1)
+    End If
+    Let extd_ext_check be 0
+    If extd_cur_val is not equal to 0:
+        Set extd_ext_check to string_equals(extd_cur_val, "External")
+    End If
+    If extd_ext_check is not equal to 1:
+        print_string("[PARSER ERROR] External declaration: expected 'External' keyword at line ")
+        Let extd_err_line2 be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+        print_integer(extd_err_line2)
+        print_newline()
+        exit_with_code(1)
+    End If
+    parser_eat(parser, 53)
+
+    Note: Eat TOKEN_PROCESS (1).
+    parser_eat(parser, 1)
+
+    Note: Eat TOKEN_CALLED (2).
+    parser_eat(parser, 2)
+
+    Note: Eat the function-name string literal.
+    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    If extd_cur_type is not equal to 10:
+        print_string("[PARSER ERROR] External declaration: expected function-name string literal, got token type ")
+        print_integer(extd_cur_type)
+        print_string(" at line ")
+        Let extd_err_line3 be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+        print_integer(extd_err_line3)
+        print_newline()
+        exit_with_code(1)
+    End If
+    Let extd_func_name_raw be memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+    If extd_func_name_raw is equal to 0:
+        print_string("[PARSER ERROR] External declaration: function name is NULL")
+        print_newline()
+        exit_with_code(1)
+    End If
+    Let extd_func_name be string_duplicate(extd_func_name_raw)
+    parser_eat(parser, 10)
+
+    Note: Allocate the Function record with the 96-byte layout. Default
+    Note: return type is "Integer", matching parser_parse_function's
+    Note: convention; overridden below if a `returns` clause appears.
+    Let extd_default_ret be string_duplicate("Integer")
+    Let extd_func be function_create(extd_func_name, extd_default_ret)
+
+    Note: --- TakesClause: optional `[that] takes Param { ParamSep Param }` ---
+    Note: Mirror of parser_parse_function's takes-clause block (8228-8395).
+    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    Note: Accept optional "that" before "takes" for canonical syntax.
+    If extd_cur_type is equal to 32:
+        parser_eat(parser, 32)
+        Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+        Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    End If
+    If extd_cur_type is equal to 33:
+        parser_eat(parser, 33)
+
+        Note: Check for "takes nothing" (no parameters).
+        Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+        Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+        Let extd_takes_nothing_val be memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+        Let extd_is_takes_nothing be 0
+        If extd_takes_nothing_val is not equal to 0:
+            Set extd_is_takes_nothing to string_equals(extd_takes_nothing_val, "nothing")
+        End If
+        If extd_is_takes_nothing is equal to 1:
+            parser_eat(parser, extd_cur_type)
+        End If
+
+        If extd_is_takes_nothing is not equal to 1:
+            Note: Parse first parameter.
+            Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+            Let extd_can_id be token_can_be_identifier(extd_cur_type)
+            If extd_can_id is not equal to 1:
+                print_string("[PARSER ERROR] External declaration: expected parameter name at line ")
+                Let extd_pln be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+                print_integer(extd_pln)
+                print_newline()
+                exit_with_code(1)
+            End If
+            Let extd_param_name be parser_collect_multiword_identifier_binding(parser)
+            parser_eat(parser, 34)
+
+            Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+            Let extd_param_type_val be memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+            Let extd_param_type be 0
+            If extd_param_type_val is not equal to 0:
+                Set extd_param_type to string_duplicate_parser(extd_param_type_val)
+            Otherwise:
+                Set extd_param_type to string_duplicate_parser("Integer")
+            End If
+            parser_eat(parser, extd_cur_type)
+
+            Note: Skip generic type parameters: List[T], Dictionary[K, V], etc.
+            Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+            If extd_cur_type is equal to 127:
+                parser_eat(parser, 127)
+                Let extd_brk_depth be 1
+                While extd_brk_depth is greater than 0:
+                    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+                    If extd_cur_type is equal to 127:
+                        Set extd_brk_depth to extd_brk_depth plus 1
+                    End If
+                    If extd_cur_type is equal to 128:
+                        Set extd_brk_depth to extd_brk_depth minus 1
+                    End If
+                    parser_eat(parser, extd_cur_type)
+                End While
+            End If
+
+            function_add_parameter(extd_func, extd_param_name, extd_param_type)
+
+            Note: Parse additional parameters separated by commas or 'and'.
+            Let extd_sep_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Let extd_sep_type be memory_get_int32(extd_sep_tok, TOKEN_TYPE_OFFSET)
+            Let extd_more_params be 0
+            If extd_sep_type is equal to 52:
+                Set extd_more_params to 1
+            End If
+            If extd_sep_type is equal to 30:
+                Set extd_more_params to 1
+            End If
+            While extd_more_params is equal to 1:
+                parser_eat(parser, extd_sep_type)
+
+                Let extd_pn_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                Let extd_pn_type be memory_get_int32(extd_pn_tok, TOKEN_TYPE_OFFSET)
+                Let extd_pn_can_id be token_can_be_identifier(extd_pn_type)
+                If extd_pn_can_id is not equal to 1:
+                    print_string("[PARSER ERROR] External declaration: expected parameter name after separator at line ")
+                    Let extd_pn_line be memory_get_int32(extd_pn_tok, TOKEN_LINE_OFFSET)
+                    print_integer(extd_pn_line)
+                    print_newline()
+                    exit_with_code(1)
+                End If
+                Set extd_param_name to parser_collect_multiword_identifier_binding(parser)
+                parser_eat(parser, 34)
+
+                Let extd_pt_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                Let extd_pt_type be memory_get_int32(extd_pt_tok, TOKEN_TYPE_OFFSET)
+                Let extd_pt_val be memory_get_pointer(extd_pt_tok, TOKEN_VALUE_OFFSET)
+                If extd_pt_val is not equal to 0:
+                    Set extd_param_type to string_duplicate_parser(extd_pt_val)
+                Otherwise:
+                    Set extd_param_type to string_duplicate_parser("Integer")
+                End If
+                parser_eat(parser, extd_pt_type)
+
+                Note: Skip generic type parameters after additional parameter type.
+                Let extd_pa_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                Let extd_pa_type be memory_get_int32(extd_pa_tok, TOKEN_TYPE_OFFSET)
+                If extd_pa_type is equal to 127:
+                    parser_eat(parser, 127)
+                    Let extd_pa_depth be 1
+                    While extd_pa_depth is greater than 0:
+                        Set extd_pa_tok to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                        Set extd_pa_type to memory_get_int32(extd_pa_tok, TOKEN_TYPE_OFFSET)
+                        If extd_pa_type is equal to 127:
+                            Set extd_pa_depth to extd_pa_depth plus 1
+                        End If
+                        If extd_pa_type is equal to 128:
+                            Set extd_pa_depth to extd_pa_depth minus 1
+                        End If
+                        parser_eat(parser, extd_pa_type)
+                    End While
+                End If
+
+                function_add_parameter(extd_func, extd_param_name, extd_param_type)
+
+                Set extd_sep_tok to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                Set extd_sep_type to memory_get_int32(extd_sep_tok, TOKEN_TYPE_OFFSET)
+                Set extd_more_params to 0
+                If extd_sep_type is equal to 52:
+                    Set extd_more_params to 1
+                End If
+                If extd_sep_type is equal to 30:
+                    Set extd_more_params to 1
+                End If
+            End While
+        End If
+    End If
+
+    Note: --- Optional `returns TypeName` clause ---
+    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    Let extd_has_returns be 0
+    If extd_cur_type is equal to 3:
+        parser_eat(parser, 3)
+        Set extd_has_returns to 1
+    End If
+    If extd_has_returns is equal to 1:
+        Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+        Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+        Let extd_ret_val be memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+        Let extd_ret_type be 0
+        If extd_ret_val is not equal to 0:
+            Set extd_ret_type to string_duplicate_parser(extd_ret_val)
+        Otherwise:
+            Set extd_ret_type to string_duplicate_parser("Integer")
+        End If
+        parser_eat(parser, extd_cur_type)
+        Note: Replace the default return type set by function_create.
+        memory_set_pointer(extd_func, 24, extd_ret_type)
+
+        Note: Skip generic type parameters on the return type: List[T], Optional[T], etc.
+        Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+        Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+        If extd_cur_type is equal to 127:
+            parser_eat(parser, 127)
+            Let extd_rt_depth be 1
+            While extd_rt_depth is greater than 0:
+                Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+                If extd_cur_type is equal to 127:
+                    Set extd_rt_depth to extd_rt_depth plus 1
+                End If
+                If extd_cur_type is equal to 128:
+                    Set extd_rt_depth to extd_rt_depth minus 1
+                End If
+                parser_eat(parser, extd_cur_type)
+            End While
+        End If
+    End If
+
+    Note: --- FromClause: mandatory `from (library|framework) "X"` ---
+    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    If extd_cur_type is not equal to 144:
+        print_string("[PARSER ERROR] External declaration: expected 'from' clause at line ")
+        Let extd_from_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+        print_integer(extd_from_line)
+        print_newline()
+        exit_with_code(1)
+    End If
+    parser_eat(parser, 144)
+
+    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    Set extd_cur_val to memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+    If extd_cur_type is not equal to 53:
+        print_string("[PARSER ERROR] External declaration: expected 'library' or 'framework' after 'from' at line ")
+        Let extd_lk_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+        print_integer(extd_lk_line)
+        print_newline()
+        exit_with_code(1)
+    End If
+    Let extd_link_kind be 0
+    Let extd_is_library be 0
+    Let extd_is_framework be 0
+    If extd_cur_val is not equal to 0:
+        Set extd_is_library to string_equals(extd_cur_val, "library")
+        Set extd_is_framework to string_equals(extd_cur_val, "framework")
+    End If
+    If extd_is_library is equal to 1:
+        Set extd_link_kind to 0
+    Otherwise:
+        If extd_is_framework is equal to 1:
+            Set extd_link_kind to 1
+        Otherwise:
+            print_string("[PARSER ERROR] External declaration: expected 'library' or 'framework', got '")
+            If extd_cur_val is not equal to 0:
+                print_string(extd_cur_val)
+            End If
+            print_string("' at line ")
+            Let extd_lk2_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+            print_integer(extd_lk2_line)
+            print_newline()
+            exit_with_code(1)
+        End If
+    End If
+    parser_eat(parser, 53)
+
+    Note: Eat the library/framework name (string literal).
+    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    If extd_cur_type is not equal to 10:
+        print_string("[PARSER ERROR] External declaration: expected library/framework name string literal at line ")
+        Let extd_ln_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+        print_integer(extd_ln_line)
+        print_newline()
+        exit_with_code(1)
+    End If
+    Let extd_lib_raw be memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+    Let extd_lib_name be 0
+    If extd_lib_raw is not equal to 0:
+        Set extd_lib_name to string_duplicate(extd_lib_raw)
+    End If
+    parser_eat(parser, 10)
+
+    Note: --- ConventionClause: mandatory `convention (c|objc)` ---
+    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    Set extd_cur_val to memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+    If extd_cur_type is not equal to 53:
+        print_string("[PARSER ERROR] External declaration: expected 'convention' clause at line ")
+        Let extd_cv_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+        print_integer(extd_cv_line)
+        print_newline()
+        exit_with_code(1)
+    End If
+    Let extd_is_convention be 0
+    If extd_cur_val is not equal to 0:
+        Set extd_is_convention to string_equals(extd_cur_val, "convention")
+    End If
+    If extd_is_convention is not equal to 1:
+        print_string("[PARSER ERROR] External declaration: expected 'convention' keyword, got '")
+        If extd_cur_val is not equal to 0:
+            print_string(extd_cur_val)
+        End If
+        print_string("' at line ")
+        Let extd_cv2_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+        print_integer(extd_cv2_line)
+        print_newline()
+        exit_with_code(1)
+    End If
+    parser_eat(parser, 53)
+
+    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    Set extd_cur_val to memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+    If extd_cur_type is not equal to 53:
+        print_string("[PARSER ERROR] External declaration: expected convention name ('c' or 'objc') at line ")
+        Let extd_cn_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+        print_integer(extd_cn_line)
+        print_newline()
+        exit_with_code(1)
+    End If
+    Let extd_convention be 0
+    Let extd_is_c be 0
+    Let extd_is_objc be 0
+    If extd_cur_val is not equal to 0:
+        Set extd_is_c to string_equals(extd_cur_val, "c")
+        Set extd_is_objc to string_equals(extd_cur_val, "objc")
+    End If
+    If extd_is_c is equal to 1:
+        Set extd_convention to 0
+    Otherwise:
+        If extd_is_objc is equal to 1:
+            Set extd_convention to 1
+        Otherwise:
+            print_string("[PARSER ERROR] External declaration: unknown convention '")
+            If extd_cur_val is not equal to 0:
+                print_string(extd_cur_val)
+            End If
+            print_string("' at line ")
+            Let extd_cn2_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+            print_integer(extd_cn2_line)
+            print_newline()
+            exit_with_code(1)
+        End If
+    End If
+    parser_eat(parser, 53)
+
+    Note: --- Optional `aliased as "X"` clause ---
+    Let extd_alias_name be 0
+    Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+    Set extd_cur_val to memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+    Let extd_is_aliased be 0
+    If extd_cur_type is equal to 53:
+        If extd_cur_val is not equal to 0:
+            Set extd_is_aliased to string_equals(extd_cur_val, "aliased")
+        End If
+    End If
+    If extd_is_aliased is equal to 1:
+        parser_eat(parser, 53)
+        Note: Eat `as` (TOKEN_AS = 34).
+        Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+        Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+        If extd_cur_type is not equal to 34:
+            print_string("[PARSER ERROR] External declaration: expected 'as' after 'aliased' at line ")
+            Let extd_al_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+            print_integer(extd_al_line)
+            print_newline()
+            exit_with_code(1)
+        End If
+        parser_eat(parser, 34)
+
+        Set extd_cur to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+        Set extd_cur_type to memory_get_int32(extd_cur, TOKEN_TYPE_OFFSET)
+        If extd_cur_type is not equal to 10:
+            print_string("[PARSER ERROR] External declaration: expected alias-name string literal at line ")
+            Let extd_an_line be memory_get_int32(extd_cur, TOKEN_LINE_OFFSET)
+            print_integer(extd_an_line)
+            print_newline()
+            exit_with_code(1)
+        End If
+        Let extd_alias_raw be memory_get_pointer(extd_cur, TOKEN_VALUE_OFFSET)
+        If extd_alias_raw is not equal to 0:
+            Set extd_alias_name to string_duplicate(extd_alias_raw)
+        End If
+        parser_eat(parser, 10)
+    End If
+
+    Note: --- Populate the FFI metadata fields in the Function struct ---
+    Note: Layout (per function_create): is_external@56, is_unsafe@60,
+    Note: library_name@64, link_kind@72, convention@76, alias_name@80.
+    memory_set_int32(extd_func, 56, 1)
+    memory_set_int32(extd_func, 60, extd_saw_unsafe)
+    memory_set_pointer(extd_func, 64, extd_lib_name)
+    memory_set_int32(extd_func, 72, extd_link_kind)
+    memory_set_int32(extd_func, 76, extd_convention)
+    memory_set_pointer(extd_func, 80, extd_alias_name)
+
+    Return extd_func
+End Process
+
 Process called "parser_parse_function" takes parser as Integer returns Integer:
     Note: Parse: Process called "name" [that takes param as Type] returns Type:
     parser_eat(parser, 1)
@@ -9286,6 +9791,40 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
                 End If
             End If
 
+            Note:
+            Handle top-level External Process declaration (P3A bug A).
+            Recognized forms:
+                External Process called "X" [that takes ...] [returns T] from <library|framework> "L" convention <c|objc> [aliased as "alias"]
+                unsafe External Process called "X" ...
+            At top level the bare identifiers `External` and `unsafe` have no
+            other meaning, so detection is by string-equals against the
+            current token's value (TOKEN_IDENTIFIER, type 53). The legacy
+            expression form `External "X" from a, b` (inside a Process body)
+            is followed by TOKEN_STRING_LITERAL and is parsed by
+            parser_parse_primary; it never enters this top-level dispatch.
+            :End Note
+            Let is_external_decl be 0
+            If token_type is equal to 53:
+                Let extd_check_val be memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
+                If extd_check_val is not equal to 0:
+                    If string_equals(extd_check_val, "External") is equal to 1:
+                        Set is_external_decl to 1
+                    End If
+                    If string_equals(extd_check_val, "unsafe") is equal to 1:
+                        Set is_external_decl to 1
+                    End If
+                End If
+            End If
+            If is_external_decl is equal to 1:
+                Let ext_func be parser_parse_external_declaration(parser)
+                If ext_func is equal to 0:
+                    print_string("[ERROR] parser_parse_external_declaration returned NULL!")
+                    print_newline()
+                    Return 0
+                End If
+                program_add_function(program, ext_func)
+            End If
+
             Note: Handle unknown token
             Let handled_token be 0
             If is_import is equal to 1:
@@ -9307,6 +9846,9 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
                 Set handled_token to 1
             End If
             If is_from_import is equal to 1:
+                Set handled_token to 1
+            End If
+            If is_external_decl is equal to 1:
                 Set handled_token to 1
             End If
             If handled_token is equal to 0:
